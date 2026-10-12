@@ -104,7 +104,7 @@ function createDeferredLegacyTables(db: DbConnection): void {
   }
 }
 
-function markDatabaseBusy(db: DbConnection): void {
+function markDatabaseBusy(db: DbConnection) {
   const host = upsertHost(db, noopNotifier, {
     name: "maintenance-host",
   });
@@ -112,7 +112,7 @@ function markDatabaseBusy(db: DbConnection): void {
     name: "maintenance-project",
     source: { type: "local_path", hostId: host.id, path: "/tmp/project" },
   });
-  createThread(db, noopNotifier, {
+  return createThread(db, noopNotifier, {
     projectId: project.id,
     providerId: "codex",
     status: "active",
@@ -139,23 +139,78 @@ function buildFreelist(db: DbConnection): void {
 function setupBusyDatabaseWithFreelist() {
   const db = createConnection(":memory:");
   migrate(db);
-  markDatabaseBusy(db);
+  const thread = markDatabaseBusy(db);
   buildFreelist(db);
 
-  return { db };
+  return { db, thread };
 }
 
-function setupBusyFileDatabaseWithFreelist(tempDatabase: TempDatabasePath) {
+function setupIdleFileDatabaseWithFreelist(tempDatabase: TempDatabasePath) {
   const db = createConnection(tempDatabase.dbPath);
   migrate(db);
-  markDatabaseBusy(db);
   buildFreelist(db);
 
   return { db };
 }
 
 describe("runDatabaseMaintenanceSweep", () => {
-  it("drops deferred legacy tables on an idle maintenance pass", () => {
+  it("defers incremental vacuum during active work and reclaims after it settles", async () => {
+    const { db, thread } = setupBusyDatabaseWithFreelist();
+    try {
+      const before = getDatabaseFreelistStats(db);
+      expect(before.freelistCount).toBeGreaterThan(1024);
+      await runDatabaseMaintenanceSweep({ db, logger: testLogger });
+      expect(getDatabaseFreelistStats(db)).toEqual(before);
+
+      db.$client
+        .prepare("UPDATE threads SET status = ? WHERE id = ?")
+        .run("idle", thread.id);
+      await runDatabaseMaintenanceSweep({ db, logger: testLogger });
+      expect(getDatabaseFreelistStats(db).freelistCount).toBeLessThan(
+        before.freelistCount,
+      );
+    } finally {
+      db.$client.close();
+    }
+  });
+
+  it("yields between vacuum batches and stops when new app work starts", async () => {
+    const { db, thread } = setupBusyDatabaseWithFreelist();
+    db.$client
+      .prepare("UPDATE threads SET status = ? WHERE id = ?")
+      .run("idle", thread.id);
+    const before = getDatabaseFreelistStats(db);
+    const incomingWork = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        db.$client
+          .prepare("UPDATE threads SET status = ? WHERE id = ?")
+          .run("active", thread.id);
+        resolve();
+      });
+    });
+    try {
+      await runDatabaseMaintenanceSweep({ db, logger: testLogger });
+      await incomingWork;
+      const after = getDatabaseFreelistStats(db);
+      expect(after.freelistCount).toBeLessThan(before.freelistCount);
+      expect(before.freelistCount - after.freelistCount).toBeLessThanOrEqual(
+        256,
+      );
+      expect(after.freelistCount).toBeGreaterThan(1024);
+      db.$client
+        .prepare("UPDATE threads SET status = ? WHERE id = ?")
+        .run("idle", thread.id);
+      await runDatabaseMaintenanceSweep({ db, logger: testLogger });
+      expect(getDatabaseFreelistStats(db).freelistCount).toBeLessThan(
+        after.freelistCount,
+      );
+    } finally {
+      await incomingWork;
+      db.$client.close();
+    }
+  });
+
+  it("drops deferred legacy tables on an idle maintenance pass", async () => {
     const db = createConnection(":memory:");
     migrate(db);
     createDeferredLegacyTables(db);
@@ -163,23 +218,23 @@ describe("runDatabaseMaintenanceSweep", () => {
       [...TEST_DEFERRED_LEGACY_TABLE_NAMES].sort(),
     );
 
-    runDatabaseMaintenanceSweep({ db, logger: testLogger });
+    await runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
     expect(listDeferredLegacyTables(db)).toEqual([]);
   });
 
-  it("skips deferred legacy table cleanup while app work is active", () => {
+  it("skips deferred legacy table cleanup while app work is active", async () => {
     const { db } = setupBusyDatabaseWithFreelist();
     createDeferredLegacyTables(db);
 
-    runDatabaseMaintenanceSweep({ db, logger: testLogger });
+    await runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
     expect(listDeferredLegacyTables(db)).toEqual(
       [...TEST_DEFERRED_LEGACY_TABLE_NAMES].sort(),
     );
   });
 
-  it("skips busy legacy databases before dbstat or full maintenance", () => {
+  it("skips busy legacy databases before dbstat or full maintenance", async () => {
     const tempDatabase = createTempDatabasePath();
     try {
       createLegacyDatabaseFile(tempDatabase.dbPath);
@@ -196,7 +251,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const before = getDatabaseFreelistStats(db);
         slowQueryLogger.clear();
 
-        runDatabaseMaintenanceSweep({ db, logger: testLogger });
+        await runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
         expect(getDatabaseAutoVacuumMode(db)).toBe("none");
         expect(getDatabaseFreelistStats(db).freelistCount).toBe(
@@ -213,10 +268,10 @@ describe("runDatabaseMaintenanceSweep", () => {
     }
   });
 
-  it("does not wait on a WAL reader during incremental maintenance", () => {
+  it("does not wait on a WAL reader during incremental maintenance", async () => {
     const tempDatabase = createTempDatabasePath();
     try {
-      const { db } = setupBusyFileDatabaseWithFreelist(tempDatabase);
+      const { db } = setupIdleFileDatabaseWithFreelist(tempDatabase);
       const readerDb = new Database(tempDatabase.dbPath, { readonly: true });
       let readerTransactionOpen = false;
       try {
@@ -226,7 +281,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const before = getDatabaseFreelistStats(db);
         const startedAt = performance.now();
 
-        runDatabaseMaintenanceSweep({ db, logger: testLogger });
+        await runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
         const elapsedMs = performance.now() - startedAt;
         expect(elapsedMs).toBeLessThan(
@@ -247,10 +302,10 @@ describe("runDatabaseMaintenanceSweep", () => {
     }
   });
 
-  it("returns quickly when a WAL writer blocks incremental maintenance", () => {
+  it("returns quickly when a WAL writer blocks incremental maintenance", async () => {
     const tempDatabase = createTempDatabasePath();
     try {
-      const { db } = setupBusyFileDatabaseWithFreelist(tempDatabase);
+      const { db } = setupIdleFileDatabaseWithFreelist(tempDatabase);
       const writerDb = new Database(tempDatabase.dbPath);
       let writerTransactionOpen = false;
       try {
@@ -260,7 +315,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const { logger, warnMessages } = createCapturingServerLogger();
         const startedAt = performance.now();
 
-        runDatabaseMaintenanceSweep({ db, logger });
+        await runDatabaseMaintenanceSweep({ db, logger });
 
         const elapsedMs = performance.now() - startedAt;
         expect(elapsedMs).toBeLessThan(

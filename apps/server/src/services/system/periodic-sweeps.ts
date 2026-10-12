@@ -85,6 +85,7 @@ type PeriodicSweepDeps = LoggedPendingInteractionWorkSessionDeps & {
 };
 
 const DATABASE_MAINTENANCE_CHECK_INTERVAL_MS = 60 * 60_000;
+const DATABASE_INCREMENTAL_VACUUM_BATCH_PAGES = 256;
 const COMPLETED_EVENT_OUTPUT_MIGRATION_MAX_ADVANCES_PER_SWEEP = 64;
 const RETAINED_EVENT_OUTPUT_EXPIRY_MAX_ADVANCES_PER_SWEEP = 256;
 const RETAINED_EVENT_OUTPUT_EXPIRY_BATCH_SIZE = 1;
@@ -173,20 +174,19 @@ export async function runPeriodicSweepJobs(
   }
 }
 
-export function runDatabaseMaintenanceSweep(
+export async function runDatabaseMaintenanceSweep(
   deps: DatabaseMaintenanceSweepDeps,
-): void {
+): Promise<void> {
+  const activity = getDatabaseMaintenanceActivity(deps.db);
+  if (!isDatabaseMaintenanceIdle(activity)) {
+    deps.logger.debug(
+      { activity },
+      "Database maintenance skipped while app work is active",
+    );
+    return;
+  }
   const deferredLegacyTables = listDeferredLegacyTables(deps.db);
   if (deferredLegacyTables.length > 0) {
-    const activity = getDatabaseMaintenanceActivity(deps.db);
-    if (!isDatabaseMaintenanceIdle(activity)) {
-      deps.logger.debug(
-        { activity, deferredLegacyTables },
-        "Deferred legacy database table cleanup skipped while app work is active",
-      );
-      return;
-    }
-
     try {
       const result = dropDeferredLegacyTables(deps.db);
       deps.logger.info(
@@ -219,22 +219,40 @@ export function runDatabaseMaintenanceSweep(
       return;
     }
     try {
-      const result = runIncrementalVacuum(deps.db, {
-        maxPages: DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
-      });
-      deps.logger.info({ result }, "Incremental database vacuum completed");
+      let remainingPages = Math.min(
+        DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
+        freelistStats.freelistCount,
+      );
+      let after = freelistStats;
+      while (remainingPages > 0 && after.freelistCount > 0) {
+        const maxPages = Math.min(
+          remainingPages,
+          DATABASE_INCREMENTAL_VACUUM_BATCH_PAGES,
+        );
+        const result = runIncrementalVacuum(deps.db, { maxPages });
+        remainingPages -= maxPages;
+        after = result.after;
+        if (
+          remainingPages === 0 ||
+          after.freelistCount === 0 ||
+          after.freelistCount >= result.before.freelistCount
+        ) {
+          break;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (
+          !isDatabaseMaintenanceIdle(getDatabaseMaintenanceActivity(deps.db))
+        ) {
+          break;
+        }
+      }
+      deps.logger.info(
+        { result: { before: freelistStats, after } },
+        "Incremental database vacuum completed",
+      );
     } catch (error) {
       deps.logger.warn({ err: error }, "Incremental database vacuum failed");
     }
-    return;
-  }
-
-  const activity = getDatabaseMaintenanceActivity(deps.db);
-  if (!isDatabaseMaintenanceIdle(activity)) {
-    deps.logger.debug(
-      { activity },
-      "Database maintenance skipped while app work is active",
-    );
     return;
   }
 
