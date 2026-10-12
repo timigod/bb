@@ -11,6 +11,8 @@ export const CODEX_ASYNC_QUESTION_EXTENSION_KIND =
 export const codexGoalStatusSchema = z.enum([
   "active",
   "paused",
+  "blocked",
+  "usageLimited",
   "budgetLimited",
   "complete",
 ]);
