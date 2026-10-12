@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { environments } from "@bb/db";
-import { describe, expect, it } from "vitest";
+import { createDeferredPromise } from "@bb/test-helpers";
+import { describe, expect, it, vi } from "vitest";
+import { hasLiveThreadStartInFlight } from "../../../../apps/server/src/services/threads/thread-lifecycle.js";
 import {
   createHostThread,
   getEnvironment,
@@ -11,7 +13,10 @@ import {
   getThreadOutput,
   sendTextMessage,
 } from "../../helpers/api.js";
-import { waitForThreadStatus } from "../../helpers/assertions.js";
+import {
+  waitForEnvironmentStatus,
+  waitForThreadStatus,
+} from "../../helpers/assertions.js";
 import { createReadyReuseThread } from "../../helpers/fixtures.js";
 import { withHarness } from "../../helpers/harness.js";
 import {
@@ -21,11 +26,6 @@ import {
   TURN_TIMEOUT_MS,
 } from "./shared.js";
 
-/**
- * Provisioning event statuses the timeline would render for a thread. The
- * synthetic `thread-start:` bookkeeping event is dropped by the client, so it
- * is excluded here too.
- */
 async function visibleProvisioningStatuses(
   api: Parameters<typeof getThreadEvents>[0],
   threadId: string,
@@ -66,14 +66,9 @@ describe.sequential("fake provider smoke reuse integration", () => {
         "error",
         TURN_TIMEOUT_MS,
       );
-      const environmentId = erroredThread.environmentId;
-      if (!environmentId) {
-        throw new Error("Provisioning thread was missing an environment");
-      }
+      expect(erroredThread.environmentId).toBeNull();
 
-      const environment = await getEnvironment(harness.api, environmentId);
       const events = await getThreadEvents(harness.api, thread.id);
-      expect(environment.status).toBe("error");
       expect(
         events.some(
           (event) =>
@@ -155,64 +150,98 @@ describe.sequential("fake provider smoke reuse integration", () => {
       expect(reusedEnvironment.id).toBe(environment.id);
       expect(output).toContain("reuse environment");
 
-      // The reuse start provisions nothing, so it must not emit a provisioning
-      // row — otherwise the timeline shows "Provisioned thread" for a start
-      // that only attached to a ready environment. The first thread did
-      // provision, so it keeps its row.
-      expect(await visibleProvisioningStatuses(harness.api,thread.id)).not.toEqual(
-        [],
-      );
       expect(
-        await visibleProvisioningStatuses(harness.api,reusedThread.thread.id),
+        await visibleProvisioningStatuses(harness.api, thread.id),
+      ).not.toEqual([]);
+      expect(
+        await visibleProvisioningStatuses(harness.api, reusedThread.thread.id),
       ).toEqual([]);
     }));
 
-  // Decision B*: un-archiving a thread whose managed environment was destroyed
-  // no longer reprovisions it (that race is gone by construction), so the old
-  // "second send conflicts with an in-progress reprovision after unarchive"
-  // scenario is unreachable. A send to a thread with a destroyed environment is
-  // covered by the decoupling tests in environment-isolation.test.ts.
+  it.each([false, true])(
+    "re-attaches a checkout whose row lost its path with delayed start acknowledgment: %s",
+    (delayStartAcknowledgment) =>
+      withHarness(async (harness) => {
+        const acknowledgment = createDeferredPromise<void>();
+        const requestRpc = harness.hub.requestHostOnlineRpc.bind(harness.hub);
+        let delayedStart = false;
+        const rpcSpy = vi
+          .spyOn(harness.hub, "requestHostOnlineRpc")
+          .mockImplementation(async (args) => {
+            const response = await requestRpc(args);
+            if (
+              delayStartAcknowledgment &&
+              !delayedStart &&
+              args.message.command.type === "thread.start"
+            ) {
+              delayedStart = true;
+              await acknowledgment.promise;
+            }
+            return response;
+          });
+        try {
+          const project = await createProjectFixture(
+            harness,
+            "Checkout Reattach After Error",
+          );
+          const { environment, thread } = await createReadyThread(harness, {
+            projectId: project.id,
+            workspace: {
+              type: "unmanaged",
+              path: harness.repoDir,
+            },
+          });
 
-  it("rejects reprovision attempts for unmanaged environments", () =>
-    withHarness(async (harness) => {
-      const project = await createProjectFixture(
-        harness,
-        "Unmanaged Reprovision Rejected",
-      );
-      const { environment, thread } = await createReadyThread(harness, {
-        projectId: project.id,
-        workspace: {
-          type: "unmanaged",
-          path: harness.repoDir,
-        },
-      });
+          if (delayStartAcknowledgment) {
+            expect(hasLiveThreadStartInFlight(thread.id)).toBe(true);
+          }
+          harness.db
+            .update(environments)
+            .set({
+              path: null,
+              status: "error",
+              updatedAt: Date.now(),
+            })
+            .where(eq(environments.id, environment.id))
+            .run();
 
-      harness.db
-        .update(environments)
-        .set({
-          path: null,
-          status: "error",
-          updatedAt: Date.now(),
-        })
-        .where(eq(environments.id, environment.id))
-        .run();
-
-      const response = await harness.api.threads[":id"].send.$post({
-        param: { id: thread.id },
-        json: {
-          input: [
-            { type: "text", text: "try unmanaged reprovision", mentions: [] },
-          ],
-          mode: "auto",
-        },
-      });
-      expect(response.status).toBe(409);
-      await expect(response.json()).resolves.toMatchObject({
-        code: "environment_not_ready",
-        details: {
-          environmentStatus: "error",
-          hasPath: false,
-        },
-      });
-    }));
+          const response = await harness.api.threads[":id"].send.$post({
+            param: { id: thread.id },
+            json: {
+              input: [
+                { type: "text", text: "try checkout reattach", mentions: [] },
+              ],
+              mode: "auto",
+            },
+          });
+          expect(response.status).toBe(200);
+          acknowledgment.resolve();
+          const readyThread = await waitForThreadStatus(
+            harness.api,
+            thread.id,
+            "idle",
+            TURN_TIMEOUT_MS,
+          );
+          const environmentId = readyThread.environmentId;
+          if (environmentId === null) {
+            throw new Error("Thread lost its environment after the re-attach");
+          }
+          expect(environmentId).not.toBe(environment.id);
+          const reattached = await waitForEnvironmentStatus(
+            harness.api,
+            environmentId,
+            "ready",
+            TURN_TIMEOUT_MS,
+          );
+          expect(reattached.path).toBe(harness.repoDir);
+          expect(reattached.environmentProviderId).toBe("project-checkout");
+          expect(await getThreadOutput(harness.api, thread.id)).toContain(
+            "try checkout reattach",
+          );
+        } finally {
+          acknowledgment.resolve();
+          rpcSpy.mockRestore();
+        }
+      }),
+  );
 });

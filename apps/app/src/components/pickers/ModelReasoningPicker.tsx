@@ -6,54 +6,56 @@ import {
   useRef,
   useState,
   type KeyboardEventHandler,
-  type PointerEventHandler,
-  type ReactNode,
 } from "react";
 import type {
   SystemExecutionOptionsModelLoadError,
   SystemProvidersQuery,
 } from "@bb/server-contract";
-import { type ReasoningLevel } from "@bb/domain";
-import { stripModelBrandPrefix } from "./model-brand-prefix";
-import { REASONING_LABELS } from "@/lib/reasoning-labels";
+import {
+  resolveServiceTierOptions,
+  type ProviderOptionDescriptor,
+  type ReasoningLevel,
+  type ServiceTier,
+} from "@bb/domain";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  stripModelBrandPrefix,
+  type ProviderPickerOption,
+} from "./model-brand-prefix";
 import { Button } from "@bb/shared-ui/button";
-import { Icon, type IconName } from "@bb/shared-ui/icon";
+import { Icon } from "@bb/shared-ui/icon";
 import { Input } from "@bb/shared-ui/input";
 import {
   COARSE_POINTER_ICON_SIZE_CLASS,
-  COARSE_POINTER_ICON_SIZE_SHRINK_CLASS,
   COARSE_POINTER_PROVIDER_TAB_SIZE_CLASS,
   COARSE_POINTER_TEXT_SM_CLASS,
 } from "@bb/shared-ui/coarse-pointer-sizing";
-import {
-  Popover,
-  PopoverAnchor,
-  PopoverContent,
-  PopoverTrigger,
-} from "@bb/shared-ui/popover";
-import { Switch } from "@bb/shared-ui/switch";
+import { Popover, PopoverContent, PopoverTrigger } from "@bb/shared-ui/popover";
+import { Skeleton } from "@bb/shared-ui/skeleton";
 import { LIST_HOVER_TRANSITION } from "@bb/shared-ui/motion";
-import {
-  MENU_ITEM_LAST_HOVERED_CLASS,
-  MenuHoverProvider,
-  useMenuItemHover,
-} from "@bb/shared-ui/menu-item-hover";
 import { cn } from "@bb/shared-ui/lib/utils";
-import { useSystemExecutionOptions } from "@/hooks/queries/system-queries";
+import {
+  prefetchSystemExecutionOptions,
+  useSystemExecutionOptions,
+} from "@/hooks/queries/system-queries";
+import { resolveModelCatalogSelection } from "@/hooks/thread-creation-options/model-catalog-selection";
 import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
-import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import {
   OPTION_BASE_CLASS_NAME,
   OPTION_INTERACTIVE_CLASS_NAME,
   OPTION_MUTED_CLASS_NAME,
   OPTION_TRIGGER_CONTENT_CLASS_NAME,
-  type PickerOption,
-} from "./OptionPicker";
+} from "@bb/shared-ui/option-display";
+import { type PickerOption } from "./OptionPicker";
 import type { ModelPickerOption } from "./model-picker-option";
 import {
-  formatModelLoadErrorText,
-  ModelLoadErrorMessage,
-} from "./model-load-error-message";
+  MODEL_PICKER_MENU_WIDTH_CLASS_NAME,
+  splitModelLabelTag,
+} from "./model-picker-menu";
+import { ModelReasoningMenu } from "./ModelReasoningMenuSplit";
+import { searchPickerOptions } from "./picker-search";
+import { useResetPickerScroll } from "./useResetPickerScroll";
+import { formatModelLoadErrorText } from "./model-load-error-message";
 import {
   useAppCommandContext,
   useAppCommandHandler,
@@ -64,6 +66,10 @@ import { AppCommandShortcutHint } from "@/components/commands/AppCommandShortcut
 import { isEditableKeyboardTarget } from "@/lib/app-keybindings";
 import { useOptionalPaneContext } from "@/views/thread-detail/PaneContext";
 import {
+  APP_COMPOSER_SELECTOR,
+  resolveComposerCommandScope,
+} from "@/lib/composer-command-ownership";
+import {
   ownsModelPickerCycleChord,
   resolveModelPickerToggle,
   type ModelPickerScope,
@@ -73,13 +79,40 @@ import {
   nextCycleValue,
   previousCycleValue,
 } from "./modelPickerCycle";
+import type {
+  SessionOptionChoice,
+  SessionOptionMenuSection,
+} from "./SessionOptionsMenu";
 
-interface ModelLabelParts {
-  base: string;
-  tag: string | null;
+const NO_AGENT_SECTIONS: readonly SessionOptionMenuSection[] = [];
+function ignoreAgentOptionChange(): void {}
+
+interface ResolvedProviderPreview {
+  providerId: string;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  supportsServiceTier: boolean;
+  serviceTierOptions: readonly ProviderOptionDescriptor[];
+}
+
+export interface ModelReasoningPickerHandoffSelection {
+  providerId: string;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+}
+
+export interface ModelReasoningPickerHandoff {
+  sourceProviderId: string;
+  active: boolean;
+  onStart: () => void;
+  onExit: () => void;
+  onSelect: (selection: ModelReasoningPickerHandoffSelection) => void;
 }
 
 const FAILED_TO_LOAD_MODELS_LABEL = "Failed to load models";
+const EMPTY_MODEL_OPTIONS: readonly ModelPickerOption[] = [];
+const EMPTY_SERVICE_TIER_OPTIONS: readonly ProviderOptionDescriptor[] = [];
+const preserveModelLabel = (displayName: string): string => displayName;
 const MODEL_CYCLE_COMMANDS = [
   "modelPicker.cycleModel",
   "modelPicker.cycleModelBackward",
@@ -93,68 +126,11 @@ const REASONING_CYCLE_COMMANDS = [
   "modelPicker.cycleReasoningBackward",
 ] as const;
 
-// Below this many models (primary + selected-only) the list is short enough to
-// scan by eye, so the search box is more clutter than help.
 const MODEL_SEARCH_MIN_OPTIONS = 5;
-const MODEL_PICKER_MENU_WIDTH_CLASS_NAME = "w-max min-w-52 max-w-80";
 
-// Splits a trailing parenthetical off a model label (e.g. "Opus 4.8 (1M)" →
-// base "Opus 4.8", tag "1M") so the tag can render as a small, muted suffix
-// without the parentheses. Labels without a trailing "(…)" pass through
-// unchanged (tag null).
-function splitModelLabelTag(label: string): ModelLabelParts {
-  const match = label.match(/^(.*\S)\s*\(([^()]+)\)$/u);
-  if (!match) {
-    return { base: label, tag: null };
-  }
-  return { base: match[1], tag: match[2] };
-}
+const HANDOFF_DRAWER_TOP_CLASS_NAME =
+  "[&>[data-persistent-drawer-handle]]:w-full [&>[data-persistent-drawer-handle]]:rounded-t-xl [&>[data-persistent-drawer-handle]]:bg-background";
 
-/**
- * Build a loose fuzzy RegExp from a plain-text query.
- * Each character is matched in order with `.*` between them, so
- * "gpt4" matches "GPT-4 Turbo".
- */
-export function buildFuzzyRegex(query: string): RegExp {
-  const pattern = query
-    .split("")
-    .map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join(".*");
-  return new RegExp(pattern, "i");
-}
-
-// Filter options by fuzzy-matching against text the caller derives from each
-// option. Pass the *rendered* text (see `modelSearchText`) so search matches
-// what the user actually sees on screen.
-function fuzzyFilter<T>(
-  options: readonly T[],
-  normalizedQuery: string,
-  getText: (option: T) => string,
-): readonly T[] {
-  if (!normalizedQuery) return options;
-  const regex = buildFuzzyRegex(normalizedQuery);
-  return options.filter((option) => regex.test(getText(option)));
-}
-
-// The text a model row is matched against: the visible (brand-stripped) label
-// plus the raw model id, so typing either the on-screen label or the id finds
-// the model. Filtering on the raw label would match brand words that were
-// stripped from the rendered row, surprising the user.
-function modelSearchText(
-  option: ModelPickerOption,
-  providerId: string,
-): string {
-  return `${stripModelBrandPrefix(option.label, providerId)} ${option.routeProviderId ?? ""} ${option.value}`;
-}
-
-/**
- * A keyboard-navigable row in the model list. Each entry maps 1:1 to a rendered,
- * highlightable row and drives arrow movement, Enter handling, and the active
- * descendant id — so the fragile hand-computed index math lives in one tested
- * place. The desktop "More models" submenu is intentionally excluded (it stays
- * pointer/native-focus driven); during an active search its filtered options are
- * flattened inline instead, keeping every match reachable from the keyboard.
- */
 export type ModelNavRow =
   | { kind: "model"; option: ModelPickerOption }
   | { kind: "more-toggle" };
@@ -172,19 +148,17 @@ export function buildModelNavRows({
   isSearching: boolean;
   showMoreModels: boolean;
 }): ModelNavRow[] {
-  const rows: ModelNavRow[] = modelOptions.map(
-    (option): ModelNavRow => ({ kind: "model", option }),
-  );
+  const rows: ModelNavRow[] = modelOptions.map((option): ModelNavRow => ({
+    kind: "model",
+    option,
+  }));
   if (moreModelOptions.length === 0) return rows;
 
-  // While searching, flatten every match into one list so results otherwise
-  // hidden behind the compact toggle or the desktop submenu stay reachable.
   if (isSearching) {
     for (const option of moreModelOptions) rows.push({ kind: "model", option });
     return rows;
   }
 
-  // Compact (not searching): a toggle expands the extra models inline.
   if (isCompactViewport) {
     rows.push({ kind: "more-toggle" });
     if (showMoreModels) {
@@ -194,68 +168,41 @@ export function buildModelNavRows({
     }
   }
 
-  // Desktop (not searching): the extra models live in the hover submenu, which
-  // is rendered separately and left out of keyboard nav.
   return rows;
 }
 
 interface ModelReasoningPickerProps {
-  // Provider state
   providerRouting?: SystemProvidersQuery;
-  providerOptions: readonly PickerOption<string>[];
+  providerOptions: readonly ProviderPickerOption[];
   selectedProviderId: string;
-  /** Omit to render the provider as locked (tabs hidden, can't switch). */
   onSelectedProviderChange?: (value: string) => void;
+  onProviderPreviewResolved?: (value: ResolvedProviderPreview) => void;
+  requireVerifiedProviderPreview?: boolean;
   hasMultipleProviders: boolean;
-  // Model state
   modelValue: string;
   modelOptions: readonly ModelPickerOption[];
-  /** Models rendered behind a collapsed "More models" row. */
   moreModelOptions?: readonly ModelPickerOption[];
   modelIsLoading?: boolean;
   modelLoadFailed?: boolean;
   modelLoadError?: SystemExecutionOptionsModelLoadError | null;
   onModelChange: (value: string) => void;
-  /**
-   * Optional case-normaliser for raw model names returned during a provider
-   * handoff. The picker itself drops the brand prefix at render — callers only
-   * need to pass this when the provider API returns un-cased ids.
-   */
   formatModelLabel?: (displayName: string) => string;
-  // Reasoning state — supported efforts are per-model, so callers derive
-  // these options from the SELECTED model and reconcile the level on model
-  // change via `reconcileReasoningLevel` in @bb/domain.
   reasoningValue: ReasoningLevel;
   reasoningOptions: readonly PickerOption<ReasoningLevel>[];
   onReasoningChange: (value: ReasoningLevel) => void;
-  // Fast mode / service tier
-  fastModeEnabled: boolean;
-  onFastModeChange: (enabled: boolean) => void;
-  showFastModeToggle: boolean;
+  serviceTierValue: ServiceTier | undefined;
+  serviceTierOptions: readonly ProviderOptionDescriptor[];
+  onServiceTierChange: (value: ServiceTier) => void;
+  agentSections?: readonly SessionOptionMenuSection[];
+  onAgentOptionChange?: (optionId: string, value: SessionOptionChoice) => void;
+  commandShortcutsEnabled?: boolean;
   serviceTierSupportByProvider?: Record<string, boolean>;
   className?: string;
-  /** Render with the dim, hover-to-foreground treatment used inside the prompt box. */
   muted?: boolean;
-  /** Render with the popover open on mount. Story-only escape hatch. */
-  defaultOpen?: boolean;
-  /** Whether the popover blocks page interaction. Defaults to true. */
   modal?: boolean;
-  /**
-   * Render the trigger as a non-interactive, dimmed label showing the same
-   * model/reasoning summary — the popover never opens. Used by read-only
-   * surfaces (e.g. the side chat) so they render the identical control as their
-   * interactive counterpart, just disabled.
-   */
+  align?: "start" | "center" | "end";
   disabled?: boolean;
-  footerAction?: ModelReasoningPickerFooterAction;
-}
-
-export interface ModelReasoningPickerFooterAction {
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  title?: string;
-  iconName?: IconName;
+  handoff?: ModelReasoningPickerHandoff;
 }
 
 export function ModelReasoningPicker({
@@ -263,6 +210,8 @@ export function ModelReasoningPicker({
   providerRouting,
   selectedProviderId,
   onSelectedProviderChange,
+  onProviderPreviewResolved,
+  requireVerifiedProviderPreview = false,
   hasMultipleProviders,
   modelValue,
   modelOptions,
@@ -275,42 +224,63 @@ export function ModelReasoningPicker({
   reasoningValue,
   reasoningOptions,
   onReasoningChange,
-  fastModeEnabled,
-  onFastModeChange,
-  showFastModeToggle,
+  serviceTierValue,
+  serviceTierOptions,
+  onServiceTierChange,
+  agentSections = NO_AGENT_SECTIONS,
+  onAgentOptionChange = ignoreAgentOptionChange,
+  commandShortcutsEnabled = true,
   serviceTierSupportByProvider,
   className,
   muted,
-  defaultOpen = false,
   modal = true,
+  align = "start",
   disabled,
-  footerAction,
+  handoff,
 }: ModelReasoningPickerProps) {
   const isCompactViewport = useIsCompactViewport();
-  const isPointerCoarse = usePointerCoarse();
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const toggleShortcut = useAppCommandShortcut("modelPicker.toggle");
+  const registeredToggleShortcut = useAppCommandShortcut("modelPicker.toggle");
+  const toggleShortcut = commandShortcutsEnabled
+    ? registeredToggleShortcut
+    : null;
   const [searchQuery, setSearchQuery] = useState("");
+  const listRef = useResetPickerScroll<HTMLDivElement>(searchQuery);
   const [activeIndex, setActiveIndex] = useState(-1);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const normalizedQuery = searchQuery.trim().toLowerCase();
-  const isSearching = normalizedQuery.length > 0;
-  // Unique per picker instance so the active-descendant ids never collide when
-  // more than one ModelReasoningPicker is mounted on the page.
+  const isSearching = searchQuery.trim().length > 0;
   const navId = useId();
   const listboxId = `${navId}-listbox`;
   const optionDomId = (index: number) => `${navId}-opt-${index}`;
 
-  // A controlled parent may need one render to apply a provider-tab change.
-  // Keep showing the clicked provider's cached/querying catalog during that
-  // handoff so the tab responds immediately without flashing the old models.
   const [previewProviderId, setPreviewProviderId] = useState<string | null>(
     null,
   );
-  // "More models" expansion is per-open: it resets when the popover closes.
   const [showMoreModels, setShowMoreModels] = useState(false);
   const [moreModelsOpen, setMoreModelsOpen] = useState(false);
+  const [trackedSelectedProviderId, setTrackedSelectedProviderId] =
+    useState(selectedProviderId);
+  const [browsingHandoff, setHandoffMode] = useState(false);
+  const handoffMode =
+    handoff !== undefined && (handoff.active || browsingHandoff);
+  const [handoffReasoningLevel, setHandoffReasoningLevel] =
+    useState<ReasoningLevel | null>(null);
+
+  if (trackedSelectedProviderId !== selectedProviderId) {
+    setTrackedSelectedProviderId(selectedProviderId);
+    setHandoffMode(
+      open &&
+        handoff !== undefined &&
+        selectedProviderId !== handoff.sourceProviderId,
+    );
+    setHandoffReasoningLevel(null);
+    setPreviewProviderId(null);
+    setShowMoreModels(false);
+    setMoreModelsOpen(false);
+    setSearchQuery("");
+    setActiveIndex(-1);
+  }
 
   const activeProviderId = previewProviderId ?? selectedProviderId;
 
@@ -330,6 +300,32 @@ export function ModelReasoningPicker({
     hasMultipleProviders &&
     onSelectedProviderChange !== undefined &&
     providerOptions.length > 1;
+  const queryClient = useQueryClient();
+  const prefetchRoutingEnvironmentId = providerRouting?.environmentId;
+  const prefetchRoutingHostId = providerRouting?.hostId;
+  const siblingIdsKey = providerOptions
+    .map((option) => option.value)
+    .filter((id) => id !== selectedProviderId)
+    .join("\0");
+  useEffect(() => {
+    if (!open || !canSwitchProviders || siblingIdsKey.length === 0) {
+      return;
+    }
+    prefetchSystemExecutionOptions(queryClient, {
+      routing: {
+        environmentId: prefetchRoutingEnvironmentId,
+        hostId: prefetchRoutingHostId,
+      },
+      providerIds: siblingIdsKey.split("\0"),
+    });
+  }, [
+    canSwitchProviders,
+    open,
+    prefetchRoutingEnvironmentId,
+    prefetchRoutingHostId,
+    queryClient,
+    siblingIdsKey,
+  ]);
   const hasAlternateSelectionPath =
     modelOptions.length > 0 ||
     (selectedModelLoadErrorMatches && canSwitchProviders);
@@ -340,13 +336,10 @@ export function ModelReasoningPicker({
           providerLabel: selectedProviderLabel,
         })
       : "Could not load models.";
-  // Strip the brand prefix at render — the trigger always shows the committed
-  // provider, so we use `selectedProviderId` (not `activeProviderId`, which
-  // can be a preview).
   const triggerModelLabel = modelIsLoading
     ? "Loading models..."
     : hasSelectedModel
-      ? stripModelBrandPrefix(selectedModelLabel, selectedProviderId)
+      ? stripModelBrandPrefix(selectedModelLabel, selectedProvider?.brandPrefix)
       : selectedModelLoadFailed
         ? hasAlternateSelectionPath
           ? "Select model"
@@ -368,8 +361,6 @@ export function ModelReasoningPicker({
     ? (selectedReasoningOption?.label ?? null)
     : null;
 
-  // Shares its cache key with the committed `useSystemExecutionOptions` call
-  // in the caller's hook, so the controlled-provider handoff is a cache hit.
   const isPreviewing =
     previewProviderId !== null && previewProviderId !== selectedProviderId;
   const previewQuery = useSystemExecutionOptions({
@@ -377,67 +368,65 @@ export function ModelReasoningPicker({
     ...providerRouting,
     providerId: isPreviewing ? previewProviderId : undefined,
   });
+  const previewProvider = useMemo(
+    () =>
+      isPreviewing
+        ? previewQuery.data?.providers.find(
+            (provider) => provider.id === previewProviderId,
+          )
+        : undefined,
+    [isPreviewing, previewProviderId, previewQuery.data?.providers],
+  );
+  const previewCatalogIsVerified =
+    isPreviewing &&
+    previewProvider !== undefined &&
+    previewQuery.data !== undefined &&
+    !previewQuery.isPlaceholderData &&
+    !previewQuery.isError &&
+    previewQuery.data.modelLoadError === null;
+  const previewSelectionBlocked =
+    isPreviewing &&
+    (previewProvider === undefined ||
+      (requireVerifiedProviderPreview && !previewCatalogIsVerified));
 
-  const previewModelOptions = useMemo((): readonly ModelPickerOption[] => {
-    if (!isPreviewing) return modelOptions;
-    const models = previewQuery.data?.models;
-    if (!models || models.length === 0) return [];
-    return models.map((model) => ({
-      value: model.model,
-      label: formatModelLabel
-        ? formatModelLabel(model.displayName || model.model)
-        : model.displayName || model.model,
-      ...(model.routeProviderId
-        ? { routeProviderId: model.routeProviderId }
-        : {}),
-    }));
-  }, [isPreviewing, modelOptions, previewQuery.data?.models, formatModelLabel]);
-  const previewMoreModelOptions = useMemo((): readonly ModelPickerOption[] => {
-    if (!isPreviewing) return moreModelOptions;
-    const models = previewQuery.data?.selectedOnlyModels;
-    if (!models || models.length === 0) return [];
-    return models.map((model) => ({
-      value: model.model,
-      label: formatModelLabel
-        ? formatModelLabel(model.displayName || model.model)
-        : model.displayName || model.model,
-      ...(model.routeProviderId
-        ? { routeProviderId: model.routeProviderId }
-        : {}),
-    }));
-  }, [
-    isPreviewing,
-    moreModelOptions,
-    previewQuery.data?.selectedOnlyModels,
-    formatModelLabel,
-  ]);
-  // While previewing, the reasoning levels belong to the previewed provider's
-  // default model (each provider exposes its own set), so the section reflects
-  // the tab on screen rather than the committed model.
-  const previewDefaultModel = useMemo(() => {
-    if (!isPreviewing) return undefined;
-    const models = previewQuery.data?.models;
-    if (!models || models.length === 0) return undefined;
-    return models.find((model) => model.isDefault) ?? models[0];
-  }, [isPreviewing, previewQuery.data?.models]);
-  const previewReasoningOptions =
-    useMemo((): readonly PickerOption<ReasoningLevel>[] => {
-      if (!previewDefaultModel) return [];
-      const seen = new Set<ReasoningLevel>();
-      const options: PickerOption<ReasoningLevel>[] = [];
-      for (const effort of previewDefaultModel.supportedReasoningEfforts) {
-        if (seen.has(effort.reasoningEffort)) continue;
-        seen.add(effort.reasoningEffort);
-        options.push({
-          value: effort.reasoningEffort,
-          label: REASONING_LABELS[effort.reasoningEffort],
-        });
-      }
-      return options;
-    }, [previewDefaultModel]);
+  const previewSelection = useMemo(
+    () =>
+      isPreviewing
+        ? resolveModelCatalogSelection({
+            models: previewProvider ? (previewQuery.data?.models ?? []) : [],
+            selectedOnlyModels: previewProvider
+              ? (previewQuery.data?.selectedOnlyModels ?? [])
+              : [],
+            selectedModel: "",
+            preferredReasoningLevel: reasoningValue,
+            provider: previewProvider,
+            catalogIsVerified: previewCatalogIsVerified,
+            formatModelLabel: formatModelLabel ?? preserveModelLabel,
+          })
+        : null,
+    [
+      formatModelLabel,
+      isPreviewing,
+      previewCatalogIsVerified,
+      previewProvider,
+      previewQuery.data?.models,
+      previewQuery.data?.selectedOnlyModels,
+      reasoningValue,
+    ],
+  );
+  const previewModelOptions = previewSelection?.modelOptions ?? modelOptions;
+  const previewMoreModelOptions =
+    previewSelection?.moreModelOptions ?? moreModelOptions;
   const activeReasoningOptions = isPreviewing
-    ? previewReasoningOptions
+    ? (previewSelection?.reasoningOptions ?? [])
     : reasoningOptions;
+  const activeReasoningValue: ReasoningLevel | "" = handoffMode
+    ? (handoffReasoningLevel ??
+      (isPreviewing ? previewSelection?.reasoningLevel : reasoningValue) ??
+      "")
+    : isPreviewing
+      ? ""
+      : reasoningValue;
   const activeModelLoadError = isPreviewing
     ? (previewQuery.data?.modelLoadError ?? null)
     : (modelLoadError ?? null);
@@ -450,48 +439,49 @@ export function ModelReasoningPicker({
   const activeProviderLabel = activeProvider?.label ?? activeProviderId;
   const activeModelLoadErrorMatches =
     activeModelLoadError?.providerId === activeProviderId;
-  const activeModelLoadErrorMessage =
-    activeModelLoadErrorMatches && activeModelLoadError
-      ? formatModelLoadErrorText({
-          error: activeModelLoadError,
-          providerLabel: activeProviderLabel,
-        })
-      : null;
   const activeModelLoadFailed = isPreviewing
     ? previewQuery.isError || activeModelLoadErrorMatches
     : modelLoadFailed || activeModelLoadErrorMatches;
-  const activeModelFailureMessage =
-    activeModelLoadErrorMessage ?? "Could not load models.";
   const activeModelOptions = previewModelOptions;
-  const activeMoreModelOptions = previewMoreModelOptions;
+  const activeMoreModelOptions = previewSelectionBlocked
+    ? EMPTY_MODEL_OPTIONS
+    : previewMoreModelOptions;
   const hasActiveModelOptions = activeModelOptions.length > 0;
   const activeModelErrorIsProviderSpecific =
     activeModelLoadErrorMatches && activeModelLoadError !== null;
   const isShowingModelError =
     !activeModelIsLoading && !hasActiveModelOptions && activeModelLoadFailed;
   const showProviderTabs =
-    hasMultipleProviders &&
-    onSelectedProviderChange !== undefined &&
+    (handoffMode || canSwitchProviders) &&
     providerOptions.length > 1 &&
     (!isShowingModelError || activeModelErrorIsProviderSpecific);
 
-  // Filtered model lists (client-side fuzzy search scoped to the active
-  // provider). Matching uses the rendered (brand-stripped) label plus the model
-  // id so search reflects what the user sees.
+  const activeBrandPrefix = activeProvider?.brandPrefix;
   const filteredModelOptions = useMemo(() => {
-    return fuzzyFilter(activeModelOptions, normalizedQuery, (option) =>
-      modelSearchText(option, activeProviderId),
-    );
-  }, [activeModelOptions, normalizedQuery, activeProviderId]);
+    if (!isSearching) {
+      return activeModelOptions;
+    }
+    return searchPickerOptions({
+      options: [...activeModelOptions, ...activeMoreModelOptions],
+      query: searchQuery,
+      getLabel: (option) =>
+        stripModelBrandPrefix(option.label, activeBrandPrefix),
+      getAliases: (option) =>
+        option.routeProviderId
+          ? [option.routeProviderId, option.value]
+          : [option.value],
+    });
+  }, [
+    activeBrandPrefix,
+    activeModelOptions,
+    activeMoreModelOptions,
+    isSearching,
+    searchQuery,
+  ]);
+  const filteredMoreModelOptions = isSearching
+    ? EMPTY_MODEL_OPTIONS
+    : activeMoreModelOptions;
 
-  const filteredMoreModelOptions = useMemo(() => {
-    return fuzzyFilter(activeMoreModelOptions, normalizedQuery, (option) =>
-      modelSearchText(option, activeProviderId),
-    );
-  }, [activeMoreModelOptions, normalizedQuery, activeProviderId]);
-
-  // The single navigable-row model that drives arrow keys, Enter, active
-  // highlighting, and active-descendant ids.
   const navRows = useMemo(
     () =>
       buildModelNavRows({
@@ -510,22 +500,62 @@ export function ModelReasoningPicker({
     ],
   );
 
-  // The active index clamped to the rows currently on screen. When the list
-  // shrinks (e.g. the query narrows it) a now-out-of-range index simply reads as
-  // "nothing highlighted" until the user arrows again — no reactive clamping
-  // effect required, and it can never point past the end.
   const highlightedIndex =
     activeIndex >= 0 && activeIndex < navRows.length ? activeIndex : -1;
 
-  // When previewing a different provider, resolve fast-mode toggle from that
-  // provider's capabilities instead of the committed provider's.
-  const effectiveShowFastModeToggle =
-    hasActiveModelOptions &&
-    (serviceTierSupportByProvider
-      ? (serviceTierSupportByProvider[activeProviderId] ?? false)
-      : showFastModeToggle);
-  const showSelectedFastMode =
-    hasSelectedModel && fastModeEnabled && modelOptions.length > 0;
+  const previewActiveModel = previewSelection?.activeModel;
+  const previewServiceTierOptions = useMemo(
+    () =>
+      previewProviderId !== null &&
+      (serviceTierSupportByProvider?.[previewProviderId] ?? false)
+        ? resolveServiceTierOptions({
+            provider: previewProvider,
+            model: previewActiveModel,
+          })
+        : EMPTY_SERVICE_TIER_OPTIONS,
+    [
+      previewActiveModel,
+      previewProvider,
+      previewProviderId,
+      serviceTierSupportByProvider,
+    ],
+  );
+  useEffect(() => {
+    if (
+      !previewCatalogIsVerified ||
+      !previewProviderId ||
+      !previewSelection?.selectedModel
+    ) {
+      return;
+    }
+    const provider = previewQuery.data?.providers.find(
+      (candidate) => candidate.id === previewProviderId,
+    );
+    onProviderPreviewResolved?.({
+      providerId: previewProviderId,
+      model: previewSelection.selectedModel,
+      reasoningLevel: previewSelection.reasoningLevel,
+      supportsServiceTier: provider?.capabilities.supportsServiceTier ?? false,
+      serviceTierOptions: previewServiceTierOptions,
+    });
+  }, [
+    onProviderPreviewResolved,
+    previewCatalogIsVerified,
+    previewProviderId,
+    previewQuery.data?.providers,
+    previewSelection,
+    previewServiceTierOptions,
+  ]);
+  const activeServiceTierOptions =
+    handoffMode || !hasActiveModelOptions
+      ? EMPTY_SERVICE_TIER_OPTIONS
+      : isPreviewing
+        ? previewServiceTierOptions
+        : serviceTierOptions;
+  const selectedServiceTierOption =
+    hasSelectedModel && modelOptions.length > 0
+      ? serviceTierOptions.find((option) => option.id === serviceTierValue)
+      : undefined;
   const showReasoningSection =
     !isShowingModelError &&
     activeReasoningOptions.length > 0 &&
@@ -533,10 +563,9 @@ export function ModelReasoningPicker({
       ? hasActiveModelOptions && !activeModelIsLoading
       : hasSelectedModel && !modelIsLoading && !selectedModelLoadFailed);
 
-  // Reset the per-open browse state after the close animation. Desktop content
-  // unmounts at that point. The compact drawer stays mounted, so its settlement
-  // callback performs the same reset without changing the visible close frame.
   const resetBrowseState = useCallback(() => {
+    setHandoffMode(false);
+    setHandoffReasoningLevel(null);
     setPreviewProviderId(null);
     setShowMoreModels(false);
     setMoreModelsOpen(false);
@@ -552,80 +581,154 @@ export function ModelReasoningPicker({
     [resetBrowseState],
   );
 
-  const openSub = useCallback(() => {
-    setMoreModelsOpen(true);
+  const toggleShowMoreModels = useCallback(() => {
+    setShowMoreModels((current) => !current);
   }, []);
 
   const handleModelSelect = useCallback(
     (model: string) => {
+      if (previewSelectionBlocked) return;
+      if (handoff !== undefined && handoffMode) {
+        handoff.onSelect({
+          providerId: activeProviderId,
+          model,
+          reasoningLevel:
+            handoffReasoningLevel ??
+            (isPreviewing ? previewSelection?.reasoningLevel : undefined) ??
+            reasoningValue,
+        });
+        setMoreModelsOpen(false);
+        return;
+      }
       onModelChange(model);
       setMoreModelsOpen(false);
       setPreviewProviderId(null);
     },
-    [onModelChange],
+    [
+      activeProviderId,
+      handoff,
+      handoffMode,
+      handoffReasoningLevel,
+      isPreviewing,
+      onModelChange,
+      previewSelection,
+      previewSelectionBlocked,
+      reasoningValue,
+    ],
   );
 
-  const handleProviderSelect = useCallback(
+  const handleHandoffProviderSelect = useCallback(
     (providerId: string) => {
-      onSelectedProviderChange?.(providerId);
+      handoff?.onStart();
+      setHandoffMode(true);
       setPreviewProviderId(
-        open && providerId !== selectedProviderId ? providerId : null,
+        providerId === selectedProviderId ? null : providerId,
       );
-      // Every provider owns a different model list. Never carry a filter or
-      // keyboard highlight across that boundary.
+      setHandoffReasoningLevel(null);
+      setShowMoreModels(false);
+      setMoreModelsOpen(false);
       setSearchQuery("");
       setActiveIndex(-1);
     },
-    [onSelectedProviderChange, open, selectedProviderId],
+    [handoff, selectedProviderId],
+  );
+  const handleProviderSelect = useCallback(
+    (providerId: string) => {
+      if (
+        open &&
+        handoff !== undefined &&
+        (handoffMode || providerId !== handoff.sourceProviderId)
+      ) {
+        handleHandoffProviderSelect(providerId);
+        return;
+      }
+      onSelectedProviderChange?.(providerId);
+      const nextPreviewProviderId =
+        open && providerId !== selectedProviderId ? providerId : null;
+      setPreviewProviderId(nextPreviewProviderId);
+      setSearchQuery("");
+      setActiveIndex(-1);
+    },
+    [
+      handoff,
+      handoffMode,
+      handleHandoffProviderSelect,
+      onSelectedProviderChange,
+      open,
+      selectedProviderId,
+    ],
+  );
+  const startHandoffMode = useCallback(() => {
+    handleHandoffProviderSelect(selectedProviderId);
+  }, [handleHandoffProviderSelect, selectedProviderId]);
+  const exitHandoffMode = useCallback(() => {
+    setHandoffMode(false);
+    setHandoffReasoningLevel(null);
+    setPreviewProviderId(null);
+    setSearchQuery("");
+    handoff?.onExit();
+  }, [handoff]);
+
+  const handleReasoningSelect = useCallback(
+    (level: ReasoningLevel) => {
+      if (previewSelectionBlocked) return;
+      if (handoffMode) {
+        setHandoffReasoningLevel(level);
+        if (!isPreviewing) {
+          onReasoningChange(level);
+        }
+        return;
+      }
+      if (isPreviewing && previewSelection?.selectedModel) {
+        onModelChange(previewSelection.selectedModel);
+      }
+      onReasoningChange(level);
+      setPreviewProviderId(null);
+      setMoreModelsOpen(false);
+    },
+    [
+      handoffMode,
+      isPreviewing,
+      previewSelection,
+      onModelChange,
+      onReasoningChange,
+      previewSelectionBlocked,
+    ],
   );
 
-  // Scope Cmd+Shift+M and the cycle chords to one composer of the focused pane.
-  // Standalone/single-pane surfaces have no pane context and default to
-  // focused/non-split.
   const paneContext = useOptionalPaneContext();
   const isFocusedPane = paneContext?.isFocused ?? true;
   const isSplitPane = paneContext?.isSplitPane ?? false;
   const resolveCommandScope = useCallback(
     (target: EventTarget | null): ModelPickerScope => {
-      const pickerComposer =
-        triggerRef.current?.closest("[data-app-composer]") ?? null;
-      const caretComposer =
-        target instanceof HTMLElement
-          ? target.closest("[data-app-composer]")
-          : null;
-      // Two composers of the same pane share its `[data-split-pane-id]` wrapper;
-      // a lone surface has none, so this stays false there.
-      const pickerPane =
-        triggerRef.current?.closest("[data-split-pane-id]") ?? null;
-      const caretPane = caretComposer?.closest("[data-split-pane-id]") ?? null;
-      return {
-        disabled: disabled ?? false,
+      const scope = resolveComposerCommandScope({
+        composer: triggerRef.current?.closest(APP_COMPOSER_SELECTOR) ?? null,
+        target,
         isFocusedPane,
+      });
+      return {
+        ...scope,
+        disabled: disabled ?? false,
         isSplitPane,
-        // The main/new-thread composer is primary; a side chat marks itself
-        // secondary via data-app-composer-role.
-        isPrimaryComposer:
-          pickerComposer?.getAttribute("data-app-composer-role") !==
-          "secondary",
-        caretInThisComposer:
-          caretComposer !== null && caretComposer === pickerComposer,
-        caretInOtherComposerOfPane:
-          caretComposer !== null &&
-          caretComposer !== pickerComposer &&
-          pickerPane !== null &&
-          caretPane === pickerPane,
         editableOutsideComposer:
-          caretComposer === null && isEditableKeyboardTarget(target),
+          !scope.caretInThisComposer &&
+          !scope.caretInOtherComposer &&
+          isEditableKeyboardTarget(target),
       };
     },
     [disabled, isFocusedPane, isSplitPane],
   );
-  useAppCommandContext("modelPickerOpen", open && !disabled);
+  useAppCommandContext(
+    "modelPickerOpen",
+    commandShortcutsEnabled && open && !disabled,
+  );
   const ownsCycleChord = (target: EventTarget | null): boolean =>
+    commandShortcutsEnabled &&
     ownsModelPickerCycleChord({ open, ...resolveCommandScope(target) });
   useAppCommandHandler(
     "modelPicker.toggle",
     ({ target }) => {
+      if (!commandShortcutsEnabled) return false;
       const action = resolveModelPickerToggle({
         open,
         ...resolveCommandScope(target),
@@ -635,36 +738,50 @@ export function ModelReasoningPicker({
       return true;
     },
     50,
+    commandShortcutsEnabled,
   );
-  // The cycle chords rotate the COMMITTED provider and its lists, never a
-  // previewed tab's, so the shortcut means the same thing whether the popover is
-  // open or shut. A preview in progress is dropped so the visible tab keeps
-  // matching the committed selection.
-  //
-  // An in-scope chord ALWAYS returns true, even with nowhere to rotate to. A
-  // false result makes the command provider bail before `preventDefault()`, and
-  // macOS would then insert the composed Option character (Option+M → "µ") into
-  // the prompt. Owning the chord and doing nothing is the correct no-op.
   useIndexedAppCommandHandlers(
     MODEL_CYCLE_COMMANDS,
     (index, { target }) => {
       if (!ownsCycleChord(target)) return false;
+      const options = (handoffMode ? activeModelOptions : modelOptions).filter(
+        (option) => option.disabled !== true,
+      );
+      const value =
+        handoffMode && isPreviewing
+          ? (previewSelection?.selectedModel ?? "")
+          : modelValue;
       const next =
         index === 0
-          ? nextCycleValue(modelOptions, modelValue)
-          : previousCycleValue(modelOptions, modelValue);
+          ? nextCycleValue(options, value)
+          : previousCycleValue(options, value);
       if (next !== null) {
-        onModelChange(next);
-        setPreviewProviderId(null);
+        if (handoffMode) {
+          handleModelSelect(next);
+        } else {
+          onModelChange(next);
+          setPreviewProviderId(null);
+        }
       }
       return true;
     },
     50,
+    commandShortcutsEnabled,
   );
   useIndexedAppCommandHandlers(
     PROVIDER_CYCLE_COMMANDS,
     (index, { target }) => {
       if (!ownsCycleChord(target)) return false;
+      if (handoffMode) {
+        const next =
+          index === 0
+            ? nextCycleValue(providerOptions, activeProviderId)
+            : previousCycleValue(providerOptions, activeProviderId);
+        if (next !== null) {
+          handleHandoffProviderSelect(next);
+        }
+        return true;
+      }
       if (canSwitchProviders && onSelectedProviderChange !== undefined) {
         const next =
           index === 0
@@ -677,62 +794,70 @@ export function ModelReasoningPicker({
       return true;
     },
     50,
+    commandShortcutsEnabled,
   );
   useIndexedAppCommandHandlers(
     REASONING_CYCLE_COMMANDS,
     (index, { target }) => {
       if (!ownsCycleChord(target)) return false;
+      const value = handoffMode ? activeReasoningValue : reasoningValue;
+      if (value === "") return true;
       const next = cycleReasoningValue(
-        reasoningOptions,
-        reasoningValue,
+        handoffMode ? activeReasoningOptions : reasoningOptions,
+        value,
         index === 0 ? "forward" : "backward",
       );
       if (next !== null) {
-        onReasoningChange(next);
-        setPreviewProviderId(null);
+        if (handoffMode) {
+          handleReasoningSelect(next);
+        } else {
+          onReasoningChange(next);
+          setPreviewProviderId(null);
+        }
       }
       return true;
     },
     50,
+    commandShortcutsEnabled,
   );
-  const handleReasoningSelect = useCallback(
-    (level: ReasoningLevel) => {
-      // A controlled parent that has not rendered the provider change yet
-      // still needs a concrete model when the user immediately picks one of
-      // the new provider's reasoning levels.
-      if (isPreviewing && previewDefaultModel) {
-        onModelChange(previewDefaultModel.model);
-      }
-      onReasoningChange(level);
-      // Keep the combined picker open so the model and reasoning effort can be
-      // changed together without reopening it between selections.
-      setPreviewProviderId(null);
-      setMoreModelsOpen(false);
-    },
-    [isPreviewing, previewDefaultModel, onModelChange, onReasoningChange],
-  );
-
-  const handleFooterActionClick = useCallback(() => {
-    if (!footerAction || footerAction.disabled) {
+  const handleReasoningArrowKeyDown: KeyboardEventHandler<HTMLElement> = (
+    event,
+  ) => {
+    if (
+      event.defaultPrevented ||
+      event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.shiftKey ||
+      disabled ||
+      !showReasoningSection ||
+      previewSelectionBlocked ||
+      (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+    ) {
       return;
     }
-    footerAction.onClick();
-    setOpen(false);
-    setPreviewProviderId(null);
-    setMoreModelsOpen(false);
-  }, [footerAction]);
+    if (
+      isEditableKeyboardTarget(event.target) &&
+      (event.target !== searchInputRef.current || searchQuery.length > 0)
+    ) {
+      return;
+    }
+    const index = activeReasoningOptions.findIndex(
+      (option) => option.value === activeReasoningValue,
+    );
+    if (index < 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const next =
+      activeReasoningOptions[index + (event.key === "ArrowRight" ? 1 : -1)];
+    if (next) handleReasoningSelect(next.value);
+  };
 
-  // Typing resets the highlight to "none" so a narrowing query never leaves a
-  // stale row selected; the user arrows into the fresh results.
   const handleQueryChange = useCallback((value: string) => {
     setSearchQuery(value);
     setActiveIndex(-1);
   }, []);
 
-  // Keyboard navigation inside the model list while the search input has focus.
-  // All movement/selection is driven by `navRows`, so the index math has a
-  // single source of truth shared with rendering. Arrow updates clamp any stale
-  // index (a list that shrank out from under the highlight) back into range.
   const handleSearchKeyDown = useCallback<
     KeyboardEventHandler<HTMLInputElement>
   >(
@@ -765,33 +890,24 @@ export function ModelReasoningPicker({
         if (!row) return;
         event.preventDefault();
         if (row.kind === "model") {
+          if (row.option.disabled === true) return;
           handleModelSelect(row.option.value);
         } else {
-          setShowMoreModels((current) => !current);
+          toggleShowMoreModels();
         }
       }
     },
-    [navRows, highlightedIndex, handleModelSelect],
+    [navRows, highlightedIndex, handleModelSelect, toggleShowMoreModels],
   );
 
-  // Scroll the active item into view.
   useEffect(() => {
     if (highlightedIndex < 0) return;
     const el = document.getElementById(`${navId}-opt-${highlightedIndex}`);
     el?.scrollIntoView({ block: "nearest" });
   }, [highlightedIndex, navId]);
 
-  // Auto-focus the search input on open (desktop only).
-  useEffect(() => {
-    if (!open || isCompactViewport || isPointerCoarse) return;
-    const frame = window.requestAnimationFrame(() => {
-      searchInputRef.current?.focus();
-      searchInputRef.current?.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [open, isCompactViewport, isPointerCoarse]);
-
-  const TriggerIcon = hasSelectedModel ? ProviderIcon : undefined;
+  const TriggerIcon =
+    hasSelectedModel || modelIsLoading ? ProviderIcon : undefined;
   const triggerTitleModelLabel = modelIsLoading
     ? "Loading models..."
     : selectedModelLoadFailed
@@ -800,13 +916,10 @@ export function ModelReasoningPicker({
   const triggerTitle = [
     `${selectedProviderLabel}: ${triggerTitleModelLabel}`,
     triggerReasoningLabel ? ` · ${triggerReasoningLabel} reasoning` : "",
-    showSelectedFastMode ? " (Fast mode)" : "",
+    selectedServiceTierOption
+      ? ` (${selectedServiceTierOption.label} mode)`
+      : "",
   ].join("");
-
-  // The trigger renders identically whether interactive or disabled — the only
-  // difference is the `disabled` button state and a dropped chevron — so fully
-  // read-only surfaces show the same model label in the same position as their
-  // editable counterpart.
   const trigger = (
     <Button
       ref={triggerRef}
@@ -820,51 +933,83 @@ export function ModelReasoningPicker({
       }
       aria-keyshortcuts={toggleShortcut?.ariaKeyshortcuts}
       disabled={disabled}
+      {...ModelReasoningMenu.intentProps}
+      onKeyDown={handleReasoningArrowKeyDown}
       className={cn(
         OPTION_BASE_CLASS_NAME,
         OPTION_INTERACTIVE_CLASS_NAME,
         LIST_HOVER_TRANSITION,
         muted && OPTION_MUTED_CLASS_NAME,
+        muted && "font-normal",
         disabled && "cursor-default disabled:opacity-100",
         className,
       )}
     >
       <span className={OPTION_TRIGGER_CONTENT_CLASS_NAME} title={triggerTitle}>
-        {showSelectedFastMode ? (
+        {modelIsLoading ? (
+          <>
+            {TriggerIcon ? (
+              <TriggerIcon className="size-4 shrink-0" />
+            ) : (
+              <Icon
+                name="Spinner"
+                className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+                aria-hidden
+              />
+            )}
+            <span className="sr-only">Loading models</span>
+            <Skeleton
+              aria-hidden
+              data-model-loading-placeholder="trigger-model"
+              className="h-3 w-10 shrink-0 rounded-sm"
+            />
+            <Skeleton
+              aria-hidden
+              data-model-loading-placeholder="trigger-reasoning"
+              className="h-3 w-8 shrink-0 rounded-sm"
+            />
+          </>
+        ) : selectedServiceTierOption ? (
           <Icon
             name="Zap"
             className="size-3.5 shrink-0 fill-current text-subtle-foreground"
           />
         ) : TriggerIcon ? (
-          <TriggerIcon className="size-3.5 shrink-0" />
+          <TriggerIcon className="size-4 shrink-0" />
         ) : null}
-        <span
-          className={cn(
-            "min-w-0 truncate",
-            modelIsLoading && "animate-shine whitespace-nowrap",
-            triggerModelValueIsDestructive && "text-destructive-text",
-          )}
-        >
-          {triggerModelBase}
-        </span>
-        {triggerModelTag ? (
-          <span className="shrink-0 text-subtle-foreground">
-            {triggerModelTag}
-          </span>
-        ) : null}
-        {triggerReasoningLabel ? (
-          <span
-            className="shrink-0 text-subtle-foreground"
-            data-promptbox-hide-compact=""
-          >
-            {triggerReasoningLabel}
-          </span>
-        ) : null}
+        {modelIsLoading ? null : (
+          <>
+            <span
+              className={cn(
+                "min-w-0 truncate",
+                triggerModelValueIsDestructive && "text-destructive-text",
+              )}
+            >
+              {triggerModelBase}
+            </span>
+            {triggerModelTag ? (
+              <span className="shrink-0 text-subtle-foreground">
+                {triggerModelTag}
+              </span>
+            ) : null}
+            {triggerReasoningLabel ? (
+              <span
+                className="shrink-0 text-subtle-foreground"
+                data-promptbox-hide-compact=""
+              >
+                {triggerReasoningLabel}
+              </span>
+            ) : null}
+          </>
+        )}
       </span>
       {disabled ? null : (
         <Icon
           name="ChevronDown"
-          className="size-3.5 shrink-0 text-muted-foreground"
+          className={cn(
+            "size-3.5 shrink-0",
+            muted ? "text-subtle-foreground/75" : "text-muted-foreground",
+          )}
         />
       )}
       <AppCommandShortcutHint
@@ -879,48 +1024,60 @@ export function ModelReasoningPicker({
   }
 
   const showSearchInput =
-    hasActiveModelOptions &&
-    !activeModelIsLoading &&
-    !isShowingModelError &&
-    activeModelOptions.length + activeMoreModelOptions.length >
-      MODEL_SEARCH_MIN_OPTIONS;
+    isCompactViewport ||
+    (hasActiveModelOptions &&
+      !activeModelIsLoading &&
+      !isShowingModelError &&
+      activeModelOptions.length + activeMoreModelOptions.length >
+        MODEL_SEARCH_MIN_OPTIONS);
 
   return (
     <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent
-        align="start"
-        mobileTitle="Model"
+        align={align}
+        mobileTitle={handoffMode ? "Handoff to new thread" : "Model"}
+        mobileClassName={cn(
+          "h-[min(32rem,80dvh)]",
+          handoffMode && HANDOFF_DRAWER_TOP_CLASS_NAME,
+        )}
+        onKeyDown={handleReasoningArrowKeyDown}
         onMobileContentAnimationEnd={handleMobileContentAnimationEnd}
+        autoFocusRef={showSearchInput ? searchInputRef : undefined}
         className={cn(
-          "flex flex-col p-0",
+          "flex min-h-0 flex-col p-0",
           MODEL_PICKER_MENU_WIDTH_CLASS_NAME,
-          "max-md:w-full max-md:min-w-0 max-md:max-w-none",
+          isCompactViewport
+            ? "flex-1 overflow-y-hidden"
+            : "max-h-[min(var(--radix-popover-content-available-height),calc(100dvh-0.5rem))] overflow-hidden",
         )}
       >
         <ResetBrowseStateOnContentUnmount onReset={resetBrowseState} />
-        {/* Provider icon tabs */}
+        {handoffMode ? <HandoffModeHeader onBack={exitHandoffMode} /> : null}
         {showProviderTabs ? (
-          <div
-            className={cn(
-              "flex items-center gap-0.5 border-b border-border px-2.5 pt-1",
-              isCompactViewport
-                ? "sticky top-0 z-10 bg-background"
-                : "bg-surface-recessed",
-            )}
-          >
+          <div className="flex shrink-0 items-center gap-0.5 border-b border-border bg-background px-2.5 pt-1">
             {providerOptions.map((provider) => {
               const TabIcon = provider.icon;
               const isActive = provider.value === activeProviderId;
+              const isHandoffSource =
+                handoffMode &&
+                handoff !== undefined &&
+                provider.value === handoff.sourceProviderId;
               return (
                 <button
                   key={provider.value}
                   type="button"
-                  title={provider.label}
+                  title={
+                    isHandoffSource
+                      ? `${provider.label} (current thread)`
+                      : provider.label
+                  }
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => {
-                    if (provider.value !== activeProviderId) {
-                      handleProviderSelect(provider.value);
+                    if (provider.value === activeProviderId) {
+                      return;
                     }
+                    handleProviderSelect(provider.value);
                   }}
                   className={cn(
                     "flex items-center justify-center border-b-2 focus-visible:outline-none",
@@ -962,370 +1119,73 @@ export function ModelReasoningPicker({
           />
         ) : null}
 
-        <MenuHoverProvider>
-          {/* Model list — keyed by the active provider so each provider mounts a
-            fresh subtree. Rows are keyed by model id, but reusing one subtree
-            across provider switches was observed to leave the previous
-            provider's rows on screen; remounting per provider guarantees the
-            list always matches the active tab. */}
-          <div
-            key={activeProviderId || "no-provider"}
-            role={showSearchInput ? "listbox" : undefined}
-            id={showSearchInput ? listboxId : undefined}
-            aria-label={showSearchInput ? "Models" : undefined}
-            className={cn(
-              "overflow-y-auto px-1 pb-1 pt-0",
-              !isCompactViewport &&
-                "max-h-[min(250px,var(--radix-popover-content-available-height,250px)-80px)]",
-            )}
-          >
-            {isShowingModelError ? null : (
-              <MenuSectionLabel>Model</MenuSectionLabel>
-            )}
-            {activeModelIsLoading ? (
-              <div
-                className={cn(
-                  "px-2 text-xs text-muted-foreground",
-                  isCompactViewport ? "py-2" : "py-[0.3125rem]",
-                )}
-              >
-                Loading models…
-              </div>
-            ) : hasActiveModelOptions ? (
-              <>
-                {navRows.map((row, index) => {
-                  const active = highlightedIndex === index;
-                  const domId = optionDomId(index);
-                  if (row.kind === "more-toggle") {
-                    return (
-                      <MoreModelsToggleRow
-                        key="more-toggle"
-                        id={domId}
-                        isActive={active}
-                        expanded={showMoreModels}
-                        onToggle={() =>
-                          setShowMoreModels((current) => !current)
-                        }
-                      />
-                    );
-                  }
-                  const option = row.option;
-                  return (
-                    <MenuRowButton
-                      key={option.value}
-                      id={domId}
-                      role={showSearchInput ? "option" : undefined}
-                      isActive={active}
-                      // The menu always reflects the provider whose models it
-                      // lists (committed or previewed) — strip with
-                      // `activeProviderId`.
-                      label={stripModelBrandPrefix(
-                        option.label,
-                        activeProviderId,
-                      )}
-                      qualifier={option.routeProviderId}
-                      selected={!isPreviewing && option.value === modelValue}
-                      onClick={() => handleModelSelect(option.value)}
-                    />
-                  );
-                })}
-                {/* Desktop, not searching: the selected-only models live in a
-                    hover submenu that is excluded from keyboard nav. During a
-                    search they are flattened into `navRows` above so every match
-                    stays reachable from the keyboard. */}
-                {!isCompactViewport &&
-                !isSearching &&
-                filteredMoreModelOptions.length > 0 ? (
-                  <MoreModelsSubmenu
-                    open={moreModelsOpen}
-                    onOpenChange={setMoreModelsOpen}
-                    openSub={openSub}
-                    activeProviderId={activeProviderId}
-                    isPreviewing={isPreviewing}
-                    modelValue={modelValue}
-                    options={filteredMoreModelOptions}
-                    onSelect={handleModelSelect}
-                  />
-                ) : null}
-                {isSearching && navRows.length === 0 ? (
-                  <div
-                    className={cn(
-                      "px-2 text-xs text-muted-foreground",
-                      isCompactViewport ? "py-2" : "py-[0.3125rem]",
-                    )}
-                  >
-                    No models match your search
-                  </div>
-                ) : null}
-              </>
-            ) : (
-              <div
-                className={cn(
-                  "px-2 text-xs leading-relaxed text-muted-foreground",
-                  isCompactViewport ? "pb-3 pt-2" : "pb-2 pt-1.5",
-                )}
-                title={activeModelLoadErrorMessage ?? undefined}
-              >
-                {activeModelLoadErrorMatches && activeModelLoadError ? (
-                  <ModelLoadErrorMessage
-                    error={activeModelLoadError}
-                    providerLabel={activeProviderLabel}
-                  />
-                ) : activeModelLoadFailed ? (
-                  activeModelFailureMessage
-                ) : (
-                  "No models available"
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Reasoning section — the committed model's levels, or (while
-            previewing) the previewed provider's default-model levels. Like the
-            model list, nothing is checked during preview until committed. */}
-          {showReasoningSection ? (
-            <>
-              <div className="border-t border-border" />
-              <div className="px-1 pb-1 pt-0">
-                <MenuSectionLabel>Reasoning</MenuSectionLabel>
-                {activeReasoningOptions.map((option) => (
-                  <MenuRowButton
-                    key={option.value}
-                    label={option.label}
-                    selected={!isPreviewing && option.value === reasoningValue}
-                    onClick={() => handleReasoningSelect(option.value)}
-                  />
-                ))}
-              </div>
-            </>
-          ) : null}
-
-          {/* Fast mode toggle */}
-          {effectiveShowFastModeToggle ? (
-            <>
-              <div className="border-t border-border" />
-              <div className="p-1">
-                <div className="flex items-center justify-between gap-3 rounded-sm px-2 py-[0.3125rem] text-xs">
-                  <span className="flex min-w-0 items-center gap-2">
-                    <Icon
-                      name="Zap"
-                      className="size-4 fill-current text-muted-foreground"
-                    />
-                    <span>Fast mode</span>
-                  </span>
-                  <Switch
-                    checked={fastModeEnabled}
-                    onCheckedChange={onFastModeChange}
-                    aria-label="Fast mode"
-                    className={LIST_HOVER_TRANSITION}
-                  />
-                </div>
-              </div>
-            </>
-          ) : null}
-
-          {footerAction ? (
-            <>
-              <div className="border-t border-border" />
-              <div className="p-1">
-                <MenuActionButton
-                  label={footerAction.label}
-                  iconName={footerAction.iconName ?? "MessageSquarePlus"}
-                  disabled={footerAction.disabled}
-                  title={footerAction.title}
-                  onClick={handleFooterActionClick}
-                />
-              </div>
-            </>
-          ) : null}
-        </MenuHoverProvider>
+        <ModelReasoningMenu
+          listRef={listRef}
+          providerId={activeProviderId}
+          provider={activeProvider}
+          providerLabel={activeProviderLabel}
+          listboxId={showSearchInput ? listboxId : undefined}
+          optionId={optionDomId}
+          modelIsLoading={activeModelIsLoading}
+          isShowingModelError={isShowingModelError}
+          hasModelOptions={hasActiveModelOptions}
+          modelLoadError={
+            activeModelLoadErrorMatches ? activeModelLoadError : null
+          }
+          modelLoadFailed={activeModelLoadFailed}
+          navRows={navRows}
+          highlightedIndex={highlightedIndex}
+          isSearching={isSearching}
+          showMoreModels={showMoreModels}
+          onToggleMoreModels={toggleShowMoreModels}
+          moreModelOptions={filteredMoreModelOptions}
+          moreModelsOpen={moreModelsOpen}
+          onMoreModelsOpenChange={setMoreModelsOpen}
+          isPreviewing={isPreviewing}
+          modelValue={modelValue}
+          selectionBlocked={previewSelectionBlocked}
+          onModelSelect={handleModelSelect}
+          showReasoningSection={showReasoningSection}
+          reasoningValue={activeReasoningValue}
+          reasoningOptions={activeReasoningOptions}
+          onReasoningSelect={handleReasoningSelect}
+          serviceTierOptions={activeServiceTierOptions}
+          serviceTierValue={serviceTierValue}
+          onServiceTierChange={onServiceTierChange}
+          agentSections={isPreviewing ? NO_AGENT_SECTIONS : agentSections}
+          onAgentOptionChange={onAgentOptionChange}
+          onStartHandoff={
+            handoff !== undefined && !handoffMode && providerOptions.length > 0
+              ? startHandoffMode
+              : null
+          }
+        />
       </PopoverContent>
     </Popover>
   );
 }
 
-// Mirrors DropdownMenuLabel spacing/typography while staying sticky in the
-// scrollable model list.
-function MenuSectionLabel({ children }: { children: ReactNode }) {
-  const isCompactViewport = useIsCompactViewport();
-
+function HandoffModeHeader({ onBack }: { onBack: () => void }) {
   return (
-    <div
-      className={cn(
-        "sticky top-0 z-10 bg-background px-2 text-xs font-medium text-muted-foreground",
-        isCompactViewport ? "pb-1.5 pt-2" : "pb-[0.3125rem] pt-2",
-      )}
-    >
-      {children}
+    <div className="flex shrink-0 items-center gap-1 bg-background px-2 pb-1 pt-1.5">
+      <button
+        type="button"
+        aria-label="Exit handoff"
+        onClick={onBack}
+        className={cn(
+          "flex size-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-state-hover hover:text-foreground",
+          LIST_HOVER_TRANSITION,
+        )}
+      >
+        <Icon name="X" className="size-3.5" aria-hidden />
+      </button>
+      <span className="min-w-0 truncate text-xs font-normal text-subtle-foreground">
+        Handoff to new thread
+      </span>
     </div>
   );
 }
 
-function MoreModelsToggleRow({
-  expanded,
-  onToggle,
-  isActive,
-  id,
-  onPointerEnter: callerPointerEnter,
-  onKeyDown: callerKeyDown,
-}: {
-  expanded: boolean;
-  onToggle: () => void;
-  isActive?: boolean;
-  id?: string;
-  onPointerEnter?: PointerEventHandler<HTMLButtonElement>;
-  onKeyDown?: KeyboardEventHandler<HTMLButtonElement>;
-}) {
-  const { hoverProps } = useMenuItemHover({
-    onPointerEnter: callerPointerEnter,
-    onKeyDown: callerKeyDown,
-  });
-  const isCompactViewport = useIsCompactViewport();
-  return (
-    <button
-      type="button"
-      id={id}
-      onClick={onToggle}
-      aria-expanded={expanded}
-      className={cn(
-        "relative flex w-full cursor-default select-none items-center gap-1 rounded-sm px-2 text-xs text-muted-foreground outline-none hover:bg-state-hover hover:text-foreground",
-        LIST_HOVER_TRANSITION,
-        MENU_ITEM_LAST_HOVERED_CLASS,
-        isActive && "bg-state-active",
-        isCompactViewport ? "py-2" : "py-[0.3125rem]",
-      )}
-      {...hoverProps}
-    >
-      <span>{expanded ? "Fewer models" : "More models"}</span>
-      <Icon
-        name={expanded ? "ChevronUp" : "ChevronDown"}
-        className="size-3.5 shrink-0"
-      />
-    </button>
-  );
-}
-
-function MoreModelsSubmenu({
-  open,
-  onOpenChange,
-  openSub,
-  activeProviderId,
-  isPreviewing,
-  modelValue,
-  options,
-  onSelect,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  openSub: () => void;
-  activeProviderId: string;
-  isPreviewing: boolean;
-  modelValue: string;
-  options: readonly ModelPickerOption[];
-  onSelect: (value: string) => void;
-}) {
-  const { isLastHovered, hoverProps } = useMenuItemHover();
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const contentRef = useRef<HTMLDivElement | null>(null);
-  const focusFirstSubItem = useCallback(() => {
-    window.setTimeout(() => {
-      contentRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
-    }, 0);
-  }, []);
-
-  // Close the moment the pointer moves to a sibling row — i.e. this trigger is
-  // no longer the menu's last-hovered item. No close-delay, so the trigger tile
-  // and the submenu clear at 0ms. While the pointer is inside the submenu the
-  // trigger stays the MAIN menu's last-hovered item (the submenu items have
-  // their own hover scope), so this does not fire and the submenu stays open.
-  useEffect(() => {
-    if (open && !isLastHovered) {
-      onOpenChange(false);
-    }
-  }, [open, isLastHovered, onOpenChange]);
-
-  return (
-    <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverAnchor asChild>
-        <button
-          ref={triggerRef}
-          type="button"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          onClick={openSub}
-          onPointerEnter={(event) => {
-            hoverProps.onPointerEnter(event);
-            openSub();
-          }}
-          onKeyDown={(event) => {
-            hoverProps.onKeyDown(event);
-
-            if (
-              event.key === "Enter" ||
-              event.key === " " ||
-              event.key === "Spacebar" ||
-              event.key === "ArrowRight"
-            ) {
-              event.preventDefault();
-              openSub();
-              focusFirstSubItem();
-              return;
-            }
-
-            if (event.key === "Escape" || event.key === "ArrowLeft") {
-              event.preventDefault();
-              onOpenChange(false);
-            }
-          }}
-          className={cn(
-            "relative flex w-full cursor-default select-none items-center gap-1 rounded-sm px-2 py-[0.3125rem] text-xs text-muted-foreground outline-none hover:bg-state-hover hover:text-foreground",
-            LIST_HOVER_TRANSITION,
-            MENU_ITEM_LAST_HOVERED_CLASS,
-          )}
-          data-last-hovered={hoverProps["data-last-hovered"]}
-        >
-          <span>More models</span>
-          <Icon name="ChevronRight" className="size-3.5 shrink-0" />
-        </button>
-      </PopoverAnchor>
-      <PopoverContent
-        ref={contentRef}
-        side="right"
-        align="start"
-        sideOffset={6}
-        className={cn(
-          "flex flex-col p-1 data-[state=closed]:animate-none",
-          MODEL_PICKER_MENU_WIDTH_CLASS_NAME,
-        )}
-        onKeyDown={(event) => {
-          if (event.key === "Escape" || event.key === "ArrowLeft") {
-            event.preventDefault();
-            onOpenChange(false);
-            triggerRef.current?.focus();
-          }
-        }}
-      >
-        <MenuHoverProvider>
-          {options.map((option) => (
-            <MenuRowButton
-              key={option.value}
-              label={stripModelBrandPrefix(option.label, activeProviderId)}
-              qualifier={option.routeProviderId}
-              selected={!isPreviewing && option.value === modelValue}
-              onClick={() => onSelect(option.value)}
-            />
-          ))}
-        </MenuHoverProvider>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-// Renders nothing; exists only to fire `onReset` when it unmounts. Mounted
-// inside PopoverContent, so its unmount coincides with the popover fully
-// closing (after the exit animation), which is when the browse state should
-// reset — not during the visible close. Kept stable via a ref so a re-render
-// never triggers a spurious reset.
 function ResetBrowseStateOnContentUnmount({
   onReset,
 }: {
@@ -1335,119 +1195,12 @@ function ResetBrowseStateOnContentUnmount({
   return null;
 }
 
-function MenuRowButton({
-  label,
-  qualifier,
-  selected,
-  onClick,
-  isActive,
-  id,
-  role,
-  onPointerEnter: callerPointerEnter,
-  onKeyDown: callerKeyDown,
-}: {
-  label: string;
-  qualifier?: string;
-  selected: boolean;
-  onClick: () => void;
-  isActive?: boolean;
-  id?: string;
-  role?: React.AriaRole;
-  onPointerEnter?: PointerEventHandler<HTMLButtonElement>;
-  onKeyDown?: KeyboardEventHandler<HTMLButtonElement>;
-}) {
-  const { hoverProps } = useMenuItemHover({
-    onPointerEnter: callerPointerEnter,
-    onKeyDown: callerKeyDown,
-  });
-  const isCompactViewport = useIsCompactViewport();
-  const { base, tag } = splitModelLabelTag(label);
-  return (
-    <button
-      type="button"
-      id={id}
-      role={role}
-      // In the searchable listbox the active row is the combobox's
-      // aria-activedescendant, so it carries aria-selected; reasoning/submenu
-      // rows keep default button semantics.
-      aria-selected={role === "option" ? Boolean(isActive) : undefined}
-      onClick={onClick}
-      className={cn(
-        "relative flex w-full cursor-default select-none items-center justify-between gap-3 rounded-sm px-2 text-xs outline-none hover:bg-state-hover hover:text-foreground",
-        LIST_HOVER_TRANSITION,
-        MENU_ITEM_LAST_HOVERED_CLASS,
-        isActive && "bg-state-active",
-        isCompactViewport ? "py-2" : "py-[0.3125rem]",
-      )}
-      {...hoverProps}
-    >
-      <span
-        className="truncate"
-        title={qualifier ? `${label} · ${qualifier}` : label}
-      >
-        {base}
-        {tag ? (
-          <span className="ml-1.5 text-subtle-foreground">{tag}</span>
-        ) : null}
-        {qualifier ? (
-          <span className="ml-1.5 text-subtle-foreground">{qualifier}</span>
-        ) : null}
-      </span>
-      <span className="flex shrink-0 items-center gap-1.5">
-        <Icon
-          name="Check"
-          className={cn(
-            COARSE_POINTER_ICON_SIZE_SHRINK_CLASS,
-            selected ? "opacity-100" : "opacity-0",
-          )}
-        />
-      </span>
-    </button>
-  );
-}
-
-function MenuActionButton({
-  label,
-  iconName,
-  disabled,
-  title,
-  onClick,
-}: {
-  label: string;
-  iconName: IconName;
-  disabled?: boolean;
-  title?: string;
-  onClick: () => void;
-}) {
-  const { hoverProps } = useMenuItemHover();
-  const isCompactViewport = useIsCompactViewport();
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      title={title}
-      onClick={onClick}
-      className={cn(
-        "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2 text-xs outline-none hover:bg-state-hover hover:text-foreground disabled:pointer-events-none disabled:opacity-50",
-        LIST_HOVER_TRANSITION,
-        MENU_ITEM_LAST_HOVERED_CLASS,
-        isCompactViewport ? "py-2" : "py-[0.3125rem]",
-      )}
-      {...hoverProps}
-    >
-      <Icon name={iconName} className="size-3.5 shrink-0" aria-hidden />
-      <span className="min-w-0 truncate">{label}</span>
-    </button>
-  );
-}
 interface ModelSearchInputProps {
   inputRef: React.RefObject<HTMLInputElement | null>;
   query: string;
   onQueryChange: (query: string) => void;
   onKeyDown: KeyboardEventHandler<HTMLInputElement>;
-  /** Id of the listbox this combobox controls (for `aria-controls`). */
   listboxId: string;
-  /** Id of the virtually-focused option, or undefined when none is active. */
   activeOptionId: string | undefined;
 }
 
@@ -1464,9 +1217,6 @@ function ModelSearchInput({
       <div className="relative">
         <Icon
           name="Search"
-          // size-4 + left-1.5 puts this icon at the same x (12px from the
-          // popover edge, center 20px) as the Fast mode "Zap" icon below, so the
-          // two leading icons line up vertically.
           className="pointer-events-none absolute left-1.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
         />
         <Input
@@ -1481,7 +1231,7 @@ function ModelSearchInput({
           aria-controls={listboxId}
           aria-autocomplete="list"
           aria-activedescendant={activeOptionId}
-          className="h-7 border-0 bg-transparent pl-8 pr-2 text-xs shadow-none focus-visible:ring-0"
+          className="h-7 border-0 bg-transparent pl-8 pr-2 text-xs text-foreground placeholder:text-subtle-foreground shadow-none focus-visible:ring-0"
         />
       </div>
     </div>

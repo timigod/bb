@@ -1,50 +1,73 @@
 import { z } from "zod";
+import { completedTurnDisplaySchema } from "./completed-turn-display.js";
 import {
   permissionModeSchema,
   promptMentionCommandTriggerSchema,
   reasoningLevelSchema,
+  serviceTierSchema,
 } from "./shared-types.js";
+import { extensionKindSchema } from "./provider-extension-kind.js";
+import { threadSessionOptionSchema } from "./thread-provider-state.js";
+import { threadEventItemPresentationSchema } from "./item-presentation.js";
 
 export const modelReasoningEffortSchema = z.object({
   reasoningEffort: reasoningLevelSchema,
+  label: z.string().min(1).optional(),
   description: z.string(),
 });
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
+
+export const modelServiceTierSchema = z.object({
+  id: serviceTierSchema,
+  label: z.string().min(1).optional(),
+  description: z.string().min(1).optional(),
+});
+export type ModelServiceTier = z.infer<typeof modelServiceTierSchema>;
 
 export const availableModelSchema = z.object({
   id: z.string(),
   model: z.string(),
   displayName: z.string(),
-  /** Provider route used to run this model when it is distinct from the
-   * selected agent provider (for example, a model provider nested under Pi). */
   routeProviderId: z.string().min(1).optional(),
   description: z.string(),
   supportedReasoningEfforts: z.array(modelReasoningEffortSchema),
   defaultReasoningEffort: reasoningLevelSchema,
+  supportedServiceTiers: z.array(modelServiceTierSchema).optional(),
+  sessionOptions: z.array(threadSessionOptionSchema).max(64).optional(),
   isDefault: z.boolean(),
 });
 export type AvailableModel = z.infer<typeof availableModelSchema>;
 
-export const providerCapabilitiesSchema = z.object({
-  supportsArchive: z.boolean(),
-  supportsRename: z.boolean(),
+export const providerModelCatalogScopeSchema = z.enum(["host", "workspace"]);
+export type ProviderModelCatalogScope = z.infer<
+  typeof providerModelCatalogScopeSchema
+>;
+
+const providerCapabilitiesSchema = z.object({
+  supportsThreadArchive: z.boolean(),
+  supportsThreadRename: z.boolean(),
   supportsServiceTier: z.boolean(),
-  supportsUserQuestion: z.boolean(),
+  supportsNativeUserQuestion: z.boolean(),
   supportsFork: z.boolean(),
-  supportedPermissionModes: z.array(permissionModeSchema).min(1),
+  supportsSessionRewind: z.boolean(),
+  permissionModes: z.array(permissionModeSchema).min(1),
+  modelCatalogScope: providerModelCatalogScopeSchema,
 });
 export type ProviderCapabilities = z.infer<typeof providerCapabilitiesSchema>;
 
-export const providerComposerCommandSchema = z.object({
+const providerComposerCommandSchema = z.object({
   trigger: promptMentionCommandTriggerSchema,
-  name: z.string().min(1).regex(/^[^\s/$]+$/u),
+  name: z
+    .string()
+    .min(1)
+    .regex(/^[^\s/$]+$/u),
   trailingText: z.string().regex(/^\s*$/u),
 });
 export type ProviderComposerCommand = z.infer<
   typeof providerComposerCommandSchema
 >;
 
-export const providerComposerActionSchema = z.discriminatedUnion("kind", [
+const providerComposerActionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("skills"),
     trigger: promptMentionCommandTriggerSchema,
@@ -62,15 +85,71 @@ export type ProviderComposerAction = z.infer<
   typeof providerComposerActionSchema
 >;
 
+export const providerStringsSchema = z.object({
+  signInHint: z.string().min(1),
+  expiredHint: z.string().min(1),
+  installUrl: z.string().min(1),
+  brandPrefix: z.string().min(1).optional(),
+  planModeCopy: z.string().min(1).optional(),
+  iconTint: z
+    .object({ light: z.string().min(1), dark: z.string().min(1) })
+    .optional(),
+});
+
+export const providerOptionDescriptorSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().min(1).optional(),
+});
+export type ProviderOptionDescriptor = z.infer<
+  typeof providerOptionDescriptorSchema
+>;
+
+export const providerExtensionKindInfoSchema = z.object({
+  item: z.boolean(),
+  state: z.boolean(),
+});
+
+export const providerExtensionKindsSchema = z.record(
+  extensionKindSchema,
+  providerExtensionKindInfoSchema,
+);
+export type ProviderExtensionKinds = z.infer<
+  typeof providerExtensionKindsSchema
+>;
+
 export const providerInfoSchema = z.object({
   id: z.string(),
+  pluginId: z.string().min(1),
   displayName: z.string(),
+  family: z.string().min(1).optional(),
+  icon: z.object({ glyph: z.string().min(1) }).optional(),
   logoUrl: z.string().min(1).nullable(),
+  maintenance: z.object({
+    health: z.boolean(),
+    usage: z.boolean(),
+    installation: z.boolean(),
+  }),
   capabilities: providerCapabilitiesSchema,
   composerActions: z.array(providerComposerActionSchema),
+  completedTurnDisplay: completedTurnDisplaySchema,
   available: z.boolean(),
+  strings: providerStringsSchema.optional(),
+  serviceTiers: z.array(providerOptionDescriptorSchema).optional(),
+  reasoningLevels: z.array(providerOptionDescriptorSchema).optional(),
+  extensionKinds: providerExtensionKindsSchema.optional(),
 });
 export type ProviderInfo = z.infer<typeof providerInfoSchema>;
+
+export const providerRecoveryKindValues = [
+  "sessionArchived",
+  "authRequired",
+  "restartRecommended",
+  "staleTurn",
+  "rateLimited",
+] as const;
+export const providerRecoveryKindSchema = z.enum(providerRecoveryKindValues);
+export type ProviderRecoveryKind = z.infer<typeof providerRecoveryKindSchema>;
 
 export const toolCallOutputItemSchema = z.discriminatedUnion("type", [
   z.object({
@@ -104,5 +183,6 @@ export const dynamicToolSchema = z.object({
   name: z.string(),
   description: z.string(),
   inputSchema: z.unknown(),
+  presentation: threadEventItemPresentationSchema.optional(),
 });
 export type DynamicTool = z.infer<typeof dynamicToolSchema>;

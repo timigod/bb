@@ -1,69 +1,85 @@
-import { describe, expect, it, vi } from "vitest";
-import { getAppSettings, setAppSettings } from "@bb/db";
+import { describe, expect, it } from "vitest";
+import { getAppSettings } from "@bb/db";
 import { appSettingsSchema, defaultAppSettings } from "@bb/domain";
 import { systemConfigResponseSchema } from "@bb/server-contract";
-import { schedulePrimaryHostCaffeinateReconciliation } from "../../src/services/system/app-settings.js";
 import { readJson } from "../helpers/json.js";
-import { registerHostRpcResponder } from "../helpers/host-rpc.js";
-import { seedHostSession, seedPrimaryHost } from "../helpers/seed.js";
 import { withTestHarness } from "../helpers/test-app.js";
+import { seedHostSession, seedPrimaryHost } from "../helpers/seed.js";
 
 describe("general settings", () => {
+  it("reports only the server's local host in /system/config", async () => {
+    await withTestHarness(async (harness) => {
+      seedHostSession(harness.deps, { name: "remote" });
+      const before = await harness.app.request("/api/v1/system/config");
+      const uninitialized = systemConfigResponseSchema.parse(
+        await readJson(before),
+      );
+      expect(uninitialized.primaryHostId).toBeNull();
+      expect(uninitialized.primaryHostPlatform).toBeNull();
+
+      const { host: local } = seedHostSession(harness.deps, { name: "local" });
+      seedPrimaryHost(harness.deps, local.id);
+      const after = await harness.app.request("/api/v1/system/config");
+      const initialized = systemConfigResponseSchema.parse(
+        await readJson(after),
+      );
+      expect(initialized.primaryHostId).toBe(local.id);
+      expect(initialized.primaryHostPlatform).toBe("darwin");
+    });
+  });
+
   it("defaults general settings in /system/config", async () => {
     await withTestHarness(async (harness) => {
       const response = await harness.app.request("/api/v1/system/config");
       expect(response.status).toBe(200);
       const body = systemConfigResponseSchema.parse(await readJson(response));
-      expect(body.generalSettings).toEqual(defaultAppSettings);
-      // A fresh server with no enrolled host is the only null-primary case.
+      expect(body.generalSettings).toEqual({
+        ...defaultAppSettings,
+        machineGitCredentialsEnabled: false,
+        showUnhandledProviderEvents: false,
+      });
       expect(body.primaryHostId).toBeNull();
     });
   });
 
-  it("persists a PUT, reflects it in /system/config, and asks the daemon to reconcile", async () => {
+  it("persists a PUT and reflects it in /system/config", async () => {
     await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps);
-      seedPrimaryHost(harness.deps, host.id);
-      const responder = registerHostRpcResponder(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        handle: (request) => {
-          expect(request.command).toEqual({
-            type: "host.caffeinate",
-            enabled: true,
-          });
-          return {
-            ok: true,
-            result: { enabled: true, supported: true },
-          };
-        },
-      });
-
       const put = await harness.app.request("/api/v1/settings/general", {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           ...defaultAppSettings,
-          caffeinate: true,
           showKeyboardHints: false,
+          allowFastServiceTier: false,
           steerActiveThreadOnEnter: true,
-          codexMemoryEnabled: false,
+          providerOrder: ["pi", "codex"],
+          defaultProviderId: "pi",
         }),
       });
       expect(put.status).toBe(200);
-      expect(appSettingsSchema.parse(await readJson(put))).toEqual({
+      expect(
+        appSettingsSchema
+          .extend({
+            showUnhandledProviderEvents:
+              appSettingsSchema.shape.showDiagnosticEvents,
+          })
+          .parse(await readJson(put)),
+      ).toEqual({
         ...defaultAppSettings,
-        caffeinate: true,
         showKeyboardHints: false,
+        allowFastServiceTier: false,
         steerActiveThreadOnEnter: true,
-        codexMemoryEnabled: false,
+        providerOrder: ["pi", "codex"],
+        defaultProviderId: "pi",
+        showUnhandledProviderEvents: false,
       });
       expect(getAppSettings(harness.db)).toEqual({
         ...defaultAppSettings,
-        caffeinate: true,
         showKeyboardHints: false,
+        allowFastServiceTier: false,
         steerActiveThreadOnEnter: true,
-        codexMemoryEnabled: false,
+        providerOrder: ["pi", "codex"],
+        defaultProviderId: "pi",
       });
 
       const config = await harness.app.request("/api/v1/system/config");
@@ -72,45 +88,12 @@ describe("general settings", () => {
       );
       expect(parsedConfig.generalSettings).toEqual({
         ...defaultAppSettings,
-        caffeinate: true,
+        showUnhandledProviderEvents: false,
         showKeyboardHints: false,
+        allowFastServiceTier: false,
         steerActiveThreadOnEnter: true,
-        codexMemoryEnabled: false,
-      });
-      expect(parsedConfig.primaryHostId).toBe(host.id);
-      expect(parsedConfig.primaryHostPlatform).toBe("darwin");
-      await vi.waitFor(() => {
-        expect(responder.requests).toHaveLength(1);
-      });
-    });
-  });
-
-  it("reconciles the saved caffeinate setting for a connected primary daemon", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps);
-      seedPrimaryHost(harness.deps, host.id);
-      setAppSettings(harness.db, { ...defaultAppSettings, caffeinate: true });
-
-      const responder = registerHostRpcResponder(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        handle: (request) => {
-          expect(request.command).toEqual({
-            type: "host.caffeinate",
-            enabled: true,
-          });
-          return {
-            ok: true,
-            result: { enabled: true, supported: true },
-          };
-        },
-      });
-      schedulePrimaryHostCaffeinateReconciliation(harness.deps, {
-        reason: "daemon-open",
-      });
-
-      await vi.waitFor(() => {
-        expect(responder.requests).toHaveLength(1);
+        providerOrder: ["pi", "codex"],
+        defaultProviderId: "pi",
       });
     });
   });
@@ -133,7 +116,6 @@ describe("general settings", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           ...defaultAppSettings,
-          caffeinate: true,
           unused: true,
         }),
       });
@@ -141,3 +123,98 @@ describe("general settings", () => {
     });
   });
 });
+
+it("accepts old SDK payloads and round-trips edits through either setting name", async () => {
+  await withTestHarness(async (harness) => {
+    const { showDiagnosticEvents, ...legacy } = defaultAppSettings;
+    expect(showDiagnosticEvents).toBe(false);
+    const update = async (settings: object) => {
+      const response = await harness.app.request("/api/v1/settings/general", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+      expect(response.status).toBe(200);
+      return appSettingsSchema
+        .extend({
+          showUnhandledProviderEvents:
+            appSettingsSchema.shape.showDiagnosticEvents,
+        })
+        .parse(await readJson(response));
+    };
+    const enabled = await update({
+      ...legacy,
+      showUnhandledProviderEvents: true,
+    });
+    expect(enabled.showDiagnosticEvents).toBe(true);
+    const disabled = await update({
+      ...enabled,
+      showUnhandledProviderEvents: false,
+    });
+    expect(disabled.showDiagnosticEvents).toBe(false);
+    const newEnabled = await update({
+      ...disabled,
+      showDiagnosticEvents: true,
+    });
+    expect(newEnabled.showUnhandledProviderEvents).toBe(true);
+    expect(getAppSettings(harness.db).showDiagnosticEvents).toBe(true);
+  });
+});
+
+it("preserves telemetry opt-out when older clients update other settings", async () => {
+  await withTestHarness(async (harness) => {
+    const put = (settings: object) =>
+      harness.app.request("/api/v1/settings/general", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+    expect(
+      (await put({ ...defaultAppSettings, telemetryEnabled: false })).status,
+    ).toBe(200);
+    expect(getAppSettings(harness.db).telemetryEnabled).toBe(false);
+    const { telemetryEnabled, ...legacy } = defaultAppSettings;
+    expect(telemetryEnabled).toBe(true);
+    expect((await put({ ...legacy, showKeyboardHints: false })).status).toBe(
+      200,
+    );
+    const config = systemConfigResponseSchema.parse(
+      await readJson(await harness.app.request("/api/v1/system/config")),
+    );
+    expect(config.generalSettings.telemetryEnabled).toBe(false);
+    expect(config.generalSettings.showKeyboardHints).toBe(false);
+  });
+});
+
+it.each(["confirmThreadArchive", "showGitChanges"] as const)(
+  "persists %s opt-out and preserves it for older clients",
+  async (key) => {
+    await withTestHarness(async (harness) => {
+      const put = (settings: object) =>
+        harness.app.request("/api/v1/settings/general", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(settings),
+        });
+      expect(getAppSettings(harness.db)[key]).toBe(true);
+      expect((await put({ ...defaultAppSettings, [key]: false })).status).toBe(
+        200,
+      );
+      expect(getAppSettings(harness.db)[key]).toBe(false);
+      const { [key]: omitted, ...legacy } = defaultAppSettings;
+      expect(omitted).toBe(true);
+      expect((await put({ ...legacy, showKeyboardHints: false })).status).toBe(
+        200,
+      );
+      const config = systemConfigResponseSchema.parse(
+        await readJson(await harness.app.request("/api/v1/system/config")),
+      );
+      expect(config.generalSettings[key]).toBe(false);
+      expect(config.generalSettings.showKeyboardHints).toBe(false);
+      expect((await put({ ...defaultAppSettings, [key]: true })).status).toBe(
+        200,
+      );
+      expect(getAppSettings(harness.db)[key]).toBe(true);
+    });
+  },
+);

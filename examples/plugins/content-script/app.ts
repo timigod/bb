@@ -1,4 +1,4 @@
-import { definePluginApp } from "@bb/plugin-sdk/app";
+import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import "./app.css";
 
 const EDITABLE_SELECTOR = 'input, textarea, [contenteditable="true"]';
@@ -38,8 +38,6 @@ export default definePluginApp((app) => {
       mark(document.activeElement);
       signal.addEventListener("abort", clear, { once: true });
 
-      // The host aborts signal first and then invokes this disposer. `clear`
-      // is deliberately idempotent so both cancellation paths are safe.
       return clear;
     },
   });

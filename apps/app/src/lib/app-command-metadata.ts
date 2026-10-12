@@ -5,13 +5,14 @@ import {
   type AppCommandId,
 } from "@bb/domain";
 
-export interface AppCommandMetadata {
+interface AppCommandMetadata {
   command: AppCommandId;
   description: string;
   label: string;
+  paletteVisible: boolean;
 }
 
-export interface AppCommandGroup {
+interface AppCommandGroup {
   commands: readonly AppCommandMetadata[];
   label: string;
 }
@@ -21,7 +22,15 @@ function command(
   label: string,
   description: string,
 ): AppCommandMetadata {
-  return { command: id, description, label };
+  return { command: id, description, label, paletteVisible: true };
+}
+
+function paletteHiddenCommand(
+  id: AppCommandId,
+  label: string,
+  description: string,
+): AppCommandMetadata {
+  return { command: id, description, label, paletteVisible: false };
 }
 
 export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
@@ -36,7 +45,7 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
       command(
         "thread.search",
         "Search threads",
-        "Focus the sidebar thread search.",
+        "Search threads in the quick palette.",
       ),
       command("thread.rename", "Rename thread", "Rename the focused thread."),
       command(
@@ -55,7 +64,7 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Open the next visible sidebar thread.",
       ),
       ...THREAD_JUMP_APP_COMMAND_IDS.map((id, index) =>
-        command(
+        paletteHiddenCommand(
           id,
           `Open thread ${index + 1}`,
           `Open visible sidebar thread ${index + 1}.`,
@@ -66,7 +75,33 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
   {
     label: "Window and layout",
     commands: [
+      paletteHiddenCommand(
+        "palette.open",
+        "Open quick palette",
+        "Search and run bb commands from the keyboard.",
+      ),
       command("window.new", "New window", "Open another bb desktop window."),
+      command(
+        "window.find",
+        "Find in window",
+        "Search the text shown in the current bb desktop window.",
+      ),
+      command(
+        "window.reload",
+        "Reload window",
+        "Reload the current bb desktop window.",
+      ),
+      command("history.back", "Go back", "Go back in this window's history."),
+      command(
+        "history.forward",
+        "Go forward",
+        "Go forward in this window's history.",
+      ),
+      command(
+        "app.back",
+        "Back to app",
+        "Return from Settings, Plugins, or Skills to the app.",
+      ),
       command("settings.open", "Open settings", "Open bb settings."),
       command(
         "settings.openServers",
@@ -79,9 +114,34 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Show or hide the app sidebar.",
       ),
       command(
+        "panel.previousTab",
+        "Previous panel tab",
+        "Select the previous visible right-panel tab, wrapping across panel splits.",
+      ),
+      command(
+        "panel.nextTab",
+        "Next panel tab",
+        "Select the next visible right-panel tab, wrapping across panel splits.",
+      ),
+      command(
+        "panel.previousNewTabItem",
+        "Previous New tab item",
+        "Focus the previous search, action, or recent item on the selected New tab page.",
+      ),
+      command(
+        "panel.nextNewTabItem",
+        "Next New tab item",
+        "Focus the next search, action, or recent item on the selected New tab page.",
+      ),
+      command(
         "panel.newTab",
         "New panel tab",
         "Open a tab in the secondary panel.",
+      ),
+      command(
+        "panel.reopenClosedTab",
+        "Reopen closed panel tab",
+        "Reopen the most recently closed secondary panel tab.",
       ),
       command(
         "panel.close",
@@ -94,6 +154,31 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Show or hide the secondary panel.",
       ),
       command(
+        "panel.fullScreen.toggle",
+        "Toggle panel full screen",
+        "Expand the right panel over the conversation, or restore the conversation.",
+      ),
+      command(
+        "pane.focus.left",
+        "Focus chat pane left",
+        "Focus the chat pane to the left of the current pane.",
+      ),
+      command(
+        "pane.focus.right",
+        "Focus chat pane right",
+        "Focus the chat pane to the right of the current pane.",
+      ),
+      command(
+        "pane.focus.up",
+        "Focus chat pane up",
+        "Focus the chat pane above the current pane.",
+      ),
+      command(
+        "pane.focus.down",
+        "Focus chat pane down",
+        "Focus the chat pane below the current pane.",
+      ),
+      command(
         "pane.focus.previous",
         "Focus previous chat pane",
         "Focus the previous chat pane in reading order.",
@@ -104,7 +189,7 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Focus the next chat pane in reading order.",
       ),
       ...PANE_FOCUS_APP_COMMAND_IDS.map((id, index) =>
-        command(
+        paletteHiddenCommand(
           id,
           `Focus chat pane ${index + 1}`,
           `Focus chat pane ${index + 1} in reading order.`,
@@ -119,6 +204,36 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "pane.close",
         "Close focused chat pane",
         "Close the focused chat pane when more than one is open.",
+      ),
+      command(
+        "logs.openServerDaemon",
+        "Open server and daemon logs",
+        "Open the desktop log viewer for the bb server and host daemon.",
+      ),
+      command(
+        "dataDirectory.open",
+        "Open data directory",
+        "Reveal the bb data directory in the system file manager.",
+      ),
+      command(
+        "notifications.open",
+        "Show all notifications",
+        "Open the notification center to read and clear past notifications.",
+      ),
+      command(
+        "plugins.enterSafeMode",
+        "Turn on plugin safe mode",
+        "Stop every plugin you installed, keeping each plugin's enabled setting. Plugins included with bb keep running.",
+      ),
+      command(
+        "plugins.exitSafeMode",
+        "Turn off plugin safe mode",
+        "Restart the plugins that were enabled before safe mode.",
+      ),
+      command(
+        "plugins.pruneCache",
+        "Clean up plugin cache",
+        "Delete cached plugin versions that no installed plugin uses, such as versions left by earlier bb releases.",
       ),
     ],
   },
@@ -160,32 +275,32 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Toggle model picker",
         "Open or close the focused composer's model picker.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleModel",
         "Cycle model forward",
         "Select the next model of the composer's provider, wrapping at the end.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleModelBackward",
         "Cycle model backward",
         "Select the previous model of the composer's provider, wrapping at the beginning.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleProvider",
         "Cycle provider forward",
         "Select the next provider for the composer, wrapping at the end.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleProviderBackward",
         "Cycle provider backward",
         "Select the previous provider for the composer, wrapping at the beginning.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleReasoning",
         "Cycle reasoning effort forward",
         "Select the next higher supported reasoning effort, wrapping after the highest.",
       ),
-      command(
+      paletteHiddenCommand(
         "modelPicker.cycleReasoningBackward",
         "Cycle reasoning effort backward",
         "Select the next lower supported reasoning effort, wrapping before the lowest.",
@@ -205,12 +320,17 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
         "Reload page",
         "Reload the active embedded browser page.",
       ),
+      command(
+        "browser.find",
+        "Find in page",
+        "Open the find bar for the active embedded browser page.",
+      ),
     ],
   },
   {
     label: "Questions",
     commands: QUESTION_SELECT_APP_COMMAND_IDS.map((id, index) =>
-      command(
+      paletteHiddenCommand(
         id,
         `Choose answer ${index + 1}`,
         `Choose visible answer ${index + 1} when bb asks a question.`,
@@ -218,19 +338,3 @@ export const APP_COMMAND_GROUPS: readonly AppCommandGroup[] = [
     ),
   },
 ];
-
-const APP_COMMAND_METADATA = new Map(
-  APP_COMMAND_GROUPS.flatMap((group) =>
-    group.commands.map((metadata) => [metadata.command, metadata]),
-  ),
-);
-
-export function getAppCommandMetadata(
-  commandId: AppCommandId,
-): AppCommandMetadata {
-  const metadata = APP_COMMAND_METADATA.get(commandId);
-  if (metadata === undefined) {
-    throw new Error(`Missing metadata for app command ${commandId}`);
-  }
-  return metadata;
-}

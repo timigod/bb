@@ -6,7 +6,7 @@ import {
   activityTextClass,
   type ActivityRowState,
 } from "./activity-row-styles";
-import { Icon } from "./icon";
+import { Icon, type IconName } from "./icon";
 import { cn } from "../../lib/utils";
 
 export type WorkflowProgressAgentState =
@@ -33,11 +33,6 @@ export interface WorkflowProgressAgent {
   tokens?: number;
   toolCalls?: number;
   durationMs?: number;
-  /**
-   * Provider-independent metadata shown before duration/attempt/cache state.
-   * Native Claude workflows omit this and use agentType + model. Cross-provider
-   * callers can provide provider/model/reasoning without changing the layout.
-   */
   metadata?: readonly string[];
 }
 
@@ -61,8 +56,6 @@ interface WorkflowPhaseGroup {
 const ACTIVE_PHASE_SCROLL_OFFSET = 12;
 const PROMPT_STACK_ACTIVE_ROW_CLASS = "shadow-none ring-0";
 const PROMPT_STACK_ACTIVE_ICON_CLASS = "text-foreground";
-// Inside the phase tree the shine shimmer is reserved for the card's top-level
-// header; running rows already carry a spinner, so their text stays static.
 const PROMPT_STACK_ACTIVE_TEXT_CLASS = "font-medium text-foreground";
 
 function isSettledAgentState(state: WorkflowProgressAgentState): boolean {
@@ -84,6 +77,19 @@ function deriveAgentDisplayState(
   return agent.state;
 }
 
+const AGENT_STATE_ICON: Record<
+  WorkflowAgentDisplayState,
+  { name: IconName; className: string }
+> = {
+  done: { name: "Check", className: "text-muted-foreground/60" },
+  failed: { name: "X", className: "text-destructive/80" },
+  skipped: { name: "X", className: "text-muted-foreground/45" },
+  cancelled: { name: "Pause", className: "text-muted-foreground/45" },
+  running: { name: "Spinner", className: "animate-spin text-foreground" },
+  queued: { name: "Circle", className: "text-muted-foreground/45" },
+  interrupted: { name: "Circle", className: "text-muted-foreground/45" },
+};
+
 function WorkflowAgentStateIcon({
   state,
   className: overrideClassName,
@@ -91,82 +97,14 @@ function WorkflowAgentStateIcon({
   state: WorkflowAgentDisplayState;
   className?: string;
 }) {
-  const baseClassName = "size-3.5 shrink-0";
-  switch (state) {
-    case "done":
-      return (
-        <Icon
-          name="Check"
-          className={cn(
-            baseClassName,
-            "text-muted-foreground/60",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-    case "failed":
-      return (
-        <Icon
-          name="X"
-          className={cn(
-            baseClassName,
-            "text-destructive/80",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-    case "skipped":
-      return (
-        <Icon
-          name="X"
-          className={cn(
-            baseClassName,
-            "text-muted-foreground/45",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-    case "cancelled":
-      return (
-        <Icon
-          name="Pause"
-          className={cn(
-            baseClassName,
-            "text-muted-foreground/45",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-    case "running":
-      return (
-        <Icon
-          name="Spinner"
-          className={cn(
-            baseClassName,
-            "animate-spin text-foreground",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-    case "queued":
-    case "interrupted":
-      return (
-        <Icon
-          name="Circle"
-          className={cn(
-            baseClassName,
-            "text-muted-foreground/45",
-            overrideClassName,
-          )}
-          aria-hidden="true"
-        />
-      );
-  }
+  const entry = AGENT_STATE_ICON[state];
+  return (
+    <Icon
+      name={entry.name}
+      className={cn("size-3.5 shrink-0", entry.className, overrideClassName)}
+      aria-hidden="true"
+    />
+  );
 }
 
 function formatCompactTokens(tokens: number): string {
@@ -193,9 +131,7 @@ function shortModelName(model: string): string {
 }
 
 interface WorkflowAgentStats {
-  /** Provider/model/effort plus qualifiers, without the duration. */
   meta: string;
-  /** Duration column, right-aligned separately so times line up. */
   duration: string | null;
 }
 
@@ -673,12 +609,7 @@ function CollapsiblePhaseGroups({
   const [overrides, setOverrides] = useState<ReadonlyMap<string, boolean>>(
     () => new Map(),
   );
-  // While running, phases auto-collapse as they complete: any phase with
-  // in-flight or failed agents stays open (pipelines can run several phases at
-  // once), a cleanly-finished phase folds away. Once the workflow settles,
-  // phases holding failed, cancelled, or stopped-mid-flight agents stay open
-  // so the reason is visible.
-  const defaultExpanded = (key: string, group: WorkflowPhaseGroup): boolean =>
+  const defaultExpanded = (group: WorkflowPhaseGroup): boolean =>
     workflowSettled
       ? group.agents.some(
           (agent) => agent.state !== "done" && agent.state !== "skipped",
@@ -688,10 +619,10 @@ function CollapsiblePhaseGroups({
             !isSettledAgentState(agent.state) || agent.state === "failed",
         );
   const isExpanded = (key: string, group: WorkflowPhaseGroup): boolean =>
-    overrides.get(key) ?? defaultExpanded(key, group);
+    overrides.get(key) ?? defaultExpanded(group);
   const toggle = (key: string, group: WorkflowPhaseGroup) =>
     setOverrides((current) => {
-      const wasExpanded = current.get(key) ?? defaultExpanded(key, group);
+      const wasExpanded = current.get(key) ?? defaultExpanded(group);
       const next = new Map(current);
       next.set(key, !wasExpanded);
       return next;
@@ -770,19 +701,32 @@ export type WorkflowStatusPillState =
   | "failed"
   | "cancelled";
 
-const STATUS_PILL_LABEL: Record<WorkflowStatusPillState, string> = {
-  queued: "Queued",
-  completed: "Complete",
-  failed: "Failed",
-  cancelled: "Cancelled",
+const STATUS_PILL: Record<
+  WorkflowStatusPillState,
+  { label: string; className: string; icon: IconName | null }
+> = {
+  queued: {
+    label: "Queued",
+    className: "bg-surface-recessed text-muted-foreground",
+    icon: null,
+  },
+  completed: {
+    label: "Complete",
+    className: "bg-success/10 text-success",
+    icon: "Check",
+  },
+  failed: {
+    label: "Failed",
+    className: "bg-destructive/10 text-destructive-text",
+    icon: "X",
+  },
+  cancelled: {
+    label: "Cancelled",
+    className: "bg-surface-recessed text-subtle-foreground",
+    icon: "Pause",
+  },
 };
 
-/**
- * Compact status chip shown in the same top-right slot of every workflow
- * surface (inline card header and right panel header), so status always reads
- * from the same place. There is deliberately no "running" pill: a live run
- * already reads as active from the header shimmer, phase strip, and spinners.
- */
 export function WorkflowStatusPill({
   state,
   className,
@@ -790,59 +734,30 @@ export function WorkflowStatusPill({
   state: WorkflowStatusPillState;
   className?: string;
 }) {
-  const base =
-    "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-2xs font-medium";
-  switch (state) {
-    case "queued":
-      return (
+  const entry = STATUS_PILL[state];
+  return (
+    <span
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-2xs font-medium",
+        entry.className,
+        className,
+      )}
+    >
+      {entry.icon === null ? (
         <span
-          className={cn(
-            base,
-            "bg-surface-recessed text-muted-foreground",
-            className,
-          )}
-        >
-          <span
-            className="size-1.5 shrink-0 rounded-full bg-muted-foreground/50"
-            aria-hidden="true"
-          />
-          {STATUS_PILL_LABEL[state]}
-        </span>
-      );
-    case "completed":
-      return (
-        <span className={cn(base, "bg-success/10 text-success", className)}>
-          <Icon name="Check" className="size-3 shrink-0" aria-hidden="true" />
-          {STATUS_PILL_LABEL[state]}
-        </span>
-      );
-    case "failed":
-      return (
-        <span
-          className={cn(
-            base,
-            "bg-destructive/10 text-destructive-text",
-            className,
-          )}
-        >
-          <Icon name="X" className="size-3 shrink-0" aria-hidden="true" />
-          {STATUS_PILL_LABEL[state]}
-        </span>
-      );
-    case "cancelled":
-      return (
-        <span
-          className={cn(
-            base,
-            "bg-surface-recessed text-subtle-foreground",
-            className,
-          )}
-        >
-          <Icon name="Pause" className="size-3 shrink-0" aria-hidden="true" />
-          {STATUS_PILL_LABEL[state]}
-        </span>
-      );
-  }
+          className="size-1.5 shrink-0 rounded-full bg-muted-foreground/50"
+          aria-hidden="true"
+        />
+      ) : (
+        <Icon
+          name={entry.icon}
+          className="size-3 shrink-0"
+          aria-hidden="true"
+        />
+      )}
+      {entry.label}
+    </span>
+  );
 }
 
 type PhaseStripSegmentState = "done" | "active" | "failed" | "upcoming";
@@ -878,11 +793,6 @@ const PHASE_STRIP_SEGMENT_CLASS: Record<PhaseStripSegmentState, string> = {
   upcoming: "bg-muted-foreground/20",
 };
 
-/**
- * Segmented per-phase progress strip for workflow card headers: one segment
- * per phase (green = done, pulsing = active, red = failed), so a collapsed
- * card still tells the whole story at a glance.
- */
 export function WorkflowPhaseStrip({
   progress,
   currentPhaseIndex,

@@ -53,6 +53,7 @@ function createBottomAnchor(
     scrollElementIntoView: vi.fn(),
     scrollElementIntoViewClampedToMaxScroll: vi.fn(),
     captureScrollAnchor: vi.fn(),
+    holdContentPosition: vi.fn(),
   };
 }
 
@@ -94,7 +95,6 @@ function renderAutoLoad(args: {
       }),
     { initialProps: { isLoading: false }, wrapper },
   );
-  // Mounting the sentinel is what starts observing.
   const sentinel = document.createElement("div");
   act(() => {
     result.result.current.sentinelRef(sentinel);
@@ -124,8 +124,6 @@ describe("useAutoLoadOlderRows", () => {
     emitIntersection(true);
 
     expect(onLoadOlderRows).toHaveBeenCalledTimes(1);
-    // Captured before the fetch, otherwise prepended rows shift the view out
-    // from under whatever the user was reading.
     expect(anchor.captureScrollAnchor).toHaveBeenCalledTimes(1);
   });
 
@@ -144,9 +142,6 @@ describe("useAutoLoadOlderRows", () => {
   });
 
   it("keeps loading while the sentinel stays visible after a page settles", async () => {
-    // A page that does not fill the viewport leaves the sentinel on screen, and
-    // IntersectionObserver reports changes rather than steady state — so this
-    // only continues if the settle path re-checks.
     const onLoadOlderRows = vi.fn(() => Promise.resolve());
     const { rerender } = renderAutoLoad({
       anchor: createBottomAnchor(),
@@ -185,8 +180,6 @@ describe("useAutoLoadOlderRows", () => {
     await act(async () => {
       rerender({ isLoading: true });
     });
-    // The prepend moves the sentinel above the prefetch margin before the
-    // observer delivers its corresponding `false` entry.
     mockElementRect(sentinel, { top: -800, bottom: -780 });
     await act(async () => {
       rerender({ isLoading: false });
@@ -197,8 +190,6 @@ describe("useAutoLoadOlderRows", () => {
   });
 
   it("stops auto-loading after a failure instead of retrying in a loop", async () => {
-    // The sentinel is still visible when the loading flag clears, so without a
-    // failure latch a persistently failing page would be refetched forever.
     const onLoadOlderRows = vi.fn(() => Promise.reject(new Error("boom")));
     const { result, rerender } = renderAutoLoad({
       anchor: createBottomAnchor(),
@@ -217,7 +208,6 @@ describe("useAutoLoadOlderRows", () => {
     await act(async () => {});
     expect(onLoadOlderRows).toHaveBeenCalledTimes(1);
 
-    // The button reappears, and pressing it clears the latch for one retry.
     await act(async () => {
       result.current.loadOlderRows();
     });

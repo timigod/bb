@@ -7,12 +7,8 @@ import { useAppSettingsRouteMemory } from "./useAppSettingsRouteMemory";
 
 function RouteMemoryTestSurface() {
   const location = useLocation();
-  const {
-    appRoutePath,
-    settingsRoutePath,
-    toolsBackRoutePath,
-    toolsRoutePath,
-  } = useAppSettingsRouteMemory();
+  const { appRoutePath, settingsRoutePath, toolsBackRoutePath } =
+    useAppSettingsRouteMemory();
 
   return (
     <>
@@ -23,14 +19,14 @@ function RouteMemoryTestSurface() {
       </div>
       <Link to={appRoutePath}>App</Link>
       <Link to={settingsRoutePath}>Settings</Link>
-      <Link to={toolsRoutePath}>Tools</Link>
+      <Link to="/plugins">Tools</Link>
       <Link to={toolsBackRoutePath}>Tools back</Link>
-      <Link to="/extensions/plugins/ui-patterns?tab=settings#source">
-        Plugin detail
-      </Link>
+      <Link to="/plugins/ui-patterns?tab=settings#source">Plugin detail</Link>
       <Link to="/settings/providers/codex?tab=models#preferred">
         Codex settings
       </Link>
+      <Link to="/projects/proj_one/settings">Legacy project settings</Link>
+      <Link to="/settings/projects/proj_one">Project detail</Link>
       <Link to="/settings/plugins">Legacy plugin collection</Link>
       <Link to="/settings/plugins/ui-patterns">Legacy plugin detail</Link>
     </>
@@ -39,6 +35,33 @@ function RouteMemoryTestSurface() {
 
 describe("useAppSettingsRouteMemory", () => {
   afterEach(cleanup);
+
+  it.each(["/projects/proj_one/settings", "/settings/projects/proj_one"])(
+    "uses a safe app destination when opening %s directly",
+    (path) => {
+      render(
+        <MemoryRouter initialEntries={[path]}>
+          <RouteMemoryTestSurface />
+        </MemoryRouter>,
+      );
+      fireEvent.click(screen.getByRole("link", { name: "App" }));
+      expect(screen.getByTestId("location").textContent).toBe("/");
+    },
+  );
+
+  it("preserves the previous app route across a legacy project settings redirect", () => {
+    render(
+      <MemoryRouter initialEntries={["/threads/thr_one"]}>
+        <RouteMemoryTestSurface />
+      </MemoryRouter>,
+    );
+    fireEvent.click(
+      screen.getByRole("link", { name: "Legacy project settings" }),
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Project detail" }));
+    fireEvent.click(screen.getByRole("link", { name: "App" }));
+    expect(screen.getByTestId("location").textContent).toBe("/threads/thr_one");
+  });
 
   it("switches between the most recent app and settings routes", () => {
     render(
@@ -70,7 +93,7 @@ describe("useAppSettingsRouteMemory", () => {
     );
   });
 
-  it("resets Extensions after Back to app returns to core app context", () => {
+  it("resets Plugins after Back to app returns to core app context", () => {
     render(
       <MemoryRouter
         initialEntries={[
@@ -82,11 +105,11 @@ describe("useAppSettingsRouteMemory", () => {
     );
 
     fireEvent.click(screen.getByRole("link", { name: "Tools" }));
-    expect(screen.getByTestId("location").textContent).toBe("/extensions/plugins");
+    expect(screen.getByTestId("location").textContent).toBe("/plugins");
 
     fireEvent.click(screen.getByRole("link", { name: "Plugin detail" }));
     expect(screen.getByTestId("location").textContent).toBe(
-      "/extensions/plugins/ui-patterns?tab=settings#source",
+      "/plugins/ui-patterns?tab=settings#source",
     );
 
     fireEvent.click(screen.getByRole("link", { name: "Tools back" }));
@@ -95,115 +118,66 @@ describe("useAppSettingsRouteMemory", () => {
     );
 
     fireEvent.click(screen.getByRole("link", { name: "Tools" }));
-    expect(screen.getByTestId("location").textContent).toBe("/extensions/plugins");
+    expect(screen.getByTestId("location").textContent).toBe("/plugins");
   });
 
-  // The legacy plugin DETAIL route is deliberately absent here: Settings
-  // hosts plugin configuration at /settings/plugins/:pluginId now, so that
-  // path participates in settings memory (covered below) — only the bare
-  // collection list still redirects.
-  it.each([["collection", "Legacy plugin collection"]])(
-    "does not remember the legacy plugin %s redirect as Settings or app context",
-    (_kind, legacyLinkName) => {
-      render(
-        <MemoryRouter
-          initialEntries={[
-            "/projects/proj_one/threads/thr_one?message=12#event-12",
-          ]}
-        >
-          <RouteMemoryTestSurface />
-        </MemoryRouter>,
-      );
+  it("remembers installed plugin management as Settings and preserves the app destination", () => {
+    render(
+      <MemoryRouter initialEntries={["/projects/proj_one/threads/thr_one"]}>
+        <RouteMemoryTestSurface />
+      </MemoryRouter>,
+    );
+    fireEvent.click(
+      screen.getByRole("link", { name: "Legacy plugin collection" }),
+    );
+    expect(
+      screen.getByRole("link", { name: "Settings" }).getAttribute("href"),
+    ).toBe("/settings/plugins");
+    fireEvent.click(screen.getByRole("link", { name: "App" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/projects/proj_one/threads/thr_one",
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Settings" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/settings/plugins",
+    );
+  });
 
-      fireEvent.click(screen.getByRole("link", { name: "Settings" }));
-      fireEvent.click(screen.getByRole("link", { name: "Codex settings" }));
-      fireEvent.click(screen.getByRole("link", { name: "App" }));
-      fireEvent.click(screen.getByRole("link", { name: legacyLinkName }));
-
-      expect(
-        screen.getByRole("link", { name: "Settings" }).getAttribute("href"),
-      ).toBe("/settings/providers/codex?tab=models#preferred");
-      expect(
-        screen.getByRole("link", { name: "Tools" }).getAttribute("href"),
-      ).toBe("/extensions/plugins");
-      expect(
-        screen.getByRole("link", { name: "Tools back" }).getAttribute("href"),
-      ).toBe("/projects/proj_one/threads/thr_one?message=12#event-12");
-
-      // Simulate the compatibility route's redirect into Extensions. The
-      // transient legacy URL must not replace either remembered destination.
-      fireEvent.click(screen.getByRole("link", { name: "Plugin detail" }));
-      expect(
-        screen.getByRole("link", { name: "Tools back" }).getAttribute("href"),
-      ).toBe("/projects/proj_one/threads/thr_one?message=12#event-12");
-      fireEvent.click(screen.getByRole("link", { name: "Settings" }));
-      expect(screen.getByTestId("location").textContent).toBe(
-        "/settings/providers/codex?tab=models#preferred",
-      );
-    },
-  );
-
-  it("uses safe defaults when opened directly at the legacy /settings/plugins list", () => {
+  it("uses safe defaults when opened directly at the installed plugins list", () => {
     render(
       <MemoryRouter initialEntries={["/settings/plugins"]}>
         <RouteMemoryTestSurface />
       </MemoryRouter>,
     );
 
-    expect(
-      screen.getByRole("link", { name: "App" }).getAttribute("href"),
-    ).toBe("/");
+    expect(screen.getByRole("link", { name: "App" }).getAttribute("href")).toBe(
+      "/",
+    );
     expect(
       screen.getByRole("link", { name: "Settings" }).getAttribute("href"),
-    ).toBe("/settings");
-    expect(
-      screen.getByRole("link", { name: "Tools" }).getAttribute("href"),
-    ).toBe("/extensions/plugins");
+    ).toBe("/settings/plugins");
     expect(
       screen.getByRole("link", { name: "Tools back" }).getAttribute("href"),
-    ).toBe("/");
+    ).toBe("/settings/plugins");
   });
 
-  it("remembers a per-plugin settings page as a real Settings route", () => {
-    // Settings hosts plugin configuration at /settings/plugins/:pluginId now;
-    // only the bare /settings/plugins list stays a legacy redirect.
+  it.each([
+    "/settings/plugins/ui-patterns",
+    "/settings/plugins/ui-patterns?view=installed#source",
+  ])("remembers %s as a Settings route", (path) => {
     render(
-      <MemoryRouter initialEntries={["/settings/plugins/ui-patterns"]}>
+      <MemoryRouter initialEntries={[path]}>
         <RouteMemoryTestSurface />
       </MemoryRouter>,
     );
 
     expect(
       screen.getByRole("link", { name: "Settings" }).getAttribute("href"),
-    ).toBe("/settings/plugins/ui-patterns");
+    ).toBe(path);
 
-    // Leaving for the app and coming back returns to the plugin's settings
-    // page, exactly like any other remembered settings section.
     fireEvent.click(screen.getByRole("link", { name: "App" }));
     expect(screen.getByTestId("location").textContent).toBe("/");
     fireEvent.click(screen.getByRole("link", { name: "Settings" }));
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/settings/plugins/ui-patterns",
-    );
+    expect(screen.getByTestId("location").textContent).toBe(path);
   });
-
-  it.each([
-    "/tools/automations",
-    "/tools/automations?view=browse",
-    "/tools/automations/browse",
-    "/tools/automations/proj_one/auto_one",
-    "/tools/automations/proj_one/auto_one/edit",
-  ])(
-    "does not remember the legacy automation location %s as Extensions",
-    (legacyAutomationPath) => {
-      render(
-        <MemoryRouter initialEntries={[legacyAutomationPath]}>
-          <RouteMemoryTestSurface />
-        </MemoryRouter>,
-      );
-
-      fireEvent.click(screen.getByRole("link", { name: "Tools" }));
-      expect(screen.getByTestId("location").textContent).toBe("/extensions/plugins");
-    },
-  );
 });

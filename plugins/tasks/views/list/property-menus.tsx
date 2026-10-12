@@ -1,8 +1,8 @@
-import type { ReactNode, Ref } from "react";
+import type { ReactNode } from "react";
 import {
-  TASK_PRIORITIES,
   TASK_STATUSES,
   type Label,
+  type Project,
   type Task,
   type TaskPriority,
   type TaskStatus,
@@ -13,7 +13,7 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
+} from "@/components/ui/dropdown-menu";
 import {
   ContextMenu,
   ContextMenuCheckboxItem,
@@ -25,21 +25,21 @@ import {
   ContextMenuSubTrigger,
   ContextMenuShortcut,
   ContextMenuTrigger,
-} from "@bb/shared-ui/context-menu";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/context-menu";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import type { TaskEdit } from "./optimistic.js";
 import { PriorityIcon, StatusIcon } from "./icons.js";
-import { formatDueDate, PRIORITY_LABELS, STATUS_LABELS } from "./lib.js";
+import {
+  DUE_DATE_PRESETS,
+  formatDueDate,
+  localIsoDate,
+  PRIORITY_LABELS,
+  STATUS_LABELS,
+} from "./lib.js";
 
 export type EditFn = (task: Task, patch: TaskEdit) => void;
 
-/**
- * Priority order for the picker menu: "No priority" first, matching the Linear
- * reference where the number shortcuts run 0 (No priority) → 4 (Low). This is
- * intentionally distinct from `TASK_PRIORITIES` (urgent-first), which drives
- * sorting and filtering.
- */
 export const PRIORITY_MENU_ORDER: readonly TaskPriority[] = [
   "none",
   "urgent",
@@ -48,7 +48,6 @@ export const PRIORITY_MENU_ORDER: readonly TaskPriority[] = [
   "low",
 ];
 
-/** Number shortcut → status (1-based, canonical status order). */
 export function statusForShortcut(key: string): TaskStatus | null {
   if (!/^[0-9]$/.test(key)) return null;
   const index = Number(key) - 1;
@@ -57,7 +56,6 @@ export function statusForShortcut(key: string): TaskStatus | null {
     : null;
 }
 
-/** Number shortcut → priority (0-based over {@link PRIORITY_MENU_ORDER}). */
 export function priorityForShortcut(key: string): TaskPriority | null {
   if (!/^[0-9]$/.test(key)) return null;
   const index = Number(key);
@@ -66,7 +64,6 @@ export function priorityForShortcut(key: string): TaskPriority | null {
     : null;
 }
 
-/** Shortcuts fire only on a bare keypress, never with a modifier held. */
 export function isBareKey(event: {
   metaKey: boolean;
   ctrlKey: boolean;
@@ -76,26 +73,10 @@ export function isBareKey(event: {
   return !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
 }
 
-function localIsoDate(daysFromNow: number): string {
-  const date = new Date();
-  date.setDate(date.getDate() + daysFromNow);
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${date.getFullYear()}-${month}-${day}`;
-}
-
-const DUE_DATE_PRESETS: readonly [label: string, days: number][] = [
-  ["Today", 0],
-  ["Tomorrow", 1],
-  ["Next week", 7],
-];
-
 function MenuHeading({ label, shortcut }: { label: string; shortcut: string }) {
   return (
     <DropdownMenuLabel className="flex items-center gap-2">
       <span className="flex-1">{label}</span>
-      {/* Right-aligned in the same fixed-width column as the rows' number
-          shortcuts, so the header key and every row number line up. */}
       <span className="w-3 text-right text-2xs tabular-nums text-subtle-foreground">
         {shortcut}
       </span>
@@ -103,14 +84,6 @@ function MenuHeading({ label, shortcut }: { label: string; shortcut: string }) {
   );
 }
 
-/**
- * A picker row's content laid out to match the Linear reference: icon + label,
- * then a check column (shown only for the current value), then the number
- * shortcut in the rightmost column (shown for every value). The check and
- * number are decorative; the current value is announced to assistive tech via
- * the visually-hidden "(current)" label, and the trigger's aria-label already
- * states the current value.
- */
 function PickerOption({
   icon,
   label,
@@ -148,21 +121,17 @@ function PickerOption({
 const TRIGGER_CLASS =
   "relative z-10 inline-flex size-5 shrink-0 items-center justify-center rounded-sm hover:bg-state-active focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:bg-state-active max-md:pointer-coarse:size-8";
 
-/** Inline status picker: the row's status glyph, click/S to open the menu. */
 export function StatusEditor({
   task,
   onEdit,
   open,
   onOpenChange,
-  triggerRef,
   className,
 }: {
   task: Task;
   onEdit: EditFn;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  triggerRef?: Ref<HTMLButtonElement>;
-  /** Extra classes for the trigger button (e.g. grid placement in list rows). */
   className?: string;
 }) {
   const select = (status: TaskStatus) => {
@@ -172,7 +141,6 @@ export function StatusEditor({
     <DropdownMenu open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger asChild>
         <button
-          ref={triggerRef}
           type="button"
           aria-label={`Change status, currently ${STATUS_LABELS[task.status]}`}
           className={cn(TRIGGER_CLASS, className)}
@@ -213,21 +181,17 @@ export function StatusEditor({
   );
 }
 
-/** Inline priority picker: the row's priority glyph, click/P to open the menu. */
 export function PriorityEditor({
   task,
   onEdit,
   open,
   onOpenChange,
-  triggerRef,
   className,
 }: {
   task: Task;
   onEdit: EditFn;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  triggerRef?: Ref<HTMLButtonElement>;
-  /** Extra classes for the trigger button (e.g. grid placement in list rows). */
   className?: string;
 }) {
   const select = (priority: TaskPriority) => {
@@ -237,7 +201,6 @@ export function PriorityEditor({
     <DropdownMenu open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger asChild>
         <button
-          ref={triggerRef}
           type="button"
           aria-label={`Set priority, currently ${PRIORITY_LABELS[task.priority]}`}
           className={cn(TRIGGER_CLASS, className)}
@@ -278,22 +241,19 @@ export function PriorityEditor({
   );
 }
 
-/**
- * Right-click property menu for a task row. Offers quick changes for exactly
- * the properties `updateTask` supports — status, priority, due date, and
- * labels. Properties the Linear reference shows but this data model does not
- * have (assignee, project move, …) are intentionally absent rather than shown
- * as dead items.
- */
 export function TaskContextMenu({
   task,
   onEdit,
   projectLabels,
+  projects,
+  onMoveToProject,
   children,
 }: {
   task: Task;
   onEdit: EditFn;
   projectLabels: readonly Label[];
+  projects: readonly Project[];
+  onMoveToProject: (task: Task, projectId: string) => void;
   children: ReactNode;
 }) {
   const toggleLabel = (labelId: string) => {
@@ -411,7 +371,6 @@ export function TaskContextMenu({
                 <ContextMenuCheckboxItem
                   key={label.id}
                   checked={task.labelIds.includes(label.id)}
-                  // Keep the submenu open so several labels can be toggled at once.
                   onSelect={(event) => event.preventDefault()}
                   onCheckedChange={() => toggleLabel(label.id)}
                 >
@@ -422,6 +381,49 @@ export function TaskContextMenu({
                   />
                   {label.name}
                 </ContextMenuCheckboxItem>
+              ))}
+            </ContextMenuSubContent>
+          </ContextMenuSub>
+        ) : null}
+
+        {projects.length > 1 ? (
+          <ContextMenuSub>
+            <ContextMenuSubTrigger>
+              <Icon name="ArrowUpRight" className="size-3.5" />
+              <span>Move to project</span>
+            </ContextMenuSubTrigger>
+            <ContextMenuSubContent className="min-w-48">
+              {projects.map((project) => (
+                <ContextMenuItem
+                  key={project.id}
+                  aria-current={
+                    project.id === task.projectId ? "true" : undefined
+                  }
+                  onSelect={() => {
+                    if (project.id !== task.projectId) {
+                      onMoveToProject(task, project.id);
+                    }
+                  }}
+                >
+                  <span className="flex flex-1 items-center gap-2">
+                    <span
+                      aria-hidden
+                      className="size-2.5 shrink-0 rounded-sm"
+                      style={{ backgroundColor: project.color }}
+                    />
+                    {project.name}
+                    {project.id === task.projectId ? (
+                      <span className="sr-only"> (current)</span>
+                    ) : null}
+                  </span>
+                  {project.id === task.projectId ? (
+                    <Icon name="Check" aria-hidden className="size-3.5" />
+                  ) : (
+                    <span className="text-2xs text-subtle-foreground">
+                      {project.prefix}
+                    </span>
+                  )}
+                </ContextMenuItem>
               ))}
             </ContextMenuSubContent>
           </ContextMenuSub>

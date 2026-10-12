@@ -24,13 +24,6 @@ describe("mapSkillScope", () => {
       manageable: true,
     },
     {
-      provider: "codex",
-      rootKind: "bb-project",
-      scope: "bb-project",
-      listedProvider: null,
-      manageable: true,
-    },
-    {
       provider: "claude-code",
       rootKind: "bb-data-dir",
       scope: "bb-user",
@@ -47,43 +40,15 @@ describe("mapSkillScope", () => {
     {
       provider: "claude-code",
       rootKind: "provider-project",
-      scope: "claude-project",
+      scope: "provider-project",
       listedProvider: "claude-code",
       manageable: true,
     },
     {
       provider: "claude-code",
       rootKind: "provider-user",
-      scope: "claude-user",
+      scope: "provider-user",
       listedProvider: "claude-code",
-      manageable: true,
-    },
-    {
-      provider: "codex",
-      rootKind: "provider-project",
-      scope: "codex-project",
-      listedProvider: "codex",
-      manageable: true,
-    },
-    {
-      provider: "codex",
-      rootKind: "provider-user",
-      scope: "codex-user",
-      listedProvider: "codex",
-      manageable: true,
-    },
-    {
-      provider: "acp-cursor",
-      rootKind: "provider-project",
-      scope: "cursor-project",
-      listedProvider: "acp-cursor",
-      manageable: true,
-    },
-    {
-      provider: "acp-cursor",
-      rootKind: "provider-user",
-      scope: "cursor-user",
-      listedProvider: "acp-cursor",
       manageable: true,
     },
     {
@@ -125,7 +90,7 @@ describe("mapSkillScope", () => {
         "provider-user",
         "/home/user/.codex/skills/.system/imagegen/SKILL.md",
       ),
-    ).toEqual({ scope: "codex-user", provider: "codex", manageable: false });
+    ).toEqual({ scope: "provider-user", provider: "codex", manageable: false });
   });
 });
 
@@ -187,12 +152,10 @@ describe("assembleSkillList", () => {
         ],
       },
     ]);
-    // bb-project sorts before claude-user before codex-user; the two `zed` skills are
-    // distinct files under different providers.
     expect(result.map((skill) => [skill.scope, skill.name])).toEqual([
       ["bb-project", "alpha"],
-      ["claude-user", "zed"],
-      ["codex-user", "zed"],
+      ["provider-user", "zed"],
+      ["provider-user", "zed"],
     ]);
   });
 
@@ -211,7 +174,7 @@ describe("assembleSkillList", () => {
     ).toContainEqual(
       expect.objectContaining({
         name: "impeccable",
-        scope: "cursor-project",
+        scope: "provider-project",
         provider: "acp-cursor",
         manageable: false,
       }),
@@ -232,7 +195,7 @@ describe("assembleSkillList", () => {
       assembleSkillList([{ provider: "codex", skills: [linked] }])[0],
     ).toMatchObject({
       name: "shared-link",
-      scope: "codex-user",
+      scope: "provider-user",
       manageable: false,
     });
   });

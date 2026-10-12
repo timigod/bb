@@ -48,6 +48,9 @@ describe("internal environment change websocket hints", () => {
         .get();
       expect(updatedSession?.status).toBe("active");
       expect(updatedSession?.leaseExpiresAt).toBeGreaterThan(Date.now());
+      expect(socket.send).toHaveBeenCalledWith(
+        JSON.stringify({ type: "heartbeat-ack" }),
+      );
       expect(socket.close).not.toHaveBeenCalled();
     });
   });
@@ -70,6 +73,9 @@ describe("internal environment change websocket hints", () => {
             type: "host.list_files",
             path: "/tmp/session-scope-test",
             limit: 10,
+            includeHidden: false,
+            respectGitIgnore: false,
+            excludeNames: [],
           },
         },
       });
@@ -193,7 +199,7 @@ describe("internal environment change websocket hints", () => {
           workspace: {
             path: environment.path,
             isGitRepo: true,
-            isWorktree: false,
+            isWorktree: true,
             branchName: "main",
             defaultBranch: "main",
           },
@@ -203,7 +209,7 @@ describe("internal environment change websocket hints", () => {
       expect(socket.close).not.toHaveBeenCalled();
       expect(getEnvironment(harness.db, environment.id)).toMatchObject({
         isGitRepo: true,
-        isWorktree: false,
+        isWorktree: true,
         branchName: "main",
         defaultBranch: "main",
       });

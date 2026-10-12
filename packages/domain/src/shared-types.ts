@@ -1,16 +1,6 @@
 import { z } from "zod";
+import { jsonObjectSchema } from "./json-value.js";
 
-/**
- * Order is load-bearing: `reasoningRank` (index) drives model-switch
- * reconciliation. "none" (no extended thinking) sits at the bottom — only
- * providers that expose a thinking-off variant list it (currently Cursor and
- * Pi models whose `thinkingLevelMap` advertises `off`).
- * "ultracode" sits between "xhigh" and "max" because its underlying effort IS
- * xhigh (plus standing workflow orchestration) — a model without ultracode
- * support should reconcile down to xhigh, not up to max.
- * "ultra" is a Codex-native top tier (max effort plus automatic task
- * delegation) exposed only by some models; it ranks above "max".
- */
 export const reasoningLevelValues = [
   "none",
   "low",
@@ -21,28 +11,43 @@ export const reasoningLevelValues = [
   "max",
   "ultra",
 ] as const;
-export const reasoningLevelSchema = z.enum(reasoningLevelValues);
+export type StandardReasoningLevel = (typeof reasoningLevelValues)[number];
+export const reasoningLevelSchema = z.string().min(1);
 export type ReasoningLevel = z.infer<typeof reasoningLevelSchema>;
 
-export const serviceTierSchema = z.enum(["fast", "default"]);
+export function isStandardReasoningLevel(
+  level: ReasoningLevel,
+): level is StandardReasoningLevel {
+  return (reasoningLevelValues as readonly string[]).includes(level);
+}
+
+export function standardReasoningLevelRank(
+  level: ReasoningLevel,
+): number | null {
+  const rank = (reasoningLevelValues as readonly string[]).indexOf(level);
+  return rank === -1 ? null : rank;
+}
+
+export function compareReasoningLevels(
+  a: ReasoningLevel,
+  b: ReasoningLevel,
+): number {
+  const aRank = standardReasoningLevelRank(a);
+  const bRank = standardReasoningLevelRank(b);
+  if (aRank === null || bRank === null) {
+    return aRank === bRank ? 0 : aRank === null ? 1 : -1;
+  }
+  return aRank - bRank;
+}
+
+export const DEFAULT_SERVICE_TIER = "default";
+export const serviceTierSchema = z.string().min(1);
 export type ServiceTier = z.infer<typeof serviceTierSchema>;
 
-/**
- * Controls how a provider should incorporate server-owned instructions into its
- * system prompt.
- *
- * - `append`: keep the provider's preset system prompt and append instructions.
- * - `replace`: use the provided instructions as the full system prompt.
- */
 export const instructionModeValues = ["append", "replace"] as const;
 export const instructionModeSchema = z.enum(instructionModeValues);
 export type InstructionMode = z.infer<typeof instructionModeSchema>;
 
-/**
- * Order is load-bearing: the index is the privilege rank that
- * {@link clampPermissionModeToCeiling} compares. "accept-edits" grants the
- * least and "full" the most.
- */
 export const permissionModeValues = ["accept-edits", "auto", "full"] as const;
 export const permissionModeSchema = z.enum(permissionModeValues);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
@@ -51,24 +56,16 @@ export function permissionModeRank(permissionMode: PermissionMode): number {
   return permissionModeValues.indexOf(permissionMode);
 }
 
-/**
- * Lower a mode to the machine's ceiling. A mode already at or below the ceiling
- * passes through untouched — including one the provider does not support, which
- * stays a provider-capability error rather than becoming a silent upgrade.
- * Above the ceiling, the result is the highest mode the provider supports that
- * still fits. Returns null when the provider supports nothing that low: a
- * machine capped below what the provider needs cannot run it at all.
- */
 export function clampPermissionModeToCeiling(args: {
   ceiling: PermissionMode;
   permissionMode: PermissionMode;
-  supportedPermissionModes?: readonly PermissionMode[];
+  permissionModes?: readonly PermissionMode[];
 }): PermissionMode | null {
   const ceilingRank = permissionModeRank(args.ceiling);
   if (permissionModeRank(args.permissionMode) <= ceilingRank) {
     return args.permissionMode;
   }
-  const supported = args.supportedPermissionModes ?? permissionModeValues;
+  const supported = args.permissionModes ?? permissionModeValues;
   const allowed = supported
     .filter((mode) => permissionModeRank(mode) <= ceilingRank)
     .sort(
@@ -77,23 +74,17 @@ export function clampPermissionModeToCeiling(args: {
   return allowed[0] ?? null;
 }
 
-/**
- * Deprecated public input accepted for one compatibility window. Stored
- * history uses {@link recordedPermissionModeSchema} instead so legacy facts
- * remain distinguishable from current presets.
- */
 export const permissionModeInputSchema = z
   .union([permissionModeSchema, z.literal("workspace-write")])
-  .transform(
-    (permissionMode): PermissionMode =>
-      permissionMode === "workspace-write" ? "accept-edits" : permissionMode,
+  .transform((permissionMode): PermissionMode =>
+    permissionMode === "workspace-write" ? "accept-edits" : permissionMode,
   );
 
-export const legacyRecordedPermissionModeValues = [
+const legacyRecordedPermissionModeValues = [
   "workspace-write",
   "readonly",
 ] as const;
-export const recordedPermissionModeSchema = z.enum([
+const recordedPermissionModeSchema = z.enum([
   ...permissionModeValues,
   ...legacyRecordedPermissionModeValues,
 ]);
@@ -102,90 +93,25 @@ export type RecordedPermissionMode = z.infer<
 >;
 
 export const permissionEscalationValues = ["ask", "deny"] as const;
-export const permissionEscalationSchema = z.enum(permissionEscalationValues);
+const permissionEscalationSchema = z.enum(permissionEscalationValues);
 export type PermissionEscalation = z.infer<typeof permissionEscalationSchema>;
 
-export const DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_ENDPOINT =
-  "https://api.anthropic.com";
-
-const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
-const CLAUDE_CODE_MOCK_CLI_TRAFFIC_TEST_HOSTNAME = "api.anthropic.com";
-
-function normalizeUrlHostname(value: string): string {
-  return value.toLowerCase().replace(/^\[(.*)\]$/u, "$1");
-}
-
-export function isClaudeCodeMockCliTrafficEndpoint(value: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-  const hostname = normalizeUrlHostname(url.hostname);
-  if (url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(hostname)) {
-    return true;
-  }
-  return (
-    url.protocol === "https:" &&
-    hostname === CLAUDE_CODE_MOCK_CLI_TRAFFIC_TEST_HOSTNAME &&
-    url.port === "" &&
-    url.username === "" &&
-    url.password === ""
-  );
-}
-
-export const claudeCodeMockCliTrafficEndpointSchema = z
-  .string()
-  .url()
-  .refine(
-    isClaudeCodeMockCliTrafficEndpoint,
-    "Endpoint must be an http:// loopback URL or https://api.anthropic.com",
-  );
-
-export const claudeCodeMockCliTrafficConfigSchema = z
-  .object({
-    enabled: z.boolean(),
-    endpoint: claudeCodeMockCliTrafficEndpointSchema,
-  })
-  .strict();
-export type ClaudeCodeMockCliTrafficConfig = z.infer<
-  typeof claudeCodeMockCliTrafficConfigSchema
->;
-
-export const DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_CONFIG: ClaudeCodeMockCliTrafficConfig =
-  {
-    enabled: false,
-    endpoint: DEFAULT_CLAUDE_CODE_MOCK_CLI_TRAFFIC_ENDPOINT,
-  };
-
-export const promptInputVisibilityValues = ["agent-only"] as const;
-export const promptInputVisibilitySchema = z.enum(promptInputVisibilityValues);
+const promptInputVisibilityValues = ["agent-only"] as const;
+const promptInputVisibilitySchema = z.enum(promptInputVisibilityValues);
 
 const promptInputVisibilityFields = {
   visibility: promptInputVisibilitySchema.optional(),
 };
 
-export const promptMentionPathSourceValues = [
-  "workspace",
-  "thread-storage",
-] as const;
-export const promptMentionPathSourceSchema = z.enum(
-  promptMentionPathSourceValues,
-);
-export type PromptMentionPathSource = z.infer<
-  typeof promptMentionPathSourceSchema
->;
+const promptMentionPathSourceValues = ["workspace", "thread-storage"] as const;
+const promptMentionPathSourceSchema = z.enum(promptMentionPathSourceValues);
 
-export const promptMentionPathEntryKindValues = ["file", "directory"] as const;
-export const promptMentionPathEntryKindSchema = z.enum(
+const promptMentionPathEntryKindValues = ["file", "directory"] as const;
+const promptMentionPathEntryKindSchema = z.enum(
   promptMentionPathEntryKindValues,
 );
-export type PromptMentionPathEntryKind = z.infer<
-  typeof promptMentionPathEntryKindSchema
->;
 
-export const promptMentionCommandTriggerValues = ["/"] as const;
+export const promptMentionCommandTriggerValues = ["/", "$"] as const;
 export const promptMentionCommandTriggerSchema = z.enum(
   promptMentionCommandTriggerValues,
 );
@@ -193,20 +119,17 @@ export type PromptMentionCommandTrigger = z.infer<
   typeof promptMentionCommandTriggerSchema
 >;
 
-export const promptMentionCommandSourceValues = ["skill", "command"] as const;
-export const promptMentionCommandSourceSchema = z.enum(
+const promptMentionCommandSourceValues = ["skill", "command"] as const;
+const promptMentionCommandSourceSchema = z.enum(
   promptMentionCommandSourceValues,
 );
-export type PromptMentionCommandSource = z.infer<
-  typeof promptMentionCommandSourceSchema
->;
 
-export const promptMentionCommandOriginValues = [
+const promptMentionCommandOriginValues = [
   "builtin",
   "project",
   "user",
 ] as const;
-export const promptMentionCommandOriginSchema = z.enum(
+const promptMentionCommandOriginSchema = z.enum(
   promptMentionCommandOriginValues,
 );
 export type PromptMentionCommandOrigin = z.infer<
@@ -249,17 +172,13 @@ const canonicalPromptMentionResourceSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("plugin"),
     pluginId: z.string(),
-    /**
-     * Named shared-UI icon hint supplied by the plugin mention item. Omitted
-     * by mentions persisted before icon hints were stored.
-     */
     icon: z.string().nullable().optional(),
-    /**
-     * Opaque item reference minted by the server's mention search
-     * (`<providerId>:<provider item id>`); resolved back through the same
-     * plugin's mention provider at send time (plugin design §4.9).
-     */
     itemId: z.string(),
+    label: z.string(),
+  }),
+  z.object({
+    kind: z.literal("attachment"),
+    path: z.string(),
     label: z.string(),
   }),
 ]);
@@ -278,11 +197,6 @@ function normalizeLegacyPromptMentionResource(value: unknown): unknown {
   return { ...rest, kind: "section", sectionId: folderId };
 }
 
-/**
- * Persisted prompts created before the section rename still contain the old
- * resource discriminator. Normalize those records at the validation boundary;
- * all newly parsed and authored resources use the canonical section contract.
- */
 export const promptMentionResourceSchema = z.preprocess(
   normalizeLegacyPromptMentionResource,
   canonicalPromptMentionResourceSchema,
@@ -310,22 +224,16 @@ export const promptInputSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("localImage"),
-    /**
-     * Absolute paths and URI-like values are passed through to the runtime.
-     * Relative paths are server-managed attachment references, not workspace
-     * relative files.
-     */
     path: z.string(),
+    sourceProjectId: z.string().min(1).optional(),
+    hostId: z.string().min(1).optional(),
     ...promptInputVisibilityFields,
   }),
   z.object({
     type: z.literal("localFile"),
-    /**
-     * Absolute paths and URI-like values are passed through to the runtime.
-     * Relative paths are server-managed attachment references, not workspace
-     * relative files.
-     */
     path: z.string(),
+    sourceProjectId: z.string().min(1).optional(),
+    hostId: z.string().min(1).optional(),
     name: z.string().optional(),
     sizeBytes: z.number().int().nonnegative().optional(),
     mimeType: z.string().optional(),
@@ -334,7 +242,17 @@ export const promptInputSchema = z.discriminatedUnion("type", [
 ]);
 export type PromptInput = z.infer<typeof promptInputSchema>;
 
-export interface PromptCommandSelector {
+export function flattenPromptInputGroups(
+  inputGroups: readonly PromptInput[][],
+): PromptInput[] {
+  return inputGroups.flatMap((group, index) =>
+    index === 0
+      ? group
+      : [{ type: "text" as const, text: "\n\n", mentions: [] }, ...group],
+  );
+}
+
+interface PromptCommandSelector {
   trigger: PromptMentionCommandTrigger;
   name: string;
 }
@@ -357,20 +275,16 @@ function isSelectedPromptCommandMention(
   );
 }
 
-const BUILTIN_COMPACT_COMMAND = { trigger: "/", name: "compact" } as const;
-
-/**
- * Whether input consists solely of one selected built-in `/compact` mention.
- * Raw matching text and project/user commands intentionally do not qualify.
- */
-export function isStandaloneBuiltinCompactCommand(
+function isStandaloneBuiltinCommand(
   input: readonly PromptInput[],
+  name: string,
 ): boolean {
+  const selector = { trigger: "/" as const, name };
   const selected = input.flatMap((item) =>
     item.type === "text"
       ? item.mentions
           .filter((mention) =>
-            isSelectedPromptCommandMention(mention, BUILTIN_COMPACT_COMMAND),
+            isSelectedPromptCommandMention(mention, selector),
           )
           .map((mention) => ({ mention, text: item.text }))
       : [],
@@ -388,17 +302,27 @@ export function isStandaloneBuiltinCompactCommand(
     mention.resource.kind !== "command" ||
     mention.resource.source !== "command" ||
     mention.resource.origin !== "builtin" ||
-    text.slice(mention.start, mention.end) !== "/compact"
+    text.slice(mention.start, mention.end) !== `/${name}`
   ) {
     return false;
   }
-  return removeCommandMentionsFromPromptInput(
-    input,
-    BUILTIN_COMPACT_COMMAND,
-  ).every((item) => item.type === "text" && item.text.trim() === "");
+  return removeCommandMentionsFromPromptInput(input, selector).every(
+    (item) => item.type === "text" && item.text.trim() === "",
+  );
 }
 
-/** Structured prompt input for the selected built-in `/compact` command. */
+export function isStandaloneBuiltinCompactCommand(
+  input: readonly PromptInput[],
+): boolean {
+  return isStandaloneBuiltinCommand(input, "compact");
+}
+
+export function isStandaloneBuiltinClearCommand(
+  input: readonly PromptInput[],
+): boolean {
+  return isStandaloneBuiltinCommand(input, "clear");
+}
+
 export function createStandaloneBuiltinCompactCommandInput(): PromptInput[] {
   return [
     {
@@ -421,6 +345,35 @@ export function createStandaloneBuiltinCompactCommandInput(): PromptInput[] {
       ],
     },
   ];
+}
+
+const BUILTIN_PLAN_COMMAND_TEXT = "/plan";
+
+export function createBuiltinPlanCommandTextInput(
+  text: string,
+): TextPromptInput {
+  return {
+    type: "text",
+    text:
+      text.length > 0
+        ? `${BUILTIN_PLAN_COMMAND_TEXT} ${text}`
+        : BUILTIN_PLAN_COMMAND_TEXT,
+    mentions: [
+      {
+        start: 0,
+        end: BUILTIN_PLAN_COMMAND_TEXT.length,
+        resource: {
+          kind: "command",
+          trigger: "/",
+          name: "plan",
+          source: "command",
+          origin: "builtin",
+          label: "plan",
+          argumentHint: null,
+        },
+      },
+    ],
+  };
 }
 
 export function promptInputHasCommandMention(
@@ -519,14 +472,20 @@ export function removeCommandMentionsFromPromptInput(
   );
 }
 
-export const threadExecutionSourceSchema = z.enum([
+const threadExecutionSourceSchema = z.enum([
   "client/thread/start",
   "client/turn/requested",
   "client/turn/start",
 ]);
 export type ThreadExecutionSource = z.infer<typeof threadExecutionSourceSchema>;
 
-export const callerExecutionInputSourceValues = [
+/**
+ * Where a caller-supplied execution value came from. `explicit` is a user
+ * choice and `client-preference` is a remembered client-side default. Only
+ * `explicit` is a user decision, so only `explicit` shapes project execution
+ * defaults.
+ */
+const callerExecutionInputSourceValues = [
   "explicit",
   "client-preference",
 ] as const;
@@ -537,7 +496,7 @@ export type CallerExecutionInputSource = z.infer<
   typeof callerExecutionInputSourceSchema
 >;
 
-export const threadExecutionOptionsSchema = z.object({
+const threadExecutionOptionsSchema = z.object({
   model: z.string().optional(),
   serviceTier: serviceTierSchema.optional(),
   reasoningLevel: reasoningLevelSchema.optional(),
@@ -570,16 +529,10 @@ export type RecordedThreadExecutionOptions = z.infer<
 >;
 
 export const runtimePermissionScopeValues = ["workspace", "full"] as const;
-export const runtimePermissionScopeSchema = z.enum(
-  runtimePermissionScopeValues,
-);
+const runtimePermissionScopeSchema = z.enum(runtimePermissionScopeValues);
 export type RuntimePermissionScope = z.infer<
   typeof runtimePermissionScopeSchema
 >;
-
-export const approvalReviewerValues = ["user", "automatic"] as const;
-export const approvalReviewerSchema = z.enum(approvalReviewerValues);
-export type ApprovalReviewer = z.infer<typeof approvalReviewerSchema>;
 
 export const runtimePermissionPolicySchema = z.discriminatedUnion(
   "permissionMode",
@@ -608,26 +561,27 @@ export type RuntimePermissionPolicy = z.infer<
   typeof runtimePermissionPolicySchema
 >;
 
+export const promptModeSchema = z.literal("plan");
+export type PromptMode = z.infer<typeof promptModeSchema>;
+
+export const sessionOptionValueSchema = z.union([z.string(), z.boolean()]);
+export type SessionOptionValue = z.infer<typeof sessionOptionValueSchema>;
+
+export const sessionOptionSelectionsSchema = z.record(
+  z.string().min(1),
+  sessionOptionValueSchema,
+);
+export type SessionOptionSelections = z.infer<
+  typeof sessionOptionSelectionsSchema
+>;
+
 const runtimeThreadExecutionBaseOptionsSchema = z.object({
   model: z.string().min(1),
   serviceTier: serviceTierSchema,
   reasoningLevel: reasoningLevelSchema,
-  claudeCodePermissionMode: z.literal("plan").optional(),
-  // Optional for legacy command compatibility; the server fills the current
-  // app setting before dispatching new runtime work.
-  claudeCodeMockCliTraffic: claudeCodeMockCliTrafficConfigSchema.optional(),
-  /**
-   * Server-owned product policy: whether the provider session may use the
-   * Workflows feature. Filled explicitly at the server boundary (per-provider
-   * policy), never defaulted downstream.
-   */
-  workflowsEnabled: z.boolean(),
-  // Optional for legacy command compatibility; the server fills the current
-  // provider preference before dispatching new runtime work.
-  memoryEnabled: z.boolean().optional(),
-  // Optional for legacy command compatibility; the server fills the current
-  // provider preference before dispatching new runtime work.
-  providerSubagentsEnabled: z.boolean().optional(),
+  promptMode: promptModeSchema.optional(),
+  sessionOptions: sessionOptionSelectionsSchema.optional(),
+  providerOptions: jsonObjectSchema,
 });
 
 export const runtimeThreadExecutionOptionsSchema =

@@ -13,7 +13,7 @@ import {
 } from "@bb/shared-ui/dialog";
 import { MachineStatusDot } from "@/components/machines/MachineStatusDot";
 
-export interface InstallCliSkillsDialogContentProps {
+interface InstallCliSkillsDialogContentProps {
   hosts: readonly Host[];
   onCancel: () => void;
   onInstall: (hostIds: string[]) => void;
@@ -40,14 +40,7 @@ function machineStatusLabel(args: {
   return args.status === undefined ? null : MACHINE_STATUS_LABELS[args.status];
 }
 
-/**
- * Confirmation for the CLI skill install. With more than one machine it doubles
- * as the picker, listing each machine's current state; disconnected machines are
- * shown but unselectable, since the install is a live RPC to each daemon. With a
- * single machine there is nothing to choose, so the list is dropped and the
- * machine is named in the description instead.
- */
-export function InstallCliSkillsDialogContent({
+function InstallCliSkillsDialogContent({
   hosts,
   onCancel,
   onInstall,
@@ -72,7 +65,7 @@ export function InstallCliSkillsDialogContent({
         <DialogDescription>
           {choosable
             ? "Choose the machines to install them onto. Each one gets the skills in ~/.agents/skills and ~/.claude/skills, replacing any copy already there."
-            : `The skills go in ~/.agents/skills and ~/.claude/skills on ${hosts[0]?.name ?? "this machine"}, replacing any copy already there.`}
+            : `The skills go in ~/.agents/skills and ~/.claude/skills on ${hosts[0]?.name ?? "the selected machine"}, replacing any copy already there.`}
         </DialogDescription>
       </DialogHeader>
 
@@ -135,7 +128,7 @@ export function InstallCliSkillsDialogContent({
   );
 }
 
-export interface InstallCliSkillsDialogProps extends InstallCliSkillsDialogContentProps {
+interface InstallCliSkillsDialogProps extends InstallCliSkillsDialogContentProps {
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }

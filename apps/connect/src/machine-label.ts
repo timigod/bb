@@ -8,6 +8,7 @@ import {
   type ConnectDb,
 } from "@bb/connect-db";
 import { verifyMachineCredentialDetails } from "./session.js";
+import { methodNotAllowed } from "./json-response.js";
 import { MACHINE_CREDENTIAL_HEADER } from "./protocol-headers.js";
 import type { Env } from "./tunnel-do.js";
 
@@ -19,7 +20,6 @@ function fallbackLabel(machineId: string): string {
   return `machine-${idPrefix || "unknown"}`;
 }
 
-/** Convert a human-readable host name to the shared public-label grammar. */
 export function sanitizeMachineLabelBase(
   desiredName: string,
   machineId: string,
@@ -45,8 +45,6 @@ function labelWithSuffix(base: string, ordinal: number): string {
   return `${stem}${suffix}`;
 }
 
-/** Affected-row count from either driver shape: better-sqlite3 `{changes}` or
- * D1 `{meta: {changes}}`. Anything else is a broken driver — fail fast. */
 function affectedRows(result: unknown): number {
   if (typeof result === "object" && result !== null) {
     if ("changes" in result && typeof result.changes === "number") {
@@ -65,8 +63,7 @@ function affectedRows(result: unknown): number {
   throw new Error("machine label update did not report affected rows");
 }
 
-export interface MachineLabelAssignmentHooks {
-  /** Test/control barrier before the one atomic source+claim update. */
+interface MachineLabelAssignmentHooks {
   beforeAttach?: (candidate: string) => Promise<void>;
 }
 
@@ -74,7 +71,6 @@ function isLabelCollision(error: unknown): boolean {
   return error instanceof Error && /unique constraint/iu.test(error.message);
 }
 
-/** Assign once, suffixing through the namespace on collisions. */
 export async function assignMachineLabel(
   db: ConnectDb,
   machineId: string,
@@ -99,8 +95,6 @@ export async function assignMachineLabel(
     await hooks.beforeAttach?.(candidate);
     let updateResult: unknown;
     try {
-      // machine_label_claim_update runs inside this SQLite statement. Its
-      // global UNIQUE insert and the source update commit or roll back together.
       updateResult = await db
         .update(machine)
         .set({ subdomain: candidate })
@@ -142,19 +136,12 @@ function jsonError(error: string, status: number): Response {
   return Response.json({ error }, { status });
 }
 
-/** `POST /api/connect/machine-label`, authenticated by the daemon credential. */
 export async function handleAssignMachineLabel(
   request: Request,
   env: Env,
 ): Promise<Response> {
   if (request.method !== "POST") {
-    return new Response(JSON.stringify({ error: "method_not_allowed" }), {
-      status: 405,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        allow: "POST",
-      },
-    });
+    return methodNotAllowed("POST");
   }
 
   const db = drizzle(env.DB, { schema });

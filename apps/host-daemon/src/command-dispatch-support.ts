@@ -1,28 +1,39 @@
+import type { DesktopBrowserBroker } from "./desktop-browser-broker.js";
 import {
-  createAgentRuntime,
-  fingerprintAcpLaunchSpec,
-  type AgentRuntime,
-  type AgentRuntimeOptions,
+  CompetingTurnError,
+  type AgentRuntimeBridgeLaunch,
 } from "@bb/agent-runtime";
 import type { AvailableModel } from "@bb/domain";
-import type { EventSinkInput } from "./event-sink.js";
-import type {
-  HostDaemonCommand,
-  HostDaemonAcpLaunchSpec,
-  HostDaemonInjectedSkillSource,
-  HostDaemonOnlineRpcCommand,
-  HostDaemonConnectTunnelIdentity,
-  ProviderCliInstallRequest,
-  ProviderCliStatus,
-  WorkspaceContext,
+import type { EventSink } from "./event-sink.js";
+import {
+  COMPETING_TURN_ERROR_CODE,
+  type EnvironmentHookProgressMessage,
+  type HostDaemonCommand,
+  type ProviderHealthResult,
+  type ProviderUsageResult,
+  type HostDaemonBridgeLaunch,
+  type HostDaemonInjectedSkillSource,
+  type HostDaemonOnlineRpcCommand,
+  type HostDaemonConnectTunnelIdentity,
+  type WorkspaceContext,
 } from "@bb/host-daemon-contract";
-import { getPersonalWorkspaceRoot } from "@bb/host-workspace";
+import { BRIDGE_JSON_RPC_ERRORS } from "@bb/provider-bridge-protocol";
+import type {
+  ProviderInstallationCommand,
+  ProviderInstallationRunResult,
+  ProviderInstallationStatus,
+} from "@bb/provider-bridge-protocol";
+import { ensurePluginProcessDataDir } from "@bb/process-utils";
 import type { InteractiveResolveCommandInput } from "./interactive-request-registry.js";
 import { RuntimeManager, type RuntimeEntry } from "./runtime-manager.js";
-import type { TerminalManager } from "./terminals/terminal-manager.js";
 import type { FetchProjectAttachment } from "./project-attachments.js";
 import type { FetchSkillTree } from "./skill-trees.js";
-import type { CaffeinateManager } from "./command-handlers/caffeinate.js";
+import type { HostDaemonLogger } from "./logger.js";
+import type { ServerMoveService } from "./server-move/service.js";
+import {
+  ensureCachedPluginHostArtifact,
+  type FetchPluginHostArtifact,
+} from "./plugin-host-artifact-cache.js";
 
 type DispatchCommand = HostDaemonCommand | HostDaemonOnlineRpcCommand;
 
@@ -31,42 +42,60 @@ export type CommandOf<TType extends DispatchCommand["type"]> = Extract<
   { type: TType }
 >;
 
-export interface EventSink {
-  emit: (event: EventSinkInput) => void;
-  flush: () => Promise<void>;
-}
-
-export const noopEventSink: EventSink = {
-  emit: () => undefined,
-  flush: async () => undefined,
-};
-
 export interface CommandDispatchOptions {
+  emitEnvironmentHookProgress?: (
+    message: EnvironmentHookProgressMessage,
+  ) => void;
+  desktopBrowserBroker?: DesktopBrowserBroker;
   dataDir: string;
+  logger: Pick<HostDaemonLogger, "debug" | "warn">;
   fetchProjectAttachment: FetchProjectAttachment;
   fetchSkillTree?: FetchSkillTree;
+  fetchPluginHostArtifact?: FetchPluginHostArtifact;
   runtimeManager: RuntimeManager;
-  terminalManager?: Pick<TerminalManager, "closeEnvironmentTerminals">;
-  eventSink: EventSink;
-  listModels?: (args: {
+  eventSink: Pick<EventSink, "emit" | "flush">;
+  listModels: (args: {
     providerId: string;
-    acpLaunchSpec?: HostDaemonAcpLaunchSpec;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
     cwd?: string;
   }) => Promise<{
     models: AvailableModel[];
     selectedOnlyModels: AvailableModel[];
   }>;
-  getProviderCliStatusForProvider?: (
-    providerId: string,
-  ) => Promise<ProviderCliStatus | null>;
-  streamProviderCliInstall?: (
-    args: ProviderCliInstallRequest & { env?: NodeJS.ProcessEnv },
-  ) => ReadableStream<Uint8Array>;
+  providerHealth: (args: {
+    providerId: string;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+  }) => Promise<ProviderHealthResult>;
+  providerUsage: (args: {
+    providerId: string;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+  }) => Promise<ProviderUsageResult>;
+  providerInstallationStatus: (args: {
+    providerId: string;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+    requirement?: "thread_rewind";
+    checkUpdates?: boolean;
+  }) => Promise<ProviderInstallationStatus>;
+  providerInstallationRun: (args: {
+    providerId: string;
+    action: "install" | "update";
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+  }) => Promise<ProviderInstallationRunResult>;
+  streamProviderInstallation?: (args: {
+    providerId: string;
+    plan: ProviderInstallationCommand;
+    env?: NodeJS.ProcessEnv;
+  }) => ReadableStream<Uint8Array>;
+  refreshShellEnv: (args: { allowStale: boolean }) => Promise<void>;
   resolveInteractiveRequest?: (
     request: InteractiveResolveCommandInput,
   ) => Promise<void>;
-  caffeinateManager?: CaffeinateManager;
   ensureConnectTunnelIdentity?: () => Promise<HostDaemonConnectTunnelIdentity>;
+  serverMove?: ServerMoveService;
   threadStorageRootPath: string;
 }
 
@@ -107,58 +136,62 @@ export function isExpectedOnlineRpcFailureError(error: unknown): boolean {
 
 const MISSING_EXECUTABLE_PATTERN = /\bENOENT\b/;
 const SPAWN_PATTERN = /\bspawn\b/;
-const ACP_AUTH_REQUIRED_PATTERN =
-  /ACP agent is (?:installed but )?not authenticated|Authentication required.*(?:agent login|CURSOR_API_KEY|CURSOR_AUTH_TOKEN|api key|auth token|login)/is;
 
-const defaultModelListRuntimes = new Map<string, AgentRuntime>();
-
-export async function shutdownDefaultListModelsRuntimes(): Promise<void> {
-  const runtimes = [...defaultModelListRuntimes.values()];
-  defaultModelListRuntimes.clear();
-  await Promise.all(runtimes.map((runtime) => runtime.shutdown()));
-}
-
-export async function defaultListModels(
-  args: { providerId: string; acpLaunchSpec?: HostDaemonAcpLaunchSpec },
-  options: { bridgeBundleDir?: AgentRuntimeOptions["bridgeBundleDir"] } = {},
-): Promise<{
-  models: AvailableModel[];
-  selectedOnlyModels: AvailableModel[];
-}> {
-  const runtimeKey =
-    `${options.bridgeBundleDir ?? ""}` +
-    (args.acpLaunchSpec !== undefined
-      ? `#acp:${fingerprintAcpLaunchSpec(args.acpLaunchSpec)}`
-      : "");
-  let runtime = defaultModelListRuntimes.get(runtimeKey);
-  if (!runtime) {
-    runtime = createAgentRuntime({
-      bridgeBundleDir: options.bridgeBundleDir,
-      workspacePath: process.cwd(),
-      onEvent: () => {},
-      onToolCall: async () => ({
-        contentItems: [],
-        success: true,
-      }),
-    });
-    defaultModelListRuntimes.set(runtimeKey, runtime);
+export async function resolveRuntimeBridgeLaunch(
+  bridgeLaunch: HostDaemonBridgeLaunch,
+  options: Pick<
+    CommandDispatchOptions,
+    "dataDir" | "fetchPluginHostArtifact" | "logger"
+  >,
+): Promise<AgentRuntimeBridgeLaunch> {
+  const capabilities = {
+    ...bridgeLaunch.capabilities,
+    permissionModes: [...bridgeLaunch.capabilities.permissionModes],
+  };
+  const providerOptions = { ...bridgeLaunch.providerOptions };
+  const envPassthrough = [...bridgeLaunch.envPassthrough];
+  const dataDir = await ensurePluginProcessDataDir({
+    daemonDataDir: options.dataDir,
+    pluginId: bridgeLaunch.pluginId,
+    kind: "bridge-data",
+  });
+  if (options.fetchPluginHostArtifact === undefined) {
+    throw new CommandDispatchError(
+      "provider_bridge_unavailable",
+      "This daemon has no plugin host artifact fetcher configured",
+    );
   }
-  try {
-    return await runtime.listModels(args);
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.startsWith("Unsupported provider")
-    ) {
-      throw new CommandDispatchError("unknown_provider", error.message);
-    }
-    throw error;
-  }
+  const artifactPath = await ensureCachedPluginHostArtifact({
+    dataDir: options.dataDir,
+    pluginId: bridgeLaunch.pluginId,
+    fetchArtifact: options.fetchPluginHostArtifact,
+    digest: bridgeLaunch.source.digest,
+    byteLength: bridgeLaunch.source.byteLength,
+    logger: options.logger,
+  });
+  return {
+    pluginId: bridgeLaunch.pluginId,
+    dataDir,
+    source: {
+      kind: "artifact",
+      digest: bridgeLaunch.source.digest,
+      artifactPath,
+    },
+    capabilities,
+    providerOptions,
+    envPassthrough,
+  };
 }
 
 export function getErrorCode(error: unknown): string {
   if (error instanceof CommandDispatchError) {
     return error.code;
+  }
+  if (error instanceof CompetingTurnError) {
+    return COMPETING_TURN_ERROR_CODE;
+  }
+  if (isBridgeMissingExecutableError(error)) {
+    return "missing_executable";
   }
   if (isStructuredSpawnMissingExecutableError(error)) {
     return "missing_executable";
@@ -173,10 +206,15 @@ export function getErrorCode(error: unknown): string {
   if (isMessageOnlySpawnMissingExecutableError(error)) {
     return "missing_executable";
   }
-  if (isMessageOnlyAcpAuthRequiredError(error)) {
-    return "auth_required";
-  }
   return "command_failed";
+}
+
+function isBridgeMissingExecutableError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === BRIDGE_JSON_RPC_ERRORS.MISSING_EXECUTABLE
+  );
 }
 
 function isStructuredSpawnMissingExecutableError(error: unknown): boolean {
@@ -204,21 +242,10 @@ function isMessageOnlySpawnMissingExecutableError(error: unknown): boolean {
   );
 }
 
-function isMessageOnlyAcpAuthRequiredError(error: unknown): boolean {
-  return (
-    error instanceof Error && ACP_AUTH_REQUIRED_PATTERN.test(error.message)
-  );
-}
-
 export async function requireWorkspaceEnvironment(
   args: {
-    dataDir?: string;
     environmentId: string;
     injectedSkillSources?: readonly HostDaemonInjectedSkillSource[];
-    /**
-     * Set by thread commands that resolve with injectedSkillSources, so a
-     * busy runtime is reused instead of conflicting; see EnsureEnvironmentArgs.
-     */
     targetThreadId?: string;
     workspaceContext: WorkspaceContext;
   },
@@ -243,10 +270,6 @@ export async function requireWorkspaceEnvironment(
     ...(args.targetThreadId !== undefined
       ? { targetThreadId: args.targetThreadId }
       : {}),
-    ...(args.dataDir
-      ? { personalWorkspaceRoot: getPersonalWorkspaceRoot(args.dataDir) }
-      : {}),
     workspacePath: args.workspaceContext.workspacePath,
-    workspaceProvisionType: args.workspaceContext.workspaceProvisionType,
   });
 }

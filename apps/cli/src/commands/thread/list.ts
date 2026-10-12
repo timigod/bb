@@ -3,10 +3,21 @@ import { PERSONAL_PROJECT_ID, type Thread } from "@bb/domain";
 import { action } from "../../action.js";
 import { createCliBbSdk } from "../../client.js";
 import { resolveExplicitIdFlag } from "../../context-env.js";
-import { renderBorderlessTable } from "../../table.js";
+import {
+  columnWidths,
+  printBorderlessTable,
+  truncateCell,
+} from "../../table.js";
 import { outputJson } from "../helpers.js";
+import {
+  resolveMachineHostId,
+  resolveMachineTargetOption,
+} from "../machine.js";
 
 interface ThreadListCommandOptions {
+  environment?: string;
+  machine?: string;
+  host?: string;
   project?: string;
   parentThread?: string;
   archived?: boolean;
@@ -24,6 +35,12 @@ export function registerListCommand(
     .command("list")
     .description("List threads")
     .option("--project <id>", "Filter by project ID (defaults to all projects)")
+    .option("--environment <id>", "Filter by environment ID")
+    .option(
+      "--machine <id-or-name>",
+      "Filter by machine ID or active machine name",
+    )
+    .option("--host <id-or-name>", "Alias for --machine")
     .option("--parent-thread <id>", "Filter by parent thread ID")
     .option("--section <id>", "Filter by thread section ID")
     .option("--unsectioned", "Show only threads outside sections")
@@ -41,6 +58,23 @@ export function registerListCommand(
           flagName: "--parent-thread",
           value: opts.parentThread,
         });
+        const environmentId = resolveExplicitIdFlag({
+          flagName: "--environment",
+          value: opts.environment,
+        });
+        const machineTarget = resolveMachineTargetOption(opts);
+        const hostId =
+          machineTarget === undefined
+            ? undefined
+            : machineTarget.trim().startsWith("host_")
+              ? resolveExplicitIdFlag({
+                  flagName: "--machine",
+                  value: machineTarget,
+                })
+              : await resolveMachineHostId({
+                  serverUrl: getUrl(),
+                  target: machineTarget,
+                });
         if (opts.section && opts.unsectioned) {
           throw new Error("Cannot combine --section with --unsectioned.");
         }
@@ -50,6 +84,8 @@ export function registerListCommand(
         });
         const threads = await sdk.threads.list({
           ...(projectId ? { projectId } : {}),
+          ...(environmentId ? { environmentId } : {}),
+          ...(hostId ? { hostId } : {}),
           ...(parentThreadId ? { parentThreadId } : {}),
           ...(opts.archived ? { archived: true } : {}),
           ...(sectionId ? { sectionId } : {}),
@@ -61,31 +97,50 @@ export function registerListCommand(
           console.log("No threads found");
           return;
         }
-        printThreadTable(threads);
+        const projects = await sdk.projects.list({ includePersonal: false });
+        const projectNames = new Map(
+          projects.map((project) => [project.id, project.name]),
+        );
+        printThreadTable(threads, projectNames);
       }),
     );
 }
 
-function printThreadTable(threads: Thread[]): void {
+const MAX_TITLE_WIDTH = 60;
+
+function printThreadTable(
+  threads: Thread[],
+  projectNames: ReadonlyMap<string, string>,
+): void {
   const rows = threads.map((thread) => [
     thread.id,
-    thread.projectId === PERSONAL_PROJECT_ID ? "-" : thread.projectId,
+    truncateCell(formatThreadListTitle(thread), MAX_TITLE_WIDTH),
+    formatThreadListProject(thread, projectNames),
     formatThreadListStatus(thread),
   ]);
-  const idWidth = Math.max(4, ...rows.map((row) => row[0].length));
-  const projectWidth = Math.max(7, ...rows.map((row) => row[1].length));
-  const statusWidth = Math.max(12, ...rows.map((row) => row[2].length));
-  const table = renderBorderlessTable(
+  printBorderlessTable(
     {
-      head: ["ID", "Project", "Status"],
-      colWidths: [idWidth, projectWidth, statusWidth],
+      head: ["ID", "Title", "Project", "Status"],
+      colWidths: columnWidths(rows, [4, 5, 7, 12]),
     },
     rows,
   );
+}
 
-  console.log("");
-  console.log(table);
-  console.log("");
+function formatThreadListTitle(thread: Thread): string {
+  const title = thread.title?.trim();
+  if (title) return title;
+  const fallback = thread.titleFallback?.trim();
+  if (fallback) return fallback;
+  return "-";
+}
+
+function formatThreadListProject(
+  thread: Thread,
+  projectNames: ReadonlyMap<string, string>,
+): string {
+  if (thread.projectId === PERSONAL_PROJECT_ID) return "-";
+  return projectNames.get(thread.projectId) ?? thread.projectId;
 }
 
 function formatThreadListStatus(thread: Thread): string {

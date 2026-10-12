@@ -9,26 +9,33 @@ import {
   summarizePendingInteractionRequestedPermissions,
 } from "@bb/core-ui";
 import {
+  isApprovalPendingInteraction,
   isApprovalPendingInteractionPayload,
   isApprovalPendingInteractionResolution,
+  isPluginPendingInteraction,
+  isPluginPendingInteractionPayload,
+  isUserQuestionPendingInteraction,
   isUserQuestionPendingInteractionPayload,
-  isUserQuestionPendingInteractionResolution,
+  jsonValueSchema,
+  parseExtensionKind,
   PendingInteraction,
-  type ProviderPendingInteraction,
+  type ApprovalPendingInteraction,
+  type JsonValue,
+  type PluginExtensionPendingInteraction,
+  type PluginPendingInteraction,
   type PendingInteractionUserAnswer,
-  type ApprovalPendingInteractionPayload,
-  type ApprovalPendingInteractionResolution,
   type PendingInteractionApprovalDecision,
   type PendingInteractionGrantablePermissionProfile,
   type PendingInteractionRequestedPermissionProfile,
   PendingInteractionResolution,
+  type UserQuestionPendingInteraction,
   type UserQuestionPendingInteractionPayload,
-  type UserQuestionPendingInteractionResolution,
 } from "@bb/domain";
 import { action } from "../../action.js";
 import { createCliBbSdk } from "../../client.js";
-import { renderBorderlessTable } from "../../table.js";
+import { printBorderlessTable } from "../../table.js";
 import {
+  collectOption,
   outputJson,
   prependErrorContext,
   requireThreadIdOrSelf,
@@ -48,21 +55,23 @@ interface ThreadInteractionAnswerOptions extends ThreadInteractionTargetOptions 
   text?: string[];
 }
 
+interface ThreadInteractionRespondOptions extends ThreadInteractionTargetOptions {
+  value: string;
+}
+
+function parseRespondValue(raw: string): JsonValue {
+  try {
+    return jsonValueSchema.parse(JSON.parse(raw));
+  } catch {
+    throw new Error("Invalid --value. Expected a JSON value.");
+  }
+}
+
 type PrintablePermissionProfile =
   | PendingInteractionGrantablePermissionProfile
   | PendingInteractionRequestedPermissionProfile;
 type UserQuestionQuestion =
   UserQuestionPendingInteractionPayload["questions"][number];
-
-interface ApprovalPendingInteraction extends ProviderPendingInteraction {
-  payload: ApprovalPendingInteractionPayload;
-  resolution: ApprovalPendingInteractionResolution | null;
-}
-
-interface UserQuestionPendingInteraction extends ProviderPendingInteraction {
-  payload: UserQuestionPendingInteractionPayload;
-  resolution: UserQuestionPendingInteractionResolution | null;
-}
 
 interface FetchInteractionArgs {
   getUrl: () => string;
@@ -121,8 +130,11 @@ function formatInteractionKind(interaction: PendingInteraction): string {
     return "question";
   }
 
-  if (!isApprovalPendingInteractionPayload(interaction.payload)) {
+  if (isPluginPendingInteractionPayload(interaction.payload)) {
     return "plugin";
+  }
+  if (!isApprovalPendingInteractionPayload(interaction.payload)) {
+    return interaction.payload.kind;
   }
 
   switch (interaction.payload.subject.kind) {
@@ -134,35 +146,17 @@ function formatInteractionKind(interaction: PendingInteraction): string {
       return "permission";
     case "plan":
       return "plan";
+    case "tool_use":
+      return "tool-use";
     default:
       return assertNever(interaction.payload.subject);
   }
 }
 
-function isApprovalInteraction(
-  interaction: PendingInteraction,
-): interaction is ApprovalPendingInteraction {
-  return (
-    isApprovalPendingInteractionPayload(interaction.payload) &&
-    (interaction.resolution === null ||
-      isApprovalPendingInteractionResolution(interaction.resolution))
-  );
-}
-
-function isUserQuestionInteraction(
-  interaction: PendingInteraction,
-): interaction is UserQuestionPendingInteraction {
-  return (
-    isUserQuestionPendingInteractionPayload(interaction.payload) &&
-    (interaction.resolution === null ||
-      isUserQuestionPendingInteractionResolution(interaction.resolution))
-  );
-}
-
 function requireApprovalInteraction(
   interaction: PendingInteraction,
 ): ApprovalPendingInteraction {
-  if (isApprovalInteraction(interaction)) {
+  if (isApprovalPendingInteraction(interaction)) {
     return interaction;
   }
   throw new Error(
@@ -173,7 +167,7 @@ function requireApprovalInteraction(
 function requireUserQuestionInteraction(
   interaction: PendingInteraction,
 ): UserQuestionPendingInteraction {
-  if (isUserQuestionInteraction(interaction)) {
+  if (isUserQuestionPendingInteraction(interaction)) {
     return interaction;
   }
   throw new Error(
@@ -251,6 +245,13 @@ function printApprovalInteraction(
         console.log(`    ${line}`);
       }
       break;
+    case "tool_use":
+      for (const line of formatPendingInteractionSubjectDetailLines(
+        interaction,
+      )) {
+        console.log(`  ${line}`);
+      }
+      break;
     default:
       assertNever(interaction.payload.subject);
   }
@@ -306,12 +307,39 @@ function printInteraction(interaction: PendingInteraction): void {
     console.log("  Delivery: waiting for provider acknowledgement");
   }
 
-  if (isUserQuestionInteraction(interaction)) {
+  if (isUserQuestionPendingInteraction(interaction)) {
     printUserQuestionInteraction(interaction);
     return;
   }
+  if (isApprovalPendingInteraction(interaction)) {
+    printApprovalInteraction(interaction);
+    return;
+  }
+  printPluginRequestInteraction(interaction);
+}
 
-  printApprovalInteraction(requireApprovalInteraction(interaction));
+function printPluginRequestInteraction(
+  interaction: PluginPendingInteraction | PluginExtensionPendingInteraction,
+): void {
+  const form = isPluginPendingInteraction(interaction)
+    ? {
+        pluginId: interaction.origin.pluginId,
+        rendererId: interaction.origin.rendererId,
+        raisedBy: "plugin",
+      }
+    : {
+        pluginId: parseExtensionKind(interaction.payload.kind).pluginId,
+        rendererId: parseExtensionKind(interaction.payload.kind).name,
+        raisedBy: "agent",
+      };
+  console.log(`  Title: ${interaction.payload.title}`);
+  console.log(
+    `  Form: ${form.pluginId}/${form.rendererId} (raised by ${form.raisedBy})`,
+  );
+  console.log(`  Data: ${JSON.stringify(interaction.payload.data)}`);
+  console.log(
+    "  Answer: bb thread interactions respond <interactionId> --value '<json>'",
+  );
 }
 
 async function fetchInteraction(
@@ -322,13 +350,6 @@ async function fetchInteraction(
     interactionId: args.interactionId,
     threadId: args.threadId,
   });
-}
-
-function appendRepeatableOption(
-  value: string,
-  previous: string[] = [],
-): string[] {
-  return [...previous, value];
 }
 
 function parseChoiceFlagValue(input: ChoiceFlagParseInput): ChoiceFlagEntry {
@@ -526,19 +547,8 @@ interface ResolveInteractionArgs {
 }
 
 interface ResolveInteractionSuccessMessageArgs {
-  interaction: PendingInteraction;
-  resolution: PendingInteractionResolution;
-  updated: PendingInteraction;
-}
-
-interface FormatResolutionSuccessMessageArgs {
   interactionId: string;
   resolution: PendingInteractionResolution;
-  updated: PendingInteraction;
-}
-
-interface FormatAnswerResolutionSuccessMessageArgs {
-  interactionId: string;
   updated: PendingInteraction;
 }
 
@@ -570,7 +580,7 @@ async function resolveInteraction(args: ResolveInteractionArgs): Promise<void> {
 
   console.log(
     args.successMessage({
-      interaction,
+      interactionId: args.interactionId,
       resolution,
       updated,
     }),
@@ -648,7 +658,7 @@ function formatBinaryResolutionMessage(
 }
 
 function formatResolutionSuccessMessage(
-  args: FormatResolutionSuccessMessageArgs,
+  args: ResolveInteractionSuccessMessageArgs,
 ): string {
   const resolution = args.updated.resolution ?? args.resolution;
   const outcome = formatBinaryResolutionMessage(resolution);
@@ -660,13 +670,47 @@ function formatResolutionSuccessMessage(
 }
 
 function formatAnswerResolutionSuccessMessage(
-  args: FormatAnswerResolutionSuccessMessageArgs,
+  args: Pick<ResolveInteractionSuccessMessageArgs, "interactionId" | "updated">,
 ): string {
   if (args.updated.status === "resolving") {
     return `Interaction ${args.interactionId} submitted (answered); delivering to provider`;
   }
 
   return `Interaction ${args.interactionId} answered`;
+}
+
+function registerBinaryResolutionCommand(
+  interactions: Command,
+  getUrl: () => string,
+  name: "approve" | "deny",
+  description: string,
+): void {
+  interactions
+    .command(`${name} <interactionId> [id]`)
+    .description(description)
+    .option("--self", "Target the current thread (from BB_THREAD_ID)")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(
+        async (
+          interactionId: string,
+          id: string | undefined,
+          opts: ThreadInteractionTargetOptions,
+        ) => {
+          const threadId = requireThreadIdOrSelf(id, opts);
+          await resolveInteraction({
+            buildResolution: (interaction) =>
+              buildBinaryResolution(interaction, name),
+            failureAction: name,
+            getUrl,
+            interactionId,
+            json: opts.json,
+            threadId,
+            successMessage: formatResolutionSuccessMessage,
+          });
+        },
+      ),
+    );
 }
 
 export function registerInteractionCommands(
@@ -703,7 +747,7 @@ export function registerInteractionCommands(
             return;
           }
 
-          const table = renderBorderlessTable(
+          printBorderlessTable(
             {
               head: ["ID", "Kind", "Status", "Summary"],
               colWidths: [20, 12, 12, 70],
@@ -713,15 +757,9 @@ export function registerInteractionCommands(
               interaction.id,
               formatInteractionKind(interaction),
               interaction.status,
-              formatPendingInteractionSummary({
-                interaction,
-                surface: "cli",
-              }),
+              formatPendingInteractionSummary({ interaction }),
             ]),
           );
-          console.log("");
-          console.log(table);
-          console.log("");
         },
       ),
     );
@@ -753,39 +791,12 @@ export function registerInteractionCommands(
       ),
     );
 
-  interactions
-    .command("approve <interactionId> [id]")
-    .description(
-      "Approve a command, file-change, or plan interaction for this turn",
-    )
-    .option("--self", "Target the current thread (from BB_THREAD_ID)")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(
-        async (
-          interactionId: string,
-          id: string | undefined,
-          opts: ThreadInteractionTargetOptions,
-        ) => {
-          const threadId = requireThreadIdOrSelf(id, opts);
-          await resolveInteraction({
-            buildResolution: (interaction) =>
-              buildBinaryResolution(interaction, "approve"),
-            failureAction: "approve",
-            getUrl,
-            interactionId,
-            json: opts.json,
-            threadId,
-            successMessage: ({ resolution, updated }) =>
-              formatResolutionSuccessMessage({
-                interactionId,
-                resolution,
-                updated,
-              }),
-          });
-        },
-      ),
-    );
+  registerBinaryResolutionCommand(
+    interactions,
+    getUrl,
+    "approve",
+    "Approve a command, file-change, or plan interaction for this turn",
+  );
 
   interactions
     .command("grant <interactionId> [id]")
@@ -810,12 +821,7 @@ export function registerInteractionCommands(
             interactionId,
             json: opts.json,
             threadId,
-            successMessage: ({ resolution, updated }) =>
-              formatResolutionSuccessMessage({
-                interactionId,
-                resolution,
-                updated,
-              }),
+            successMessage: formatResolutionSuccessMessage,
           });
         },
       ),
@@ -829,13 +835,13 @@ export function registerInteractionCommands(
     .option(
       "--choice <questionId=value>",
       "Select an option value; repeat for multi-select answers",
-      appendRepeatableOption,
+      collectOption,
       [],
     )
     .option(
       "--text <questionId=text>",
       "Provide a free-text answer",
-      appendRepeatableOption,
+      collectOption,
       [],
     )
     .action(
@@ -858,45 +864,55 @@ export function registerInteractionCommands(
             interactionId,
             json: opts.json,
             threadId,
-            successMessage: ({ updated }) =>
-              formatAnswerResolutionSuccessMessage({
-                interactionId,
-                updated,
-              }),
+            successMessage: formatAnswerResolutionSuccessMessage,
           });
         },
       ),
     );
 
   interactions
-    .command("deny <interactionId> [id]")
-    .description("Deny a command, file-change, plan, or permission interaction")
+    .command("respond <interactionId> [id]")
+    .description(
+      "Answer a plugin form (a plugin's request or a provider's plugin-defined request) with a JSON value",
+    )
     .option("--self", "Target the current thread (from BB_THREAD_ID)")
     .option("--json", "Print machine-readable JSON output")
+    .requiredOption(
+      "--value <json>",
+      "The form's answer as JSON, in the shape the plugin's form defines",
+    )
     .action(
       action(
         async (
           interactionId: string,
           id: string | undefined,
-          opts: ThreadInteractionTargetOptions,
+          opts: ThreadInteractionRespondOptions,
         ) => {
           const threadId = requireThreadIdOrSelf(id, opts);
-          await resolveInteraction({
-            buildResolution: (interaction) =>
-              buildBinaryResolution(interaction, "deny"),
-            failureAction: "deny",
-            getUrl,
-            interactionId,
-            json: opts.json,
-            threadId,
-            successMessage: ({ resolution, updated }) =>
-              formatResolutionSuccessMessage({
-                interactionId,
-                resolution,
-                updated,
-              }),
-          });
+          const value = parseRespondValue(opts.value);
+          const sdk = createCliBbSdk(getUrl());
+          const updated = await sdk.threads.interactions
+            .respond({ interactionId, threadId, value })
+            .catch((error: unknown) => {
+              throw prependErrorContext(
+                `Failed to respond to interaction ${interactionId}`,
+                error,
+              );
+            });
+          if (outputJson(opts, updated)) {
+            return;
+          }
+          console.log(
+            formatAnswerResolutionSuccessMessage({ interactionId, updated }),
+          );
         },
       ),
     );
+
+  registerBinaryResolutionCommand(
+    interactions,
+    getUrl,
+    "deny",
+    "Deny a command, file-change, plan, or permission interaction",
+  );
 }

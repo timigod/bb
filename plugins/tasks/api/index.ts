@@ -1,4 +1,4 @@
-import type { BbPluginApi, PluginRpcHandlers } from "@bb/plugin-sdk";
+import type { BbPluginApi, PluginRpcHandlers } from "@get-bb/plugin-sdk";
 import {
   createTasksStore,
   type Attachment as StoredAttachment,
@@ -12,6 +12,8 @@ import {
   removeAttachmentBlobs,
 } from "../attachments";
 import { deliverCommentToLatestAgent } from "../steer";
+import { displayName } from "../shared/display-name";
+import { errorMessage } from "../shared/errors";
 import { isSideChatShapedThread } from "../shared/side-chat";
 import {
   tasksRpcContract,
@@ -22,12 +24,9 @@ import {
   type TaskPullRequest,
   type TasksChangedEvent,
   type TasksDomainError,
-  type TaskStatus,
   type CommentsChangedEvent,
   type CommentProvider,
 } from "../shared/contract";
-
-type PluginDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 
 interface TaskLabelIdRow {
   task_id: string;
@@ -47,14 +46,6 @@ interface SummaryRow {
   task_count: number;
   active_agent_count: number;
 }
-
-const PRESET_REASONING_LEVELS = [
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
 
 const MAX_THREAD_SEARCH_RESULTS = 10;
 
@@ -103,10 +94,9 @@ export function createStore(bb: BbPluginApi): TasksApiStore {
     projectTaskCount(projectId: string): number {
       return (
         database
-          .prepare<
-            [string],
-            CountRow
-          >("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?")
+          .prepare<[string], CountRow>(
+            "SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?",
+          )
           .get(projectId)?.count ?? 0
       );
     },
@@ -180,22 +170,7 @@ function taskFailure(error: TasksDomainFailure) {
   return { ok: false as const, error: error.detail };
 }
 
-function projectFailure(error: TasksDomainFailure) {
-  return { ok: false as const, error: error.detail };
-}
-
-function statusName(status: TaskStatus): string {
-  return status
-    .split("_")
-    .map((part) => part[0]?.toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function priorityName(priority: StoredTask["priority"]): string {
-  return priority[0]?.toUpperCase() + priority.slice(1);
-}
-
-function publishTasksChanged(
+export function publishTasksChanged(
   bb: BbPluginApi,
   taskId: string,
   projectId: string,
@@ -212,15 +187,8 @@ export function publishProjectsChanged(
   bb.realtime.publish("projects:changed", payload);
 }
 
-export function publishCommentsChanged(
-  bb: BbPluginApi,
-  taskId: string,
-  notifiedCount?: number,
-): void {
-  const payload: CommentsChangedEvent = {
-    taskId,
-    ...(notifiedCount === undefined ? {} : { notifiedCount }),
-  };
+export function publishCommentsChanged(bb: BbPluginApi, taskId: string): void {
+  const payload: CommentsChangedEvent = { taskId };
   bb.realtime.publish("comments:changed", payload);
 }
 
@@ -340,7 +308,6 @@ function writeSystemComments(
       kind: "system",
       authorName,
       body,
-      notifiedCount: 0,
     });
   }
 }
@@ -370,27 +337,11 @@ function attachmentsForTasks(
   ]);
 }
 
-/**
- * Live display facts about an agent thread that authored a comment.
- *   - `title`: the current human title for the byline link, or null when it
- *     must be suppressed — a side chat (an internal conversation that must not
- *     surface a title/link) or a thread with only a blank/whitespace title.
- *   - `providerId`: the thread's live provider id, always present when the
- *     thread resolves (including side chats — a brand logo exposes no link).
- * A thread contributes no entry at all when it is deleted, hidden, or otherwise
- * inaccessible (the SDK read rejects), so callers fall back to `authorName`
- * with no link and no provider logo.
- */
 interface AgentThreadInfo {
   title: string | null;
   providerId: string;
 }
 
-/**
- * Resolve {@link AgentThreadInfo} for each distinct agent thread that authored
- * one of `comments`, keyed by thread id, reading each thread once from the live
- * SDK so renames are reflected.
- */
 async function resolveAgentThreadInfo(
   bb: BbPluginApi,
   comments: readonly StoredComment[],
@@ -407,9 +358,6 @@ async function resolveAgentThreadInfo(
       try {
         const thread = await bb.sdk.threads.get({ threadId });
         const isSideChat = isSideChatShapedThread(thread);
-        // Prefer the first non-blank candidate: a whitespace-only primary
-        // title must not suppress a useful fallback. Side chats never surface
-        // a title/link, but still expose their provider.
         const title = isSideChat
           ? undefined
           : [thread.title, thread.titleFallback].find(
@@ -419,22 +367,12 @@ async function resolveAgentThreadInfo(
           title: title ?? null,
           providerId: thread.providerId,
         });
-      } catch {
-        // Deleted, hidden, or inaccessible threads leave no entry.
-      }
+      } catch {}
     }),
   );
   return infos;
 }
 
-/**
- * Resolve a display badge ({@link CommentProvider}) for each provider id that
- * appears in `threadInfo`, keyed by provider id. `name`/`logoUrl` come from the
- * live host provider list (one call, only when at least one provider is
- * needed). A provider that is no longer installed — or a provider list that
- * fails to load — leaves no entry, and callers fall back to a badge carrying
- * the raw provider id so the UI can still render a brand glyph by id.
- */
 async function resolveProviderBadges(
   bb: BbPluginApi,
   threadInfo: ReadonlyMap<string, AgentThreadInfo>,
@@ -448,7 +386,6 @@ async function resolveProviderBadges(
   try {
     providers = await bb.sdk.providers.list();
   } catch {
-    // Host provider list unavailable: callers fall back to raw-id badges.
     return badges;
   }
   for (const provider of providers) {
@@ -457,6 +394,8 @@ async function resolveProviderBadges(
         id: provider.id,
         name: provider.displayName,
         logoUrl: provider.logoUrl,
+        icon: provider.icon ?? null,
+        strings: { iconTint: provider.strings?.iconTint ?? null },
       });
     }
   }
@@ -471,6 +410,7 @@ interface CreateCommentInput {
   threadId: string | null;
   body: string;
   notify: boolean;
+  awaitDelivery: boolean;
 }
 
 export async function createComment(
@@ -478,7 +418,7 @@ export async function createComment(
   store: TasksApiStore,
   input: CreateCommentInput,
 ): Promise<StoredComment> {
-  let comment = store.transaction(() =>
+  const comment = store.transaction(() =>
     store.tasks.createComment({
       taskId: input.taskId,
       kind: input.kind,
@@ -486,25 +426,32 @@ export async function createComment(
       presetName: input.presetName,
       threadId: input.threadId,
       body: input.body,
-      notifiedCount: 0,
     }),
   );
 
-  if (input.notify) {
-    const delivery = await deliverCommentToLatestAgent(bb, store.tasks, {
+  publishCommentsChanged(bb, input.taskId);
+  if (!input.notify) return comment;
+
+  const deliver = async (): Promise<StoredComment> => {
+    const notifiedCount = await deliverCommentToLatestAgent(bb, store.tasks, {
       taskId: comment.taskId,
       commentId: comment.id,
       body: comment.body,
       authorName: comment.authorName,
     });
-    comment = store.transaction(() =>
-      store.tasks.updateComment(comment.id, {
-        notifiedCount: delivery.notifiedCount,
-      }),
+    const updated = store.transaction(() =>
+      store.tasks.updateComment(comment.id, { notifiedCount }),
     );
-  }
+    publishCommentsChanged(bb, input.taskId);
+    return updated;
+  };
 
-  publishCommentsChanged(bb, input.taskId, comment.notifiedCount);
+  if (input.awaitDelivery) return deliver();
+  void deliver().catch((error) => {
+    bb.log.warn(
+      `failed to update comment notification ${comment.id}: ${errorMessage(error)}`,
+    );
+  });
   return comment;
 }
 
@@ -513,14 +460,8 @@ interface TaskPullRequestsResult {
   unavailableThreadIds: string[];
 }
 
-/** Cap on simultaneous environment PR lookups — each one may shell out to
- *  `gh` on the host, so a task with many worktrees must not stampede it. */
 const PULL_REQUEST_LOOKUP_CONCURRENCY = 4;
 
-/**
- * Run `work` over every item with at most `limit` invocations in flight.
- * Results keep item order. Rejections propagate to the caller.
- */
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
   limit: number,
@@ -542,17 +483,6 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-/**
- * Resolve the pull requests reachable from a task's attached threads: each
- * thread's environment PR (the branch its agent pushed), deduplicated by URL.
- * Thread metadata resolves concurrently, then threads are grouped by
- * environment so each distinct environment costs exactly one lookup, and
- * those lookups run with bounded concurrency. A thread lands in
- * `unavailableThreadIds` when its metadata cannot be read (deleted thread) or
- * its environment lookup reports/throws "unavailable" (gh missing, not
- * authenticated, unreachable workspace); threads with no environment or a
- * genuinely absent PR simply produce nothing.
- */
 async function listTaskPullRequests(
   bb: BbPluginApi,
   store: TasksApiStore,
@@ -610,9 +540,6 @@ async function listTaskPullRequests(
         });
         return;
       }
-      // Two environments can surface the same PR (e.g. two worktrees on the
-      // same branch). Union the threads and keep the freshest payload so a
-      // stale duplicate never masks a newer state.
       const threadIdUnion = [...existing.threadIds, ...threadIds];
       if (pullRequest.updatedAt.localeCompare(existing.updatedAt) > 0) {
         byUrl.set(pullRequest.url, {
@@ -629,7 +556,6 @@ async function listTaskPullRequests(
     },
   );
 
-  // Keep both lists in stable task-thread order regardless of lookup timing.
   const threadOrder = new Map(
     taskThreads.map((taskThread, index) => [taskThread.threadId, index]),
   );
@@ -643,8 +569,6 @@ async function listTaskPullRequests(
   }));
 
   return {
-    // Most recently updated first, matching how the threads list surfaces
-    // the freshest work.
     pullRequests: pullRequests.sort((left, right) =>
       right.updatedAt.localeCompare(left.updatedAt),
     ),
@@ -679,9 +603,9 @@ export function registerHandlers(
       return { folder };
     },
     deleteFolder(input) {
-      const deleted = store.tasks.deleteFolder(input.folderId);
-      if (deleted) publishProjectsChanged(bb, null);
-      return { deleted };
+      const result = store.tasks.deleteFolder(input.folderId);
+      if (result.deleted) publishProjectsChanged(bb, null);
+      return result;
     },
     listFolders() {
       return { folders: store.tasks.listFolders() };
@@ -711,7 +635,7 @@ export function registerHandlers(
         publishProjectsChanged(bb, project.id);
         return { ok: true, project };
       } catch (error) {
-        if (error instanceof TasksDomainFailure) return projectFailure(error);
+        if (error instanceof TasksDomainFailure) return taskFailure(error);
         throw error;
       }
     },
@@ -734,7 +658,7 @@ export function registerHandlers(
         }
         return { ok: true, deleted };
       } catch (error) {
-        if (error instanceof TasksDomainFailure) return projectFailure(error);
+        if (error instanceof TasksDomainFailure) return taskFailure(error);
         throw error;
       }
     },
@@ -805,12 +729,12 @@ export function registerHandlers(
           const bodies: string[] = [];
           if (updated.status !== current.status) {
             bodies.push(
-              `Status changed to ${statusName(updated.status)} by ${input.authorName}`,
+              `Status changed to ${displayName(updated.status)} by ${input.authorName}`,
             );
           }
           if (updated.priority !== current.priority) {
             bodies.push(
-              `Priority changed to ${priorityName(updated.priority)} by ${input.authorName}`,
+              `Priority changed to ${displayName(updated.priority)} by ${input.authorName}`,
             );
           }
           if (updated.dueDate !== current.dueDate) {
@@ -842,11 +766,15 @@ export function registerHandlers(
     },
     async deleteTask(input) {
       const task = store.tasks.getTask(input.taskId);
+      const subtasks = task ? store.tasks.listSubtasks(task.id) : [];
       const attachments = attachmentsForTasks(store.tasks, [input.taskId]);
       const deleted = store.tasks.deleteTask(input.taskId);
       if (deleted && task) {
         await removeAttachmentBlobs(bb, store.tasks, attachments);
         publishTasksChanged(bb, task.id, task.projectId);
+        for (const subtask of subtasks) {
+          publishTasksChanged(bb, subtask.id, subtask.projectId);
+        }
       }
       return { deleted };
     },
@@ -880,13 +808,38 @@ export function registerHandlers(
         const statusChanged = moved.status !== current.status;
         if (statusChanged) {
           writeSystemComments(store, current.id, input.authorName, [
-            `Status changed to ${statusName(moved.status)} by ${input.authorName}`,
+            `Status changed to ${displayName(moved.status)} by ${input.authorName}`,
           ]);
         }
         return { task: apiTask(store, moved), statusChanged };
       });
       publishTasksChanged(bb, result.task.id, result.task.projectId);
       if (result.statusChanged) publishCommentsChanged(bb, result.task.id);
+      return { ok: true, task: result.task };
+    },
+    moveTaskToProject(input) {
+      const current = store.tasks.getTask(input.taskId);
+      if (!current) throw new Error(`Task not found: ${input.taskId}`);
+      const result = store.transaction(() => {
+        const outcome = store.tasks.moveTaskToProject(
+          current.id,
+          input.projectId,
+        );
+        for (const { previousKey, task } of outcome.moved) {
+          writeSystemComments(store, task.id, input.authorName, [
+            `Moved from ${previousKey} to ${task.key} by ${input.authorName}`,
+          ]);
+        }
+        return { task: apiTask(store, outcome.task), moved: outcome.moved };
+      });
+      if (result.moved.length > 0) {
+        publishTasksChanged(bb, current.id, current.projectId);
+        publishTasksChanged(bb, result.task.id, result.task.projectId);
+        publishProjectsChanged(bb, result.task.projectId);
+        for (const { task } of result.moved) {
+          publishCommentsChanged(bb, task.id);
+        }
+      }
       return { ok: true, task: result.task };
     },
     createLabel(input) {
@@ -920,6 +873,7 @@ export function registerHandlers(
         threadId: null,
         body: input.body,
         notify: input.notify,
+        awaitDelivery: false,
       });
       return { comment };
     },
@@ -943,6 +897,8 @@ export function registerHandlers(
                     id: info.providerId,
                     name: info.providerId,
                     logoUrl: null,
+                    icon: null,
+                    strings: { iconTint: null },
                   }),
           };
         }),
@@ -952,7 +908,11 @@ export function registerHandlers(
       const attachments =
         "taskId" in input
           ? store.tasks.listAttachmentsForTask(input.taskId)
-          : store.tasks.listAttachmentsForComment(input.commentId);
+          : "commentId" in input
+            ? store.tasks.listAttachmentsForComment(input.commentId)
+            : store.tasks.listAttachmentsForTaskComments(
+                input.commentsOfTaskId,
+              );
       return {
         attachments: attachments.map(attachmentMetadata),
       };
@@ -1016,45 +976,6 @@ export function registerHandlers(
     },
     listPresets() {
       return { presets: store.tasks.listPresets() };
-    },
-    async listProviders() {
-      const providers = await bb.sdk.providers.list();
-      return {
-        providers: providers.map((provider) => ({
-          id: provider.id,
-          name: provider.displayName,
-          supportedPermissionModes:
-            provider.capabilities.supportedPermissionModes,
-        })),
-      };
-    },
-    async listProviderModels(input) {
-      const result = await bb.sdk.providers.models({
-        providerId: input.providerId,
-      });
-      const supportedReasoningLevels = new Set(
-        result.models.flatMap((model) =>
-          model.supportedReasoningEfforts.map(
-            (effort) => effort.reasoningEffort,
-          ),
-        ),
-      );
-      const reasoningLevels = PRESET_REASONING_LEVELS.filter((level) =>
-        supportedReasoningLevels.has(level),
-      );
-      return {
-        models: result.models.map((model) => ({
-          id: model.model,
-          name: model.displayName,
-          isDefault: model.isDefault,
-        })),
-        // The SDK has model-level reasoning metadata but no provider-level
-        // list. Fall back to the standard picker levels when models omit it.
-        reasoningLevels:
-          reasoningLevels.length > 0
-            ? reasoningLevels
-            : [...PRESET_REASONING_LEVELS],
-      };
     },
     async listMachines() {
       const machines = await bb.sdk.hosts.list();

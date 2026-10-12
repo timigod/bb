@@ -1,14 +1,3 @@
-// Relays a gzip-encoded origin response through the real TunnelDO and the real
-// edge-cache layer inside a real workerd (miniflare).
-//
-// Why not a plain unit test: `encodeBody` exists only in workerd. Under Node,
-// `new Response(gzipBytes, { headers: { "content-encoding": "gzip" } })` is
-// inert, so a Node test passes identically with and without this fix. In
-// workerd the default (`encodeBody: "automatic"`) means "this body is identity
-// and I own the encoding", so it drops the header and ships compressed bytes
-// labelled text/html — the browser then renders raw gzip. That is the
-// corruption that forced the revert of #909, and reproducing it needs the real
-// runtime.
 import { fileURLToPath } from "node:url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { build } from "esbuild";
@@ -25,7 +14,6 @@ type ClientWebSocket = NonNullable<
 >;
 
 let mf: Miniflare;
-/** Kept open for the whole file: the DO only proxies while a tunnel is live. */
 let tunnel: ClientWebSocket;
 
 async function bundleFixture(): Promise<string> {
@@ -42,14 +30,7 @@ async function bundleFixture(): Promise<string> {
   return result.outputFiles[0].text;
 }
 
-/**
- * Minimal stand-in for the bb tunnel client: answers every relayed request with
- * the origin's gzip bytes forwarded verbatim, which is what the client does
- * since #909 stopped stripping accept-encoding.
- */
 function serveOriginOverTunnel(ws: ClientWebSocket): void {
-  // Copy into a plain ArrayBuffer-backed view: send() rejects the encoder's
-  // ArrayBufferLike-typed result.
   const send = (frame: Frame) => ws.send(new Uint8Array(encodeFrame(frame)));
   ws.addEventListener("message", (event) => {
     if (typeof event.data === "string") return;
@@ -59,6 +40,8 @@ function serveOriginOverTunnel(ws: ClientWebSocket): void {
       new URL(frame.path, "http://origin.local").searchParams.get(
         "cacheable",
       ) === "1";
+    const cookieBoundary =
+      frame.path === "/cookie-boundary" || frame.path === "/install.sh";
     send({
       type: "resp-head",
       streamId: frame.streamId,
@@ -68,6 +51,20 @@ function serveOriginOverTunnel(ws: ClientWebSocket): void {
         ["content-encoding", "gzip"],
         ["content-length", String(GZIP.byteLength)],
         ["cache-control", cacheable ? IMMUTABLE : "no-store"],
+        ...(cookieBoundary
+          ? ([
+              ["set-cookie", "tenant=kept; Path=/; HttpOnly"],
+              [
+                "set-cookie",
+                "__Secure-better-auth.session_token=stolen; Secure; Path=/",
+              ],
+              ["set-cookie", "parent=stolen; Domain=.relay.test; Path=/"],
+              [
+                "x-origin-cookie",
+                frame.headers.find(([name]) => name === "cookie")?.[1] ?? "",
+              ],
+            ] satisfies [string, string][])
+          : []),
       ],
     });
     send({
@@ -79,12 +76,15 @@ function serveOriginOverTunnel(ws: ClientWebSocket): void {
   });
 }
 
-/** Bytes as they left workerd, after the client's own content-decoding. */
+const TRANSPORTS = ["object-held", "worker-held"] as const;
+type Transport = (typeof TRANSPORTS)[number];
+
 async function get(
   path: string,
+  transport: Transport = "object-held",
 ): Promise<{ status: number; encoding: string | null; body: Buffer }> {
   const res = await mf.dispatchFetch(`https://relay.test${path}`, {
-    headers: { "accept-encoding": "gzip" },
+    headers: { "accept-encoding": "gzip", "x-fixture-transport": transport },
   });
   return {
     status: res.status,
@@ -131,43 +131,83 @@ afterAll(async () => {
 });
 
 describe("relaying a gzip-encoded origin response", () => {
-  it("hands the visitor a body that decodes back to the origin's HTML", async () => {
-    const res = await get("/index.html");
+  it.each(TRANSPORTS)(
+    "hands the visitor a body that decodes back to the origin's HTML (%s response)",
+    async (transport) => {
+      const res = await get(`/${transport}/index.html`, transport);
 
-    expect(res.status).toBe(200);
-    // The client content-decodes, so an intact gzip response arrives as the
-    // original HTML; the corruption shows up as the compressed bytes instead.
-    expect(res.body.toString("utf8")).toBe(HTML);
-  });
+      expect(res.status).toBe(200);
+      expect(res.body.toString("utf8")).toBe(HTML);
+    },
+  );
 
   it("would corrupt the response if it were rebuilt with workerd's default encoding", async () => {
     const res = await get("/legacy-relay");
 
-    // Pins the runtime behaviour the fix exists for: content-encoding dropped,
-    // compressed bytes delivered as text/html.
     expect(res.encoding).toBeNull();
     expect(res.body.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b]));
     expect(res.body.toString("utf8")).not.toBe(HTML);
     expect(gunzipSync(res.body).toString("utf8")).toBe(HTML);
   });
+
+  it.each(TRANSPORTS)(
+    "preserves compressed bodies when enforcing the cookie boundary (%s response)",
+    async (transport) => {
+      for (const path of ["/cookie-boundary", "/install.sh"]) {
+        const response = await mf.dispatchFetch(`https://relay.test${path}`, {
+          headers: {
+            "accept-encoding": "gzip",
+            "x-fixture-transport": transport,
+            cookie:
+              "tenant=kept; __Secure-better-auth.session_token=secret; __Secure-bb-connect.desktop_session=secret",
+          },
+        });
+        expect(response.status).toBe(200);
+        expect(response.headers.getSetCookie()).toEqual([
+          "tenant=kept; Path=/; HttpOnly",
+        ]);
+        expect(response.headers.get("x-origin-cookie")).toBe("tenant=kept");
+        expect(response.headers.get("content-type")).toBe(
+          path === "/install.sh"
+            ? "text/plain; charset=utf-8"
+            : "text/html; charset=utf-8",
+        );
+        if (path === "/install.sh") {
+          expect(response.headers.get("content-security-policy")).toBe(
+            "sandbox",
+          );
+          expect(response.headers.get("x-content-type-options")).toBe(
+            "nosniff",
+          );
+        }
+        expect(await response.text()).toBe(HTML);
+      }
+    },
+  );
 });
 
 describe("edge cache", () => {
-  it("keeps the body decodable on both the miss and the hit", async () => {
-    const miss = await get("/asset.js?cacheable=1");
-    expect(miss.body.toString("utf8")).toBe(HTML);
+  it.each(TRANSPORTS)(
+    "keeps the body decodable on both the miss and the hit (%s response)",
+    async (transport) => {
+      const path = `/${transport}/asset.js?cacheable=1`;
+      const miss = await get(path, transport);
+      expect(miss.body.toString("utf8")).toBe(HTML);
 
-    // The hit is the dangerous one: the cache keeps the origin's bytes
-    // compressed, so this Response is rebuilt around raw gzip.
-    const hit = await get("/asset.js?cacheable=1");
-    expect(hit.status).toBe(200);
-    expect(hit.body.toString("utf8")).toBe(HTML);
-  });
+      for (const reader of TRANSPORTS) {
+        const hit = await get(path, reader);
+        expect(hit.status).toBe(200);
+        expect(hit.body.toString("utf8")).toBe(HTML);
+      }
+      const marker = await mf.dispatchFetch(`https://relay.test${path}`, {
+        headers: { "x-fixture-transport": transport },
+      });
+      expect(marker.headers.get("x-bb-cache")).toBe("hit");
+      await marker.arrayBuffer();
+    },
+  );
 
   it("content-decodes a relayed body as the gate reads it", async () => {
-    // The invariant behind the miss/hit asymmetry: a body read out of a
-    // subrequest is already plain even though content-encoding still says gzip,
-    // so the miss path must stay on automatic encoding.
     const res = await mf.dispatchFetch("https://relay.test/subrequest-bytes");
 
     expect(await res.json()).toEqual({

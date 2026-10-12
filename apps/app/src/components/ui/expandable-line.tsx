@@ -1,23 +1,17 @@
-import { useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 
-export interface ExpandableLineProps {
+interface ExpandableLineProps {
   fullText: string;
   children: ReactNode;
-  className?: string;
   collapsedClassName: string;
-  collapsedStyle?: CSSProperties;
-  expandedClassName?: string;
 }
 
-const DEFAULT_EXPANDED_CLASS_NAME = "whitespace-pre-wrap break-words";
+const EXPANDED_CLASS_NAME = "whitespace-pre-wrap break-words";
 
 export function ExpandableLine({
   fullText,
   children,
-  className,
   collapsedClassName,
-  collapsedStyle,
-  expandedClassName = DEFAULT_EXPANDED_CLASS_NAME,
 }: ExpandableLineProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -40,12 +34,10 @@ export function ExpandableLine({
       onClick={handleToggle}
       className={[
         "block w-full cursor-pointer select-text text-left leading-tight transition-[max-height] duration-200 ease-out",
-        isExpanded ? expandedClassName : collapsedClassName,
-        className,
+        isExpanded ? EXPANDED_CLASS_NAME : collapsedClassName,
       ]
         .filter(Boolean)
         .join(" ")}
-      style={isExpanded ? undefined : collapsedStyle}
       title={isExpanded ? "Click to collapse" : fullText}
       aria-expanded={isExpanded}
     >

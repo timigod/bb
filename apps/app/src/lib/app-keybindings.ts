@@ -6,6 +6,10 @@ export interface AppShortcutPresentation {
   label: string;
 }
 
+export function browserPlatform(): string {
+  return typeof navigator === "undefined" ? "" : navigator.platform;
+}
+
 export function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -32,6 +36,13 @@ export function matchesAppCommandContext(
   );
 }
 
+const SHORTCUT_KEY_GLYPHS: Readonly<Record<string, string>> = {
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+  ArrowLeft: "←",
+  ArrowRight: "→",
+};
+
 export function formatAppShortcut(
   shortcut: AppShortcut,
   platform: string,
@@ -40,7 +51,9 @@ export function formatAppShortcut(
   const showMeta = shortcut.meta || (shortcut.mod && useMetaForMod);
   const showControl = shortcut.control || (shortcut.mod && !useMetaForMod);
   const key =
-    shortcut.key.length === 1 ? shortcut.key.toUpperCase() : shortcut.key;
+    shortcut.key.length === 1
+      ? shortcut.key.toUpperCase()
+      : (SHORTCUT_KEY_GLYPHS[shortcut.key] ?? shortcut.key);
 
   if (useMetaForMod) {
     const parts: string[] = [];
@@ -77,4 +90,47 @@ export function formatAppShortcutAria(
     shortcut.key.length === 1 ? shortcut.key.toUpperCase() : shortcut.key,
   );
   return parts.join("+");
+}
+
+export function presentAppShortcut(
+  shortcut: AppShortcut,
+  platform: string,
+): AppShortcutPresentation {
+  return {
+    ariaKeyshortcuts: formatAppShortcutAria(shortcut, platform),
+    label: formatAppShortcut(shortcut, platform),
+  };
+}
+
+export function appShortcutMatchesQuery(
+  shortcut: AppShortcut,
+  platform: string,
+  query: string,
+): boolean {
+  const tokens = query
+    .toLowerCase()
+    .split(/[\s+]+/u)
+    .filter((token) => token.length > 0);
+  if (query.trimEnd().endsWith("+")) tokens.push("+");
+  if (tokens.length === 0) return false;
+  const useMetaForMod = isMacKeyboardPlatform(platform);
+  const modifiers = new Set<string>();
+  if (shortcut.mod) modifiers.add("mod");
+  if (shortcut.meta || (shortcut.mod && useMetaForMod)) {
+    modifiers.add("cmd");
+    modifiers.add("command");
+    modifiers.add("meta");
+  }
+  if (shortcut.control || (shortcut.mod && !useMetaForMod)) {
+    modifiers.add("ctrl");
+    modifiers.add("control");
+  }
+  if (shortcut.alt) {
+    modifiers.add("alt");
+    modifiers.add("opt");
+    modifiers.add("option");
+  }
+  if (shortcut.shift) modifiers.add("shift");
+  const key = shortcut.key.toLowerCase();
+  return tokens.every((token) => modifiers.has(token) || key.includes(token));
 }

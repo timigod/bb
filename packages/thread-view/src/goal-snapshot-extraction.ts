@@ -1,6 +1,22 @@
+import {
+  LEGACY_CODEX_GOAL_EXTENSION_KIND,
+  threadTimelineGoalStatusSchema,
+} from "@bb/domain";
 import type { ThreadEvent, ThreadTimelineGoal } from "@bb/domain";
+import { z } from "zod";
 import type { ThreadEventWithMeta } from "./build-event-projection.js";
 import { getOrderedThreadEvents } from "./group-event-projection-turns.js";
+
+const goalStatePayloadSchema = z.union([
+  z.object({
+    objective: z.string(),
+    status: threadTimelineGoalStatusSchema,
+    tokenBudget: z.number().nullable(),
+    tokensUsed: z.number(),
+    timeUsedSeconds: z.number(),
+  }),
+  z.null(),
+]);
 
 type GoalSnapshotCandidate =
   | {
@@ -17,24 +33,30 @@ function extractGoalSnapshotCandidate(
   event: ThreadEvent,
   meta: { createdAt: number; seq: number },
 ): GoalSnapshotCandidate | null {
-  if (event.type === "thread/goal/cleared") {
-    return {
-      kind: "cleared",
-      seq: meta.seq,
-    };
+  if (
+    event.type !== "thread/extensionState/updated" ||
+    event.kind !== LEGACY_CODEX_GOAL_EXTENSION_KIND
+  ) {
+    return null;
   }
-  if (event.type !== "thread/goal/updated") return null;
+  const payload = goalStatePayloadSchema.safeParse(event.payload);
+  if (!payload.success) {
+    return null;
+  }
+  if (payload.data === null) {
+    return { kind: "cleared", seq: meta.seq };
+  }
   return {
     kind: "updated",
     seq: meta.seq,
     goal: {
       sourceSeq: meta.seq,
       updatedAt: meta.createdAt,
-      objective: event.objective,
-      status: event.status,
-      tokenBudget: event.tokenBudget,
-      tokensUsed: event.tokensUsed,
-      timeUsedSeconds: event.timeUsedSeconds,
+      objective: payload.data.objective,
+      status: payload.data.status,
+      tokenBudget: payload.data.tokenBudget,
+      tokensUsed: payload.data.tokensUsed,
+      timeUsedSeconds: payload.data.timeUsedSeconds,
     },
   };
 }

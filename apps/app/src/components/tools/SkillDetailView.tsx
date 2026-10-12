@@ -1,7 +1,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
-import { formatHomePathForDisplay } from "@bb/shared-ui/lib/utils";
+import { HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS } from "@bb/shared-ui/hover-reveal";
+import { cn, formatHomePathForDisplay } from "@bb/shared-ui/lib/utils";
 import { ResourceInfiniteScrollSentinel } from "@bb/shared-ui/resource-pagination";
 import {
   ResourceDefinitionSection,
@@ -20,52 +21,33 @@ import {
 import { FilePreview } from "@/components/secondary-panel/FilePreview.js";
 import { ProvenancePill } from "@/components/tools/ProvenancePill";
 import { useClipboardCopy } from "@/lib/clipboard";
+import type { MarkdownLinkRouting } from "@/components/ui/markdown-link-routing";
 
-export type SkillDetailTitleBadge = {
+type SkillDetailTitleBadge = {
   label: string;
   tooltip: ReactNode;
   accessibleLabel?: string;
 };
 
-export type SkillDetailContentState =
+type SkillDetailContentState =
   | { kind: "loading" }
   | { kind: "error"; message: string; onRetry: () => void }
   | { kind: "ready"; content: string };
 
-export interface SkillDetailViewProps {
+interface SkillDetailViewProps {
   leading?: ReactNode;
   title: string;
   path: string;
   pathHref?: string;
   titleBadge?: SkillDetailTitleBadge;
-  /** Extra contextual actions displayed at the trailing edge of the header. */
   headerActions?: ReactNode;
   overflowMenu?: ReactNode;
   files: readonly string[];
   selectedPath: string;
   onSelectFile: (path: string) => void;
   contentState: SkillDetailContentState;
-  contentActions?: ReactNode;
-  editor?: ReactNode;
   footer?: ReactNode;
-}
-
-export function SkillOwnershipBadge({
-  label,
-  tooltip,
-  accessibleLabel,
-}: {
-  label: string;
-  tooltip: ReactNode;
-  accessibleLabel?: string;
-}) {
-  return (
-    <ProvenancePill
-      label={label}
-      accessibleLabel={accessibleLabel}
-      tooltip={tooltip}
-    />
-  );
+  markdownLinkRouting?: MarkdownLinkRouting;
 }
 
 function SkillPath({ path, href }: { path: string; href?: string }) {
@@ -104,7 +86,10 @@ function SkillPath({ path, href }: { path: string; href?: string }) {
               <span className="truncate font-mono">{displayPath}</span>
               <Icon
                 name={copied ? "Check" : "Copy"}
-                className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+                className={cn(
+                  "size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100",
+                  HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS,
+                )}
                 aria-hidden
               />
             </button>
@@ -150,14 +135,6 @@ function SkillFileList({
   );
 }
 
-/**
- * Markdown renders progressively: fence-safe chunks of the source, with more
- * appended as the panel scrolls — the same endless-scroll behavior the
- * extension lists use, in place of the old page-flip footer. Chunking is what
- * keeps big BB-official docs fast to open: the first chunk paints immediately
- * instead of the whole document (dozens of viewport-heights of highlighted
- * code fences) rendering up front.
- */
 const SKILL_CONTENT_CHUNK_LINES = 120;
 
 export function splitMarkdownIntoChunks(content: string): string[] {
@@ -170,8 +147,6 @@ export function splitMarkdownIntoChunks(content: string): string[] {
     if (/^\s*(```|~~~)/u.test(line)) {
       inFence = !inFence;
     }
-    // Split only at blank lines outside code fences, so a chunk boundary can
-    // never cut a fence, table, or list item in half.
     if (
       !inFence &&
       current.length >= SKILL_CONTENT_CHUNK_LINES &&
@@ -191,13 +166,13 @@ function ScrollingSkillContent({
   path,
   content,
   markdown,
+  markdownLinkRouting,
 }: {
   path: string;
   content: string;
   markdown: boolean;
+  markdownLinkRouting?: MarkdownLinkRouting;
 }) {
-  // Non-markdown files render whole: they are code previews whose line
-  // numbering and header would restart at every chunk seam.
   const chunks = useMemo(
     () => (markdown ? splitMarkdownIntoChunks(content) : [content]),
     [content, markdown],
@@ -216,6 +191,7 @@ function ScrollingSkillContent({
             key={index}
             path={path}
             headerMode="none"
+            markdownLinkRouting={markdownLinkRouting}
             state={{
               kind: "ready",
               file: {
@@ -228,6 +204,7 @@ function ScrollingSkillContent({
           />
         ))}
         <ResourceInfiniteScrollSentinel
+          itemCount={shownChunks.length}
           hasMore={visibleChunkCount < chunks.length}
           onLoadMore={() =>
             setVisibleChunkCount((current) =>
@@ -252,16 +229,15 @@ export function SkillDetailView({
   selectedPath,
   onSelectFile,
   contentState,
-  contentActions,
-  editor,
   footer,
+  markdownLinkRouting,
 }: SkillDetailViewProps) {
   const directoryPath = getSkillDirectoryPath(path);
   const selectedDisplayPath = formatHomePathForDisplay(selectedPath);
   const selectedFileIsMarkdown = selectedPath.toLowerCase().endsWith(".md");
   const titleMeta =
     titleBadge === undefined ? undefined : (
-      <SkillOwnershipBadge
+      <ProvenancePill
         label={titleBadge.label}
         tooltip={titleBadge.tooltip}
         accessibleLabel={titleBadge.accessibleLabel}
@@ -277,7 +253,7 @@ export function SkillDetailView({
       actions={headerActions}
     >
       <ResourceDetailStack>
-        {files.length > 1 && editor === undefined ? (
+        {files.length > 1 ? (
           <ResourceDetailIncludesSection label="Files">
             <SkillFileList
               files={files}
@@ -287,52 +263,49 @@ export function SkillDetailView({
           </ResourceDetailIncludesSection>
         ) : null}
 
-        <ResourceDefinitionSection
-          label={selectedDisplayPath}
-          actions={contentActions}
-        >
-          {editor ??
-            (contentState.kind === "loading" ? (
-              <ResourceDetailPanel
-                surface="recessed"
-                className="px-3 py-10 text-center text-sm text-muted-foreground"
+        <ResourceDefinitionSection label={selectedDisplayPath}>
+          {contentState.kind === "loading" ? (
+            <ResourceDetailPanel
+              surface="recessed"
+              className="px-3 py-10 text-center text-sm text-muted-foreground"
+            >
+              Loading {selectedDisplayPath}…
+            </ResourceDetailPanel>
+          ) : contentState.kind === "error" ? (
+            <ResourceDetailPanel
+              surface="recessed"
+              className="px-3 py-10 text-center text-sm"
+            >
+              <div
+                role="alert"
+                className="flex items-start justify-center gap-2 text-foreground"
               >
-                Loading {selectedDisplayPath}…
-              </ResourceDetailPanel>
-            ) : contentState.kind === "error" ? (
-              <ResourceDetailPanel
-                surface="recessed"
-                className="px-3 py-10 text-center text-sm"
+                <Icon
+                  name="CircleX"
+                  className="mt-0.5 size-4 shrink-0 text-destructive"
+                  aria-hidden
+                />
+                <p>{contentState.message}</p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-3"
+                onClick={contentState.onRetry}
               >
-                <div
-                  role="alert"
-                  className="flex items-start justify-center gap-2 text-foreground"
-                >
-                  <Icon
-                    name="CircleX"
-                    className="mt-0.5 size-4 shrink-0 text-destructive"
-                    aria-hidden
-                  />
-                  <p>{contentState.message}</p>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="mt-3"
-                  onClick={contentState.onRetry}
-                >
-                  Retry
-                </Button>
-              </ResourceDetailPanel>
-            ) : (
-              <ScrollingSkillContent
-                key={`${selectedPath}:${contentState.content}`}
-                path={selectedPath}
-                content={contentState.content}
-                markdown={selectedFileIsMarkdown}
-              />
-            ))}
+                Retry
+              </Button>
+            </ResourceDetailPanel>
+          ) : (
+            <ScrollingSkillContent
+              key={`${selectedPath}:${contentState.content}`}
+              path={selectedPath}
+              content={contentState.content}
+              markdown={selectedFileIsMarkdown}
+              markdownLinkRouting={markdownLinkRouting}
+            />
+          )}
         </ResourceDefinitionSection>
       </ResourceDetailStack>
       {footer}

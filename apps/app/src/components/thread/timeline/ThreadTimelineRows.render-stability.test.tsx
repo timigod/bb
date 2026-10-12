@@ -4,17 +4,18 @@ import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import { threadsQueryKey } from "@/hooks/queries/query-keys";
-import { makeThreadListEntry } from "@/test/fixtures/thread-list-entries";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 import { conversationRow } from "@/test/fixtures/thread-timeline-rows";
 import { ThreadTimelineRows } from "./ThreadTimelineRows";
+import { sdk } from "@/lib/sdk";
+import { createQueryNotificationScheduler } from "@/test/queryNotificationScheduler";
 
-// The query cache notifies through notifyManager's scheduler (a macrotask),
-// so cache writes only reach subscribers after a timer tick.
-function flushCacheNotifications(): Promise<void> {
-  return act(() => new Promise<void>((resolve) => setTimeout(resolve, 20)));
-}
+const notifications = createQueryNotificationScheduler();
+
+beforeEach(() => notifications.install());
 
 function timelineRowsFixture() {
   const rows = [
@@ -68,9 +69,30 @@ function renderProfiledTimeline(queryClient: QueryClient) {
 
 afterEach(() => {
   cleanup();
+  notifications.restore();
+  vi.restoreAllMocks();
 });
 
 describe("ThreadTimelineRows render stability", () => {
+  it("routes a personal-project sender pill directly from sender metadata", async () => {
+    const getThread = vi.spyOn(sdk.threads, "get");
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(threadsQueryKey(), [
+      makeThreadListEntry({
+        id: "thr_sender",
+        projectId: PERSONAL_PROJECT_ID,
+        title: "Personal sender",
+      }),
+    ]);
+    const { view } = renderProfiledTimeline(queryClient);
+
+    expect(
+      view.getByRole("link", { name: "Personal sender" }).getAttribute("href"),
+    ).toBe("/threads/thr_sender");
+    await notifications.flush();
+    expect(getThread).not.toHaveBeenCalled();
+  });
+
   it("does not re-render the timeline when cache events carry equal thread metadata", async () => {
     const queryClient = new QueryClient();
     queryClient.setQueryData(threadsQueryKey(), [
@@ -78,13 +100,9 @@ describe("ThreadTimelineRows render stability", () => {
     ]);
     const { commits, view } = renderProfiledTimeline(queryClient);
     expect(view.getByText("Sender thread")).toBeTruthy();
-    await flushCacheNotifications();
+    await notifications.flush();
     const settledCommitCount = commits.length;
 
-    // Realtime events refetch thread lists constantly; each success dispatches
-    // an "updated" cache event with fresh array identity but equal values.
-    // None of them may commit the timeline again — before the stable-reference
-    // fix, every event re-rendered all rows past React.memo.
     for (let round = 0; round < 10; round += 1) {
       await act(async () => {
         queryClient.setQueryData(threadsQueryKey(), [
@@ -92,7 +110,7 @@ describe("ThreadTimelineRows render stability", () => {
         ]);
       });
     }
-    await flushCacheNotifications();
+    await notifications.flush();
 
     expect(commits.length).toBe(settledCommitCount);
   });

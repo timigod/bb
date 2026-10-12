@@ -9,18 +9,14 @@ export const TERMINAL_DATA_MAX_BASE64_LENGTH =
 const terminalBase64DataPattern =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 
-export const terminalSessionStatusValues = [
+const terminalSessionStatusValues = [
   "starting",
   "running",
   "disconnected",
   "exited",
 ] as const;
-export const terminalSessionStatusSchema = z.enum(
-  terminalSessionStatusValues,
-);
-export type TerminalSessionStatus = z.infer<
-  typeof terminalSessionStatusSchema
->;
+export const terminalSessionStatusSchema = z.enum(terminalSessionStatusValues);
+export type TerminalSessionStatus = z.infer<typeof terminalSessionStatusSchema>;
 
 export function isActiveTerminalSessionStatus(
   status: TerminalSessionStatus,
@@ -35,20 +31,7 @@ export function isActiveTerminalSessionStatus(
   }
 }
 
-export function isVisibleTerminalSessionStatus(
-  status: TerminalSessionStatus,
-): boolean {
-  switch (status) {
-    case "starting":
-    case "running":
-    case "disconnected":
-      return true;
-    case "exited":
-      return false;
-  }
-}
-
-export const terminalSessionCloseReasonValues = [
+const terminalSessionCloseReasonValues = [
   "user",
   "process-exit",
   "daemon-disconnect",
@@ -64,7 +47,7 @@ export type TerminalSessionCloseReason = z.infer<
   typeof terminalSessionCloseReasonSchema
 >;
 
-export interface TerminalOutputLineReader {
+interface TerminalOutputLineReader {
   flush(): string[];
   push(text: string): string[];
 }
@@ -124,12 +107,16 @@ export function readTerminalOutputLines(text: string): string[] {
   return [...reader.push(text), ...reader.flush()];
 }
 
-export const terminalColsSchema = z.number().int().positive().max(
-  TERMINAL_COLS_MAX,
-);
-export const terminalRowsSchema = z.number().int().positive().max(
-  TERMINAL_ROWS_MAX,
-);
+export const terminalColsSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(TERMINAL_COLS_MAX);
+export const terminalRowsSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(TERMINAL_ROWS_MAX);
 export const terminalDataBase64Schema = z
   .string()
   .min(1)

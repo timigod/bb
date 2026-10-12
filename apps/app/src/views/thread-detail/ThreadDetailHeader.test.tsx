@@ -7,23 +7,28 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { createStore, Provider as JotaiProvider } from "jotai";
 import type { ReactNode, Ref } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThreadDetailHeader } from "./ThreadDetailHeader";
 import { PaneContext, type PaneContextValue } from "./PaneContext";
-import { dimInactiveSplitsAtom } from "@/lib/split-layout/atoms";
 import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
-import { makeThreadListEntry } from "@/test/fixtures/thread-list-entries";
+import { makeThreadListEntry } from "@bb/test-helpers/domain-fixtures";
 import { sdk } from "@/lib/sdk";
+import { createBbDesktopApi } from "@/test/bb-desktop-test-utils";
+import { AppCommandProvider } from "@/components/commands/AppCommandProvider";
+import {
+  ThreadActionCollectors,
+  resetThreadActionRegistryForTest,
+} from "@/lib/thread-actions/thread-action-registry";
+import type { ThreadDetailHeaderActionsMenuArgs } from "./ThreadDetailHeader";
 
 const mocks = vi.hoisted(() => ({
-  renameThread: vi.fn(),
+  renameThreadAsync: vi.fn(),
 }));
 
 vi.mock("@/components/thread/ThreadActionsProvider", () => ({
   useThreadActions: () => ({
-    renameThread: mocks.renameThread,
+    renameThreadAsync: mocks.renameThreadAsync,
   }),
 }));
 
@@ -48,12 +53,32 @@ vi.mock("@/components/layout/AppPageHeader", () => ({
   ),
 }));
 
-vi.mock("@bb/shared-ui/hooks/use-compact-viewport", () => ({
-  useIsCompactViewport: () => false,
+const viewportState = vi.hoisted(() => ({ isCompactViewport: false }));
+
+vi.mock("@/hooks/queries/system-queries", () => ({
+  useSystemConfig: () => ({
+    data: {
+      keybindings: [
+        {
+          command: "thread.rename",
+          desktopOnly: false,
+          shortcut: {
+            key: "r",
+            mod: true,
+            meta: false,
+            control: false,
+            alt: false,
+            shift: true,
+          },
+          when: { all: ["mainSurface"], none: ["modalOpen"] },
+        },
+      ],
+    },
+  }),
 }));
 
-vi.mock("./SplitDimmingButton", () => ({
-  SplitDimmingButton: () => null,
+vi.mock("@bb/shared-ui/hooks/use-compact-viewport", () => ({
+  useIsCompactViewport: () => viewportState.isCompactViewport,
 }));
 
 const THREAD_ID = "thr_header";
@@ -75,15 +100,15 @@ const PANE_CONTEXT: PaneContextValue = {
 
 afterEach(() => {
   cleanup();
-  mocks.renameThread.mockReset();
+  resetThreadActionRegistryForTest();
+  viewportState.isCompactViewport = false;
+  mocks.renameThreadAsync.mockReset();
   vi.restoreAllMocks();
   window.localStorage.clear();
+  delete window.bbDesktop;
 });
 
 describe("ThreadDetailHeader", () => {
-  // The header seam now belongs to AppPageHeader, so AppPageHeader.test.tsx
-  // guards it for every header instead of this one call site.
-
   it("leaves the open right-panel collapse control to the panel header", () => {
     render(
       <PaneContext.Provider value={PANE_CONTEXT}>
@@ -104,6 +129,62 @@ describe("ThreadDetailHeader", () => {
       screen.queryByRole("button", { name: "Hide right panel" }),
     ).toBeNull();
   });
+
+  it("retains the compact trigger while the open shelf hides page actions", () => {
+    viewportState.isCompactViewport = true;
+
+    render(
+      <PaneContext.Provider value={PANE_CONTEXT}>
+        <ThreadDetailHeader
+          actionsMenu={null}
+          childPillLabel={null}
+          isSecondaryPanelOpen
+          onOpenThreadGitAction={vi.fn()}
+          onToggleSecondaryPanel={vi.fn()}
+          threadHeaderGitActions={[]}
+          threadId={THREAD_ID}
+          threadTitle="Panel state"
+        />
+      </PaneContext.Provider>,
+    );
+
+    const trigger = screen.getByRole("button", {
+      name: "Hide right panel",
+    });
+    expect(trigger.closest("[data-thread-header-pane-actions]")).not.toBeNull();
+  });
+
+  it.each([
+    { expectedIcon: "PanelRight", isCompactViewport: true },
+    { expectedIcon: "PanelRight", isCompactViewport: false },
+  ])(
+    "shows the $expectedIcon glyph on the right-panel trigger",
+    ({ expectedIcon, isCompactViewport }) => {
+      viewportState.isCompactViewport = isCompactViewport;
+
+      render(
+        <PaneContext.Provider value={PANE_CONTEXT}>
+          <ThreadDetailHeader
+            actionsMenu={null}
+            childPillLabel={null}
+            isSecondaryPanelOpen={false}
+            onOpenThreadGitAction={vi.fn()}
+            onToggleSecondaryPanel={vi.fn()}
+            threadHeaderGitActions={[]}
+            threadId={THREAD_ID}
+            threadTitle="Panel state"
+          />
+        </PaneContext.Provider>,
+      );
+
+      const showButton = screen.getByRole("button", {
+        name: "Show right panel",
+      });
+      expect(
+        showButton.querySelector(`[data-icon="${expectedIcon}"]`),
+      ).not.toBeNull();
+    },
+  );
 
   it("keeps thread Full Screen in a split header while its panel is open", () => {
     render(
@@ -128,7 +209,9 @@ describe("ThreadDetailHeader", () => {
       </PaneContext.Provider>,
     );
 
-    expect(screen.getByRole("button", { name: /Full Screen/ })).not.toBeNull();
+    expect(
+      screen.getByRole("button", { name: /Maximize pane/ }),
+    ).not.toBeNull();
     expect(
       screen.queryByRole("button", { name: "Hide right panel" }),
     ).toBeNull();
@@ -156,7 +239,7 @@ describe("ThreadDetailHeader", () => {
     render(
       <PaneContext.Provider value={splitContext}>
         <ThreadDetailHeader
-          actionsMenu={(includeResponsiveActions) => (
+          actionsMenu={({ includeResponsiveActions }) => (
             <>
               <span>Thread menu</span>
               {includeResponsiveActions ? (
@@ -215,7 +298,7 @@ describe("ThreadDetailHeader", () => {
     render(
       <PaneContext.Provider value={splitContext}>
         <ThreadDetailHeader
-          actionsMenu={(includeResponsiveActions) => (
+          actionsMenu={({ includeResponsiveActions }) => (
             <>
               <span>Thread menu</span>
               {includeResponsiveActions ? (
@@ -421,93 +504,8 @@ describe("ThreadDetailHeader", () => {
     expect(container.querySelector('[data-prompt-mention="true"]')).toBeNull();
   });
 
-  it("uses a title tab for the focused split and no pane-wide dimming", () => {
-    const splitContext: PaneContextValue = {
-      ...PANE_CONTEXT,
-      isFocused: true,
-      isSplitPane: true,
-      beginPaneDrag: vi.fn(),
-    };
-    const { container, rerender } = render(
-      <PaneContext.Provider value={splitContext}>
-        <ThreadDetailHeader
-          actionsMenu={null}
-          childPillLabel="child"
-          isSecondaryPanelOpen={false}
-          onOpenThreadGitAction={vi.fn()}
-          onToggleSecondaryPanel={vi.fn()}
-          threadHeaderGitActions={[]}
-          threadId={THREAD_ID}
-          threadTitle="Focused thread"
-        />
-      </PaneContext.Provider>,
-    );
-
-    const focusedTab = container.querySelector<HTMLElement>(
-      "[data-pane-header-focus-tab]",
-    );
-    expect(focusedTab).not.toBeNull();
-    expect(focusedTab?.classList).toContain("bg-state-active");
-    expect(focusedTab?.classList).not.toContain("shadow-sm");
-    expect(container.querySelector("[data-app-page-header-dim]")).toBeNull();
-    const activeTitle = screen.getByText("Focused thread");
-    expect(activeTitle.classList).toContain("font-normal");
-    expect(activeTitle.classList).not.toContain("font-medium");
-    expect(screen.getByText("child")).not.toBeNull();
-
-    rerender(
-      <PaneContext.Provider value={{ ...splitContext, isFocused: false }}>
-        <ThreadDetailHeader
-          actionsMenu={null}
-          childPillLabel="child"
-          isSecondaryPanelOpen={false}
-          onOpenThreadGitAction={vi.fn()}
-          onToggleSecondaryPanel={vi.fn()}
-          threadHeaderGitActions={[]}
-          threadId={THREAD_ID}
-          threadTitle="Focused thread"
-        />
-      </PaneContext.Provider>,
-    );
-
-    expect(container.querySelector("[data-pane-header-focus-tab]")).toBeNull();
-    const inactiveTitle = screen.getByText("Focused thread");
-    expect(inactiveTitle.classList).toContain("text-muted-foreground/60");
-    expect(inactiveTitle.classList).toContain("font-normal");
-    expect(inactiveTitle.classList).not.toContain("font-medium");
-  });
-
-  it("keeps inactive split titles undimmed when split dimming is off", () => {
-    const store = createStore();
-    store.set(dimInactiveSplitsAtom, false);
-    const splitContext: PaneContextValue = {
-      ...PANE_CONTEXT,
-      isFocused: false,
-      isSplitPane: true,
-      beginPaneDrag: vi.fn(),
-    };
-    render(
-      <JotaiProvider store={store}>
-        <PaneContext.Provider value={splitContext}>
-          <ThreadDetailHeader
-            actionsMenu={null}
-            childPillLabel={null}
-            isSecondaryPanelOpen={false}
-            onOpenThreadGitAction={vi.fn()}
-            onToggleSecondaryPanel={vi.fn()}
-            threadHeaderGitActions={[]}
-            threadId={THREAD_ID}
-            threadTitle="Inactive thread"
-          />
-        </PaneContext.Provider>
-      </JotaiProvider>,
-    );
-    expect(screen.getByText("Inactive thread").classList).not.toContain(
-      "text-muted-foreground/60",
-    );
-  });
-
-  it("edits the title inline after a double click and commits on Enter", () => {
+  it("edits the title inline after a double click and commits on Enter", async () => {
+    mocks.renameThreadAsync.mockResolvedValue(undefined);
     render(
       <PaneContext.Provider value={PANE_CONTEXT}>
         <ThreadDetailHeader
@@ -524,18 +522,68 @@ describe("ThreadDetailHeader", () => {
     );
 
     fireEvent.doubleClick(screen.getByText("Focused thread"));
-    const input = screen.getByRole("textbox", { name: "Thread name" });
+    const input = await screen.findByRole("textbox", { name: "Thread name" });
     expect(input).toHaveProperty("value", "Focused thread");
+    expect(screen.queryByText("Focused thread")).toBeNull();
 
     fireEvent.change(input, { target: { value: "Renamed thread" } });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    expect(mocks.renameThread).toHaveBeenCalledWith(THREAD_ID, "Renamed thread");
-    expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull();
+    await waitFor(() =>
+      expect(mocks.renameThreadAsync).toHaveBeenCalledWith(
+        THREAD_ID,
+        "Renamed thread",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull(),
+    );
     expect(screen.getByText("Focused thread")).not.toBeNull();
   });
 
-  it("cancels an inline header rename on Escape without saving", () => {
+  it("discards an unsaved header draft when switching threads", async () => {
+    const header = (threadId: string, threadTitle: string) => (
+      <PaneContext.Provider value={PANE_CONTEXT}>
+        <ThreadDetailHeader
+          actionsMenu={null}
+          childPillLabel={null}
+          isSecondaryPanelOpen={false}
+          onOpenThreadGitAction={vi.fn()}
+          onToggleSecondaryPanel={vi.fn()}
+          threadHeaderGitActions={[]}
+          threadId={threadId}
+          threadTitle={threadTitle}
+        />
+      </PaneContext.Provider>
+    );
+    const { rerender } = render(header(THREAD_ID, "Focused thread"));
+
+    fireEvent.doubleClick(screen.getByText("Focused thread"));
+    const input = await screen.findByRole("textbox", { name: "Thread name" });
+    fireEvent.change(input, { target: { value: "Unsaved draft" } });
+
+    rerender(header("thr_other", "Other thread"));
+
+    expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull();
+    expect(screen.getByText("Other thread")).not.toBeNull();
+    expect(mocks.renameThreadAsync).not.toHaveBeenCalled();
+
+    fireEvent.doubleClick(screen.getByText("Other thread"));
+    expect(
+      await screen.findByRole("textbox", { name: "Thread name" }),
+    ).toHaveProperty("value", "Other thread");
+  });
+
+  it("keeps the header title out of the macOS window-drag region so double click renames", async () => {
+    window.bbDesktop = createBbDesktopApi({
+      lastCheckedAt: null,
+      latestVersion: null,
+      pendingVersion: null,
+      platform: "macos",
+      updateAvailable: false,
+      updateDownloaded: false,
+      version: "0.0.0-test",
+    });
     render(
       <PaneContext.Provider value={PANE_CONTEXT}>
         <ThreadDetailHeader
@@ -551,17 +599,17 @@ describe("ThreadDetailHeader", () => {
       </PaneContext.Provider>,
     );
 
-    fireEvent.doubleClick(screen.getByText("Focused thread"));
-    const input = screen.getByRole("textbox", { name: "Thread name" });
-    fireEvent.change(input, { target: { value: "Scratch name" } });
-    fireEvent.keyDown(input, { key: "Escape" });
+    const title = screen.getByText("Focused thread").closest("p");
+    expect(title?.className).toContain("[-webkit-app-region:no-drag]");
 
-    expect(mocks.renameThread).not.toHaveBeenCalled();
-    expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull();
-    expect(screen.getByText("Focused thread")).not.toBeNull();
+    fireEvent.doubleClick(screen.getByText("Focused thread"));
+    const input = await screen.findByRole("textbox", { name: "Thread name" });
+    expect(input.closest("p")?.className).toContain(
+      "[-webkit-app-region:no-drag]",
+    );
   });
 
-  it("does not start a pane drag while the header title is being edited", () => {
+  it("does not start a pane drag while the header title is being edited", async () => {
     const beginPaneDrag = vi.fn();
     render(
       <PaneContext.Provider
@@ -585,9 +633,91 @@ describe("ThreadDetailHeader", () => {
     );
 
     fireEvent.doubleClick(screen.getByText("Focused thread"));
-    const input = screen.getByRole("textbox", { name: "Thread name" });
+    const input = await screen.findByRole("textbox", { name: "Thread name" });
     fireEvent.pointerDown(input, { button: 0 });
 
     expect(beginPaneDrag).not.toHaveBeenCalled();
   });
+
+  function renderWithMenuArgs(focused = true) {
+    const menuArgs: { current: ThreadDetailHeaderActionsMenuArgs | null } = {
+      current: null,
+    };
+    const requestRenameDialog = vi.fn();
+    render(
+      <AppCommandProvider>
+        <ThreadActionCollectors
+          coreRegistrations={[]}
+          requestRename={requestRenameDialog}
+        />
+        <PaneContext.Provider value={{ ...PANE_CONTEXT, isFocused: focused }}>
+          <ThreadDetailHeader
+            actionsMenu={(args) => {
+              menuArgs.current = args;
+              return null;
+            }}
+            childPillLabel={null}
+            isSecondaryPanelOpen={false}
+            onOpenThreadGitAction={vi.fn()}
+            onToggleSecondaryPanel={vi.fn()}
+            threadHeaderGitActions={[]}
+            threadId={THREAD_ID}
+            threadTitle="Focused thread"
+          />
+        </PaneContext.Provider>
+      </AppCommandProvider>,
+    );
+    return { menuArgs, requestRenameDialog };
+  }
+
+  it("renames inline from the actions menu once the menu has closed on desktop", async () => {
+    const { menuArgs, requestRenameDialog } = renderWithMenuArgs();
+    menuArgs.current?.requestRename(THREAD_ID);
+    expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull();
+    const closeEvent = new Event("focusout", { cancelable: true });
+    menuArgs.current?.onCloseAutoFocus(closeEvent);
+
+    expect(closeEvent.defaultPrevented).toBe(true);
+    expect(
+      await screen.findByRole("textbox", { name: "Thread name" }),
+    ).toHaveProperty("value", "Focused thread");
+    expect(requestRenameDialog).not.toHaveBeenCalled();
+  });
+
+  it("opens the rename dialog from the actions menu at compact width", () => {
+    viewportState.isCompactViewport = true;
+    const { menuArgs, requestRenameDialog } = renderWithMenuArgs();
+    menuArgs.current?.requestRename(THREAD_ID);
+    const closeEvent = new Event("focusout", { cancelable: true });
+    menuArgs.current?.onCloseAutoFocus(closeEvent);
+
+    expect(requestRenameDialog).toHaveBeenCalledWith(THREAD_ID);
+    expect(closeEvent.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("textbox", { name: "Thread name" })).toBeNull();
+  });
+
+  it.each([
+    [true, true],
+    [false, false],
+  ])(
+    "starts the inline rename from the rename command when focused=%s",
+    async (focused, edits) => {
+      renderWithMenuArgs(focused);
+      fireEvent.keyDown(window, {
+        key: "R",
+        code: "KeyR",
+        ctrlKey: true,
+        shiftKey: true,
+      });
+      if (edits) {
+        expect(
+          await screen.findByRole("textbox", { name: "Thread name" }),
+        ).not.toBeNull();
+      } else {
+        expect(
+          screen.queryByRole("textbox", { name: "Thread name" }),
+        ).toBeNull();
+      }
+    },
+  );
 });

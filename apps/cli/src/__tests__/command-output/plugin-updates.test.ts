@@ -18,6 +18,7 @@ const pluginList = (id: string, source: string) => ({
       rootDir: `/plugins/${id}`,
       version: "1.0.0",
       provenance: "direct",
+      publisherLabel: null,
       isOrphanedBuiltin: false,
       sourceDisplay: `npm · ${id} · tracks compatible`,
       updateState: {},
@@ -193,6 +194,32 @@ describe("bb plugin update commands", () => {
     expect(output).not.toContain("other@1.0.0");
   });
 
+  it("list annotates only CLI commands shadowed by core", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      jsonResponse({
+        plugins: [
+          {
+            ...pluginList("shadower", "path:/shadower").plugins[0],
+            cliCommand: { name: "thread", summary: "Shadow threads" },
+          },
+          {
+            ...pluginList("notes", "path:/notes").plugins[0],
+            cliCommand: { name: "notes", summary: "Take notes" },
+          },
+        ],
+      }),
+    );
+
+    await runCommand(["plugin", "list"], register);
+
+    const output = collectLogPayloads(vi.mocked(console.log)).join("\n");
+    expect(output).toContain(
+      'command: bb plugin run shadower — Shadow threads (core command "bb thread" takes precedence)',
+    );
+    expect(output).toContain("command: bb notes — Take notes");
+    expect(output).not.toContain('core command "bb notes"');
+  });
+
   it("skips pinned plugins with manual reinstall guidance", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
       jsonResponse({
@@ -210,9 +237,48 @@ describe("bb plugin update commands", () => {
     await runCommand(["plugin", "update", "notes"], register);
 
     expect(collectLogPayloads(vi.mocked(console.log)).join("\n")).toContain(
-      "remove and reinstall with a tracking npm range or git branch",
+      "remove and reinstall with a tracking npm range, git branch, or git semver range",
     );
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts an update without waiting and lets the user inspect its job", async () => {
+    const job = {
+      id: "update-1",
+      pluginId: "notes",
+      displayName: "Notes",
+      state: "running",
+      phase: "checking",
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            {
+              id: "notes",
+              outcome: "update-available",
+              installed: version("1.0.0"),
+              candidate: version("1.1.0"),
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(pluginList("notes", "npm:notes@^1")))
+      .mockResolvedValueOnce(jsonResponse({ job }, 202));
+    await runCommand(
+      ["plugin", "update", "notes", "--yes", "--no-wait"],
+      register,
+    );
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(collectLogPayloads(vi.mocked(console.log)).join("\n")).toContain(
+      "bb plugin update-jobs update-1",
+    );
+    vi.mocked(console.log).mockClear();
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ job }));
+    await runCommand(["plugin", "update-jobs", "update-1", "--json"], register);
+    expect(collectLogPayloads(vi.mocked(console.log))).toEqual([
+      JSON.stringify({ jobs: [job] }, null, 2),
+    ]);
   });
 
   it("--all updates compatible results and skips pinned and incompatible", async () => {
@@ -328,14 +394,9 @@ describe("bb plugin update commands", () => {
     );
   });
 
-  it("documents update commands and flags in help", async () => {
-    const pluginHelp = await getHelpOutput(["plugin"], register);
-    expect(pluginHelp).toContain("outdated");
-    expect(pluginHelp).toContain("update [options] [id]");
+  it("does not offer the removed update flags in help", async () => {
     const updateHelp = await getHelpOutput(["plugin", "update"], register);
-    expect(updateHelp).toContain("--all");
     expect(updateHelp).not.toContain("--dry-run");
     expect(updateHelp).not.toContain("--latest");
-    expect(updateHelp).toContain("--yes");
   });
 });

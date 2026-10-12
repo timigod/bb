@@ -1,6 +1,5 @@
 import type { PromptMentionResource, PromptTextMention } from "@bb/domain";
 import type { TimelineConversationTurnRequest } from "@bb/server-contract";
-import type { TimelineTitleLink } from "@bb/thread-view";
 import type { ReactNode } from "react";
 import { ConversationMessageContent } from "@/components/thread/timeline/ConversationMessageContent";
 import {
@@ -13,8 +12,6 @@ export default {
   title: "thread/timeline/User Message Markdown",
 };
 
-// ThreadTimelinePane caps content at 760px; match it so the bubble reflects
-// production width.
 function TimelineStage({
   children,
   revealMessageActions = false,
@@ -33,14 +30,6 @@ function TimelineStage({
   );
 }
 
-function resolveThreadLink(link: TimelineTitleLink): string | null {
-  return link.kind === "thread"
-    ? `/projects/proj_demo/threads/${link.threadId}`
-    : null;
-}
-
-// File/command pills render interactive when a click action resolves; a no-op
-// keeps the story self-contained while still showing the interactive style.
 const resolveMentionLink = () => () => {};
 
 const acceptedMessage: TimelineConversationTurnRequest = {
@@ -49,7 +38,6 @@ const acceptedMessage: TimelineConversationTurnRequest = {
   status: "accepted",
 };
 
-// Builds a mention spanning the first occurrence of `token` in `text`.
 function mentionAt(
   text: string,
   token: string,
@@ -75,16 +63,15 @@ function UserMessage({
       <ConversationMessageContent
         role="user"
         initiator="user"
-        originKind={null}
         senderThreadId={null}
         senderThreadTitle={null}
         senderIsPluginSideChat={false}
-        resolveSegmentLinkHref={resolveThreadLink}
         resolveMentionLink={resolveMentionLink}
         onAddToChat={onAddToChat}
         systemMessageKind="unlabeled"
         systemMessageSubject={null}
         text={text}
+        timestamp={0}
         attachments={null}
         mentions={mentions}
         projectId="proj_demo"
@@ -143,7 +130,6 @@ const QUOTE_BODY = [
   "Which phase is safe to deploy on a Friday?",
 ].join("\n");
 
-// Long enough to overflow the collapsed clamp and reveal "Show more".
 const LONG_BODY = [
   "# Migration rollout",
   "",
@@ -203,6 +189,67 @@ export function Overview() {
       >
         <StoryDraftPromptBox draft={promptDraft} />
       </StoryRow>
+    </StoryCard>
+  );
+}
+
+const MARKER_WIDTH_CASES = [
+  {
+    label: "1–9",
+    text: Array.from(
+      { length: 9 },
+      (_, index) => `${index + 1}. Item ${index + 1}`,
+    ).join("\n"),
+  },
+  { label: "10–12", text: "10. Item ten\n11. Item eleven\n12. Item twelve" },
+  {
+    label: "98–101",
+    text: "98. Item ninety-eight\n99. Item ninety-nine\n100. Item one hundred\n101. Item one hundred one",
+  },
+  {
+    label: "Nested 7–11",
+    text: "1. Outer item\n\n   7. Nested seven\n   8. Nested eight\n   9. Nested nine\n   10. Nested ten\n   11. Nested eleven\n\n2. Another outer item",
+  },
+];
+
+export function OrderedListMarkers() {
+  return (
+    <StoryCard>
+      {(["user", "assistant"] as const).map((role) => (
+        <StoryRow
+          key={role}
+          label={role}
+          hint="single, double, triple digits and nested lists"
+        >
+          <div data-marker-width-role={role} className="w-full space-y-4">
+            {MARKER_WIDTH_CASES.map(({ label, text }) => (
+              <div key={label}>
+                <div className="mb-2 text-sm text-muted-foreground">
+                  {label}
+                </div>
+                {role === "user" ? (
+                  <UserMessage text={text} />
+                ) : (
+                  <TimelineStage>
+                    <ConversationMessageContent
+                      role="assistant"
+                      id="msg_marker_widths"
+                      threadId="thr_demo"
+                      turnId="turn_demo"
+                      text={text}
+                      timestamp={0}
+                      attachments={null}
+                      showActions={false}
+                      mobileActionDisplay="inline"
+                      streaming={false}
+                    />
+                  </TimelineStage>
+                )}
+              </div>
+            ))}
+          </div>
+        </StoryRow>
+      ))}
     </StoryCard>
   );
 }

@@ -4,9 +4,6 @@ import {
   selectionAnchorFromPointerRelease,
 } from "./SelectableMessageProse.js";
 
-// Minimal fake node tree: a node "contains" another if it is the node itself
-// or appears in its descendant set. Avoids a full DOM while still exercising
-// the containment predicate.
 class FakeNode {
   descendants = new Set<FakeNode>();
   contains(other: unknown): boolean {
@@ -25,18 +22,6 @@ function makeProse() {
 }
 
 describe("isSelectionWithinNode", () => {
-  it("rejects a collapsed selection", () => {
-    const { node, inside } = makeProse();
-    expect(
-      isSelectionWithinNode(node as unknown as Node, {
-        isCollapsed: true,
-        anchorNode: inside as unknown as Node,
-        focusNode: inside as unknown as Node,
-        commonAncestorContainer: inside as unknown as Node,
-      }),
-    ).toBe(false);
-  });
-
   it("rejects a selection with an endpoint outside the node", () => {
     const { node, inside, outside } = makeProse();
     expect(

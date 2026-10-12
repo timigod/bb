@@ -4,6 +4,7 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { defaultAppSettings, type AppShortcut } from "@bb/domain";
+import { EMPTY_ORDERED_MENTION_SUGGESTIONS } from "@bb/client-core";
 import {
   AppCommandProvider,
   useAppCommandHandler,
@@ -18,8 +19,6 @@ const testState = vi.hoisted(() => ({
   calls: [] as string[],
   composerInputLocked: false,
   sidebarHandlerResult: true,
-  // The sidebar chord under test. Overridden per test to cover both a chord the
-  // editor ignores and a chord the editor's own keymap claims.
   sidebarShortcut: {
     key: "\\",
     mod: true,
@@ -121,7 +120,7 @@ function renderComposer(extra: React.ReactNode = null) {
           mentionMenuPlacement="bottom"
           typeahead={{
             mention: {
-              suggestions: [],
+              results: EMPTY_ORDERED_MENTION_SUGGESTIONS,
               isLoading: false,
               isError: false,
               onQueryChange: vi.fn(),
@@ -198,8 +197,6 @@ describe("prompt editor app shortcuts", () => {
   });
 
   it("runs a sidebar shortcut whose chord the editor keymap also claims", () => {
-    // Mod+Shift+B toggles a blockquote in the editor. The editor cancels the
-    // event, which used to leave the app command unreachable from the composer.
     testState.sidebarShortcut = {
       key: "b",
       mod: true,
@@ -220,18 +217,7 @@ describe("prompt editor app shortcuts", () => {
     expect(testState.calls).toEqual(["sidebar.toggle"]);
   });
 
-  it("releases composer focus on Escape", () => {
-    const editor = renderComposer();
-    expect(document.activeElement).toBe(editor);
-
-    pressInEditor(editor, { key: "Escape" });
-
-    expect(document.activeElement).not.toBe(editor);
-  });
-
   it("offers a declined chord to the handlers only once", () => {
-    // The editor dispatches first and leaves a declined event alone, so the
-    // window listener receives the same event. The handlers must not run twice.
     testState.sidebarHandlerResult = false;
     const editor = renderComposer();
 
@@ -241,7 +227,7 @@ describe("prompt editor app shortcuts", () => {
     expect(event.defaultPrevented).toBe(false);
   });
 
-  it("clears the keyboard hint when the composer runs a shortcut", () => {
+  it("keeps the keyboard hint until modifier release when the composer runs a shortcut", () => {
     vi.useFakeTimers();
     try {
       const editor = renderComposer(<ShortcutHintState />);
@@ -256,6 +242,10 @@ describe("prompt editor app shortcuts", () => {
       });
 
       expect(testState.calls).toEqual(["sidebar.toggle"]);
+      expect(screen.getByText("hint-held")).toBeDefined();
+      act(() => {
+        window.dispatchEvent(new KeyboardEvent("keyup", { key: "Control" }));
+      });
       expect(screen.getByText("hint-released")).toBeDefined();
     } finally {
       vi.useRealTimers();

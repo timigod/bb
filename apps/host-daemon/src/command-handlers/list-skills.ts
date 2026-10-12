@@ -1,9 +1,15 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolveCodexHome } from "@bb/config/codex-home";
 import { resolveDataDirSkillsRootPath } from "@bb/config/skill-storage-paths";
+import {
+  EMPTY_PROVIDER_NATIVE_ROOTS,
+  EMPTY_PROVIDER_RESOLVED_NATIVE_ROOTS,
+  providerNativeRootsAreEmpty,
+  type ProviderNativeRoots,
+} from "@bb/domain";
 import type {
+  DiscoveredSkill,
   HostDaemonOnlineRpcResult,
   SkillRootKind,
 } from "@bb/host-daemon-contract";
@@ -15,17 +21,18 @@ import {
 import {
   type CommandScanRoot,
   discoverSkills,
+  SKILL_FILE_NAME,
   type SkillScanRoot,
 } from "../command-discovery.js";
 import {
-  type CommandRootResolution,
-  resolveProviderCommandScanRoots,
+  type DeclaredScanRootResolution,
+  resolveDeclaredScanRoots,
 } from "./list-commands.js";
 import { writeHostFile } from "./file-write.js";
 
-const SKILL_FILE_NAME = "SKILL.md";
+type SkillRootResolution = DeclaredScanRootResolution;
 
-type SkillRootResolution = CommandRootResolution;
+const SHARED_SKILLS_PROVIDER_ID = "bb-shared";
 
 function createBbSkillScanRoot(
   rootPath: string,
@@ -42,16 +49,14 @@ function createBbSkillScanRoot(
   };
 }
 
-/**
- * Resolve the project-local bb root owned by this host. Global bb-user and
- * bb-builtin skills remain server-owned so remote hosts never interpret server
- * filesystem paths or create a second, divergent user catalog.
- */
 function resolveBbSkillScanRoots(
   resolution: SkillRootResolution,
 ): SkillScanRoot[] {
   const roots: SkillScanRoot[] = [];
-  if (resolution.cwd !== null) {
+  if (
+    resolution.cwd !== null &&
+    resolution.providerId !== SHARED_SKILLS_PROVIDER_ID
+  ) {
     roots.push(
       createBbSkillScanRoot(
         path.join(resolution.cwd, ".bb", "skills"),
@@ -62,90 +67,41 @@ function resolveBbSkillScanRoots(
   return roots;
 }
 
-/**
- * Classify a scan root by its originating identity so the server can map it to a
- * product scope. Plugin roots are tagged structurally (they always carry a
- * `namePrefix`); provider base roots are matched by exact path against the same
- * resolution that produced them. bb roots arrive already tagged from
- * `resolveBbSkillScanRoots`. Returns `null` for legacy command roots or an
- * unrecognized root.
- */
 function classifySkillRoot(
   root: CommandScanRoot,
-  resolution: CommandRootResolution,
+  resolution: SkillRootResolution,
 ): Pick<SkillScanRoot, "identitySeed" | "rootKind"> | null {
   if (root.source !== "skill") {
     return null;
   }
   if (root.namePrefix !== "") {
     const rootPath = "rootPath" in root ? root.rootPath : root.filePath;
-    // Provider plugin discovery currently exposes a display namespace but not
-    // the registry's canonical plugin id. Keep plugin skills unique by their
-    // authoritative root path until that discovery contract grows a stable
-    // plugin identity; native/bb skills below are path-independent.
     return {
       identitySeed: `plugin:${resolution.providerId}:${root.namePrefix}:${rootPath}`,
       rootKind: "plugin",
     };
   }
-  if (root.skillIdentitySeed !== undefined) {
-    const shared = resolution.providerId === "bb-shared";
-    return {
-      identitySeed: root.skillIdentitySeed,
-      rootKind: shared
-        ? root.origin === "project"
-          ? "shared-project"
-          : "shared-user"
-        : root.origin === "project"
-          ? "provider-project"
-          : "provider-user",
-    };
-  }
-  // All remaining non-plugin skill base roots are directory-shaped.
-  if (root.shape !== "skill" && root.shape !== "skill-recursive") {
+  if (root.skillIdentitySeed === undefined) {
     return null;
   }
-  const { rootPath } = root;
-  if (
-    resolution.cwd !== null &&
-    (rootPath === path.join(resolution.cwd, ".claude", "skills") ||
-      rootPath === path.join(resolution.cwd, ".codex", "skills") ||
-      (resolution.providerId === "codex" &&
-        root.origin === "project" &&
-        path.basename(rootPath) === "skills" &&
-        path.basename(path.dirname(rootPath)) === ".agents"))
-  ) {
-    return {
-      identitySeed:
-        root.skillIdentitySeed ?? `${resolution.providerId}:provider-project`,
-      rootKind: "provider-project",
-    };
-  }
-  if (
-    rootPath === path.join(resolution.homeDir, ".claude", "skills") ||
-    rootPath === path.join(resolution.codexHome, "skills") ||
-    rootPath === path.join(resolution.codexHome, "skills", ".system")
-  ) {
-    return {
-      identitySeed: `${resolution.providerId}:provider-user:${
-        rootPath.endsWith(`${path.sep}.system`) ? "system" : "user"
-      }`,
-      rootKind: "provider-user",
-    };
-  }
-  return null;
+  const shared = resolution.providerId === SHARED_SKILLS_PROVIDER_ID;
+  return {
+    identitySeed: root.skillIdentitySeed,
+    rootKind: shared
+      ? root.origin === "project"
+        ? "shared-project"
+        : "shared-user"
+      : root.origin === "project"
+        ? "provider-project"
+        : "provider-user",
+  };
 }
 
-/**
- * Resolve the skill scan roots for a provider and tag each with its `rootKind`.
- * Reuses the command-typeahead root resolution verbatim (single source of root
- * paths), then drops non-skill roots and roots that do not classify.
- */
 export async function resolveSkillScanRoots(
   resolution: SkillRootResolution,
 ): Promise<SkillScanRoot[]> {
   const skillRoots = resolveBbSkillScanRoots(resolution);
-  const providerRoots = await resolveProviderCommandScanRoots(resolution);
+  const providerRoots = await resolveDeclaredScanRoots(resolution);
   for (const root of providerRoots) {
     const classification = classifySkillRoot(root, resolution);
     if (classification === null) {
@@ -156,6 +112,26 @@ export async function resolveSkillScanRoots(
   return skillRoots;
 }
 
+export async function listSharedSkills(args: {
+  cwd: string;
+  roots: ProviderNativeRoots;
+}): Promise<DiscoveredSkill[]> {
+  if (providerNativeRootsAreEmpty(args.roots)) {
+    return [];
+  }
+  const roots = await resolveSkillScanRoots({
+    cwd: args.cwd,
+    homeDir: os.homedir(),
+    providerId: SHARED_SKILLS_PROVIDER_ID,
+    nativeRoots: {
+      skills: args.roots,
+      commands: EMPTY_PROVIDER_NATIVE_ROOTS,
+      resolved: EMPTY_PROVIDER_RESOLVED_NATIVE_ROOTS,
+    },
+  });
+  return discoverSkills({ roots });
+}
+
 export async function listHostSkills(
   command: CommandOf<"host.list_skills">,
   _options: { dataDir: string },
@@ -163,15 +139,11 @@ export async function listHostSkills(
   if (command.cwd !== null && !path.isAbsolute(command.cwd)) {
     throw new CommandDispatchError("invalid_path", "cwd must be absolute");
   }
-  const homeDir = os.homedir();
   const roots = await resolveSkillScanRoots({
     cwd: command.cwd,
-    homeDir,
-    codexHome: resolveCodexHome(homeDir),
+    homeDir: os.homedir(),
     providerId: command.providerId,
-    ...(command.nativeSkillRoots !== undefined
-      ? { nativeSkillRoots: command.nativeSkillRoots }
-      : {}),
+    nativeRoots: command.nativeRoots,
   });
   const skills = await discoverSkills({ roots });
   return { skills };
@@ -188,10 +160,6 @@ function isSafeSkillName(name: string): boolean {
   );
 }
 
-/**
- * Resolve the root that owns a deletable skill. bb roots are derived locally;
- * provider roots are supplied by the server after authoritative discovery.
- */
 function resolveDeletableSkillRoot(
   args: {
     scope: CommandOf<"host.delete_skill">["scope"];
@@ -233,11 +201,6 @@ async function realpathOrNull(targetPath: string): Promise<string | null> {
   }
 }
 
-/**
- * Delete a user-owned skill directory. Defense-in-depth confinement requires a
- * safe single-segment name and an exact realpath match to the named direct
- * child `<root>/<name>`, refusing symlink leaves before recursive removal.
- */
 export async function deleteHostSkill(
   command: CommandOf<"host.delete_skill">,
   options: { dataDir: string },
@@ -266,8 +229,6 @@ export async function deleteHostSkill(
       `Skill "${command.name}" not found`,
     );
   }
-  // Must resolve to the named direct child — a symlinked leaf pointing anywhere
-  // else (in or out of the root) is refused for this destructive op.
   if (realTarget !== path.join(realRoot, command.name)) {
     throw new CommandDispatchError(
       "skill_outside_root",
@@ -296,12 +257,6 @@ export async function deleteHostSkill(
   return { deletedPath: realTarget };
 }
 
-/**
- * Overwrite an existing bb skill's SKILL.md. Same confinement as delete: path
- * built host-side from `(scope, name, cwd)`, name a single safe segment, and the
- * resolved target must be exactly `<bb-root>/<name>` of an existing skill (one
- * whose SKILL.md already exists). Edits only — never creates a new skill.
- */
 export async function writeHostSkill(
   command: CommandOf<"host.write_skill">,
   options: { dataDir: string },
@@ -331,7 +286,6 @@ export async function writeHostSkill(
     );
   }
   const skillFilePath = path.join(realTarget, SKILL_FILE_NAME);
-  // Edit-only: the SKILL.md must already exist (creation is via prompt).
   const skillFileStat = await fs.stat(skillFilePath).catch(() => null);
   if (skillFileStat === null || !skillFileStat.isFile()) {
     throw new ExpectedCommandDispatchError(

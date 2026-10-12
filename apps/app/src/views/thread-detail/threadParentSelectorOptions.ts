@@ -1,6 +1,6 @@
 import type { ThreadListEntry } from "@bb/domain";
 
-export interface ParentSelectorOption {
+interface ParentSelectorOption {
   label: string;
   value: string;
 }
@@ -16,7 +16,7 @@ interface CollectDescendantThreadIdsArgs {
   threads: readonly ThreadListEntry[];
 }
 
-export interface BuildParentSelectorOptionsArgs {
+interface BuildParentSelectorOptionsArgs {
   currentThreadId: string | undefined;
   parentThreads: readonly ThreadListEntry[];
   parentThreadDisplayName: string | null | undefined;
@@ -33,7 +33,6 @@ export function isRootThread(
   );
 }
 
-// A hidden thread (a side chat, say) is not a parent a user can pick.
 function isHiddenThread(
   thread: Pick<ThreadAssignmentState, "visibility">,
 ): boolean {
@@ -99,14 +98,25 @@ export function buildParentSelectorOptions({
     parentThreadId ?? undefined,
     parentThreadDisplayName ?? "Parent thread",
   );
-  for (const parentThread of parentThreads) {
-    if (isHiddenThread(parentThread)) {
-      continue;
+  const threadIdsWithChildren = new Set<string>();
+  for (const thread of parentThreads) {
+    if (thread.parentThreadId !== null) {
+      threadIdsWithChildren.add(thread.parentThreadId);
     }
-    addOption(
-      parentThread.id,
-      parentThread.title?.trim() ? parentThread.title : "Parent thread",
-    );
+  }
+  for (const hasChildren of [true, false]) {
+    for (const parentThread of parentThreads) {
+      if (
+        isHiddenThread(parentThread) ||
+        threadIdsWithChildren.has(parentThread.id) !== hasChildren
+      ) {
+        continue;
+      }
+      addOption(
+        parentThread.id,
+        parentThread.title?.trim() ? parentThread.title : "Parent thread",
+      );
+    }
   }
 
   return options;

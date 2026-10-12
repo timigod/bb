@@ -3,9 +3,12 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import semver from "semver";
 import { PLUGIN_SDK_MAJOR } from "@bb/domain";
-import { assertValidPluginCompactIconSvg } from "@bb/plugin-build";
+import {
+  assertValidPluginCompactIconSvg,
+  assertValidPluginIconSvg,
+} from "@bb/plugin-build";
 
-export interface PluginArtifactMeta {
+interface PluginArtifactMeta {
   sdkMajor: number;
   sdkVersion: string;
   artifactFormatVersion?: 1;
@@ -17,46 +20,27 @@ export interface PluginArtifactMeta {
   };
 }
 
-export interface PluginArtifactMetaParseResult {
+interface PluginArtifactMetaParseResult {
   meta: PluginArtifactMeta | null;
   error: string | null;
 }
 
-/**
- * Frontend bundle inventory + asset state for plugins that declare `bb.app`
- * (design §5.1). The plugin service refreshes this per load (install, boot,
- * reload); GET /api/v1/plugins serves the wire shape and the asset routes
- * serve the recorded file paths with the recorded content hash.
- */
-
-/** Wire shape of one plugin's loadable frontend bundle (GET /api/v1/plugins). */
-export interface PluginAppBundleInfo {
-  /** App-relative asset URL, content-hash query included. */
+interface PluginAppBundleInfo {
   jsUrl: string;
-  /** Null when the plugin ships no dist/app.css (host loads JS only). */
   cssUrl: string | null;
-  /** sha256 (first 16 hex chars) over dist/app.js + dist/app.css +
-   * dist/app.meta.json bytes. Meta rides the hash so an SDK-version-only
-   * change (identical js/css) still re-keys frontend reconcile + caching. */
+  jsBytes: number;
   hash: string;
-  /** SDK version stamped into dist/app.meta.json at build time. */
   sdkMajor: number;
   sdkVersion: string;
-  /** False when sdkMajor differs from the running PLUGIN_SDK_MAJOR — the
-   * frontend skips the bundle ("needs update"); the backend keeps running. */
   compatible: boolean;
 }
 
-/** App-bundle slice of a GET /api/v1/plugins entry. */
-export interface PluginAppState {
-  /** Whether the manifest declares a `bb.app` frontend entry. */
+interface PluginAppState {
   hasApp: boolean;
-  /** Null when dist/app.js or dist/app.meta.json is missing/unreadable. */
   bundle: PluginAppBundleInfo | null;
 }
 
-/** On-disk asset record backing GET /plugins/:id/assets/*. */
-export interface PluginAppAssets {
+interface PluginAppAssets {
   jsPath: string;
   cssPath: string | null;
   hash: string;
@@ -67,43 +51,32 @@ export interface PluginAppBundleSnapshot {
   assets: PluginAppAssets | null;
 }
 
-// ---------------------------------------------------------------------------
-// Plugin branding assets from path-shaped `bb.branding.icon` values and
-// `bb.branding.logo`. Served with the same hash-busting scheme as bundle
-// assets and refreshed on every load like the bundle snapshot.
-// ---------------------------------------------------------------------------
-
 const BRANDING_ASSET_CONTENT_TYPES: Record<string, string> = {
   svg: "image/svg+xml",
   png: "image/png",
   webp: "image/webp",
 };
 
-/** Stable route names for plugin-owned branding assets. */
 export type PluginBrandingAssetVariant = "icon" | "logo" | "logo-dark";
 
-/** Immutable byte snapshot backing one GET /plugins/:id/assets/<variant>. */
 export interface PluginBrandingAssetSnapshot {
-  /** App-relative asset URL, content-hash query included. */
   url: string;
-  /** The exact bytes used to compute `hash`; never re-read from source. */
   bytes: Uint8Array;
   contentType: string;
-  /** sha256 (first 16 hex chars) over the asset bytes. */
   hash: string;
 }
 
-/** All declared branding assets of one plugin; each is null when absent. */
 export interface PluginBrandingAssetSet {
   compactIcon: PluginBrandingAssetSnapshot | null;
   logo: PluginBrandingAssetSnapshot | null;
   logoDark: PluginBrandingAssetSnapshot | null;
+  icons: ReadonlyMap<string, PluginBrandingAssetSnapshot>;
 }
 
-/**
- * Read and hash one explicitly declared branding asset. Manifest parsing has
- * already validated that the path is a readable supported asset.
- */
+export function brandingAssetHash(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+}
+
 async function loadPluginBrandingAsset(
   pluginId: string,
   manifestPath: string | undefined,
@@ -119,7 +92,7 @@ async function loadPluginBrandingAsset(
     .toLowerCase();
   const contentType = BRANDING_ASSET_CONTENT_TYPES[extension];
   if (contentType === undefined) return null;
-  const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+  const hash = brandingAssetHash(bytes);
   return {
     url: `/api/v1/plugins/${encodeURIComponent(pluginId)}/assets/${variant}?h=${hash}`,
     bytes,
@@ -128,16 +101,36 @@ async function loadPluginBrandingAsset(
   };
 }
 
-/** Read and hash every explicitly declared branding asset. */
+async function loadPluginIconAsset(
+  pluginId: string,
+  name: string,
+  path: string,
+): Promise<PluginBrandingAssetSnapshot> {
+  const bytes = await readFile(path);
+  assertValidPluginIconSvg(bytes, `bb.branding.experimental_icons["${name}"]`);
+  const hash = brandingAssetHash(bytes);
+  return {
+    url: `/api/v1/plugins/${encodeURIComponent(pluginId)}/assets/icons/${encodeURIComponent(name)}.svg?h=${hash}`,
+    bytes,
+    contentType: "image/svg+xml",
+    hash,
+  };
+}
+
 export async function loadPluginBrandingAssets(
   pluginId: string,
   manifest: {
     branding: {
       compactIconPath?: string;
       logo?: { lightPath: string; darkPath?: string };
+      icons: ReadonlyMap<string, string>;
     };
   },
 ): Promise<PluginBrandingAssetSet> {
+  const icons = new Map<string, PluginBrandingAssetSnapshot>();
+  for (const [name, path] of manifest.branding.icons) {
+    icons.set(name, await loadPluginIconAsset(pluginId, name, path));
+  }
   return {
     compactIcon: await loadPluginBrandingAsset(
       pluginId,
@@ -154,18 +147,11 @@ export async function loadPluginBrandingAssets(
       manifest.branding.logo?.darkPath,
       "logo-dark",
     ),
+    icons,
   };
 }
 
-/**
- * Parse `dist/app.meta.json` contents strictly, or null when malformed:
- * sdkMajor must be a non-negative safe integer, sdkVersion a valid semver,
- * and the two must agree (semver.major(sdkVersion) === sdkMajor) — an
- * inconsistent sidecar would make the compatibility gate lie.
- */
-export function parsePluginArtifactMeta(
-  raw: string,
-): PluginArtifactMetaParseResult {
+function parsePluginArtifactMeta(raw: string): PluginArtifactMetaParseResult {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -266,9 +252,8 @@ export function parsePluginAppBundleMeta(
   return parsePluginArtifactMeta(raw).meta;
 }
 
-/** Validate one install artifact against the running SDK and its manifest. */
 export function validatePluginArtifactMeta(args: {
-  artifact: "server" | "app";
+  artifact: "server" | "app" | "host";
   raw: string;
   pluginId: string;
   pluginVersion: string;
@@ -291,7 +276,6 @@ export function validatePluginArtifactMeta(args: {
   return null;
 }
 
-/** `dist/app.meta.json` contents, or null when missing/malformed. */
 export async function readPluginAppBundleMeta(
   rootDir: string,
 ): Promise<PluginArtifactMeta | null> {
@@ -304,11 +288,6 @@ export async function readPluginAppBundleMeta(
   return parsePluginAppBundleMeta(raw);
 }
 
-/**
- * Read `<rootDir>/dist/` into a servable snapshot. Missing/unreadable
- * app.js or app.meta.json → `bundle: null` (the frontend has nothing to
- * load); a missing app.css is fine (`cssUrl: null`).
- */
 export async function loadPluginAppBundle(
   pluginId: string,
   rootDir: string,
@@ -338,22 +317,20 @@ export async function loadPluginAppBundle(
   } catch {
     css = null;
   }
-  // Meta bytes ride the hash: a meta-only change (same js/css) must still
-  // produce a fresh hash, or the frontend's hash-keyed reconcile would never
-  // re-evaluate compatibility and the immutable asset cache would never key
-  // off the new state.
   const hasher = createHash("sha256").update(js);
   if (css !== null) hasher.update(css);
   hasher.update(metaRaw);
+  hasher.update(pluginId);
   const hash = hasher.digest("hex").slice(0, 16);
   const assetUrl = (file: string) =>
-    `/api/v1/plugins/${encodeURIComponent(pluginId)}/assets/${file}?h=${hash}`;
+    `/api/v1/plugin-app-assets/${hash}/${file}`;
   return {
     state: {
       hasApp: true,
       bundle: {
         jsUrl: assetUrl("app.js"),
         cssUrl: css !== null ? assetUrl("app.css") : null,
+        jsBytes: js.byteLength,
         hash,
         sdkMajor: meta.sdkMajor,
         sdkVersion: meta.sdkVersion,

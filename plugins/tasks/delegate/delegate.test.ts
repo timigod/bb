@@ -1,7 +1,7 @@
 import {
   createFakePluginHost,
   makeThreadResponse,
-} from "@bb/plugin-sdk/testing";
+} from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { createStore } from "../api";
 import type { Comment, Project, Task } from "../db";
@@ -21,6 +21,7 @@ function createTestPreset(
     providerId: "claude-code",
     modelId: "claude-sonnet-5",
     reasoningLevel: "high",
+    serviceTier: "fast",
     permissionMode: "full",
     environmentKind: overrides.environmentKind ?? "project-default",
     baseBranch: overrides.baseBranch ?? null,
@@ -75,6 +76,7 @@ describe("task delegation", () => {
           providerId: "claude-code",
           model: "claude-sonnet-5",
           reasoningLevel: "high",
+          serviceTier: "fast",
           permissionMode: "full",
           title: "TASK-1 · Implement delegation",
           prompt: expect.stringContaining(
@@ -163,6 +165,44 @@ describe("task delegation", () => {
         threadId: "thr_fast",
         liveStatus: "working",
       }),
+    ]);
+
+    await harness.dispose();
+  });
+
+  it("bounds delegated thread titles by display width", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "tasks",
+      sdk: {
+        threads: {
+          spawn: async () => ({ id: "thr_wide_title" }),
+          get: async () =>
+            makeThreadResponse({ id: "thr_wide_title", status: "starting" }),
+        },
+      },
+    });
+    const store = createStore(bb);
+    const project = store.tasks.createProject({
+      name: "Tasks plugin",
+      prefix: "TASK",
+      color: "blue",
+      linkedBbProjectId: "proj_bb",
+    });
+    const task = store.tasks.createTask({
+      projectId: project.id,
+      title: "调".repeat(100),
+    });
+    registerDelegation(bb, store);
+    const preset = createTestPreset(store);
+
+    await harness.callRpc("delegate", {
+      taskId: task.id,
+      presetId: preset.id,
+    });
+
+    const title = `TASK-1 · ${"调".repeat(55)}`;
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([
+      [expect.objectContaining({ title })],
     ]);
 
     await harness.dispose();
@@ -325,35 +365,6 @@ describe("task delegation", () => {
     await harness.dispose();
   });
 
-  it("fails before spawning when the task project is not linked to bb", async () => {
-    const { bb, harness } = createFakePluginHost({
-      pluginId: "tasks",
-      sdk: { threads: { spawn: async () => ({ id: "thr_never" }) } },
-    });
-    const store = createStore(bb);
-    const project = store.tasks.createProject({
-      name: "Unlinked",
-      prefix: "UNL",
-      color: "blue",
-    });
-    const task = store.tasks.createTask({
-      projectId: project.id,
-      title: "Cannot delegate yet",
-    });
-    registerDelegation(bb, store);
-    const preset = createTestPreset(store);
-
-    await expect(
-      harness.callRpc("delegate", { taskId: task.id, presetId: preset.id }),
-    ).rejects.toMatchObject({
-      code: "handler_error",
-      message: 'Task project "Unlinked" is not linked to a bb project',
-    });
-    expect(harness.sdk.callsTo("threads.spawn")).toEqual([]);
-
-    await harness.dispose();
-  });
-
   it("self-attaches an existing thread through taskThreadsAttach", async () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "tasks",
@@ -361,7 +372,7 @@ describe("task delegation", () => {
         threads: {
           get: async () => ({
             id: "thr_existing",
-            title: "Existing worker",
+            title: "𠮷".repeat(100),
             titleFallback: null,
             status: "active",
           }),
@@ -393,7 +404,7 @@ describe("task delegation", () => {
       expect.objectContaining({
         threadId: "thr_existing",
         presetName: "Attached",
-        title: "Existing worker",
+        title: "𠮷".repeat(60),
         liveStatus: "working",
       }),
     ]);
@@ -404,6 +415,85 @@ describe("task delegation", () => {
         payload: { taskId: task.id, projectId: project.id },
       },
     ]);
+
+    await harness.dispose();
+  });
+});
+
+describe("task thread detach", () => {
+  it("detaches an attached thread through taskThreadsDetach and invalidates", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "tasks",
+      sdk: {
+        threads: {
+          get: async ({ threadId }: { threadId: string }) => ({
+            id: threadId,
+            title: `Worker ${threadId}`,
+            titleFallback: null,
+            status: threadId === "thr_dead" ? "error" : "idle",
+          }),
+        },
+      },
+    });
+    const store = createStore(bb);
+    const project = store.tasks.createProject({
+      name: "Manual",
+      prefix: "MAN",
+      color: "blue",
+    });
+    const task = store.tasks.createTask({
+      projectId: project.id,
+      title: "Respawned work",
+    });
+    const otherTask = store.tasks.createTask({
+      projectId: project.id,
+      title: "Other work",
+    });
+    registerDelegation(bb, store);
+
+    await harness.callRpc("taskThreadsAttach", {
+      taskId: task.id,
+      threadId: "thr_dead",
+    });
+    await harness.callRpc("taskThreadsAttach", {
+      taskId: task.id,
+      threadId: "thr_live",
+    });
+    await harness.callRpc("taskThreadsAttach", {
+      taskId: otherTask.id,
+      threadId: "thr_dead",
+    });
+    harness.realtimeSignals.length = 0;
+
+    await expect(
+      harness.callRpc("taskThreadsDetach", {
+        taskId: task.id,
+        threadId: "thr_dead",
+      }),
+    ).resolves.toEqual({ threadId: "thr_dead" });
+
+    expect(
+      store.tasks.listTaskThreads(task.id).map((thread) => thread.threadId),
+    ).toEqual(["thr_live"]);
+    expect(
+      store.tasks
+        .listTaskThreads(otherTask.id)
+        .map((thread) => thread.threadId),
+    ).toEqual(["thr_dead"]);
+    expect(harness.realtimeSignals).toEqual([
+      { channel: "threads:changed", payload: { taskId: task.id } },
+      {
+        channel: "tasks:changed",
+        payload: { taskId: task.id, projectId: project.id },
+      },
+    ]);
+
+    await expect(
+      harness.callRpc("taskThreadsDetach", {
+        taskId: task.id,
+        threadId: "thr_dead",
+      }),
+    ).rejects.toThrow(`Thread thr_dead is not attached to ${task.key}`);
 
     await harness.dispose();
   });

@@ -9,9 +9,10 @@ import {
   connectCode,
   labelClaim,
   machine,
-  MAX_SERVERS_PER_ACCOUNT,
+  MAX_PER_ACCOUNT,
   schema,
   server,
+  sha256Hex,
   user,
 } from "@bb/connect-db";
 import {
@@ -20,6 +21,7 @@ import {
   claimHandle,
   createConnectCode,
   createMachineCodeForServerCredential,
+  lookupMachineCodeForServerCredential,
   createServer,
   disconnectServer,
   removeServer,
@@ -30,10 +32,7 @@ import {
   revokeMachineForServerCredential,
   revokeMachine,
 } from "./api.js";
-import { sha256Hex } from "./tokens.js";
 
-// Real in-memory SQLite (never mock the DB): apply the same connect-db
-// migration chain the worker runs, then drive the product-state functions.
 const MIGRATIONS_DIR = fileURLToPath(
   new URL("../../../../packages/connect-db/migrations", import.meta.url),
 );
@@ -57,6 +56,7 @@ beforeEach(() => {
     appUrl: "https://getbb.app",
     serverUrlTemplate: "https://{label}.getbb.app",
     closeTunnel,
+    tunnelConnected: null,
   };
 });
 
@@ -123,7 +123,6 @@ describe("claimHandle", () => {
     expect(await claimHandle(deps, "u1", "ab")).toEqual({ error: "too-short" });
 
     await claimHandle(deps, "u1", "sawyer");
-    // A second account cannot take a handle already used as another server's subdomain.
     expect(await claimHandle(deps, "u2", "sawyer")).toEqual({ error: "taken" });
   });
 
@@ -174,15 +173,14 @@ describe("createServer (connect another bb)", () => {
   it("enforces the per-account server cap", async () => {
     seedUser("u1");
     await claimHandle(deps, "u1", "sawyer");
-    // One primary already; add up to the cap, then the next is rejected.
-    for (let i = 1; i < MAX_SERVERS_PER_ACCOUNT; i++) {
+    for (let i = 1; i < MAX_PER_ACCOUNT; i++) {
       expect("ok" in (await createServer(deps, "u1", `sawyer-${i}`))).toBe(
         true,
       );
     }
     expect(
       db.select().from(server).where(eq(server.userId, "u1")).all(),
-    ).toHaveLength(MAX_SERVERS_PER_ACCOUNT);
+    ).toHaveLength(MAX_PER_ACCOUNT);
     expect(await createServer(deps, "u1", "sawyer-over")).toEqual({
       error: "server-limit",
     });
@@ -267,7 +265,6 @@ describe("redeemConnectCode (multi-server routing label)", () => {
     const desktop = await createServer(deps, "u1", "sawyer-desktop");
     if (!("ok" in desktop)) throw new Error("setup");
 
-    // Primary starts unpaired (no credential hash); second server is the redeem target.
     const primary = db
       .select()
       .from(server)
@@ -284,14 +281,11 @@ describe("redeemConnectCode (multi-server routing label)", () => {
     if ("error" in result)
       throw new Error(`${result.error} (${result.status})`);
 
-    // (a) Wire handle is the second server's routing label, not the primary account handle.
     expect(result.handle).toBe("sawyer-desktop");
     expect(result.serverId).toBe(desktop.server.id);
-    // (b) tunnelUrl is keyed by that subdomain.
     expect(result.tunnelUrl).toBe("wss://sawyer-desktop.getbb.app/__tunnel");
     expect(result.credential.startsWith("bbcred_")).toBe(true);
 
-    // (c) Credential hash lands on the second server only; primary is untouched.
     const second = db
       .select()
       .from(server)
@@ -325,7 +319,6 @@ describe("redeemConnectCode (multi-server routing label)", () => {
     if ("error" in result)
       throw new Error(`${result.error} (${result.status})`);
 
-    // Primary server: subdomain === account handle — byte-identical pre-fix behavior.
     expect(result.handle).toBe("sawyer");
     expect(result.tunnelUrl).toBe("wss://sawyer.getbb.app/__tunnel");
   });
@@ -357,7 +350,6 @@ describe("disconnectServer (server-scoped)", () => {
     const desktop = await createServer(deps, "u1", "sawyer-desktop");
     if (!("ok" in desktop)) throw new Error("setup");
 
-    // Pair both servers (give each a credential).
     db.update(server).set({ credentialHash: "hash", revokedAt: null }).run();
 
     const r = await disconnectServer(deps, "u1", desktop.server.id);
@@ -373,7 +365,6 @@ describe("disconnectServer (server-scoped)", () => {
     expect(target?.credentialHash).toBeNull();
     expect(target?.revokedAt).not.toBeNull();
 
-    // The primary is untouched.
     const primary = db
       .select()
       .from(server)
@@ -414,11 +405,9 @@ describe("removeServer (delete a never-paired row)", () => {
       db.select().from(server).where(eq(server.id, desktop.server.id)).get(),
     ).toBeUndefined();
 
-    // The address is now free (availability treats any live row as taken).
     const avail = await checkAvailability(deps, "sawyer-desktop");
     expect(avail.available).toBe(true);
 
-    // The primary is untouched.
     expect(
       db.select().from(server).where(eq(server.subdomain, "sawyer")).get(),
     ).toBeDefined();
@@ -481,7 +470,7 @@ describe("getAccountState (adaptive single / multi)", () => {
     expect(state.handle).toBeNull();
     expect(state.servers).toHaveLength(0);
     expect(state.githubLogin).toBe("sawyerhood");
-    expect(state.maxServers).toBe(MAX_SERVERS_PER_ACCOUNT);
+    expect(state.maxServers).toBe(MAX_PER_ACCOUNT);
   });
 
   it("returns one server, flagged primary, after a claim", async () => {
@@ -524,7 +513,6 @@ describe("getAccountState (adaptive single / multi)", () => {
     expect(online.connected).toBe(true);
     expect(online.online).toBe(true);
 
-    // Stale heartbeat → connected but offline.
     db.update(server)
       .set({ lastSeenAt: new Date(Date.now() - 10 * 60 * 1000) })
       .run();
@@ -534,49 +522,259 @@ describe("getAccountState (adaptive single / multi)", () => {
   });
 });
 
-describe("server-authenticated machine-code round trip", () => {
-  it("mints for the credential's exact server and redeems one durable bbcm_ token", async () => {
+describe("getAccountState with tunnel objects as the liveness source", () => {
+  it("reports servers and labelled machines online from their tunnel objects, not from last_seen_at", async () => {
     seedUser("u1");
     await claimHandle(deps, "u1", "sawyer");
-    const target = await createServer(deps, "u1", "sawyer-desktop");
-    if (!("ok" in target)) throw new Error("server setup failed");
-    const serverCredential = "bbcred_server_owned";
+    await createServer(deps, "u1", "sawyer-desktop");
+    await createServer(deps, "u1", "sawyer-unpaired");
+    const stale = new Date(Date.now() - 60 * 60 * 1000);
+    const fresh = new Date();
     db.update(server)
-      .set({
-        credentialHash: await sha256Hex(serverCredential),
-        revokedAt: null,
-      })
-      .where(eq(server.id, target.server.id))
+      .set({ credentialHash: "hash", revokedAt: null, lastSeenAt: stale })
+      .where(eq(server.subdomain, "sawyer"))
       .run();
-
-    const minted = await createMachineCodeForServerCredential(
-      deps,
-      serverCredential,
+    db.update(server)
+      .set({ credentialHash: "hash-2", revokedAt: null, lastSeenAt: fresh })
+      .where(eq(server.subdomain, "sawyer-desktop"))
+      .run();
+    db.insert(machine)
+      .values([
+        {
+          id: "machine-tunnel",
+          userId: "u1",
+          subdomain: "air",
+          credentialHash: "hash-air",
+          lastSeenAt: stale,
+          createdAt: new Date(1),
+        },
+        {
+          id: "machine-requests",
+          userId: "u1",
+          credentialHash: "hash-requests",
+          lastSeenAt: fresh,
+          createdAt: new Date(2),
+        },
+        {
+          id: "machine-gone",
+          userId: "u1",
+          subdomain: "gone",
+          credentialHash: "hash-gone",
+          lastSeenAt: stale,
+          createdAt: new Date(3),
+        },
+      ])
+      .run();
+    const machineRoutingKeys = Object.fromEntries(
+      db
+        .select()
+        .from(labelClaim)
+        .where(eq(labelClaim.kind, "machine"))
+        .all()
+        .map((claim) => [claim.label, `${claim.label}:${claim.generation}`]),
     );
-    if ("status" in minted) throw new Error(minted.error);
-    expect(minted.serverUrl).toBe("https://sawyer-desktop.getbb.app");
+    const airKey = machineRoutingKeys.air;
+    const goneKey = machineRoutingKeys.gone;
+    if (airKey === undefined || goneKey === undefined) {
+      throw new Error("expected label claims for both labelled machines");
+    }
+    const asked: string[] = [];
+    const answers: Record<string, boolean> = {
+      sawyer: true,
+      "sawyer-desktop": false,
+      [airKey]: true,
+      [goneKey]: false,
+    };
 
-    const redeemed = await redeemMachineCode(deps, minted.code);
-    if ("error" in redeemed) throw new Error(redeemed.error);
-    expect(redeemed.credential.startsWith("bbcm_")).toBe(true);
-    expect(redeemed.serverUrl).toBe("https://sawyer-desktop.getbb.app");
-    expect(db.select().from(machine).all()).toHaveLength(1);
-    await expect(
-      revokeMachineForServerCredential(
+    const state = await getAccountState(
+      {
+        ...deps,
+        tunnelConnected: async (routingKey) => {
+          asked.push(routingKey);
+          return answers[routingKey] ?? null;
+        },
+      },
+      "u1",
+    );
+
+    expect(
+      Object.fromEntries(state.servers.map((s) => [s.subdomain, s.online])),
+    ).toEqual({
+      sawyer: true,
+      "sawyer-desktop": false,
+      "sawyer-unpaired": false,
+    });
+    expect(
+      Object.fromEntries(state.machines.map((m) => [m.id, m.online])),
+    ).toEqual({
+      "machine-tunnel": true,
+      "machine-requests": true,
+      "machine-gone": false,
+    });
+    expect(asked.sort()).toEqual(
+      [airKey, goneKey, "sawyer", "sawyer-desktop"].sort(),
+    );
+  });
+});
+
+describe("pairing code purposes", () => {
+  it("refuses a machine code at the server redeem endpoint and leaves it usable for the machine", async () => {
+    seedUser("u1");
+    await claimHandle(deps, "u1", "sawyer");
+    const pair = await createConnectCode(deps, "u1", {});
+    if ("error" in pair) throw new Error(pair.error);
+    const paired = await redeemConnectCode(deps, pair.code);
+    if ("error" in paired) throw new Error(paired.error);
+
+    const machineCode = await createMachineCodeForServerCredential(
+      deps,
+      paired.credential,
+    );
+    if ("status" in machineCode) throw new Error(machineCode.error);
+
+    expect(await redeemConnectCode(deps, machineCode.code)).toEqual({
+      error: "invalid-code",
+      status: 404,
+    });
+    const row = db
+      .select()
+      .from(server)
+      .where(eq(server.subdomain, "sawyer"))
+      .get();
+    expect(row?.credentialHash).toBe(await sha256Hex(paired.credential));
+
+    const redeemed = await redeemMachineCode(deps, machineCode.code, null);
+    expect("error" in redeemed).toBe(false);
+  });
+});
+
+describe("server-authenticated machine-code round trip", () => {
+  it.each(["Pixel 9 Pro", null])(
+    "mints for the exact server and redeems a device named %s",
+    async (deviceName) => {
+      seedUser("u1");
+      await claimHandle(deps, "u1", "sawyer");
+      const target = await createServer(deps, "u1", "sawyer-desktop");
+      if (!("ok" in target)) throw new Error("server setup failed");
+      const serverCredential = "bbcred_server_owned";
+      db.update(server)
+        .set({
+          credentialHash: await sha256Hex(serverCredential),
+          revokedAt: null,
+        })
+        .where(eq(server.id, target.server.id))
+        .run();
+
+      const minted = await createMachineCodeForServerCredential(
         deps,
         serverCredential,
-        redeemed.machineId,
-      ),
-    ).resolves.toEqual({ ok: true });
-    expect(
-      db.select().from(machine).where(eq(machine.id, redeemed.machineId)).get()
-        ?.revokedAt,
-    ).not.toBeNull();
-    await expect(redeemMachineCode(deps, minted.code)).resolves.toMatchObject({
-      error: "already-used",
-      status: 409,
-    });
-  });
+      );
+      if ("status" in minted) throw new Error(minted.error);
+      expect(minted.serverUrl).toBe("https://sawyer-desktop.getbb.app");
+
+      expect(
+        await lookupMachineCodeForServerCredential(
+          deps,
+          serverCredential,
+          minted.code,
+        ),
+      ).toEqual({ consumed: false, machineId: null });
+      const redeemed = await redeemMachineCode(deps, minted.code, deviceName);
+      if ("error" in redeemed) throw new Error(redeemed.error);
+      expect(
+        await lookupMachineCodeForServerCredential(
+          deps,
+          serverCredential,
+          minted.code,
+        ),
+      ).toEqual({ consumed: true, machineId: redeemed.machineId });
+      expect(
+        await lookupMachineCodeForServerCredential(deps, "bogus", minted.code),
+      ).toMatchObject({ status: 401 });
+      const other = await createServer(deps, "u1", "sawyer-other");
+      if (!("ok" in other)) throw new Error("server setup failed");
+      db.update(server)
+        .set({ credentialHash: await sha256Hex("bbcred_other") })
+        .where(eq(server.id, other.server.id))
+        .run();
+      expect(
+        await lookupMachineCodeForServerCredential(
+          deps,
+          "bbcred_other",
+          minted.code,
+        ),
+      ).toMatchObject({ status: 404 });
+      expect(redeemed.credential.startsWith("bbcm_")).toBe(true);
+      expect(redeemed.serverUrl).toBe("https://sawyer-desktop.getbb.app");
+      expect(db.select().from(machine).all()).toHaveLength(1);
+      expect((await getAccountState(deps, "u1")).machines).toEqual([
+        expect.objectContaining({ id: redeemed.machineId, name: deviceName }),
+      ]);
+      await expect(
+        revokeMachineForServerCredential(
+          deps,
+          serverCredential,
+          redeemed.machineId,
+        ),
+      ).resolves.toEqual({ ok: true });
+      expect(
+        db
+          .select()
+          .from(machine)
+          .where(eq(machine.id, redeemed.machineId))
+          .get()?.revokedAt,
+      ).not.toBeNull();
+      const revokedAt = db.select().from(machine).get()?.revokedAt;
+      for (const token of [serverCredential, "bbcred_other"]) {
+        await expect(
+          revokeMachineForServerCredential(deps, token, redeemed.machineId),
+        ).resolves.toEqual({ ok: true });
+      }
+      expect(db.select().from(machine).get()?.revokedAt).toEqual(revokedAt);
+      await expect(
+        revokeMachineForServerCredential(deps, serverCredential, "missing"),
+      ).resolves.toEqual({ error: "not-found", status: 404 });
+      seedUser("foreign");
+      db.insert(machine)
+        .values({
+          id: "foreign-device",
+          userId: "foreign",
+          credentialHash: "foreign-hash",
+          createdAt: new Date(),
+          revokedAt: new Date(),
+        })
+        .run();
+      await expect(
+        revokeMachineForServerCredential(
+          deps,
+          serverCredential,
+          "foreign-device",
+        ),
+      ).resolves.toEqual({ error: "not-found", status: 404 });
+      for (const token of ["", "bogus"]) {
+        await expect(
+          revokeMachineForServerCredential(deps, token, redeemed.machineId),
+        ).resolves.toEqual({ error: "unauthorized", status: 401 });
+      }
+      db.update(server)
+        .set({ revokedAt: new Date() })
+        .where(eq(server.id, target.server.id))
+        .run();
+      await expect(
+        revokeMachineForServerCredential(
+          deps,
+          serverCredential,
+          redeemed.machineId,
+        ),
+      ).resolves.toEqual({ error: "unauthorized", status: 401 });
+      await expect(
+        redeemMachineCode(deps, minted.code, null),
+      ).resolves.toMatchObject({
+        error: "already-used",
+        status: 409,
+      });
+    },
+  );
 
   it("rejects a bogus server credential", async () => {
     seedUser("u1");
@@ -635,6 +833,10 @@ describe("dashboard machine recovery", () => {
     expect(closeTunnel).toHaveBeenCalledWith("lost-laptop:lost-generation");
     expect(closeTunnel).toHaveBeenCalledTimes(1);
     expect((await getAccountState(deps, "u1")).machines).toEqual([]);
+    await expect(revokeMachine(deps, "u1", "machine-owner")).resolves.toEqual({
+      ok: true,
+    });
+    expect(closeTunnel).toHaveBeenCalledTimes(1);
     expect(
       db.select().from(machine).where(eq(machine.id, "machine-owner")).get()
         ?.subdomain,

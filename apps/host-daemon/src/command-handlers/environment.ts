@@ -1,13 +1,13 @@
-import { threadScope, type ProvisioningTranscriptEntry } from "@bb/domain";
+import {
+  threadScope,
+  type ProvisioningTranscriptEntry,
+  WORKSPACE_PROVISIONING_STEP_KEYS,
+} from "@bb/domain";
 import type {
   EnvironmentProvisionCommand,
   HostDaemonCommandResult,
 } from "@bb/host-daemon-contract";
-import {
-  getPersonalWorkspaceRoot,
-  validatePersonalWorkspaceTargetPath,
-  type ProvisionWorkspaceArgs,
-} from "@bb/host-workspace";
+import type { ProvisionWorkspaceArgs } from "@bb/host-workspace";
 import {
   type CommandDispatchOptions,
   type CommandOf,
@@ -19,35 +19,32 @@ interface ProvisionProgressEmitter {
   onProgress: ProvisionProgressCallback;
 }
 type BuildOnProgressArgs = {
-  command: CommandOf<"environment.provision">;
+  command: CommandOf<"environment.attach">;
   options: CommandDispatchOptions;
-  transcript: ProvisioningTranscriptEntry[];
 };
 
 const PROVISION_PROGRESS_BATCH_MS = 1_000;
 
 export async function provisionEnvironment(
-  command: CommandOf<"environment.provision">,
+  command: CommandOf<"environment.attach">,
   options: CommandDispatchOptions,
-): Promise<HostDaemonCommandResult<"environment.provision">> {
+): Promise<HostDaemonCommandResult<"environment.attach">> {
   const alreadyExists =
     options.runtimeManager.get(command.environmentId) != null;
 
-  const transcript: ProvisioningTranscriptEntry[] = [];
-  const progress = buildOnProgress({
-    command,
-    options,
-    transcript,
-  });
+  const progress = buildOnProgress({ command, options });
+  let streamedAnyStep = false;
+  const onProgress: ProvisionProgressCallback = (entry) => {
+    streamedAnyStep = true;
+    progress.onProgress(entry);
+  };
 
   try {
     const entry = await options.runtimeManager.ensureEnvironment({
       environmentId: command.environmentId,
-      provision: toProvisionWorkspaceOptions(
-        command,
-        options,
-        progress.onProgress,
-      ),
+      provision: toProvisionWorkspaceOptions(command, onProgress),
+      setupScriptTimeoutMs: command.setupScriptTimeoutMs,
+      setupContributedEnv: command.contributedEnv,
     });
 
     const [branchName, resolvedDefaultBranch] = await Promise.all([
@@ -60,17 +57,14 @@ export async function provisionEnvironment(
       ? (resolvedDefaultBranch ?? branchName)
       : null;
 
-    // For fresh provisions, emit cwd (for unmanaged) and branch/SHA entries.
-    if (!alreadyExists) {
-      if (!entry.workspace.managed) {
-        progress.onProgress({
-          type: "step",
-          key: "workspace-path",
-          text: `Using workspace: ${entry.workspace.path}`,
-          status: "completed",
-          startedAt: Date.now(),
-        });
-      }
+    if (!alreadyExists || !streamedAnyStep) {
+      onProgress({
+        type: "step",
+        key: WORKSPACE_PROVISIONING_STEP_KEYS.workspacePath,
+        text: `Using workspace: ${entry.workspace.path}`,
+        status: "completed",
+        startedAt: Date.now(),
+      });
       if (entry.workspace.isGitRepo && branchName) {
         let branchText = `Using branch: ${branchName}`;
         const metadata: { branchName: string; sha?: string } = { branchName };
@@ -80,12 +74,10 @@ export async function provisionEnvironment(
             branchText = `Using branch: ${branchName} (${sha.slice(0, 7)})`;
             metadata.sha = sha;
           }
-        } catch {
-          // SHA unavailable (e.g., empty repo)
-        }
-        progress.onProgress({
+        } catch {}
+        onProgress({
           type: "step",
-          key: "workspace-branch",
+          key: WORKSPACE_PROVISIONING_STEP_KEYS.workspaceBranch,
           text: branchText,
           status: "completed",
           startedAt: Date.now(),
@@ -100,11 +92,8 @@ export async function provisionEnvironment(
       isWorktree: entry.workspace.isWorktree,
       branchName,
       defaultBranch,
-      transcript: alreadyExists ? [] : transcript,
     };
   } finally {
-    // Flush buffered progress events before reporting the command result so
-    // streamed transcript entries stay ordered ahead of the terminal outcome.
     progress.flush();
     if (command.initiator) {
       await options.eventSink.flush();
@@ -113,24 +102,22 @@ export async function provisionEnvironment(
 }
 
 export function cancelEnvironmentProvision(
-  command: CommandOf<"environment.provision.cancel">,
+  command: CommandOf<"environment.attach.cancel">,
   options: CommandDispatchOptions,
-): Promise<HostDaemonCommandResult<"environment.provision.cancel">> {
+): Promise<HostDaemonCommandResult<"environment.attach.cancel">> {
   return options.runtimeManager.cancelEnvironmentProvision({
     environmentId: command.environmentId,
   });
 }
 
 function buildOnProgress(args: BuildOnProgressArgs): ProvisionProgressEmitter {
-  const { command, options, transcript } = args;
+  const { command, options } = args;
   const initiator = command.initiator;
   const eventSink = options.eventSink;
   if (!initiator) {
     return {
       flush: () => undefined,
-      onProgress: (entry) => {
-        transcript.push(entry);
-      },
+      onProgress: () => undefined,
     };
   }
   const threadId = initiator.threadId;
@@ -170,52 +157,18 @@ function buildOnProgress(args: BuildOnProgressArgs): ProvisionProgressEmitter {
   return {
     flush,
     onProgress: (entry) => {
-      transcript.push(entry);
       pendingEntries.push(entry);
       scheduleFlush();
     },
   };
 }
 
-export function toProvisionWorkspaceOptions(
+function toProvisionWorkspaceOptions(
   command: EnvironmentProvisionCommand,
-  options: Pick<CommandDispatchOptions, "dataDir">,
   onProgress?: ProvisionProgressCallback,
 ): ProvisionWorkspaceArgs {
-  switch (command.workspaceProvisionType) {
-    case "unmanaged": {
-      return {
-        workspaceProvisionType: "unmanaged" as const,
-        path: command.path,
-        ...(command.checkout ? { checkout: command.checkout } : {}),
-        onProgress,
-      };
-    }
-    case "managed-worktree": {
-      return {
-        workspaceProvisionType: command.workspaceProvisionType,
-        sourcePath: command.sourcePath,
-        targetPath: command.targetPath,
-        branchName: command.branchName,
-        baseBranch: command.baseBranch,
-        timeoutMs: command.setupTimeoutMs,
-        onProgress,
-      };
-    }
-    case "personal": {
-      const personalWorkspaceRoot = getPersonalWorkspaceRoot(options.dataDir);
-      const targetPath = validatePersonalWorkspaceTargetPath({
-        environmentId: command.environmentId,
-        personalWorkspaceRoot,
-        targetPath: command.targetPath,
-      });
-      return {
-        workspaceProvisionType: command.workspaceProvisionType,
-        environmentId: command.environmentId,
-        personalWorkspaceRoot,
-        targetPath,
-        onProgress,
-      };
-    }
-  }
+  return {
+    path: command.path,
+    onProgress,
+  };
 }

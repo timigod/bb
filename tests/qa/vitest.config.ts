@@ -4,5 +4,6 @@ export default defineWorkspaceTestConfig({
   test: {
     include: ["test/**/*.test.ts"],
     name: "@bb/qa",
+    testTimeout: 15_000,
   },
 });

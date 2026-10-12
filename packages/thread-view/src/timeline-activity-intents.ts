@@ -1,7 +1,8 @@
 import type {
   TimelineActivityIntent,
   TimelineCommandWorkRow,
-  TimelineToolWorkRow,
+  TimelineFileReadWorkRow,
+  TimelineSearchWorkRow,
 } from "@bb/server-contract";
 import { assertNever } from "./assert-never.js";
 import {
@@ -11,27 +12,66 @@ import {
 
 export type TimelineExplorationWorkRow =
   | TimelineCommandWorkRow
-  | TimelineToolWorkRow;
+  | TimelineFileReadWorkRow
+  | TimelineSearchWorkRow;
 type TimelineReadActivityIntent = Extract<
   TimelineActivityIntent,
   { type: "read" }
 >;
 
+export function timelineRowActivityIntents(
+  row: TimelineExplorationWorkRow,
+): readonly TimelineActivityIntent[] {
+  switch (row.workKind) {
+    case "command":
+      return row.activityIntents;
+    case "file-read":
+      return [
+        {
+          type: "read",
+          command: row.cmd ?? row.path,
+          name: "fileRead",
+          path: row.path,
+        },
+      ];
+    case "search":
+      if (row.mode === "content") {
+        return [
+          {
+            type: "search",
+            command: row.cmd ?? row.query,
+            query: row.query,
+            path: row.path,
+          },
+        ];
+      }
+      return [
+        {
+          type: "list_files",
+          command: row.cmd ?? row.query,
+          path: row.path ?? (row.query.length > 0 ? row.query : null),
+        },
+      ];
+    default:
+      return assertNever(row);
+  }
+}
+
 const SKILL_FILE_NAME = "SKILL.md";
 const PLUGIN_CACHE_PATH_MARKERS = ["plugins", "cache"];
 
-export interface FormatTimelineActivityIntentDetailArgs {
+interface FormatTimelineActivityIntentDetailArgs {
   intent: TimelineActivityIntent;
   pathMode: TimelinePathDisplayMode;
   pending: boolean;
 }
 
-export interface TimelineActivityIntentTextParts {
+interface TimelineActivityIntentTextParts {
   prefix: string | null;
   content: string;
 }
 
-export interface FormatTimelineActivityIntentDetailPartsArgs {
+interface FormatTimelineActivityIntentDetailPartsArgs {
   intent: TimelineActivityIntent;
   pathMode: TimelinePathDisplayMode;
   pending: boolean;
@@ -47,7 +87,9 @@ export function primaryTimelineActivityIntent(
   row: TimelineExplorationWorkRow,
 ): TimelineActivityIntent | null {
   return (
-    row.activityIntents.find((intent) => intent.type !== "unknown") ?? null
+    timelineRowActivityIntents(row).find(
+      (intent) => intent.type !== "unknown",
+    ) ?? null
   );
 }
 

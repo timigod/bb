@@ -5,54 +5,42 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThreadTerminalContent } from "./ThreadTerminalContent";
 import type { ThreadTerminalController } from "./useThreadTerminalController";
+import { makeTerminalSession } from "@/test/fixtures/terminal-sessions";
 
 const threadTerminalView = vi.hoisted(() =>
-  vi.fn((_props: { autoFocus: boolean; isPanelOpen: boolean }) => null),
+  vi.fn((props: { autoFocus: boolean; isPanelOpen: boolean }) => (
+    <div
+      data-testid="terminal-view"
+      data-panel-open={String(props.isPanelOpen)}
+    />
+  )),
 );
 
 vi.mock("./ThreadTerminalView", () => ({
   ThreadTerminalView: threadTerminalView,
 }));
 
-const session: TerminalSession = {
+const session: TerminalSession = makeTerminalSession({
   id: "term_1",
   threadId: "thr_1",
   environmentId: "env_1",
   hostId: "host_1",
-  title: "Terminal",
-  initialCwd: "/workspace",
-  cols: 100,
-  rows: 30,
-  status: "running",
-  exitCode: null,
-  closeReason: null,
   createdAt: 1,
   updatedAt: 1,
-  lastUserInputAt: null,
-};
+});
 
-function controller(isPanelOpen: boolean): ThreadTerminalController {
+function controller(
+  isPanelOpen: boolean,
+  shouldMountTerminalView: boolean = isPanelOpen,
+): ThreadTerminalController {
   return {
     activeSession: session,
-    activeTerminalId: session.id,
-    canCreateTerminal: true,
-    closingTerminalId: null,
-    emptyTerminalMessage: "No terminals",
     handleActiveTerminalSessionChange: () => undefined,
     handleActiveTerminalTitleChange: () => undefined,
-    handleActiveTerminalUserInput: () => undefined,
-    handleClosePanel: () => undefined,
-    handleCloseTerminal: () => undefined,
-    handleCreateTerminal: () => undefined,
-    handleSelectTerminal: () => undefined,
     hasTerminalQueryError: false,
-    isCreateTerminalPending: false,
     isPanelOpen,
-    isTerminalQueryLoading: false,
-    showTerminalPlaceholders: false,
-    shouldRetainActiveTerminalView: false,
+    shouldMountTerminalView,
     terminalBodyMessage: "No terminals",
-    visibleSessions: [session],
   };
 }
 
@@ -82,5 +70,44 @@ describe("ThreadTerminalContent", () => {
       autoFocus: true,
       isPanelOpen: true,
     });
+  });
+
+  it("keeps the mounted terminal view alive while a persisted panel is hidden", () => {
+    const rendered = render(
+      <ThreadTerminalContent autoFocus={false} controller={controller(true)} />,
+    );
+    const mountedView = rendered.getByTestId("terminal-view");
+
+    rendered.rerender(
+      <ThreadTerminalContent
+        autoFocus={false}
+        controller={controller(false, true)}
+      />,
+    );
+
+    const hiddenView = rendered.getByTestId("terminal-view");
+    expect(hiddenView).toBe(mountedView);
+    expect(hiddenView.dataset.panelOpen).toBe("false");
+
+    rendered.rerender(
+      <ThreadTerminalContent autoFocus={false} controller={controller(true)} />,
+    );
+    expect(rendered.getByTestId("terminal-view")).toBe(mountedView);
+  });
+
+  it("unmounts the terminal view once the panel is neither open nor persisted", () => {
+    const rendered = render(
+      <ThreadTerminalContent autoFocus={false} controller={controller(true)} />,
+    );
+    expect(rendered.queryByTestId("terminal-view")).not.toBeNull();
+
+    rendered.rerender(
+      <ThreadTerminalContent
+        autoFocus={false}
+        controller={controller(false, false)}
+      />,
+    );
+
+    expect(rendered.queryByTestId("terminal-view")).toBeNull();
   });
 });

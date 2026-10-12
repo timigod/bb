@@ -14,14 +14,11 @@ interface SystemTitleArgs {
   systemMessageSubject: SystemMessageSubject | null;
 }
 
-// The component always supplies the `agent`-only props; the `system` path
-// ignores them, so anchor them to inert values for these system-title cases.
 function systemTitle({
   systemMessageKind,
   systemMessageSubject,
 }: SystemTitleArgs) {
   return generatedConversationTitle({
-    originKind: null,
     sourceKind: "system",
     sourceName: "BB",
     sourceThreadId: null,
@@ -103,6 +100,25 @@ describe("generatedConversationTitle — system source", () => {
     expect(title.segments[0]?.link).toBeUndefined();
   });
 
+  it("names the tool whose detached result arrived", () => {
+    const title = systemTitle({
+      systemMessageKind: "tool-result-delivered",
+      systemMessageSubject: {
+        kind: "tool-call",
+        toolName: "grill_round",
+        suppress: false,
+      },
+    });
+
+    expect(title.plain).toBe("Delivered grill_round result");
+    expect(title.segments).toHaveLength(3);
+    expect(title.segments[0]?.text).toBe("Delivered");
+    expect(title.segments[1]?.text).toBe("grill_round");
+    expect(title.segments[1]?.em).toBe(true);
+    expect(title.segments[1]?.link).toBeUndefined();
+    expect(title.segments[2]?.text).toBe("result");
+  });
+
   it("falls back to the generic System Message title for unlabeled rows", () => {
     const title = systemTitle({
       systemMessageKind: "unlabeled",
@@ -116,8 +132,6 @@ describe("generatedConversationTitle — system source", () => {
   });
 
   it("falls back to System Message when the subject shape mismatches the kind", () => {
-    // Defensive: a `thread`-expecting kind handed a non-thread subject must not
-    // throw — it degrades to the generic title.
     const title = systemTitle({
       systemMessageKind: "child-completed",
       systemMessageSubject: { kind: "thread-batch", count: 2 },
@@ -130,7 +144,6 @@ describe("generatedConversationTitle — system source", () => {
 describe("generatedConversationTitle — agent source", () => {
   it("links the sender thread name (reference pattern, unchanged)", () => {
     const title = generatedConversationTitle({
-      originKind: null,
       sourceKind: "agent",
       sourceName: "Worker 2",
       sourceThreadId: "thr_sender",
@@ -143,5 +156,18 @@ describe("generatedConversationTitle — agent source", () => {
     expect(title.segments).toHaveLength(2);
     expect(title.segments[1]?.text).toBe("Worker 2");
     expect(title.segments[1]?.link).toEqual(threadLink("thr_sender"));
+  });
+  it("links the recipient thread name of a sent message", () => {
+    const title = generatedConversationTitle({
+      sourceKind: "agent-recipient",
+      sourceName: "Worker 2",
+      sourceThreadId: "thr_recipient",
+      sourceIsPluginSideChat: false,
+      systemMessageKind: "unlabeled",
+      systemMessageSubject: null,
+    });
+
+    expect(title.plain).toBe("Sent to Worker 2");
+    expect(title.segments[1]?.link).toEqual(threadLink("thr_recipient"));
   });
 });

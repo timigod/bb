@@ -1,7 +1,6 @@
-import { access } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import {
   resolveCurrentDevInstanceConfig,
   toDevProcessEnv,
@@ -9,24 +8,27 @@ import {
 } from "@bb/config/runtime";
 import { migrateLegacyDevData } from "../lib/legacy-dev-data-migration.js";
 import { runScriptProcess } from "../lib/process-helpers.js";
+import { repoRoot, runMainIfEntrypoint } from "../lib/script-entry.js";
 
 interface PortAvailabilityCheck {
   label: string;
   port: number;
 }
 
-interface DevTurboCommand {
+interface DevCommand {
   args: string[];
   command: string;
 }
 
+export type DevLaunchMode = "vite" | "worktree";
+
+export type DevCloud = "local" | "staging";
+
+export const STAGING_CLOUD_URL = "https://vibecodethis.site";
+
 const LOOPBACK_HOST = "127.0.0.1";
 
-const commandDir = dirname(fileURLToPath(import.meta.url));
-const packageRoot = resolve(commandDir, "..", "..");
-const repoRoot = resolve(packageRoot, "..", "..");
-
-export function createDevTurboCommand(): DevTurboCommand {
+function createDevTurboCommand(): DevCommand {
   return {
     args: [
       "exec",
@@ -46,13 +48,91 @@ export function createDevTurboCommand(): DevTurboCommand {
   };
 }
 
-function formatConfig(config: DevInstanceConfig): string {
+export function createStartWorktreeCommand(
+  dryRun = false,
+  performanceDiagnostics = false,
+): DevCommand {
+  return {
+    args: [
+      "--conditions=source",
+      "--import",
+      "tsx",
+      resolve(repoRoot, "scripts", "start-bb.mjs"),
+      "--worktree-runtime-policy",
+      ...(dryRun ? ["--dryrun"] : []),
+      ...(performanceDiagnostics ? ["--perf-diagnostics"] : []),
+    ],
+    command: process.execPath,
+  };
+}
+
+export function resolveDevLaunchMode(args: string[]): DevLaunchMode {
+  if (args.length === 0) {
+    return "vite";
+  }
+  if (args.length === 1 && args[0] === "--worktree") {
+    return "worktree";
+  }
+  throw new Error(
+    `[dev] Unknown arguments: ${args.join(" ")}. Expected no arguments, --staging, or --worktree.`,
+  );
+}
+
+export function resolveDevCloud(args: {
+  staging: boolean;
+  mode: DevLaunchMode;
+}): DevCloud {
+  if (!args.staging) {
+    return "local";
+  }
+  if (args.mode !== "vite") {
+    throw new Error("[dev] --staging is supported by pnpm dev only.");
+  }
+  return "staging";
+}
+
+export function toDevLaunchProcessEnv(args: {
+  baseEnv: NodeJS.ProcessEnv;
+  cloud: DevCloud;
+  config: DevInstanceConfig;
+  mode: DevLaunchMode;
+}): NodeJS.ProcessEnv {
+  const env = toDevProcessEnv({
+    baseEnv: args.baseEnv,
+    config: args.config,
+  });
+  if (args.cloud === "staging") {
+    env.BB_DEV_CONNECT_BASE_URL = STAGING_CLOUD_URL;
+  }
+  if (args.mode === "vite") {
+    return env;
+  }
+
+  delete env.BB_DEV_APP_PORT;
+  env.BB_TELEMETRY = "false";
+  env.NODE_ENV = "production";
+  return env;
+}
+
+function formatConfig(
+  config: DevInstanceConfig,
+  mode: DevLaunchMode,
+  cloud: DevCloud,
+): string {
+  const prefix = mode === "worktree" ? "[start:worktree]" : "[dev]";
+  const appUrl =
+    mode === "worktree"
+      ? config.serverUrl
+      : `http://localhost:${config.ports.appPort}`;
   return [
-    `[dev] Instance ${config.instanceId}`,
-    `[dev] Data dir ${config.dataDir}`,
-    `[dev] App http://localhost:${config.ports.appPort}`,
-    `[dev] Server ${config.serverUrl}`,
-    `[dev] Host daemon http://127.0.0.1:${config.ports.hostDaemonPort}`,
+    `${prefix} Instance ${config.instanceId}`,
+    `${prefix} Data dir ${config.dataDir}`,
+    `${prefix} App ${appUrl}`,
+    `${prefix} Server ${config.serverUrl}`,
+    `${prefix} Host daemon http://127.0.0.1:${config.ports.hostDaemonPort}`,
+    ...(cloud === "staging"
+      ? [`${prefix} bb account and Connect use ${STAGING_CLOUD_URL}`]
+      : []),
   ].join("\n");
 }
 
@@ -80,12 +160,17 @@ function checkPortAvailable(check: PortAvailabilityCheck): Promise<void> {
   });
 }
 
-async function assertPortsAvailable(config: DevInstanceConfig): Promise<void> {
+async function assertPortsAvailable(
+  config: DevInstanceConfig,
+  mode: DevLaunchMode,
+): Promise<void> {
   const checks: PortAvailabilityCheck[] = [
-    { label: "app", port: config.ports.appPort },
     { label: "server", port: config.ports.serverPort },
     { label: "host-daemon", port: config.ports.hostDaemonPort },
   ];
+  if (mode === "vite") {
+    checks.unshift({ label: "app", port: config.ports.appPort });
+  }
   await Promise.all(checks.map(checkPortAvailable));
 }
 
@@ -94,42 +179,66 @@ async function resolveExistingRepoRoot(): Promise<string> {
   return repoRoot;
 }
 
-export async function main(): Promise<void> {
-  const resolvedRepoRoot = await resolveExistingRepoRoot();
-  const config = resolveCurrentDevInstanceConfig(resolvedRepoRoot);
-  const migration = await migrateLegacyDevData({
-    config,
-    output: process.stdout,
-  });
-  if (migration.skippedReason === "legacy-dev-process-running") {
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const dryRun = args.includes("--dryrun");
+  const mode = resolveDevLaunchMode(
+    args.filter(
+      (arg) =>
+        arg !== "--dryrun" &&
+        arg !== "--staging" &&
+        arg !== "--perf-diagnostics",
+    ),
+  );
+  if (args.includes("--perf-diagnostics") && mode !== "worktree") {
     throw new Error(
-      "[dev] Legacy ~/.bb-dev data was found, but an old dev server or host-daemon is still running. Stop the old dev process and rerun pnpm dev to migrate it.",
+      "--perf-diagnostics is supported by pnpm start and pnpm start:worktree.",
     );
   }
-  await assertPortsAvailable(config);
-  process.stdout.write(`${formatConfig(config)}\n`);
-
-  const turboCommand = createDevTurboCommand();
-  process.exitCode = await runScriptProcess({
-    args: turboCommand.args,
-    command: turboCommand.command,
-    cwd: config.repoRoot,
-    env: toDevProcessEnv({
-      baseEnv: process.env,
+  const cloud = resolveDevCloud({ staging: args.includes("--staging"), mode });
+  if (dryRun && mode !== "worktree") {
+    throw new Error(
+      "--dryrun is supported by pnpm start and pnpm start:worktree.",
+    );
+  }
+  const resolvedRepoRoot = await resolveExistingRepoRoot();
+  const config = resolveCurrentDevInstanceConfig(resolvedRepoRoot);
+  if (!dryRun) {
+    const migration = await migrateLegacyDevData({
       config,
+      output: process.stdout,
+    });
+    if (migration.skippedReason === "legacy-dev-process-running") {
+      throw new Error(
+        "[dev] Legacy ~/.bb-dev data was found, but an old dev server or host-daemon is still running. Stop the old dev process and rerun pnpm dev to migrate it.",
+      );
+    }
+    await assertPortsAvailable(config, mode);
+    await mkdir(config.dataDir, { recursive: true });
+    await writeFile(
+      resolve(config.dataDir, "bb-dev-instance.json"),
+      JSON.stringify({ repoRoot: config.repoRoot }),
+      "utf8",
+    );
+    process.stdout.write(`${formatConfig(config, mode, cloud)}\n`);
+  }
+
+  const command =
+    mode === "worktree"
+      ? createStartWorktreeCommand(dryRun, args.includes("--perf-diagnostics"))
+      : createDevTurboCommand();
+  process.exitCode = await runScriptProcess({
+    args: command.args,
+    command: command.command,
+    cwd: config.repoRoot,
+    env: toDevLaunchProcessEnv({
+      baseEnv: process.env,
+      cloud,
+      config,
+      mode,
     }),
     stdio: "inherit",
   });
 }
 
-if (
-  process.argv[1] != null &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
-  void main().catch((error) => {
-    const message =
-      error instanceof Error ? (error.stack ?? error.message) : String(error);
-    process.stderr.write(`${message}\n`);
-    process.exitCode = 1;
-  });
-}
+runMainIfEntrypoint(import.meta.url, main);

@@ -3,73 +3,25 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { HostDaemonOnlineRpcResult } from "@bb/host-daemon-contract";
-import {
-  CommandDispatchError,
-  ExpectedCommandDispatchError,
-} from "../command-dispatch-support.js";
+import { isPathWithinDirectory } from "@bb/process-utils";
+import { CommandDispatchError } from "../command-dispatch-support.js";
 import type { CommandOf } from "../command-dispatch-support.js";
 import { isFsErrorWithCode } from "../fs-errors.js";
-import { NON_IMAGE_FILE_SIZE_LIMIT_BYTES, sha256Hex } from "./file-read.js";
+import { sha256Hex } from "../sha256-hex.js";
+import {
+  createMissingTargetError,
+  NON_IMAGE_FILE_SIZE_LIMIT_BYTES,
+} from "./file-read.js";
 import { resolveNonSymlinkDirectoryPath } from "./root-path.js";
+import { runInSerialLane } from "../serial-lane.js";
 
 const guardedWriteTails = new Map<string, Promise<void>>();
 
-async function serializeGuardedWrite<T>(
-  writePath: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = guardedWriteTails.get(writePath) ?? Promise.resolve();
-  let release: () => void = () => undefined;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const tail = previous.then(() => gate);
-  guardedWriteTails.set(writePath, tail);
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (guardedWriteTails.get(writePath) === tail) {
-      guardedWriteTails.delete(writePath);
-    }
-  }
-}
-
-export interface ResolvedWriteTarget {
-  /** Real (symlink-resolved) path to write, existing or not. */
+interface ResolvedWriteTarget {
   writePath: string;
-  /** True when the write target's direct parent directory is missing. */
   parentMissing: boolean;
 }
 
-export function isPathWithinRoot(
-  candidatePath: string,
-  rootPath: string,
-): boolean {
-  const relativePath = path.relative(rootPath, candidatePath);
-  return (
-    relativePath === "" ||
-    (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
-  );
-}
-
-function createMissingTargetError(
-  resultPath: string,
-): ExpectedCommandDispatchError {
-  return new ExpectedCommandDispatchError(
-    "ENOENT",
-    `Path does not exist: ${resultPath}`,
-  );
-}
-
-/**
- * Resolve the write target through symlinks even though it may not exist yet:
- * realpath the nearest existing ancestor and re-append the missing segments.
- * Containment (when a root is declared) is checked against this resolved
- * path, so a symlinked directory inside the root cannot smuggle a write
- * outside it.
- */
 export async function resolveWriteTarget(
   resolvedPath: string,
   resultPath: string,
@@ -127,7 +79,7 @@ export async function writeHostFile(
   const target = await resolveWriteTarget(resolvedPath, command.path);
 
   const write = () => writeResolvedHostFile(command, contents, target);
-  return serializeGuardedWrite(target.writePath, write);
+  return runInSerialLane(guardedWriteTails, target.writePath, write);
 }
 
 async function writeResolvedHostFile(
@@ -148,7 +100,7 @@ async function writeResolvedHostFile(
       }
       throw error;
     }
-    if (!isPathWithinRoot(target.writePath, realRootPath)) {
+    if (!isPathWithinDirectory(realRootPath, target.writePath)) {
       throw new CommandDispatchError(
         "invalid_path",
         `Path "${command.path}" escapes write root`,
@@ -213,7 +165,6 @@ async function writeResolvedHostFile(
 
       if (command.expectedSha256 === null) {
         try {
-          // Linking is an atomic no-replace create on every supported host.
           await fs.link(temporaryPath, target.writePath);
         } catch (error) {
           if (isFsErrorWithCode(error, "EEXIST")) {
@@ -228,8 +179,6 @@ async function writeResolvedHostFile(
           throw error;
         }
       } else {
-        // Recheck after preparing the complete replacement, then swap it into
-        // place with one rename so readers never observe partial content.
         const latest = await fs.readFile(target.writePath).catch(() => null);
         const latestSha256 = latest === null ? null : sha256Hex(latest);
         if (latestSha256 !== command.expectedSha256) {

@@ -8,8 +8,9 @@ import {
   type CSSProperties,
   type ComponentPropsWithoutRef,
   type PointerEventHandler,
+  type Ref,
 } from "react";
-import type { MermaidConfig, RenderResult } from "mermaid";
+import type { MermaidConfig } from "mermaid";
 import {
   Dialog,
   DialogContent,
@@ -20,18 +21,22 @@ import { Button } from "@bb/shared-ui/button";
 import { CopyButton } from "./copy-button.js";
 import { Icon } from "@bb/shared-ui/icon";
 import { loadMermaid } from "./markdown-mermaid-loader.js";
+import {
+  buildMermaidRenderCacheKey,
+  MERMAID_SOURCE_RENDER_DEBOUNCE_MS,
+  observeMermaidViewportEntry,
+  peekMermaidRenderCache,
+  readMermaidRenderCache,
+  storeMermaidRenderCache,
+  type RenderedMermaidDiagram,
+} from "./markdown-mermaid-render-cache.js";
 import { useAppThemeEpoch } from "@/hooks/useAppTheme";
 import type { Theme } from "@/hooks/useTheme";
 import { cn } from "@bb/shared-ui/lib/utils";
 
-export interface MarkdownMermaidDiagramProps {
+interface MarkdownMermaidDiagramProps {
   preferredTheme: Theme;
   source: string;
-}
-
-interface RenderedMermaidDiagram {
-  bindFunctions: RenderResult["bindFunctions"];
-  svg: string;
 }
 
 interface MermaidThemePalette {
@@ -205,7 +210,9 @@ type MermaidRenderState =
   | { kind: "source" };
 
 type MermaidTheme = NonNullable<MermaidConfig["theme"]>;
-type MermaidDiagramContainerProps = ComponentPropsWithoutRef<"div">;
+type MermaidDiagramContainerProps = ComponentPropsWithoutRef<"div"> & {
+  ref?: Ref<HTMLDivElement>;
+};
 type MermaidDiagramPointerHandler = PointerEventHandler<HTMLDivElement>;
 
 const MERMAID_THEME: MermaidTheme = "base";
@@ -223,13 +230,6 @@ const MERMAID_WHEEL_MIN_ZOOM_FACTOR = 0.82;
 const MERMAID_WHEEL_MAX_ZOOM_FACTOR = 1.22;
 const MERMAID_DIAGRAM_CENTER_POINT: MermaidDiagramPoint = { x: 0, y: 0 };
 
-// Mermaid bakes concrete colors into the rendered SVG and does its own
-// lighten/darken math, so it can't consume `var(--token)` directly. Resolve the
-// app's theme tokens to concrete rgb() strings at render time — mirroring
-// buildTerminalTheme in ThreadTerminalView — so diagrams track the active
-// palette (built-in or custom), not just light/dark mode. Each mermaid slot maps
-// to the closest semantic token; the neutral fills/borders/text follow the
-// canvas/ink anchors and the line color follows the accent.
 const MERMAID_TOKEN = {
   nodeFill: "--secondary",
   altFill: "--muted",
@@ -242,11 +242,6 @@ const MERMAID_TOKEN = {
 
 let srgbCanvasContext: CanvasRenderingContext2D | null | undefined;
 
-// Normalize any CSS color (including the oklch()/color-mix() values
-// getComputedStyle preserves) to an sRGB rgb()/rgba() string. Mermaid's color
-// math (khroma) only understands sRGB, so feeding it raw oklch() breaks shading.
-// fillStyle alone preserves the color space, so rasterize a pixel and read the
-// sRGB backing store back.
 function toSrgbColor(color: string): string {
   if (srgbCanvasContext === undefined) {
     srgbCanvasContext =
@@ -269,9 +264,6 @@ function resolveThemeColor(probe: HTMLElement, varName: string): string {
   const raw = getComputedStyle(document.documentElement)
     .getPropertyValue(varName)
     .trim();
-  // Assigning the (possibly color-mix/var) token to a real color property forces
-  // the browser to compute a concrete color. "currentColor" is a themed fallback
-  // if a token is ever missing.
   probe.style.color = raw || "currentColor";
   return toSrgbColor(getComputedStyle(probe).color);
 }
@@ -557,11 +549,13 @@ function createMermaidDialogDiagramStyle({
 function MermaidDiagramContainer({
   children,
   className,
+  ref,
   ...containerProps
 }: MermaidDiagramContainerProps) {
   return (
     <div
       {...containerProps}
+      ref={ref}
       className={cn(
         "my-2 overflow-hidden rounded-md border border-border bg-surface-recessed",
         className,
@@ -973,53 +967,119 @@ export function MarkdownMermaidDiagram({
   source,
 }: MarkdownMermaidDiagramProps) {
   const reactId = useId();
+  const containerElementRef = useRef<HTMLDivElement>(null);
   const diagramElementRef = useRef<HTMLDivElement>(null);
   const renderId = useMemo(() => buildMermaidRenderId(reactId), [reactId]);
-  // Re-render the SVG (which has baked-in colors) when the app palette changes,
-  // not just on light/dark mode toggles.
+  const renderAttemptRef = useRef(0);
   const appThemeEpoch = useAppThemeEpoch();
-  const [renderState, setRenderState] = useState<MermaidRenderState>({
-    kind: "loading",
-  });
+  const [initialCachedDiagram] = useState(() =>
+    peekMermaidRenderCache(
+      buildMermaidRenderCacheKey({ appThemeEpoch, preferredTheme, source }),
+    ),
+  );
+  const [renderState, setRenderState] = useState<MermaidRenderState>(() =>
+    initialCachedDiagram === null
+      ? { kind: "loading" }
+      : { kind: "rendered", diagram: initialCachedDiagram },
+  );
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [displayMode, setDisplayMode] =
     useState<MermaidDiagramDisplayMode>("preview");
+  const [hasEnteredViewport, setHasEnteredViewport] = useState(
+    initialCachedDiagram !== null,
+  );
+  const renderedSourceRef = useRef<string | null>(
+    initialCachedDiagram === null ? null : source,
+  );
 
   useEffect(() => {
+    const containerElement = containerElementRef.current;
+    if (hasEnteredViewport || containerElement === null) {
+      return;
+    }
+    return observeMermaidViewportEntry(containerElement, () => {
+      setHasEnteredViewport(true);
+    });
+  }, [hasEnteredViewport]);
+
+  useEffect(() => {
+    if (!hasEnteredViewport) {
+      return;
+    }
+    const cacheKey = buildMermaidRenderCacheKey({
+      appThemeEpoch,
+      preferredTheme,
+      source,
+    });
+    const cachedDiagram = readMermaidRenderCache(cacheKey);
+    const isSourceUpdate =
+      renderedSourceRef.current !== null &&
+      renderedSourceRef.current !== source;
+    renderedSourceRef.current = source;
+    if (cachedDiagram !== null) {
+      setRenderState((currentState) =>
+        currentState.kind === "rendered" &&
+        currentState.diagram === cachedDiagram
+          ? currentState
+          : { kind: "rendered", diagram: cachedDiagram },
+      );
+      setDisplayMode("preview");
+      return;
+    }
+
     let isCurrentRender = true;
-
-    setRenderState({ kind: "loading" });
-    setDisplayMode("preview");
-    loadMermaid()
-      .then((mermaid) => {
-        mermaid.initialize(buildMermaidConfig(preferredTheme));
-        return mermaid.render(renderId, source);
-      })
-      .then((renderResult) => {
-        if (!isCurrentRender) {
-          return;
-        }
-
-        setRenderState({
-          kind: "rendered",
-          diagram: {
+    const runRender = () => {
+      loadMermaid()
+        .then((mermaid) => {
+          if (!isCurrentRender) {
+            return null;
+          }
+          mermaid.initialize(buildMermaidConfig(preferredTheme));
+          return mermaid.render(
+            `${renderId}-${++renderAttemptRef.current}`,
+            source,
+          );
+        })
+        .then((renderResult) => {
+          if (!isCurrentRender || renderResult === null) {
+            return;
+          }
+          const diagram: RenderedMermaidDiagram = {
             bindFunctions: renderResult.bindFunctions,
             svg: renderResult.svg,
-          },
+          };
+          storeMermaidRenderCache(cacheKey, diagram);
+          setRenderState({ kind: "rendered", diagram });
+        })
+        .catch(() => {
+          if (!isCurrentRender) {
+            return;
+          }
+          setRenderState((currentState) =>
+            currentState.kind === "rendered"
+              ? currentState
+              : { kind: "source" },
+          );
         });
-      })
-      .catch(() => {
-        if (!isCurrentRender) {
-          return;
-        }
+    };
 
-        setRenderState({ kind: "source" });
-      });
-
+    if (!isSourceUpdate) {
+      setRenderState({ kind: "loading" });
+      setDisplayMode("preview");
+      runRender();
+      return () => {
+        isCurrentRender = false;
+      };
+    }
+    const timeoutId = window.setTimeout(
+      runRender,
+      MERMAID_SOURCE_RENDER_DEBOUNCE_MS,
+    );
     return () => {
       isCurrentRender = false;
+      window.clearTimeout(timeoutId);
     };
-  }, [preferredTheme, renderId, source, appThemeEpoch]);
+  }, [appThemeEpoch, hasEnteredViewport, preferredTheme, renderId, source]);
 
   useEffect(() => {
     if (renderState.kind !== "rendered" || displayMode !== "preview") {
@@ -1045,7 +1105,7 @@ export function MarkdownMermaidDiagram({
   };
 
   return (
-    <MermaidDiagramContainer>
+    <MermaidDiagramContainer ref={containerElementRef}>
       <div className="flex items-center justify-between pl-3 pr-1.5 pt-1.5">
         <span className="font-mono text-xs uppercase text-muted-foreground">
           mermaid

@@ -5,13 +5,11 @@
 //   node packages/plugin-registry/scripts/build-registry.mjs [--check]
 //
 // Inputs:
-// - registry.json — the item list (uiItems), npm version pins, and an
-//   (currently empty) override map for swapping a component-src file for a
-//   registry-only flavor.
+// - registry.json — the item list (uiItems).
 // - packages/shared-ui/src/components/ui/*.tsx — component source, verbatim.
 //   @bb/shared-ui is itself the plugin/registry flavor: its portal-scope and
 //   useBrowserDimmingModal leaves are already the no-op/plugin variants (the
-//   app injects its own flavors at build time), so no override is needed.
+//   app injects its own flavors at build time).
 //
 // Every file in an item's transitive @/-import closure becomes its own
 // registry item (named from its basename), referenced via
@@ -20,6 +18,9 @@
 // react-dom excluded: the plugin runtime provides them; the shimmed
 // radix/sonner/vaul packages are KEPT as dependencies — the build shims them
 // at bundle time, but plugin authors need their types to typecheck).
+//
+// registry.json's pluginFlavors swap a shared-ui file for a plugin-side
+// version (icon draws from the host's icon registry through the SDK).
 //
 // Output: r/<item>.json + r/index.json, checked in; `--check` exits 1 on any
 // drift (wired into this package's typecheck/test like @bb/templates).
@@ -37,24 +38,15 @@ const outDir = path.join(packageRoot, "r");
 const config = JSON.parse(
   await readFile(path.join(packageRoot, "registry.json"), "utf8"),
 );
-const overrides = new Map(Object.entries(config.overrides ?? {}));
-const dependencyPins = config.dependencyPins ?? {};
-
-/** shared-ui/src-relative path → absolute source path, honoring overrides. */
-function sourcePathFor(relPath) {
-  const override = overrides.get(relPath);
-  if (override) return path.join(packageRoot, override);
-  return path.join(srcRoot, relPath);
-}
-
+const pluginFlavors = config.pluginFlavors ?? {};
 /** Resolve an import specifier from `importerRel` to an app-src-relative path. */
 function resolveLocal(specifier, importerRel) {
   let base;
   if (specifier.startsWith("@/")) {
     base = specifier.slice(2);
   } else if (specifier.startsWith(".")) {
-    base = path.normalize(
-      path.join(path.dirname(importerRel), specifier),
+    base = path.posix.normalize(
+      path.posix.join(path.posix.dirname(importerRel), specifier),
     );
   } else {
     return null;
@@ -67,7 +59,7 @@ function resolveLocal(specifier, importerRel) {
     `${base}/index.ts`,
     `${base}/index.tsx`,
   ]) {
-    if (existsSync(path.join(srcRoot, candidate)) || overrides.has(candidate)) {
+    if (existsSync(path.join(srcRoot, candidate))) {
       return candidate;
     }
   }
@@ -78,10 +70,14 @@ function resolveLocal(specifier, importerRel) {
 
 function importSpecifiersOf(content) {
   const specs = [];
-  const re = /(?:^|\n)\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']|(?:^|\n)\s*import\s+["']([^"']+)["']/g;
+  // Static imports/re-exports, bare side-effect imports, and dynamic
+  // `import("...")` calls (icon.tsx loads its extended glyph registry that
+  // way): all three are edges a vendored copy needs to keep resolving.
+  const re =
+    /(?:^|\n)\s*(?:import|export)[^;]*?from\s+["']([^"']+)["']|(?:^|\n)\s*import\s+["']([^"']+)["']|\bimport\(\s*["']([^"']+)["']\s*\)/g;
   let match;
   while ((match = re.exec(content)) !== null) {
-    specs.push(match[1] ?? match[2]);
+    specs.push(match[1] ?? match[2] ?? match[3]);
   }
   return specs;
 }
@@ -89,21 +85,30 @@ function importSpecifiersOf(content) {
 /** npm package name of a bare specifier ("@scope/pkg/sub" → "@scope/pkg"). */
 function npmPackageOf(specifier) {
   const parts = specifier.split("/");
-  return specifier.startsWith("@")
-    ? parts.slice(0, 2).join("/")
-    : parts[0];
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
 }
 
-/** react/react-dom come from the plugin runtime; never item dependencies. */
-const RUNTIME_PROVIDED = new Set(["react", "react-dom"]);
+/**
+ * react/react-dom come from the plugin runtime and every plugin already pins
+ * @get-bb/plugin-sdk; never item dependencies.
+ */
+const RUNTIME_PROVIDED = new Set(["react", "react-dom", "@get-bb/plugin-sdk"]);
 
 /** Item name from an app-src-relative file path. */
 function itemNameFor(relPath) {
   const base = path.basename(relPath).replace(/\.(tsx?|jsx?)$/, "");
+  const componentGroup = componentGroupOf(relPath);
   // camelCase hooks (useBrowserDimmingModal) → kebab-case item names.
-  return base
+  return [...componentGroup, base]
+    .join("-")
     .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
     .toLowerCase();
+}
+
+function componentGroupOf(relPath) {
+  if (!relPath.startsWith("components/ui/")) return [];
+  const segments = path.posix.dirname(relPath).split("/").slice(2);
+  return segments[0] === "hooks" ? [] : segments;
 }
 
 /** shadcn item type + install target for an app-src-relative path. */
@@ -113,7 +118,7 @@ function classify(relPath) {
     return { type: "registry:hook", target: `components/ui/hooks/${base}` };
   }
   if (relPath.startsWith("components/ui/")) {
-    return { type: "registry:ui", target: `components/ui/${base}` };
+    return { type: "registry:ui", target: relPath };
   }
   if (relPath.startsWith("lib/")) {
     return { type: "registry:lib", target: `lib/${base}` };
@@ -130,9 +135,13 @@ function classify(relPath) {
 const fileByItem = new Map(); // itemName → relPath
 const queue = [];
 for (const name of config.uiItems) {
-  const relPath = `components/ui/${name}.tsx`;
-  if (!existsSync(sourcePathFor(relPath))) {
-    throw new Error(`uiItem "${name}" has no source at packages/shared-ui/src/${relPath}`);
+  const relPath = [".tsx", ".ts"]
+    .map((extension) => `components/ui/${name}${extension}`)
+    .find((candidate) => existsSync(path.join(srcRoot, candidate)));
+  if (relPath === undefined) {
+    throw new Error(
+      `uiItem "${name}" has no source at packages/shared-ui/src/components/ui/${name}.tsx or .ts`,
+    );
   }
   queue.push(relPath);
 }
@@ -151,7 +160,13 @@ while (queue.length > 0) {
   }
   fileByItem.set(itemName, relPath);
 
-  const content = await readFile(sourcePathFor(relPath), "utf8");
+  const flavor = pluginFlavors[relPath];
+  const content = await readFile(
+    flavor === undefined
+      ? path.join(srcRoot, relPath)
+      : path.join(packageRoot, flavor),
+    "utf8",
+  );
   const dependencies = new Set();
   const registryDependencies = new Set();
   for (const spec of importSpecifiersOf(content)) {
@@ -172,25 +187,22 @@ while (queue.length > 0) {
 // ---------------------------------------------------------------------------
 // Emit r/<item>.json + r/index.json.
 // ---------------------------------------------------------------------------
-function pinned(pkg) {
-  const pin = dependencyPins[pkg];
-  return pin ? `${pkg}@${pin}` : pkg;
-}
-
 const generatedFiles = new Map(); // filename → content string
 const indexEntries = [];
 for (const [itemName, relPath] of [...fileByItem.entries()].sort()) {
-  const { content, dependencies, registryDependencies } =
-    itemMeta.get(relPath);
+  const { content, dependencies, registryDependencies } = itemMeta.get(relPath);
   const { type, target } = classify(relPath);
   const item = {
     $schema: "https://ui.shadcn.com/schema/registry-item.json",
     name: itemName,
     type,
     title: itemName,
-    description: `BB ${type.replace("registry:", "")} "${itemName}" — vendored from the BB app's own source (version-matched to this BB release).`,
+    description:
+      pluginFlavors[relPath] === undefined
+        ? `BB ${type.replace("registry:", "")} "${itemName}" — vendored from the BB app's own source (version-matched to this BB release).`
+        : `BB ${type.replace("registry:", "")} "${itemName}" — the plugin version of the BB app's ${itemName}, drawing on the host app at runtime (version-matched to this BB release).`,
     ...(dependencies.size > 0
-      ? { dependencies: [...dependencies].sort().map(pinned) }
+      ? { dependencies: [...dependencies].sort() }
       : {}),
     ...(registryDependencies.size > 0
       ? {
@@ -244,7 +256,9 @@ for (const [name, content] of generatedFiles) {
     : null;
   if (existing !== content) {
     stale = true;
-    staleReasons.push(existing === null ? `missing r/${name}` : `changed r/${name}`);
+    staleReasons.push(
+      existing === null ? `missing r/${name}` : `changed r/${name}`,
+    );
   }
 }
 
@@ -262,7 +276,9 @@ if (check) {
   for (const [name, content] of generatedFiles) {
     await writeFile(path.join(outDir, name), content);
   }
-  console.log(`wrote ${generatedFiles.size} files to r/ (${fileByItem.size} items)`);
+  console.log(
+    `wrote ${generatedFiles.size} files to r/ (${fileByItem.size} items)`,
+  );
 } else {
   console.log(`plugin registry up to date (${fileByItem.size} items)`);
 }

@@ -1,9 +1,15 @@
+import { appendQuoteAndAttachmentsToDraft } from "@bb/client-core";
 // @vitest-environment jsdom
 
-import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createCoreComposerActions } from "@/lib/plugin-composer-handle";
+import { act, cleanup, render, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  getPromptDraftAccessor,
+  usePromptDraftController,
+  usePromptDraftInputEmpty,
   usePromptDraftInputThreadIds,
+  usePromptDraftSnapshot,
   usePromptDraftStorage,
 } from "./usePromptDraftStorage";
 
@@ -14,8 +20,6 @@ function storedDraft(text: string): string {
   return JSON.stringify({ text, attachments: [] });
 }
 
-// Each test uses a unique projectId so the module-level draft cache/subscriber
-// maps (keyed by storage key) never collide across tests.
 let scopeCounter = 0;
 function uniqueScope() {
   scopeCounter += 1;
@@ -32,9 +36,107 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
 });
 
 describe("usePromptDraftStorage", () => {
+  it("keeps deferred text writes readable and serializes at the persist boundary", () => {
+    vi.useFakeTimers();
+    const scope = uniqueScope();
+    const { result } = renderHook(() => usePromptDraftStorage(scope));
+
+    act(() => {
+      result.current.setTextAndMentions("large pending draft", []);
+    });
+
+    expect(result.current.text).toBe("large pending draft");
+    expect(window.localStorage.getItem(result.current.storageKey)).toBeNull();
+    act(() => vi.advanceTimersByTime(249));
+    expect(window.localStorage.getItem(result.current.storageKey)).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("large pending draft"),
+    );
+  });
+
+  it("lets an immediate write replace a pending deferred write", () => {
+    vi.useFakeTimers();
+    const scope = uniqueScope();
+    const { result } = renderHook(() => usePromptDraftStorage(scope));
+
+    act(() => {
+      result.current.setTextAndMentions("stale pending draft", []);
+      result.current.setDraft({
+        text: "immediate replacement",
+        mentions: [],
+        attachments: [],
+      });
+    });
+
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("immediate replacement"),
+    );
+    act(() => vi.advanceTimersByTime(250));
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("immediate replacement"),
+    );
+  });
+
+  it("keeps the in-memory draft when localStorage rejects the write", () => {
+    const scope = uniqueScope();
+    const { result } = renderHook(() => usePromptDraftStorage(scope));
+    act(() => {
+      result.current.setDraft({ text: "small", mentions: [], attachments: [] });
+    });
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("small"),
+    );
+
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new DOMException("quota", "QuotaExceededError");
+      });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      act(() => {
+        result.current.setDraft({
+          text: "too large for storage",
+          mentions: [],
+          attachments: [],
+        });
+      });
+    } finally {
+      setItem.mockRestore();
+    }
+
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("small"),
+    );
+    expect(result.current.text).toBe("too large for storage");
+    expect(result.current.getCurrent().text).toBe("too large for storage");
+    expect(getPromptDraftAccessor(scope).getCurrent().text).toBe(
+      "too large for storage",
+    );
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("flushes a deferred write when the page is hidden", () => {
+    vi.useFakeTimers();
+    const scope = uniqueScope();
+    const { result } = renderHook(() => usePromptDraftStorage(scope));
+
+    act(() => {
+      result.current.setTextAndMentions("flush before leaving", []);
+      window.dispatchEvent(new Event("pagehide"));
+    });
+
+    expect(window.localStorage.getItem(result.current.storageKey)).toBe(
+      storedDraft("flush before leaving"),
+    );
+  });
+
   it("subscribes to draft presence for a batch of threads", () => {
     const projectId = "proj-batch-drafts";
     const threadRefs = [
@@ -64,6 +166,53 @@ describe("usePromptDraftStorage", () => {
 
     act(() => result.current.draft.clear());
     expect([...result.current.inputThreadIds]).toEqual([]);
+  });
+
+  it("does not re-read storage or re-render the batch when a draft edit keeps presence", () => {
+    const projectId = "proj-batch-keystrokes";
+    const threadRefs = Array.from({ length: 30 }, (_, index) => ({
+      id: `thr-batch-${index}`,
+      projectId,
+    }));
+    const composer = getPromptDraftAccessor({
+      kind: "thread",
+      projectId,
+      threadId: "thr-batch-3",
+    });
+    let batchRenders = 0;
+    const { result, rerender } = renderHook(() => {
+      batchRenders += 1;
+      return usePromptDraftInputThreadIds(threadRefs);
+    });
+    act(() => {
+      composer.setDraft({ text: "first", mentions: [], attachments: [] });
+    });
+    expect([...result.current]).toEqual(["thr-batch-3"]);
+
+    const getItem = vi.spyOn(Storage.prototype, "getItem");
+    const presenceReads = () =>
+      getItem.mock.calls.filter(([key]) => String(key).includes(projectId))
+        .length;
+    rerender();
+    expect(presenceReads()).toBe(0);
+
+    const rendersBefore = batchRenders;
+    act(() => {
+      composer.setDraft({
+        text: "first keystroke",
+        mentions: [],
+        attachments: [],
+      });
+    });
+    expect(presenceReads()).toBeLessThanOrEqual(1);
+    expect(batchRenders).toBe(rendersBefore);
+
+    act(() => {
+      composer.setDraft({ text: "", mentions: [], attachments: [] });
+    });
+    expect([...result.current]).toEqual([]);
+    expect(batchRenders).toBe(rendersBefore + 1);
+    getItem.mockRestore();
   });
 
   it("uses project-agnostic storage for new-thread prompt contents", () => {
@@ -127,38 +276,56 @@ describe("usePromptDraftStorage", () => {
   });
 });
 
-describe("usePromptDraftStorage addQuote", () => {
-  it("appends a trimmed quote as a '> ' block to the draft text and persists", () => {
+function addQuote(
+  source: ReturnType<typeof getPromptDraftAccessor>,
+  text: string,
+  attachments?: Parameters<typeof appendQuoteAndAttachmentsToDraft>[2],
+) {
+  const composer = createCoreComposerActions({ ...source, focus: () => {} });
+  composer.replace((current) =>
+    appendQuoteAndAttachmentsToDraft(current, text, attachments ?? []),
+  );
+}
+
+describe("composer quote persistence", () => {
+  it("keeps an imperative draft-action consumer unsubscribed from composer writes", () => {
     const scope = uniqueScope();
-    const { result } = renderHook(() => usePromptDraftStorage(scope));
+    let consumerRenders = 0;
+    let draftActions: ReturnType<typeof getPromptDraftAccessor> | undefined;
 
-    act(() => result.current.addQuote("  ship it  "));
+    function DraftActionConsumer() {
+      consumerRenders += 1;
+      draftActions = getPromptDraftAccessor(scope);
+      return null;
+    }
 
-    // Blockquote-prefixed, with a trailing newline so the reply sits below it.
-    expect(result.current.text).toBe("> ship it\n");
-    expect(window.localStorage.length).toBe(1);
-    expect(
-      window.localStorage.getItem(result.current.storageKey ?? ""),
-    ).toContain("> ship it");
+    render(<DraftActionConsumer />);
+    const rendersBeforeTyping = consumerRenders;
+    const composer = renderHook(() => usePromptDraftStorage(scope));
+
+    act(() => {
+      composer.result.current.setTextAndMentions("typed reply", []);
+    });
+
+    expect(consumerRenders).toBe(rendersBeforeTyping);
+    expect(draftActions?.storageKey).toBe(composer.result.current.storageKey);
+
+    act(() => {
+      if (draftActions) addQuote(draftActions, "selected text");
+    });
+
+    expect(composer.result.current.text).toBe("typed reply\n> selected text\n");
+    expect(consumerRenders).toBe(rendersBeforeTyping);
   });
 
   it("stacks a second quote below the first, separated by a blank line", () => {
     const scope = uniqueScope();
     const { result } = renderHook(() => usePromptDraftStorage(scope));
 
-    act(() => result.current.addQuote("first"));
-    act(() => result.current.addQuote("second"));
+    act(() => addQuote(result.current, "first"));
+    act(() => addQuote(result.current, "second"));
 
     expect(result.current.text).toBe("> first\n\n> second\n");
-  });
-
-  it("prefixes every line of a multi-line selection", () => {
-    const scope = uniqueScope();
-    const { result } = renderHook(() => usePromptDraftStorage(scope));
-
-    act(() => result.current.addQuote("line a\nline b"));
-
-    expect(result.current.text).toBe("> line a\n> line b\n");
   });
 
   it("adds quote attachments to the draft and persists them", () => {
@@ -166,7 +333,7 @@ describe("usePromptDraftStorage addQuote", () => {
     const { result } = renderHook(() => usePromptDraftStorage(scope));
 
     act(() =>
-      result.current.addQuote("review this", [
+      addQuote(result.current, "review this", [
         {
           type: "localFile",
           path: "uploads/spec.md",
@@ -190,23 +357,56 @@ describe("usePromptDraftStorage addQuote", () => {
     ).toContain("uploads/spec.md");
   });
 
-  it("ignores whitespace-only text without writing", () => {
-    const scope = uniqueScope();
-    const { result } = renderHook(() => usePromptDraftStorage(scope));
-
-    act(() => result.current.addQuote("   \n  "));
-
-    expect(result.current.text).toBe("");
-    expect(window.localStorage.length).toBe(0);
-  });
-
   it("syncs an added quote live across two instances of the same scope", () => {
     const scope = uniqueScope();
     const first = renderHook(() => usePromptDraftStorage(scope));
     const second = renderHook(() => usePromptDraftStorage(scope));
 
-    act(() => first.result.current.addQuote("shared selection"));
+    act(() => addQuote(first.result.current, "shared selection"));
 
     expect(second.result.current.text).toBe("> shared selection\n");
+  });
+});
+
+describe("usePromptDraftController", () => {
+  it("returns stable methods and never re-renders its caller on draft writes", () => {
+    const scope = uniqueScope();
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      const controller = usePromptDraftController(scope);
+      return { controller, inputEmpty: usePromptDraftInputEmpty(controller) };
+    });
+    const initialController = result.current.controller;
+    const rendersBefore = renders;
+
+    act(() => initialController.setTextAndMentions("h", []));
+    const rendersAfterFirstKey = renders;
+    for (const text of ["he", "hel", "hell", "hello"]) {
+      act(() => initialController.setTextAndMentions(text, []));
+    }
+
+    expect(rendersAfterFirstKey).toBe(rendersBefore + 1);
+    expect(renders).toBe(rendersAfterFirstKey);
+    expect(result.current.inputEmpty).toBe(false);
+    expect(result.current.controller).toBe(initialController);
+    expect(initialController.getCurrent().text).toBe("hello");
+  });
+
+  it("follows the live draft through the snapshot hook", () => {
+    const scope = uniqueScope();
+    const { result } = renderHook(() =>
+      usePromptDraftSnapshot(usePromptDraftController(scope)),
+    );
+
+    act(() =>
+      getPromptDraftAccessor(scope).setDraft({
+        text: "typed",
+        mentions: [],
+        attachments: [],
+      }),
+    );
+
+    expect(result.current.text).toBe("typed");
   });
 });

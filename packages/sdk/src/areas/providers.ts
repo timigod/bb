@@ -1,16 +1,22 @@
 import type {
   SystemExecutionOptionsResponse,
   SystemProviderInfo,
+  SystemProviderCatalogEntry,
+  SystemProvidersQuery,
 } from "@bb/server-contract";
-import { signalRequestArgs, type CreateSdkAreaArgs } from "./common.js";
+import {
+  readExecutionOptions,
+  signalRequestArgs,
+  type CreateSdkAreaArgs,
+} from "./common.js";
 
-/** Select exactly one provider-discovery host source, or omit both for primary. */
 export type ProviderHostRoutingArgs =
   | { environmentId: string; hostId?: never }
   | { environmentId?: never; hostId: string }
   | { environmentId?: never; hostId?: never };
 
 export type ProviderListArgs = ProviderHostRoutingArgs & {
+  capability?: SystemProvidersQuery["capability"];
   signal?: AbortSignal;
 };
 export type ProviderModelsArgs = ProviderHostRoutingArgs & {
@@ -22,20 +28,37 @@ export type ProviderListResult = SystemProviderInfo[];
 export type ProviderModelsResult = SystemExecutionOptionsResponse;
 
 export interface ProvidersArea {
-  /** List providers on the environment host, explicit host, or primary host. */
+  catalog(): Promise<SystemProviderCatalogEntry[]>;
+  setEnabled(args: {
+    providerId: string;
+    enabled: boolean;
+  }): Promise<SystemProviderCatalogEntry[]>;
   list(args?: ProviderListArgs): Promise<ProviderListResult>;
-  /** List models on the environment host, explicit host, or primary host. */
   models(args?: ProviderModelsArgs): Promise<ProviderModelsResult>;
 }
 
 export function createProvidersArea(args: CreateSdkAreaArgs): ProvidersArea {
   const { transport } = args;
   return {
+    async catalog() {
+      return transport.readJson(
+        transport.api.v1.system.providers.catalog.$get(),
+      );
+    },
+    async setEnabled(input) {
+      return transport.readJson(
+        transport.api.v1.system.providers[":id"].enabled.$put({
+          param: { id: input.providerId },
+          json: { enabled: input.enabled },
+        }),
+      );
+    },
     async list(input = {}) {
       return transport.readJson(
         transport.api.v1.system.providers.$get(
           {
             query: {
+              capability: input.capability,
               environmentId: input.environmentId,
               hostId: input.hostId,
             },
@@ -45,18 +68,7 @@ export function createProvidersArea(args: CreateSdkAreaArgs): ProvidersArea {
       );
     },
     async models(input = {}) {
-      return transport.readJson(
-        transport.api.v1.system["execution-options"].$get(
-          {
-            query: {
-              environmentId: input.environmentId,
-              hostId: input.hostId,
-              providerId: input.providerId,
-            },
-          },
-          ...signalRequestArgs(input.signal),
-        ),
-      );
+      return readExecutionOptions(transport, input);
     },
   };
 }

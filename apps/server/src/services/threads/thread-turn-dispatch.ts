@@ -1,5 +1,4 @@
 import type {
-  Environment,
   PromptInput,
   ResolvedThreadExecutionOptions,
   SystemMessageKind,
@@ -7,83 +6,41 @@ import type {
   Thread,
   ThreadTurnInitiator,
 } from "@bb/domain";
-import { createThreadProvisioningId } from "@bb/db";
-import type { DbTransaction } from "@bb/db";
+import { getThread, type DbTransaction, type EnvironmentRow } from "@bb/db";
 import type { LoggedPendingInteractionWorkSessionDeps } from "../../types.js";
-import { ApiError } from "../../errors.js";
-import {
-  dispatchManagedEnvironmentReprovision,
-  hasActiveManagedEnvironmentProvision,
-  MANAGED_REPROVISION_IN_PROGRESS,
-  MANAGED_REPROVISION_STARTED,
-} from "../environments/environment-provisioning-internal.js";
-import { ensureHostSessionReadyForWork } from "../hosts/host-lifecycle.js";
 import {
   goneThreadEnvironmentDetails,
   throwEnvironmentNotReady,
   throwThreadEnvironmentUnavailable,
 } from "../lib/lifecycle-api-errors.js";
 import {
-  appendThreadProvisioningEvent,
-  getLastProviderThreadId,
-} from "./thread-events.js";
-import { requestThreadReprovision } from "./thread-provisioning.js";
-import { applyLoggedThreadLifecycleEvent } from "./lifecycle-outcome.js";
-import { applyLoggedEnvironmentLifecycleEvent } from "../environments/lifecycle-outcome.js";
+  requestThreadTargetReprovision,
+  scheduleThreadProvisioningAdvance,
+} from "./thread-provisioning.js";
+import { applyLoggedThreadLifecycleEventInTransaction } from "./lifecycle-outcome.js";
+import { buildThreadStatusChangeMetadata } from "./thread-runtime-display.js";
 
-export interface ReadyThreadEnvironment extends Environment {
+export interface ReadyThreadEnvironment extends EnvironmentRow {
   path: string;
   status: "ready";
 }
 
-export interface DispatchTurnDuringReprovisionArgs {
+interface DispatchTurnDuringReprovisionArgs {
   beforeRequestAppendInTransaction?: (args: { tx: DbTransaction }) => void;
   deps: LoggedPendingInteractionWorkSessionDeps;
-  environment: Environment;
+  environment: EnvironmentRow;
   execution: ResolvedThreadExecutionOptions;
   initiator: ThreadTurnInitiator;
   input: PromptInput[];
   inputGroups?: PromptInput[][];
-  onStarted?: () => void;
   senderThreadId: string | null;
-  // Family-B taxonomy fields for `initiator: "system"` reprovision dispatches.
-  // Threaded onto the deferred `client/turn/requested` event the reprovision
-  // queues once the workspace is ready.
   systemMessageKind?: SystemMessageKind;
   systemMessageSubject?: SystemMessageSubject | null;
   thread: Thread;
 }
 
-type ThreadTurnDispatchReadDeps = Pick<
-  LoggedPendingInteractionWorkSessionDeps,
-  "db"
->;
-
-function reprovisionStartedText(
-  workspaceProvisionType: Environment["workspaceProvisionType"],
-): string {
-  switch (workspaceProvisionType) {
-    case "managed-worktree":
-      return "Restoring worktree";
-    case "personal":
-      return "Restoring personal workspace";
-    case "unmanaged":
-      return "Restoring environment";
-  }
-}
-
-function canRecoverPreStartErroredThread(
-  deps: ThreadTurnDispatchReadDeps,
-  thread: Thread,
-): boolean {
-  return (
-    thread.status === "error" &&
-    getLastProviderThreadId(deps, thread.id) === null
-  );
-}
-
 export function requireReadyThreadEnvironment(
-  environment: Environment,
+  environment: EnvironmentRow,
 ): ReadyThreadEnvironment {
   if (environment.status !== "ready" || !environment.path) {
     throwEnvironmentNotReady(environment);
@@ -103,107 +60,56 @@ export async function dispatchTurnDuringReprovision(
     return false;
   }
 
-  if (args.environment.status === "retiring") {
-    applyLoggedEnvironmentLifecycleEvent(args.deps, {
-      environmentId: args.environment.id,
-      event: { type: "retire.cancelled" },
+  const environmentProviderId = args.environment.environmentProviderId;
+  const environmentProviderSelection =
+    args.environment.environmentProviderSelection;
+  if (
+    environmentProviderId !== null &&
+    environmentProviderSelection !== null &&
+    args.environment.status !== "provisioning" &&
+    args.environment.status !== "destroyed"
+  ) {
+    requestThreadTargetReprovision(args.deps, {
+      beforeRequestAppendInTransaction: ({ tx }) => {
+        args.beforeRequestAppendInTransaction?.({ tx });
+        const prepared = applyLoggedThreadLifecycleEventInTransaction(
+          { db: tx, logger: args.deps.logger },
+          { event: { type: "run.preparing" }, threadId: args.thread.id },
+        );
+        if (!prepared.applied) {
+          throwEnvironmentNotReady(args.environment);
+        }
+      },
+      environment: args.environment,
+      execution: args.execution,
+      initiator: args.initiator,
+      input: args.input,
+      inputGroups: args.inputGroups,
+      senderThreadId: args.senderThreadId,
+      systemMessageKind: args.systemMessageKind,
+      systemMessageSubject: args.systemMessageSubject,
+      provider: {
+        environmentProviderId,
+        selection: environmentProviderSelection,
+      },
+      thread: args.thread,
     });
-    return false;
+    const startingThread = getThread(args.deps.db, args.thread.id);
+    if (startingThread !== null) {
+      args.deps.hub.notifyThread(
+        args.thread.id,
+        ["status-changed"],
+        buildThreadStatusChangeMetadata(args.deps, startingThread),
+      );
+    }
+    scheduleThreadProvisioningAdvance(args.deps, args.thread.id);
+    return true;
   }
 
-  // A destroying/destroyed environment is gone and is never reprovisioned.
-  // Surface the "environment is gone" condition the frontend banner keys off
-  // instead of dispatching a reprovision. Error-recovery reprovision for an
-  // `error`-status environment is still legitimate and falls through.
   const goneDetails = goneThreadEnvironmentDetails(args.environment);
   if (goneDetails) {
     throwThreadEnvironmentUnavailable(goneDetails);
   }
 
-  if (!args.environment.managed || args.environment.status === "provisioning") {
-    throwEnvironmentNotReady(args.environment);
-  }
-  if (
-    hasActiveManagedEnvironmentProvision(args.deps, {
-      environmentId: args.environment.id,
-    })
-  ) {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      "Environment is already provisioning",
-    );
-  }
-  await ensureHostSessionReadyForWork(args.deps, {
-    hostId: args.environment.hostId,
-  });
-
-  // Stronger than the run.preparing table cell on purpose: an errored
-  // thread may reprovision only when it never started (no provider thread id),
-  // an event-log condition the thread row cannot express.
-  if (
-    args.thread.status === "idle" ||
-    canRecoverPreStartErroredThread(args.deps, args.thread)
-  ) {
-    applyLoggedThreadLifecycleEvent(args.deps, {
-      event: { type: "run.preparing" },
-      threadId: args.thread.id,
-    });
-  }
-  const provisioningId = createThreadProvisioningId();
-  const provisionEventSequence = appendThreadProvisioningEvent(args.deps, {
-    threadId: args.thread.id,
-    environmentId: args.environment.id,
-    provisioningId,
-    status: "active",
-    entries: [
-      {
-        type: "step",
-        key: "workspace-restore-started",
-        text: reprovisionStartedText(args.environment.workspaceProvisionType),
-        status: "started",
-      },
-    ],
-  });
-
-  const reprovisionResult = await dispatchManagedEnvironmentReprovision(
-    args.deps,
-    {
-      beforeProvisionCommandStart: () => {
-        requestThreadReprovision(args.deps, {
-          beforeRequestAppendInTransaction:
-            args.beforeRequestAppendInTransaction,
-          thread: args.thread,
-          environment: args.environment,
-          provisionEventSequence,
-          input: args.input,
-          inputGroups: args.inputGroups,
-          execution: args.execution,
-          initiator: args.initiator,
-          provisioningId,
-          senderThreadId: args.senderThreadId,
-          systemMessageKind: args.systemMessageKind,
-          systemMessageSubject: args.systemMessageSubject,
-        });
-      },
-      environment: args.environment,
-      projectId: args.thread.projectId,
-      provisionEventSequence,
-      provisioningId,
-      threadId: args.thread.id,
-    },
-  );
-  if (reprovisionResult === MANAGED_REPROVISION_IN_PROGRESS) {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      "Environment is already provisioning",
-    );
-  }
-  if (reprovisionResult.status !== MANAGED_REPROVISION_STARTED) {
-    throw new ApiError(500, "internal_error", "Unexpected reprovision result");
-  }
-
-  args.onStarted?.();
-  return true;
+  throwEnvironmentNotReady(args.environment);
 }

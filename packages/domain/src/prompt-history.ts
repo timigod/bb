@@ -2,9 +2,11 @@ import { z } from "zod";
 import { promptInputSchema, type PromptInput } from "./shared-types.js";
 
 export const PROMPT_HISTORY_ENTRY_LIMIT = 50;
+export const PROMPT_HISTORY_PAGE_DEFAULT_LIMIT = 100;
+export const PROMPT_HISTORY_PAGE_MAX_LIMIT = 1000;
 
-export const promptHistoryScopeValues = ["project", "thread"] as const;
-export const promptHistoryScopeSchema = z.enum(promptHistoryScopeValues);
+const promptHistoryScopeValues = ["project", "thread"] as const;
+const promptHistoryScopeSchema = z.enum(promptHistoryScopeValues);
 export type PromptHistoryScope = z.infer<typeof promptHistoryScopeSchema>;
 
 export const promptHistoryEntrySchema = z.object({
@@ -14,7 +16,16 @@ export const promptHistoryEntrySchema = z.object({
 });
 export type PromptHistoryEntry = z.infer<typeof promptHistoryEntrySchema>;
 
-export interface PromptHistoryComparableEntry {
+export const promptHistoryListEntrySchema = promptHistoryEntrySchema.extend({
+  projectId: z.string().min(1),
+  threadId: z.string().min(1),
+  scope: promptHistoryScopeSchema,
+});
+export type PromptHistoryListEntry = z.infer<
+  typeof promptHistoryListEntrySchema
+>;
+
+interface PromptHistoryComparableEntry {
   input: readonly PromptInput[];
 }
 
@@ -34,10 +45,7 @@ export function arePromptHistoryInputsEqual(
 
 export function takeVisiblePromptHistoryEntries<
   TEntry extends PromptHistoryComparableEntry,
->({
-  entries,
-  limit,
-}: TakeVisiblePromptHistoryEntriesArgs<TEntry>): TEntry[] {
+>({ entries, limit }: TakeVisiblePromptHistoryEntriesArgs<TEntry>): TEntry[] {
   if (limit <= 0 || entries.length === 0) {
     return [];
   }

@@ -86,6 +86,49 @@ describe("bb thread interactions command output", () => {
     ]);
   });
 
+  it("bb thread interactions show prints a tool-use approval from its presentation", async () => {
+    const getInteraction = vi.fn(async () =>
+      fixtures.makePendingInteraction({
+        id: "int-tool-use",
+        providerId: "acp-cursor",
+        threadId: "thread-tool-use",
+        payload: {
+          kind: "approval",
+          reason: null,
+          availableDecisions: ["allow_once", "deny"],
+          subject: {
+            kind: "tool_use",
+            itemId: "call-1",
+            tool: "mcp__github__create_issue",
+            presentation: {
+              label: { pending: "Creating issue", completed: "Created issue" },
+              icon: { glyph: "Globe" },
+              title: "get-bb/bb#42",
+              detail: "Opens a bug issue",
+            },
+          },
+        },
+      }),
+    );
+    stubServerApi({
+      "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
+    });
+
+    await runCommand(
+      ["thread", "interactions", "show", "int-tool-use", "thread-tool-use"],
+      register,
+    );
+
+    const lines = collectLogLines(vi.mocked(console.log));
+    expect(lines).toContain("  Kind: tool-use");
+    expect(lines.slice(5)).toEqual([
+      "  Tool: mcp__github__create_issue",
+      "  get-bb/bb#42",
+      "  Opens a bug issue",
+      "  Decisions: allow_once, deny",
+    ]);
+  });
+
   it("bb thread interactions show prints user question details", async () => {
     vi.stubEnv("BB_THREAD_ID", "thread-show-question");
     const getInteraction = vi.fn(async () =>
@@ -401,6 +444,101 @@ describe("bb thread interactions command output", () => {
     expect(errorOutput).toContain("does not offer choice 'qa'");
   });
 
+  it("bb thread interactions show prints a provider's plugin-defined request with its form and data", async () => {
+    const getInteraction = vi.fn(async () =>
+      fixtures.makePendingInteraction({
+        id: "int-plugin-request",
+        providerId: "acp-cursor",
+        threadId: "thread-plugin-request",
+        payload: {
+          kind: "secrets/secret-request",
+          title: "Add a token",
+          data: { fields: ["TOKEN"] },
+        },
+      }),
+    );
+    stubServerApi({
+      "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
+    });
+
+    await runCommand(
+      [
+        "thread",
+        "interactions",
+        "show",
+        "int-plugin-request",
+        "thread-plugin-request",
+      ],
+      register,
+    );
+
+    const lines = collectLogLines(vi.mocked(console.log));
+    expect(lines).toContain("  Kind: secrets/secret-request");
+    expect(lines).toContain("  Title: Add a token");
+    expect(lines).toContain("  Form: secrets/secret-request (raised by agent)");
+    expect(lines).toContain('  Data: {"fields":["TOKEN"]}');
+  });
+
+  it("bb thread interactions respond posts the form's JSON value", async () => {
+    const respond = vi.fn(async () =>
+      fixtures.makePendingInteraction({
+        id: "int-plugin-request",
+        providerId: "acp-cursor",
+        threadId: "thread-plugin-request",
+        status: "resolving",
+        payload: {
+          kind: "secrets/secret-request",
+          title: "Add a token",
+          data: { fields: ["TOKEN"] },
+        },
+        resolution: { kind: "request_answer", value: { TOKEN: "x" } },
+      }),
+    );
+    stubServerApi({
+      "v1.threads.:id.interactions.:interactionId.respond.$post": respond,
+    });
+
+    await runCommand(
+      [
+        "thread",
+        "interactions",
+        "respond",
+        "int-plugin-request",
+        "thread-plugin-request",
+        "--value",
+        '{"TOKEN":"x"}',
+      ],
+      register,
+    );
+
+    expect(respond).toHaveBeenCalledWith(
+      expect.objectContaining({ json: { value: { TOKEN: "x" } } }),
+    );
+    expect(collectLogLines(vi.mocked(console.log))).toEqual([
+      "Interaction int-plugin-request submitted (answered); delivering to provider",
+    ]);
+  });
+
+  it("bb thread interactions respond rejects a value that is not JSON", async () => {
+    await expect(
+      runCommand(
+        [
+          "thread",
+          "interactions",
+          "respond",
+          "int-plugin-request",
+          "thread-plugin-request",
+          "--value",
+          "not json",
+        ],
+        register,
+      ),
+    ).rejects.toThrow("process.exit:1");
+    expect(collectLogLines(vi.mocked(console.error)).join("\n")).toContain(
+      "Invalid --value. Expected a JSON value.",
+    );
+  });
+
   it("bb thread interactions show indicates when resolution delivery is in progress", async () => {
     vi.stubEnv("BB_THREAD_ID", "thread-show-resolving");
     const getInteraction = vi.fn(async () =>
@@ -431,113 +569,87 @@ describe("bb thread interactions command output", () => {
     expect(lines).toContain("  Decision: allow_for_session");
   });
 
-  it("bb thread interactions approve resolves command approvals for the current turn", async () => {
-    const getInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-approve",
-        providerId: "codex",
-        threadId: "thread-approve",
-      }),
-    );
-    const resolveInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-approve",
-        providerId: "codex",
-        threadId: "thread-approve",
-        status: "resolving",
-        resolvedAt: null,
-        resolution: {
-          decision: "allow_once",
-          grantedPermissions: null,
-        },
-      }),
-    );
-    stubServerApi({
-      "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
-      "v1.threads.:id.interactions.:interactionId.resolve.$post":
-        resolveInteraction,
-    });
+  it.each([
+    {
+      name: "command approvals for the current turn",
+      id: "int-approve",
+      threadId: "thread-approve",
+      payload: fixtures.makeCommandApprovalPayload("item-approve"),
+      decision: "allow_once",
+      outcome: "approved",
+    },
+    {
+      name: "file-change approvals without granting extra permissions",
+      id: "int-file-change",
+      threadId: "thread-file-change",
+      payload: fixtures.makeFileChangeApprovalPayload("item-file-change"),
+      decision: "allow_once",
+      outcome: "approved",
+    },
+    {
+      name: "for the session when no single-turn approval is offered",
+      id: "int-approve-session",
+      threadId: "thread-approve-session",
+      payload: fixtures.makeCommandApprovalPayload("item-approve-session", [
+        "allow_for_session",
+        "deny",
+      ]),
+      decision: "allow_for_session",
+      outcome: "approved for this session",
+    },
+    {
+      name: "for the turn when no session approval is offered",
+      id: "int-approve-once",
+      threadId: "thread-approve-once",
+      payload: fixtures.makeCommandApprovalPayload("item-approve-once", [
+        "allow_once",
+        "deny",
+      ]),
+      decision: "allow_once",
+      outcome: "approved",
+    },
+  ] as const)(
+    "bb thread interactions approve resolves $name",
+    async ({ id, threadId, payload, decision, outcome }) => {
+      const getInteraction = vi.fn(async () =>
+        fixtures.makePendingInteraction({
+          id,
+          providerId: "codex",
+          threadId,
+          payload,
+        }),
+      );
+      const resolveInteraction = vi.fn(async () =>
+        fixtures.makePendingInteraction({
+          id,
+          providerId: "codex",
+          threadId,
+          payload,
+          status: "resolving",
+          resolvedAt: null,
+          resolution: { decision, grantedPermissions: null },
+        }),
+      );
+      stubServerApi({
+        "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
+        "v1.threads.:id.interactions.:interactionId.resolve.$post":
+          resolveInteraction,
+      });
 
-    await runCommand(
-      ["thread", "interactions", "approve", "int-approve", "thread-approve"],
-      register,
-    );
+      await runCommand(
+        ["thread", "interactions", "approve", id, threadId],
+        register,
+      );
 
-    expect(resolveInteraction).toHaveBeenCalledWith({
-      param: {
-        id: "thread-approve",
-        interactionId: "int-approve",
-      },
-      json: {
-        decision: "allow_once",
-        grantedPermissions: null,
-      },
-    });
-    expect(collectLogLines(vi.mocked(console.log))).toEqual([
-      "Interaction int-approve submitted (approved); delivering to provider",
-    ]);
-  });
-
-  it("bb thread interactions approve falls back to accept when session approval is unavailable", async () => {
-    const getInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-approve-no-session",
-        providerId: "codex",
-        threadId: "thread-approve-no-session",
-        payload: fixtures.makeCommandApprovalPayload(
-          "item-approve-no-session",
-          ["allow_once", "deny"],
-        ),
-      }),
-    );
-    const resolveInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-approve-no-session",
-        providerId: "codex",
-        threadId: "thread-approve-no-session",
-        payload: fixtures.makeCommandApprovalPayload(
-          "item-approve-no-session",
-          ["allow_once", "deny"],
-        ),
-        status: "resolving",
-        resolvedAt: null,
-        resolution: {
-          decision: "allow_once",
-          grantedPermissions: null,
-        },
-      }),
-    );
-    stubServerApi({
-      "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
-      "v1.threads.:id.interactions.:interactionId.resolve.$post":
-        resolveInteraction,
-    });
-
-    await runCommand(
-      [
-        "thread",
-        "interactions",
-        "approve",
-        "int-approve-no-session",
-        "thread-approve-no-session",
-      ],
-      register,
-    );
-
-    expect(resolveInteraction).toHaveBeenCalledWith({
-      param: {
-        id: "thread-approve-no-session",
-        interactionId: "int-approve-no-session",
-      },
-      json: {
-        decision: "allow_once",
-        grantedPermissions: null,
-      },
-    });
-    expect(collectLogLines(vi.mocked(console.log))).toEqual([
-      "Interaction int-approve-no-session submitted (approved); delivering to provider",
-    ]);
-  });
+      expect(resolveInteraction).toHaveBeenCalledWith({
+        param: { id: threadId, interactionId: id },
+        json: { decision, grantedPermissions: null },
+      });
+      expect(collectLogLines(vi.mocked(console.log))).toEqual([
+        `Interaction ${id} submitted (${outcome}); delivering to provider`,
+      ]);
+    },
+  );
 
   it("bb thread interactions approve errors when no allow decision is available", async () => {
     const getInteraction = vi.fn(async () =>
@@ -648,61 +760,6 @@ describe("bb thread interactions command output", () => {
     expect(collectLogLines(vi.mocked(console.error)).join("\n")).toContain(
       "does not offer a deny decision",
     );
-  });
-
-  it("bb thread interactions approve resolves file-change approvals without granting extra permissions", async () => {
-    const getInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-file-change",
-        providerId: "codex",
-        threadId: "thread-file-change",
-        payload: fixtures.makeFileChangeApprovalPayload("item-file-change"),
-      }),
-    );
-    const resolveInteraction = vi.fn(async () =>
-      fixtures.makePendingInteraction({
-        id: "int-file-change",
-        providerId: "codex",
-        threadId: "thread-file-change",
-        payload: fixtures.makeFileChangeApprovalPayload("item-file-change"),
-        status: "resolving",
-        resolvedAt: null,
-        resolution: {
-          decision: "allow_once",
-          grantedPermissions: null,
-        },
-      }),
-    );
-    stubServerApi({
-      "v1.threads.:id.interactions.:interactionId.$get": getInteraction,
-      "v1.threads.:id.interactions.:interactionId.resolve.$post":
-        resolveInteraction,
-    });
-
-    await runCommand(
-      [
-        "thread",
-        "interactions",
-        "approve",
-        "int-file-change",
-        "thread-file-change",
-      ],
-      register,
-    );
-
-    expect(resolveInteraction).toHaveBeenCalledWith({
-      param: {
-        id: "thread-file-change",
-        interactionId: "int-file-change",
-      },
-      json: {
-        decision: "allow_once",
-        grantedPermissions: null,
-      },
-    });
-    expect(collectLogLines(vi.mocked(console.log))).toEqual([
-      "Interaction int-file-change submitted (approved); delivering to provider",
-    ]);
   });
 
   it("bb thread interactions grant resolves permission requests", async () => {

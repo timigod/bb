@@ -26,16 +26,11 @@ const StoryCardContext = createContext<{
   valueAlign: "start",
 });
 
-export interface StoryCardProps {
+interface StoryCardProps {
   children: ReactNode;
   className?: string;
   labelWidth?: string;
-  /**
-   * When provided, lays out children as a column-aligned grid: each StoryRow
-   * child fills one column and the labels render as a header row.
-   */
   columns?: readonly string[];
-  /** Where StoryRow value content sits horizontally. Defaults to "start". */
   valueAlign?: ValueAlign;
 }
 
@@ -78,10 +73,7 @@ export function StoryCard({
   return (
     <StoryCardContext.Provider value={{ inGrid: false, valueAlign }}>
       <div
-        className={cn(
-          "m-6 flex flex-col rounded-md",
-          className,
-        )}
+        className={cn("m-6 flex flex-col rounded-md", className)}
         style={labelWidthStyle(labelWidth)}
       >
         {children}
@@ -90,19 +82,14 @@ export function StoryCard({
   );
 }
 
-export interface StoryRowProps {
+interface StoryRowProps {
   label: ReactNode;
   hint?: ReactNode;
   children: ReactNode;
   className?: string;
 }
 
-export function StoryRow({
-  label,
-  hint,
-  children,
-  className,
-}: StoryRowProps) {
+export function StoryRow({ label, hint, children, className }: StoryRowProps) {
   const { inGrid, valueAlign } = useContext(StoryCardContext);
 
   const labelEl = (

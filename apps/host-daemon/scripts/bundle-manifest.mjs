@@ -5,7 +5,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptsDir, "..");
 const workspaceRoot = resolve(packageRoot, "..", "..");
 
-export const NODE_ESM_REQUIRE_BANNER = [
+const NODE_ESM_REQUIRE_BANNER = [
   'import { createRequire as __createRequire } from "node:module";',
   'import { dirname as __pathDirname } from "node:path";',
   'import { fileURLToPath as __fileURLToPath } from "node:url";',
@@ -22,52 +22,28 @@ export const bundleTargets = [
     outfile: resolve(packageRoot, "dist", "daemon-bundle.mjs"),
   },
   {
+    // The bootstrap the runtime spawns for EVERY bridge: it imports the
+    // bridge module out of a `bb.host` artifact and owns the process
+    // boundary.
     banner: NODE_ESM_REQUIRE_BANNER,
     entryPoint: resolve(
       workspaceRoot,
       "packages",
-      "agent-runtime",
+      "provider-bridge-protocol",
       "src",
-      "claude-code",
-      "bridge",
-      "bridge.ts",
+      "bridge-worker-entry.ts",
     ),
-    label: "claude-code bridge",
-    outfile: resolve(packageRoot, "dist", "bb-claude-code-bridge.mjs"),
+    label: "provider bridge worker",
+    outfile: resolve(packageRoot, "dist", "bb-provider-bridge-worker.mjs"),
   },
   {
+    // Forked child that runs a plugin's `bb.host` entry (plugin-host-manager.ts).
+    // Emitted next to the daemon bundle so defaultWorkerEntryPath resolves it as
+    // a sibling in the packaged app.
     banner: NODE_ESM_REQUIRE_BANNER,
-    entryPoint: resolve(
-      workspaceRoot,
-      "packages",
-      "agent-runtime",
-      "src",
-      "pi",
-      "bridge",
-      "bridge.ts",
-    ),
-    // Pi extensions import the host's Pi modules. Keep the pinned Pi package
-    // tree on disk so Pi's extension loader can resolve those shared modules.
-    externalPackages: [
-      "@earendil-works/pi-ai",
-      "@earendil-works/pi-coding-agent",
-    ],
-    label: "pi bridge",
-    outfile: resolve(packageRoot, "dist", "bb-pi-bridge.mjs"),
-  },
-  {
-    banner: NODE_ESM_REQUIRE_BANNER,
-    entryPoint: resolve(
-      workspaceRoot,
-      "packages",
-      "agent-runtime",
-      "src",
-      "acp",
-      "bridge",
-      "bridge.ts",
-    ),
-    label: "acp bridge",
-    outfile: resolve(packageRoot, "dist", "bb-acp-bridge.mjs"),
+    entryPoint: resolve(packageRoot, "src", "plugin-host-worker.ts"),
+    label: "plugin host worker",
+    outfile: resolve(packageRoot, "dist", "bb-plugin-host-worker.mjs"),
   },
   {
     banner: NODE_ESM_REQUIRE_BANNER,
@@ -75,6 +51,9 @@ export const bundleTargets = [
     executable: true,
     label: "bb cli",
     outfile: resolve(packageRoot, "dist", "bb"),
+    // The CLI `import()`s each command group on demand; chunks land in
+    // dist/bb-chunks, which packages/bb-app ships next to this entry.
+    splitting: true,
   },
   {
     // Forked child that runs @parcel/watcher in isolation (BB_WATCHER_SUBPROCESS=1).

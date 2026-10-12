@@ -1,35 +1,33 @@
 import { BrowserWindow, ipcMain, type IpcMainEvent } from "electron";
+import type { z } from "zod";
 import {
   bbDesktopBrowserAttachRequestSchema,
+  bbDesktopBrowserEvaluateRequestSchema,
+  bbDesktopBrowserFindInPageRequestSchema,
   bbDesktopBrowserNavigateRequestSchema,
   bbDesktopBrowserSetBoundsRequestSchema,
   bbDesktopBrowserSetVisibleRequestSchema,
+  bbDesktopBrowserStopFindInPageRequestSchema,
   bbDesktopBrowserTabRefSchema,
+  type BbDesktopBrowserEvaluateResult,
 } from "@bb/desktop-contract";
 import {
   BB_DESKTOP_BROWSER_ATTACH_CHANNEL,
   BB_DESKTOP_BROWSER_DETACH_CHANNEL,
+  BB_DESKTOP_BROWSER_EVALUATE_CHANNEL,
+  BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+  BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
   BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
   BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
   BB_DESKTOP_BROWSER_NAVIGATE_CHANNEL,
   BB_DESKTOP_BROWSER_RELOAD_CHANNEL,
   BB_DESKTOP_BROWSER_SET_BOUNDS_CHANNEL,
   BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
+  BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
   BB_DESKTOP_BROWSER_STOP_CHANNEL,
+  BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
 } from "./desktop-browser-ipc.js";
 import type { DesktopBrowserViewManager } from "./desktop-browser-view.js";
-
-interface DesktopBrowserTabCommandArgs {
-  hostWindow: BrowserWindow;
-  tabId: string;
-}
-
-type DesktopBrowserTabCommand = (args: DesktopBrowserTabCommandArgs) => void;
-
-interface RegisterDesktopBrowserTabCommandArgs {
-  channel: string;
-  run: DesktopBrowserTabCommand;
-}
 
 function hostWindowFromBrowserIpcEvent(
   event: IpcMainEvent,
@@ -37,99 +35,113 @@ function hostWindowFromBrowserIpcEvent(
   return BrowserWindow.fromWebContents(event.sender);
 }
 
-function registerTabCommand(args: RegisterDesktopBrowserTabCommandArgs): void {
-  ipcMain.on(args.channel, (event, payload: unknown) => {
+function registerRequestCommand<T>(
+  channel: string,
+  schema: z.ZodType<T>,
+  run: (args: { hostWindow: BrowserWindow; request: T }) => void,
+): void {
+  ipcMain.on(channel, (event, payload: unknown) => {
     const hostWindow = hostWindowFromBrowserIpcEvent(event);
     if (hostWindow === null) {
       return;
     }
-    const parsed = bbDesktopBrowserTabRefSchema.safeParse(payload);
+    const parsed = schema.safeParse(payload);
     if (!parsed.success) {
       return;
     }
-    args.run({ hostWindow, tabId: parsed.data.tabId });
+    run({ hostWindow, request: parsed.data });
   });
 }
 
 export function registerDesktopBrowserIpc(
   manager: DesktopBrowserViewManager,
 ): void {
-  // Every browser command is renderer -> main fire-and-forget; navigation state
-  // flows back over `BB_DESKTOP_BROWSER_STATE_CHANNEL`. Each handler resolves
-  // its own host window from the sender, so multi-window is safe, and zod-parses
-  // the untrusted-content-adjacent payload before touching the view.
-  ipcMain.on(BB_DESKTOP_BROWSER_ATTACH_CHANNEL, (event, payload: unknown) => {
-    const hostWindow = hostWindowFromBrowserIpcEvent(event);
-    if (hostWindow === null) {
-      return;
-    }
-    const parsed = bbDesktopBrowserAttachRequestSchema.safeParse(payload);
-    if (!parsed.success) {
-      return;
-    }
-    manager.attach({ hostWindow, request: parsed.data });
-  });
-
-  ipcMain.on(BB_DESKTOP_BROWSER_NAVIGATE_CHANNEL, (event, payload: unknown) => {
-    const hostWindow = hostWindowFromBrowserIpcEvent(event);
-    if (hostWindow === null) {
-      return;
-    }
-    const parsed = bbDesktopBrowserNavigateRequestSchema.safeParse(payload);
-    if (!parsed.success) {
-      return;
-    }
-    manager.navigate({ hostWindow, request: parsed.data });
-  });
-
-  ipcMain.on(
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_ATTACH_CHANNEL,
+    bbDesktopBrowserAttachRequestSchema,
+    (args) => manager.attach(args),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_NAVIGATE_CHANNEL,
+    bbDesktopBrowserNavigateRequestSchema,
+    (args) => manager.navigate(args),
+  );
+  registerRequestCommand(
     BB_DESKTOP_BROWSER_SET_BOUNDS_CHANNEL,
-    (event, payload: unknown) => {
-      const hostWindow = hostWindowFromBrowserIpcEvent(event);
-      if (hostWindow === null) {
-        return;
-      }
-      const parsed = bbDesktopBrowserSetBoundsRequestSchema.safeParse(payload);
-      if (!parsed.success) {
-        return;
-      }
-      manager.setBounds({ hostWindow, request: parsed.data });
-    },
+    bbDesktopBrowserSetBoundsRequestSchema,
+    (args) => manager.setBounds(args),
   );
-
-  ipcMain.on(
+  registerRequestCommand(
     BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
-    (event, payload: unknown) => {
-      const hostWindow = hostWindowFromBrowserIpcEvent(event);
+    bbDesktopBrowserSetVisibleRequestSchema,
+    (args) => manager.setVisible(args),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
+    bbDesktopBrowserSetVisibleRequestSchema,
+    (args) => manager.setVisibleWithoutFocus(args),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+    bbDesktopBrowserFindInPageRequestSchema,
+    (args) => manager.findInPage(args),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
+    bbDesktopBrowserStopFindInPageRequestSchema,
+    (args) => manager.stopFindInPage(args),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_DETACH_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.detach({ hostWindow, tabId: request.tabId }),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.focus({ hostWindow, tabId: request.tabId }),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.goBack({ hostWindow, tabId: request.tabId }),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.goForward({ hostWindow, tabId: request.tabId }),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_RELOAD_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.reload({ hostWindow, tabId: request.tabId }),
+  );
+  registerRequestCommand(
+    BB_DESKTOP_BROWSER_STOP_CHANNEL,
+    bbDesktopBrowserTabRefSchema,
+    ({ hostWindow, request }) =>
+      manager.stop({ hostWindow, tabId: request.tabId }),
+  );
+  ipcMain.handle(
+    BB_DESKTOP_BROWSER_EVALUATE_CHANNEL,
+    async (
+      event,
+      payload: unknown,
+    ): Promise<BbDesktopBrowserEvaluateResult> => {
+      const hostWindow = BrowserWindow.fromWebContents(event.sender);
       if (hostWindow === null) {
-        return;
+        return { ok: false, error: "Browser host window is not available" };
       }
-      const parsed = bbDesktopBrowserSetVisibleRequestSchema.safeParse(payload);
+      const parsed = bbDesktopBrowserEvaluateRequestSchema.safeParse(payload);
       if (!parsed.success) {
-        return;
+        return { ok: false, error: "Invalid browser page evaluation request" };
       }
-      manager.setVisible({ hostWindow, request: parsed.data });
+      return manager.evaluate({ hostWindow, request: parsed.data });
     },
   );
-
-  registerTabCommand({
-    channel: BB_DESKTOP_BROWSER_DETACH_CHANNEL,
-    run: (args) => manager.detach(args),
-  });
-  registerTabCommand({
-    channel: BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
-    run: (args) => manager.goBack(args),
-  });
-  registerTabCommand({
-    channel: BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
-    run: (args) => manager.goForward(args),
-  });
-  registerTabCommand({
-    channel: BB_DESKTOP_BROWSER_RELOAD_CHANNEL,
-    run: (args) => manager.reload(args),
-  });
-  registerTabCommand({
-    channel: BB_DESKTOP_BROWSER_STOP_CHANNEL,
-    run: (args) => manager.stop(args),
-  });
 }

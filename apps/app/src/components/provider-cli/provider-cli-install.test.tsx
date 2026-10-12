@@ -3,11 +3,9 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import type {
-  ProviderCliInstallEvent,
-  ProviderCliKey,
-} from "@bb/host-daemon-contract";
+import type { ProviderCliInstallEvent } from "@bb/host-daemon-contract";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BbHttpError } from "@bb/sdk/browser";
 import { sdk } from "@/lib/sdk";
 import { appToast } from "@/components/ui/app-toast";
 import {
@@ -74,14 +72,13 @@ function renderRunner() {
 }
 
 function issueForProvider(
-  provider: Extract<ProviderCliKey, "codex" | "claudeCode">,
+  provider: "codex" | "claude-code",
 ): ProviderCliActionableIssue {
   const displayName = provider === "codex" ? "Codex" : "Claude Code";
   const executableName = provider === "codex" ? "codex" : "claude";
   const action = {
     kind: "update" as const,
     label: "Update" as const,
-    commandKind: "exec" as const,
     command: `${executableName} update`,
   };
 
@@ -130,7 +127,6 @@ beforeEach(() => {
     defaultOptions: { queries: { retry: false } },
   });
   resetProviderCliInstallStoreForTests();
-  // main.tsx does this at bootstrap; the store never reads React context.
   registerProviderCliInstallQueryClient(queryClient);
   installHostProviderCliMock.mockImplementation(
     (args) =>
@@ -147,9 +143,9 @@ afterEach(() => {
 
 describe("buildProviderCliIssue", () => {
   it("keeps an external update visible when bb cannot apply it", () => {
-    const actionable = issueForProvider("claudeCode");
+    const actionable = issueForProvider("claude-code");
     const issue = buildProviderCliIssue({
-      provider: "claudeCode",
+      provider: "claude-code",
       status: {
         ...actionable.status,
         installSource: "external",
@@ -158,16 +154,16 @@ describe("buildProviderCliIssue", () => {
     });
 
     expect(issue).toMatchObject({
-      provider: "claudeCode",
+      provider: "claude-code",
       action: null,
       title: "Claude Code update available",
     });
   });
 
   it("describes an update without inventing a target for an unknown channel", () => {
-    const actionable = issueForProvider("claudeCode");
+    const actionable = issueForProvider("claude-code");
     const issue = buildProviderCliIssue({
-      provider: "claudeCode",
+      provider: "claude-code",
       status: {
         ...actionable.status,
         latestVersion: null,
@@ -204,14 +200,14 @@ describe("useProviderCliInstallRunner", () => {
     act(() => {
       result.current.startInstall({
         hostId: "host_1",
-        issue: issueForProvider("claudeCode"),
+        issue: issueForProvider("claude-code"),
       });
     });
 
     expect(installHostProviderCliMock).toHaveBeenCalledTimes(1);
     expect(appToastMock.message).not.toHaveBeenCalled();
     expect(appToastMock.loading).not.toHaveBeenCalled();
-    expect(result.current.queuedJobKeys.has("host_1:claudeCode")).toBe(true);
+    expect(result.current.queuedJobKeys.has("host_1:claude-code")).toBe(true);
 
     await act(async () => {
       completeInstall(installAt(0), {
@@ -228,16 +224,16 @@ describe("useProviderCliInstallRunner", () => {
     });
     expect(installHostProviderCliMock).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        provider: "claudeCode",
+        provider: "claude-code",
         actionKind: "update",
       }),
     );
-    expect(result.current.queuedJobKeys.has("host_1:claudeCode")).toBe(false);
+    expect(result.current.queuedJobKeys.has("host_1:claude-code")).toBe(false);
 
     await act(async () => {
       completeInstall(installAt(1), {
         type: "completed",
-        provider: "claudeCode",
+        provider: "claude-code",
         success: true,
         exitCode: 0,
         signal: null,
@@ -254,8 +250,6 @@ describe("useProviderCliInstallRunner", () => {
     expect(appToastMock.success).not.toHaveBeenCalled();
   });
 
-  // The whole point of the module-level store: leaving Settings → Updates must
-  // not abandon the queue or drop the status refresh on the floor.
   it("keeps draining the queue after every consumer unmounts", async () => {
     const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
     const { result, unmount } = renderRunner();
@@ -267,7 +261,7 @@ describe("useProviderCliInstallRunner", () => {
       });
       result.current.startInstall({
         hostId: "host_1",
-        issue: issueForProvider("claudeCode"),
+        issue: issueForProvider("claude-code"),
       });
     });
     expect(installHostProviderCliMock).toHaveBeenCalledTimes(1);
@@ -288,15 +282,14 @@ describe("useProviderCliInstallRunner", () => {
       expect(installHostProviderCliMock).toHaveBeenCalledTimes(2);
     });
     expect(installHostProviderCliMock).toHaveBeenLastCalledWith(
-      expect.objectContaining({ provider: "claudeCode" }),
+      expect.objectContaining({ provider: "claude-code" }),
     );
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: hostProviderCliStatusQueryKey("host_1"),
     });
 
-    // Remounting elsewhere in the app picks the still-running job back up.
     const remounted = renderRunner();
-    expect(remounted.result.current.runningJobKey).toBe("host_1:claudeCode");
+    expect(remounted.result.current.runningJobKey).toBe("host_1:claude-code");
   });
 
   it("keeps a failed install and its stderr available for a retry", async () => {
@@ -342,6 +335,7 @@ describe("useProviderCliInstallRunner", () => {
     );
     expect(result.current.failuresByJobKey.get("host_1:codex")).toMatchObject({
       issueFingerprint: issue.fingerprint,
+      kind: "command",
       logDialogState: {
         message: "Command exited with code 1",
         log: "$ codex update\npermission denied\n",
@@ -352,6 +346,47 @@ describe("useProviderCliInstallRunner", () => {
       result.current.startInstall({ hostId: "host_1", issue });
     });
     expect(result.current.failuresByJobKey.has("host_1:codex")).toBe(false);
+  });
+
+  it("summarizes a dropped connection but keeps a server rejection's reason", async () => {
+    const { result } = renderRunner();
+    const codex = issueForProvider("codex");
+    const claude = issueForProvider("claude-code");
+
+    act(() => {
+      result.current.startInstall({ hostId: "host_1", issue: codex });
+      result.current.startInstall({ hostId: "host_1", issue: claude });
+    });
+
+    await act(async () => {
+      installAt(0).reject(new TypeError("Failed to fetch"));
+    });
+    await waitFor(() => expect(pendingInstalls).toHaveLength(2));
+    await act(async () => {
+      installAt(1).reject(
+        new BbHttpError({
+          status: 409,
+          code: "provider_bridge_unavailable",
+          message: "Provider bridge unavailable",
+          body: null,
+        }),
+      );
+    });
+
+    expect(result.current.failuresByJobKey.get("host_1:codex")).toMatchObject({
+      kind: "interrupted",
+      logDialogState: { message: "Connection lost during update" },
+    });
+    expect(
+      result.current.failuresByJobKey.get("host_1:claude-code"),
+    ).toMatchObject({
+      kind: "command",
+      logDialogState: { message: "Provider bridge unavailable" },
+    });
+    expect(appToastMock.error).toHaveBeenCalledWith(
+      "Claude Code update failed",
+      expect.objectContaining({ description: "Provider bridge unavailable" }),
+    );
   });
 
   it("bounds retained failures by entry count and log bytes", async () => {

@@ -1,29 +1,14 @@
-import { reasoningLevelValues, type ReasoningLevel } from "./shared-types.js";
+import {
+  standardReasoningLevelRank,
+  type ReasoningLevel,
+} from "./shared-types.js";
 
-/**
- * When the model changes, we want the reasoning preference to follow as
- * closely as possible:
- *
- * 1. If the new model supports the previously selected level → keep it.
- * 2. Otherwise, pick the supported level with the smallest distance from
- *    the previous level in the canonical low→max ordering. On a tie, prefer
- *    the higher level (closer to max) — matches user intent that picking a
- *    high reasoning level reflects a preference for more effort, so a model
- *    switch should not silently downgrade past a closer-up option.
- *
- * Examples (using order low(1) < medium(2) < high(3) < xhigh(4) < max(5)):
- *   reconcile("max",    ["low","medium","high","xhigh"]) → "xhigh"
- *   reconcile("high",   ["low","medium","high","xhigh","max"]) → "high"
- *   reconcile("medium", ["low","high"]) → "high"   (tie at distance 1, upward)
- *   reconcile("low",    ["high","max"]) → "high"   (closest available)
- *
- * `supported` MUST be non-empty — every real model exposes at least one
- * reasoning effort. Callers that may receive an empty list should guard the
- * call themselves.
- */
+const UNRANKED_PREVIOUS_LEVEL: ReasoningLevel = "medium";
+
 export function reconcileReasoningLevel(
   previous: ReasoningLevel,
   supported: readonly ReasoningLevel[],
+  unrankedFallback?: ReasoningLevel,
 ): ReasoningLevel {
   if (supported.length === 0) {
     throw new Error(
@@ -32,34 +17,33 @@ export function reconcileReasoningLevel(
   }
   if (supported.includes(previous)) return previous;
 
-  // Ultracode's underlying effort IS xhigh (plus workflow orchestration), so a
-  // model without ultracode support reconciles as if from xhigh — never up to
-  // max, which would silently select more raw effort than ultracode ever used.
   const effectivePrevious = previous === "ultracode" ? "xhigh" : previous;
   if (supported.includes(effectivePrevious)) return effectivePrevious;
 
-  const previousRank = reasoningRank(effectivePrevious);
-  let bestLevel = supported[0];
-  let bestDistance = Math.abs(reasoningRank(bestLevel) - previousRank);
-  for (const candidate of supported.slice(1)) {
-    const distance = Math.abs(reasoningRank(candidate) - previousRank);
-    if (distance < bestDistance) {
-      bestLevel = candidate;
-      bestDistance = distance;
+  const previousRank =
+    standardReasoningLevelRank(effectivePrevious) ??
+    standardReasoningLevelRank(UNRANKED_PREVIOUS_LEVEL) ??
+    0;
+  let best: { level: ReasoningLevel; rank: number; distance: number } | null =
+    null;
+  for (const candidate of supported) {
+    const rank = standardReasoningLevelRank(candidate);
+    if (rank === null) {
       continue;
     }
-    // Tie → prefer the level with the higher rank.
+    const distance = Math.abs(rank - previousRank);
     if (
-      distance === bestDistance &&
-      reasoningRank(candidate) > reasoningRank(bestLevel)
+      best === null ||
+      distance < best.distance ||
+      (distance === best.distance && rank > best.rank)
     ) {
-      bestLevel = candidate;
+      best = { level: candidate, rank, distance };
     }
   }
-  return bestLevel;
-}
-
-function reasoningRank(level: ReasoningLevel): number {
-  // Canonical low→max ordering pinned by `reasoningLevelValues`.
-  return reasoningLevelValues.indexOf(level);
+  if (best !== null) {
+    return best.level;
+  }
+  return unrankedFallback !== undefined && supported.includes(unrankedFallback)
+    ? unrankedFallback
+    : supported[0];
 }

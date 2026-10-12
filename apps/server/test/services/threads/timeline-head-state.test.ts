@@ -15,7 +15,7 @@ import {
   upsertHost,
 } from "@bb/db";
 import type { DbConnection } from "@bb/db";
-import { buildThreadTimeline } from "../../../src/services/threads/timeline.js";
+import { buildThreadTimelineWithProfile } from "../../../src/services/threads/timeline.js";
 
 const providerThreadId = "provider-root";
 const execution = {
@@ -34,7 +34,6 @@ function setup(): { db: DbConnection; thread: Thread } {
   migrate(db);
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
@@ -48,15 +47,13 @@ function setup(): { db: DbConnection; thread: Thread } {
   return { db, thread };
 }
 
-/**
- * Turn 1 establishes head state (goal, todos, a still-running workflow), then
- * `turns - 1` further turns bury it far above any budgeted window.
- */
 function seedThreadWithEarlyHeadState(
   db: DbConnection,
   thread: Thread,
   turns: number,
   itemsPerTurn: number,
+  runningWorkflow: boolean,
+  pendingCommand = false,
 ): void {
   const events: Parameters<typeof insertEvents>[2] = [];
   let sequence = 0;
@@ -70,6 +67,7 @@ function seedThreadWithEarlyHeadState(
       scope: threadScope(),
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({
         direction: "outbound",
         source: "tell",
@@ -90,6 +88,7 @@ function seedThreadWithEarlyHeadState(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({}),
     });
     events.push({
@@ -100,6 +99,7 @@ function seedThreadWithEarlyHeadState(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({ clientRequestId }),
     });
 
@@ -111,6 +111,7 @@ function seedThreadWithEarlyHeadState(
         scope: threadScope(),
         itemId: null,
         itemKind: null,
+        parentToolCallId: null,
         data: JSON.stringify({
           threadId: thread.id,
           providerThreadId,
@@ -127,52 +128,70 @@ function seedThreadWithEarlyHeadState(
         type: "item/completed",
         scope: turnScope(turnId),
         providerThreadId,
-        itemId: "todo-1",
-        itemKind: "toolCall",
-        data: JSON.stringify({
-          item: {
-            type: "toolCall",
-            id: "todo-1",
-            tool: "TodoWrite",
-            arguments: {
-              todos: [
-                {
-                  content: "Ship the thing",
-                  status: "in_progress",
-                  activeForm: "Shipping the thing",
-                },
-                { content: "Write the docs", status: "pending" },
-              ],
-            },
-            status: "completed",
-            result: "ok",
-          },
-        }),
-      });
-      // A workflow started early and never completed: the banner must survive.
-      events.push({
-        threadId: thread.id,
-        sequence: (sequence += 1),
-        type: "item/started",
-        scope: turnScope(turnId),
-        providerThreadId,
-        itemId: "wf-1",
-        itemKind: "backgroundTask",
+        itemId: "plan-1",
+        itemKind: "planSteps",
+        parentToolCallId: null,
         data: JSON.stringify({
           providerThreadId,
           item: {
-            id: "wf-1",
-            type: "backgroundTask",
-            taskType: "local_workflow",
-            description: "long running workflow",
-            status: "pending",
-            taskStatus: "running",
-            skipTranscript: false,
-            workflowName: "fixture-mini",
-            usage: { totalTokens: 100, toolUses: 2, durationMs: 1500 },
+            type: "planSteps",
+            id: "plan-1",
+            steps: [
+              { step: "Shipping the thing", status: "active" },
+              { step: "Write the docs", status: "pending" },
+            ],
+            status: "completed",
           },
         }),
       });
+      if (pendingCommand) {
+        events.push({
+          threadId: thread.id,
+          sequence: (sequence += 1),
+          type: "item/started",
+          scope: turnScope(turnId),
+          providerThreadId,
+          itemId: "old-command",
+          itemKind: "commandExecution",
+          parentToolCallId: null,
+          data: JSON.stringify({
+            item: {
+              type: "commandExecution",
+              id: "old-command",
+              command: "echo done",
+              cwd: "/tmp",
+              status: "pending",
+              aggregatedOutput: "",
+              approvalStatus: null,
+            },
+          }),
+        });
+      }
+      if (runningWorkflow)
+        events.push({
+          threadId: thread.id,
+          sequence: (sequence += 1),
+          type: "item/started",
+          scope: turnScope(turnId),
+          providerThreadId,
+          itemId: "wf-1",
+          itemKind: "backgroundTask",
+          parentToolCallId: null,
+          data: JSON.stringify({
+            providerThreadId,
+            item: {
+              id: "wf-1",
+              type: "backgroundTask",
+              taskType: "local_workflow",
+              description: "long running workflow",
+              status: "pending",
+              taskStatus: "running",
+              skipTranscript: false,
+              workflowName: "fixture-mini",
+              usage: { totalTokens: 100, toolUses: 2, durationMs: 1500 },
+            },
+          }),
+        });
     }
 
     for (let item = 0; item < itemsPerTurn; item += 1) {
@@ -184,6 +203,7 @@ function seedThreadWithEarlyHeadState(
         providerThreadId,
         itemId: `${turnId}-item-${item}`,
         itemKind: "agentMessage",
+        parentToolCallId: null,
         data: JSON.stringify({
           item: {
             type: "agentMessage",
@@ -198,7 +218,8 @@ function seedThreadWithEarlyHeadState(
 }
 
 const baseOptions = {
-  includeProviderUnhandledOperations: false,
+  includeClearedContextHistory: false,
+  includeDiagnosticOperations: false,
   includeNestedRows: true,
   maxInlineOutputChars: null,
   maxSeq: 0,
@@ -207,22 +228,20 @@ const baseOptions = {
 
 describe("timeline head state under a budgeted window", () => {
   it("keeps goal, todos, and a running workflow when the budget excludes the turn that set them", () => {
-    // Head-state banners describe the head of the thread but are extracted by
-    // scanning the window. A budgeted window starts well after turn 1 here, so
-    // without thread-scoped lookups these silently disappear mid-session.
     const { db, thread } = setup();
-    seedThreadWithEarlyHeadState(db, thread, 12, 60);
+    seedThreadWithEarlyHeadState(db, thread, 12, 60, true);
 
-    const unbudgeted = buildThreadTimeline(db, thread, {
+    const unbudgeted = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
       ...baseOptions,
       eventBudget: 1_000_000,
-    });
-    const budgeted = buildThreadTimeline(db, thread, {
+    }).response;
+    const budgeted = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
       ...baseOptions,
       eventBudget: 100,
-    });
+    }).response;
 
-    // The budget really did cut the window, otherwise this proves nothing.
     expect(budgeted.timelinePage.returnedSegmentCount).toBeLessThan(
       unbudgeted.timelinePage.returnedSegmentCount,
     );
@@ -241,6 +260,70 @@ describe("timeline head state under a budgeted window", () => {
     expect(budgeted.activeWorkflows).toHaveLength(1);
   });
 
+  it("keeps historical plan state without loading intervening conversation markers", () => {
+    const { db, thread } = setup();
+    seedThreadWithEarlyHeadState(db, thread, 100, 1, false);
+    const latest = buildThreadTimelineWithProfile(db, thread, {
+      ...baseOptions,
+      completedTurnDisplay: "collapse",
+      eventBudget: 8,
+      page: { kind: "latest", segmentLimit: 2 },
+    });
+    expect(
+      latest.response.pendingTodos?.items.map((item) => item.text),
+    ).toEqual(["Shipping the thing", "Write the docs"]);
+    expect(latest.response.goal?.objective).toBe("Land the timeline fix");
+    expect(latest.response.rows.some((row) => row.sourceSeqStart < 390)).toBe(
+      false,
+    );
+    expect(latest.profile.eventRowCount).toBeLessThan(20);
+    db.$client.close();
+  });
+
+  it("still marks an omitted older message changed by a late completion", () => {
+    const { db, thread } = setup();
+    seedThreadWithEarlyHeadState(db, thread, 100, 1, false, true);
+    const options = {
+      ...baseOptions,
+      completedTurnDisplay: "collapse" as const,
+      eventBudget: 8,
+      page: { kind: "latest" as const, segmentLimit: 2 },
+    };
+    const before = buildThreadTimelineWithProfile(db, thread, options).response;
+    insertEvents(db, noopNotifier, [
+      {
+        threadId: thread.id,
+        sequence: before.maxSeq + 1,
+        type: "item/completed",
+        scope: turnScope("turn-1"),
+        providerThreadId,
+        itemId: "old-command",
+        itemKind: "commandExecution",
+        parentToolCallId: null,
+        data: JSON.stringify({
+          item: {
+            type: "commandExecution",
+            id: "old-command",
+            command: "echo done",
+            cwd: "/tmp",
+            status: "completed",
+            aggregatedOutput: "done",
+            approvalStatus: null,
+            exitCode: 0,
+            durationMs: 1000,
+          },
+        }),
+      },
+    ]);
+    const after = buildThreadTimelineWithProfile(db, thread, options).response;
+    expect(
+      after.timelinePage.olderRowUpdates?.map((row) => row.sourceSeqEnd),
+    ).toContain(before.maxSeq + 1);
+    expect(after.pendingTodos).toEqual(before.pendingTodos);
+    expect(after.goal).toEqual(before.goal);
+    db.$client.close();
+  });
+
   it("still reports no head state when the thread never set any", () => {
     const { db, thread } = setup();
     const events: Parameters<typeof insertEvents>[2] = [];
@@ -251,6 +334,7 @@ describe("timeline head state under a budgeted window", () => {
       scope: threadScope(),
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({
         direction: "outbound",
         source: "tell",
@@ -265,10 +349,11 @@ describe("timeline head state under a budgeted window", () => {
     });
     insertEvents(db, noopNotifier, events);
 
-    const budgeted = buildThreadTimeline(db, thread, {
+    const budgeted = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
       ...baseOptions,
       eventBudget: 100,
-    });
+    }).response;
     expect(budgeted.pendingTodos).toBeNull();
     expect(budgeted.goal).toBeNull();
     expect(budgeted.activeWorkflows).toHaveLength(0);

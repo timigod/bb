@@ -6,8 +6,20 @@
    Without this, utility classes used only by moved components — row-height,
    overlay, icon sizing — get purged from the app's CSS. */
 @source "../../../../../packages/shared-ui/src";
+@source "../../../../../plugins/thread-list/app";
 
 @custom-variant dark (&:is(.dark *));
+
+/*
+ * Blink cannot anchor a `:has()` that Tailwind nests inside `:is()`/`:where()`
+ * with a universal subject (the shape it emits for `group-has-*` variants).
+ * With that shape present, every DOM insertion or removal under the page
+ * restyles the whole subtree (~1 s on a large thread). Keep `:has()` on the
+ * group element itself instead.
+ */
+@custom-variant queue-boundary-row-hover (:where(.group\/queue):has([data-queued-message-group-boundary-row]:hover) &);
+@custom-variant queue-boundary-row-focus-within (:where(.group\/queue):has([data-queued-message-group-boundary-row]:focus-within) &);
+@custom-variant tab-pill-close-focus-visible (:where(.group\/tab-pill):has([data-tab-pill-close]:focus-visible) &);
 
 @theme inline {
   --color-background: var(--background);
@@ -27,6 +39,7 @@
    * settled/closed-turn machinery, and a text-only destructive that clears AA in
    * dark mode (the --destructive fill is below the 4.5:1 text floor there). */
   --color-readback-foreground: var(--readback-foreground);
+  --color-version-upgrade: var(--version-upgrade);
   --color-timeline-accent: var(--timeline-accent);
   --color-file-accent: var(--file-accent);
   --color-accent: var(--accent);
@@ -45,6 +58,7 @@
   /* GitHub's merged-PR purple — the one chromatic exception in the PR state
    * dots, matching the universal merged-PR color language. */
   --color-pr-merged: var(--pr-merged);
+  --color-brand-discord: var(--brand-discord);
   --color-diff-removed: var(--diff-removed);
   --color-border: var(--border);
   --color-border-hairline: var(--border-hairline);
@@ -168,8 +182,27 @@
       var(--bb-sidebar-sticky-stack-padding);
   }
 
+  /* The stack's top padding is inside the scrollport, so rows stay visible as
+     they scroll through it. A sticky label hides that strip behind its own top
+     shield; a pinned row with no label above it has nothing to hide it, so the
+     stack caps the strip for every tier. */
+  [data-sidebar-sticky-stack]::before {
+    content: "";
+    position: sticky;
+    top: 0;
+    z-index: 55;
+    display: block;
+    height: var(--bb-sidebar-sticky-stack-padding-top);
+    margin-top: calc(-1 * var(--bb-sidebar-sticky-stack-padding-top));
+    background-color: var(--sidebar);
+  }
+
   [data-sidebar-sticky-stack][data-sidebar-sticky-density="compact-actions"] {
     --bb-sidebar-sticky-stack-padding-top: 0.5rem;
+  }
+
+  [data-sidebar-sticky-tier] {
+    position: relative;
   }
 
   [data-sidebar-sticky-stack] [data-sidebar-sticky-tier] {
@@ -235,14 +268,16 @@
   }
 
   [data-sidebar-sticky-stack]
-    [data-sidebar-sticky-tier].bb-sidebar-open-in-split-row:is(
+    [data-sidebar-sticky-tier].bb-sidebar-accent-row:is(
       :hover,
-      :has([data-state="open"])
-    ) {
-    background-image: linear-gradient(
-      var(--sidebar-accent),
-      var(--sidebar-accent)
-    );
+      :has([data-state="open"]),
+      :has([data-sidebar-rename-anchor]:focus-visible),
+      :has([data-row-actions-customize]),
+      [data-sidebar-nest-target="valid"]
+    ):not([data-sidebar-touch-armed="true"]) {
+    background-image:
+      linear-gradient(var(--sidebar-accent), var(--sidebar-accent)),
+      linear-gradient(var(--sidebar), var(--sidebar));
   }
 
   .bb-sidebar-hover-actions {
@@ -259,32 +294,26 @@
     opacity: 1;
   }
 
-  /* Sidebar row glyph that swaps on hover (the Extensions row's toolbox ->
-   * tool case). Both glyphs share one grid cell and only opacity changes, so
-   * the row can never reflow mid-swap. Driven by the same
-   * :is(:hover, :has(:focus-visible)) row selector as the hover actions above,
-   * so a keyboard focus swaps the glyph exactly like a pointer hover. */
-  .bb-sidebar-row-icon-swap {
-    display: grid;
-    grid-template-areas: "glyph";
-  }
-
-  .bb-sidebar-row-icon-swap > * {
-    grid-area: glyph;
-  }
-
-  .bb-sidebar-row-icon-hover {
-    opacity: 0;
+  /* Row content beside a hover-actions overlay that grows past its rest slot
+   * (the thread row's quick actions sit left of the menu trigger). Reserve
+   * their width, one action unless the row sets the inset variable, under the
+   * same row states that reveal the overlay, so the title truncates instead of
+   * running under the buttons. */
+  .bb-sidebar-hover-actions-inset {
+    transition-property: padding;
+    transition-duration: 0ms;
   }
 
   .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
-    .bb-sidebar-row-icon-rest {
-    opacity: 0;
-  }
-
-  .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
-    .bb-sidebar-row-icon-hover {
-    opacity: 1;
+    .bb-sidebar-hover-actions-inset,
+  .bb-sidebar-hover-actions-row:has(
+      .bb-sidebar-hover-actions[data-sidebar-hover-actions-open="true"]
+    )
+    .bb-sidebar-hover-actions-inset {
+    padding-right: var(
+      --bb-sidebar-hover-actions-inset,
+      calc(var(--spacing) * 7.5)
+    );
   }
 
   .bb-sidebar-hover-actions-fade {
@@ -299,7 +328,17 @@
     opacity: 0;
   }
 
-  @media (max-width: 767px) and (pointer: coarse) {
+  @media (hover: none) {
+    /* The overlay is hidden where the primary input cannot hover, so no room is reserved. */
+    .bb-sidebar-hover-actions-row:is(:hover, :has(:focus-visible))
+      .bb-sidebar-hover-actions-inset,
+    .bb-sidebar-hover-actions-row:has(
+        .bb-sidebar-hover-actions[data-sidebar-hover-actions-open="true"]
+      )
+      .bb-sidebar-hover-actions-inset {
+      padding-right: 0;
+    }
+
     .bb-sidebar-hover-actions-row:hover:not(:has(:focus-visible))
       .bb-sidebar-hover-actions:not(
         [data-sidebar-hover-actions-open="true"]
@@ -374,6 +413,14 @@
     margin-top: var(--bb-sidebar-sticky-row-gap);
   }
 
+  /* A section header that scrolls with its contents (Pinned) pins no label, so
+     every tier below it moves up by the slot the label would have held. The
+     label slot is the origin both deeper offsets derive from, so collapsing it
+     here covers the project tier and every parent level at once. */
+  [data-sidebar-sticky-stack] [data-sidebar-sticky-header="false"] {
+    --bb-sidebar-sticky-project-top: var(--bb-sidebar-sticky-stack-padding-top);
+  }
+
   /* Section-variant trees (Pinned, projectless Threads) have no project tier:
      the hierarchy is label -> parents. Drop the parent base up one level so the
      first parent pins directly under the section label instead of reserving an
@@ -423,6 +470,11 @@
   --subtle-foreground: oklch(0.5 0 0);
   /* Recede tier between muted (7.77:1) and subtle (6.00:1); ~6.83:1 on white. */
   --readback-foreground: oklch(0.47 0 0);
+  /* The version an update would move you to. Its own role rather than plain
+   * body text so the "this is the one you'd get" emphasis can be tuned without
+   * touching every other foreground, and derived from the anchors so custom
+   * palettes tint it instead of stranding it neutral beside their own text. */
+  --version-upgrade: color-mix(in oklch, var(--ink) 96%, var(--canvas));
   /* Soft "paper blue" timeline accent — the one tint in the otherwise
    * achromatic timeline. ~5.0:1 on white. */
   --timeline-accent: oklch(0.55 0.1 250);
@@ -432,14 +484,6 @@
    * canvas these match an opaque ink-over-canvas mix exactly; on elevated
   * surfaces they composite for real, visible contrast. */
   --state-hover: color-mix(in oklab, var(--ink) 5.9%, transparent);
-  --resource-source-shelf-card-hover-border: color-mix(
-    in oklch,
-    var(--ink) 24%,
-    var(--canvas)
-  );
-  --resource-source-shelf-card-hover-shadow:
-    -1px 2px 0 0 color-mix(in oklab, var(--ink) 8%, transparent),
-    -4px 6px 10px -5px color-mix(in oklab, var(--ink) 10%, transparent);
   --state-active: color-mix(in oklab, var(--ink) 11.8%, transparent);
   --destructive: oklch(0.45 0.19 25.8625);
   --destructive-foreground: oklch(1 0 0);
@@ -454,6 +498,7 @@
   --success-foreground: color-mix(in oklch, var(--success) 45%, var(--ink));
   --diff-added: oklch(0.4 0.13 163);
   --pr-merged: oklch(0.53 0.2 295);
+  --brand-discord: oklch(0.5774 0.2091 273.85);
   --diff-removed: oklch(0.4 0.17 28);
   --border: color-mix(in oklch, var(--ink) 14%, var(--canvas));
   --border-hairline: color-mix(in oklch, var(--ink) 14.7%, var(--canvas));
@@ -540,15 +585,16 @@
     oklch(0.8 0.13 88),
     var(--canvas) 76%
   );
-  --sidebar-search-match-border: color-mix(
-    in oklab,
-    oklch(0.8 0.13 88),
-    var(--canvas) 60%
-  );
   --sidebar-ring: var(--primary);
   --font-sans: "Inter Variable", Inter, sans-serif;
   --font-serif: Georgia, serif;
-  --font-mono: "Fira Code", monospace;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --font-terminal:
+    "JetBrainsMono Nerd Font Mono", "MesloLGS NF", "Symbols Nerd Font Mono",
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
   --radius: 0.5rem;
   --bb-sidebar-row-height: 1.75rem;
   --bb-sidebar-row-height-coarse: 2.5rem;
@@ -581,14 +627,8 @@
   --resource-source-shelf-inset: calc(var(--spacing) * 3);
   --resource-source-shelf-section-gap: calc(var(--spacing) * 2);
   --resource-source-shelf-label-gap: calc(var(--spacing) * 1.5);
-  --resource-source-shelf-item-gap: var(--spacing);
-  --resource-source-shelf-item-width: 31.25%;
-  --resource-source-shelf-card-action-gap: calc(var(--spacing) * 2);
   --resource-source-shelf-action-inline: calc(var(--spacing) * 1.5);
   --resource-source-shelf-action-block: var(--spacing);
-  --resource-source-shelf-fade-ramp: calc(var(--spacing) * 4);
-  --resource-source-shelf-shadow-bleed: calc(var(--spacing) * 5);
-  --resource-source-shelf-shadow-left-bleed: var(--spacing);
   --icon-stroke-width: 1.75;
   /* ANSI 16-color palette (light mode) tuned for readable terminal output. */
   --ansi-0: #000000;
@@ -667,22 +707,14 @@
   --subtle-foreground: oklch(0.68 0 0);
   /* Recede tier between muted (9.14:1) and subtle (6.35:1); ~7.24:1 on canvas. */
   --readback-foreground: oklch(0.715 0 0);
+  /* See the light block: the version an update would move you to. */
+  --version-upgrade: color-mix(in oklch, var(--ink) 96%, var(--canvas));
   /* Soft "paper blue" timeline accent, lifted for the dark canvas (~6:1). */
   --timeline-accent: oklch(0.72 0.09 250);
   --file-accent: var(--timeline-accent);
   /* Interactive-state fills: translucent ink so the same hover/active step
   * reads consistently on canvas, cards, and recessed surfaces alike. */
   --state-hover: color-mix(in oklab, var(--ink) 13.8%, transparent);
-  /* Intentionally close to --input: shadows contribute little on the dark
-   * canvas, so this border carries the card's complete hover signal. */
-  --resource-source-shelf-card-hover-border: color-mix(
-    in oklch,
-    var(--ink) 30%,
-    var(--canvas)
-  );
-  --resource-source-shelf-card-hover-shadow:
-    -1px 2px 0 0 color-mix(in oklab, var(--canvas) 22%, transparent),
-    -4px 6px 10px -5px color-mix(in oklab, var(--canvas) 45%, transparent);
   --state-active: color-mix(in oklab, var(--ink) 22.5%, transparent);
   --destructive: oklch(0.56 0.19 22.1703);
   --destructive-foreground: oklch(1 0 0);
@@ -697,6 +729,7 @@
   --diff-added: oklch(0.77 0.17 163);
   --diff-removed: oklch(0.72 0.19 22);
   --pr-merged: oklch(0.68 0.18 295);
+  --brand-discord: var(--foreground);
   --border: color-mix(in oklch, var(--ink) 19.4%, var(--canvas));
   --border-hairline: color-mix(in oklch, var(--ink) 21%, var(--canvas));
   /* One app-shell seam for top nav, sidebar, split, and panel boundaries. */
@@ -771,15 +804,12 @@
     oklch(0.8 0.13 88),
     var(--canvas) 80%
   );
-  --sidebar-search-match-border: color-mix(
-    in oklab,
-    oklch(0.8 0.13 88),
-    var(--canvas) 67%
-  );
   --sidebar-ring: var(--primary);
   --font-sans: "Inter Variable", Inter, sans-serif;
   --font-serif: Georgia, serif;
-  --font-mono: "Fira Code", monospace;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
   --radius: 0.5rem;
   /* Dark shadows are pure black at higher alpha — a 20%-gray shadow is
    * invisible on the dark canvas, so floating surfaces (popovers, dropdowns)
@@ -871,9 +901,25 @@
     touch-action: manipulation;
   }
 
-  .lucide {
+  .bb-icon-stroke {
     stroke-width: var(--icon-stroke-width);
   }
+}
+
+/*
+ * Non-inherited on purpose. The sidebar resize drag rewrites this length on
+ * every animation frame; an inherited custom property change makes the
+ * engine restyle every descendant of the element it is set on (measured at
+ * ~20-45 µs per element, so a long thread cost 50-400 ms per frame).
+ * `Sidebar` therefore sets it directly on the two elements that read it (the
+ * desktop gap and panel), and a change touches only those. The initial value
+ * mirrors the 16rem default in sidebar.tsx (`@property` requires an absolute
+ * length here).
+ */
+@property --sidebar-width {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 256px;
 }
 
 body.sidebar-resizing [data-sidebar="gap"],
@@ -893,112 +939,104 @@ body.sidebar-resizing [data-sidebar="panel"] {
 }
 
 @layer utilities {
+  .bb-thread-title {
+    @apply flex min-w-0 items-baseline;
+  }
+
+  .bb-thread-title .prompt-mention-pill {
+    @apply min-w-10;
+    flex: 1 1 0%;
+    max-width: max-content;
+  }
+
+  /*
+   * The working sweep is an animated image used as a mask: `shine-sweep.png`
+   * is a 128x2 APNG whose alpha band travels left to right once a second,
+   * stretched over the label or glyph (`apps/app/scripts/generate-shine-sweep.mjs`
+   * writes it). Chromium advances animated images on the compositor, with no
+   * style, paint, or commit on the main thread, so an agent working costs the
+   * main thread nothing; an engine that animates images on the main thread
+   * repaints this one small layer at the file's 30 fps.
+   * A `background-position` / `mask-position` keyframe sweep looks the same but
+   * cannot leave the main thread: at 60 fps it cost a full rendering pass per
+   * frame, growing with the weight of the page around the label. The mask only
+   * carries alpha, so one file serves every theme, label, and icon;
+   * `-webkit-text-fill-color` keeps labels at full `--foreground` strength at
+   * the peak whatever text color utility they carry. `will-change: transform`
+   * gives the element its own layer while the class is present, so each frame
+   * re-rasters the small label instead of the scroller tile it sits in. The
+   * file stays under Vite's 4 KB inline limit, so production CSS embeds it.
+   */
+  .animate-shine,
+  .animate-shine-icon {
+    -webkit-mask-image: url("./shine-sweep.png");
+    mask-image: url("./shine-sweep.png");
+    -webkit-mask-size: 100% 100%;
+    mask-size: 100% 100%;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    will-change: transform;
+  }
+
   .animate-shine {
     display: inline-block;
-    background: linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--foreground) 50%, transparent) 0%,
-      var(--foreground) 50%,
-      color-mix(in srgb, var(--foreground) 50%, transparent) 100%
-    );
-    background-size: 200% 100%;
-    background-clip: text;
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: shine 2s linear infinite;
+    -webkit-text-fill-color: var(--foreground);
   }
 
   /*
-   * Icon counterpart to `.animate-shine`: `background-clip: text` only shimmers
-   * glyphs, so for an SVG icon we sweep the same bright band as a mask instead
-   * (the icon retains 45% opacity at the edges with a full-opacity band moving
-   * across). The longer cycle keeps this small status cue from pulling focus.
+   * Hidden hosts keep shimmering rows mounted: the closed sidebar drawer's
+   * inert panel, a collapsed `aria-hidden` banner body, a retained overlay.
+   * Drop the mask and release the layer there so nothing off-screen draws.
+   * The rightmost compound is a class, so toggling `inert` or
+   * `aria-hidden` on the host invalidates only these elements.
    */
-  .animate-shine-icon {
-    --shine-icon-edge-opacity: 0.45;
-    -webkit-mask-image: linear-gradient(
-      90deg,
-      rgb(0 0 0 / var(--shine-icon-edge-opacity)) 0%,
-      rgba(0, 0, 0, 1) 50%,
-      rgb(0 0 0 / var(--shine-icon-edge-opacity)) 100%
-    );
-    mask-image: linear-gradient(
-      90deg,
-      rgb(0 0 0 / var(--shine-icon-edge-opacity)) 0%,
-      rgba(0, 0, 0, 1) 50%,
-      rgb(0 0 0 / var(--shine-icon-edge-opacity)) 100%
-    );
-    -webkit-mask-size: 200% 100%;
-    mask-size: 200% 100%;
-    animation: shine-mask 2.6s linear infinite;
-  }
-
-  /* Plugin status glyphs are the only visible progress cue. Keep their sweep
-     above the 3:1 graphical-object floor instead of dimming to the generic
-     decorative-icon edge opacity. */
-  .animate-shine-icon-status {
-    --shine-icon-edge-opacity: 0.93;
+  [inert] .animate-shine,
+  [inert] .animate-shine-icon,
+  [aria-hidden="true"] .animate-shine,
+  [aria-hidden="true"] .animate-shine-icon {
+    -webkit-mask-image: none;
+    mask-image: none;
+    will-change: auto;
   }
 
   /*
-   * Indeterminate progress sweep. Used while a plugin installs: the server does
-   * the work behind one blocking request, so the client can say that work is
-   * happening but not how far along it is. A first install on a machine also
-   * downloads the build toolchain, which is why this window can run ~17s.
+   * Indeterminate progress sweep, for work whose duration the client cannot
+   * predict: a plugin install (one blocking server request that can run ~17s on
+   * a machine's first install, because it also downloads the build toolchain),
+   * and route navigation that React has deprioritized behind a transition.
    */
-  .animate-plugin-install-progress {
-    animation: plugin-install-progress 1.5s ease-in-out infinite;
+  .animate-indeterminate-progress {
+    animation: indeterminate-progress 1.5s ease-in-out infinite;
   }
 
-  /* Reduced motion: drop the shimmer sweep and render the active cue as plain
-     full-strength foreground text/glyph instead of a frozen gradient/mask. */
+  /* Reduced motion: drop the sweep and render the active cue as plain
+     full-strength text/glyph. */
   @media (prefers-reduced-motion: reduce) {
     /* A static half-width fill still reads as "busy" without the sweep. */
-    .animate-plugin-install-progress {
+    .animate-indeterminate-progress {
       animation: none;
       width: 50%;
     }
 
-    .animate-shine {
-      animation: none;
-      background: none;
-      -webkit-text-fill-color: currentColor;
-    }
-
+    .animate-shine,
     .animate-shine-icon {
-      animation: none;
       -webkit-mask-image: none;
       mask-image: none;
+      will-change: auto;
+    }
+
+    .animate-shine {
+      -webkit-text-fill-color: currentColor;
     }
   }
 }
 
-@keyframes shine {
-  0% {
-    background-position: 200% 0%;
-  }
-  100% {
-    background-position: -200% 0%;
-  }
-}
-
-@keyframes plugin-install-progress {
+@keyframes indeterminate-progress {
   0% {
     margin-inline-start: -35%;
   }
   100% {
     margin-inline-start: 100%;
-  }
-}
-
-@keyframes shine-mask {
-  0% {
-    -webkit-mask-position: 200% 0%;
-    mask-position: 200% 0%;
-  }
-  100% {
-    -webkit-mask-position: -200% 0%;
-    mask-position: -200% 0%;
   }
 }
 
@@ -1012,11 +1050,18 @@ body.sidebar-resizing [data-sidebar="panel"] {
   transition-property: opacity;
 }
 
-.scroll-bottom-anchor-content * {
+/*
+ * Bottom-anchored scroll bodies (see bottom-anchored-scroll-body.tsx). The
+ * class goes on the content wrapper alone: scroll anchoring skips an excluded
+ * element's whole subtree, so no descendant rule is needed. A `*` descendant
+ * rule here would restyle every timeline node each time the class toggles.
+ * The sentinel is a sibling of the wrapper, so it stays eligible.
+ */
+.scroll-bottom-anchor-content {
   overflow-anchor: none;
 }
 
-.scroll-bottom-anchor-content .scroll-bottom-anchor {
+.scroll-bottom-anchor {
   height: 1px;
   flex-shrink: 0;
   overflow-anchor: auto;

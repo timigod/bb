@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppCommandId } from "@bb/domain";
 import type {
   BbDesktopApi,
+  BbDesktopBrowserFindResult,
   BbDesktopBrowserOpenTabRequest,
   BbDesktopBrowserScopedOpenTabRequest,
   BbDesktopBrowserSnapshot,
@@ -12,12 +13,17 @@ import type {
 import {
   BB_DESKTOP_CHECK_FOR_UPDATES_CHANNEL,
   BB_DESKTOP_GET_INFO_CHANNEL,
+  BB_DESKTOP_INFO_CHANGED_CHANNEL,
   BB_DESKTOP_INSTALL_UPDATE_CHANNEL,
   BB_DESKTOP_SET_THEME_CHANNEL,
 } from "../src/desktop-update-ipc.js";
 import {
   BB_DESKTOP_BROWSER_ATTACH_CHANNEL,
   BB_DESKTOP_BROWSER_DETACH_CHANNEL,
+  BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+  BB_DESKTOP_BROWSER_FOCUSED_CHANNEL,
+  BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+  BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL,
   BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
   BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
   BB_DESKTOP_BROWSER_NAVIGATE_CHANNEL,
@@ -26,20 +32,22 @@ import {
   BB_DESKTOP_BROWSER_SCOPED_OPEN_TAB_CHANNEL,
   BB_DESKTOP_BROWSER_SET_BOUNDS_CHANNEL,
   BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
+  BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
   BB_DESKTOP_BROWSER_SNAPSHOT_CHANNEL,
   BB_DESKTOP_BROWSER_STATE_CHANNEL,
   BB_DESKTOP_BROWSER_STOP_CHANNEL,
+  BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
 } from "../src/desktop-browser-ipc.js";
 import {
   BB_DESKTOP_APP_COMMAND_CHANNEL,
   BB_DESKTOP_CLOSE_WINDOW_REQUEST_CHANNEL,
   BB_DESKTOP_CLOSE_WINDOW_RESPONSE_CHANNEL,
+  BB_DESKTOP_FOCUS_WINDOW_CHANNEL,
   BB_DESKTOP_GET_WINDOW_STATE_CHANNEL,
   BB_DESKTOP_OPEN_NEW_TAB_CHANNEL,
+  BB_DESKTOP_OPEN_SERVER_DAEMON_LOGS_CHANNEL,
   BB_DESKTOP_WINDOW_STATE_CHANGED_CHANNEL,
 } from "../src/desktop-window-command-ipc.js";
-import { BB_DESKTOP_SPELLCHECK_GLOBAL_NAME } from "../src/desktop-spellcheck-contract.js";
-
 const electronMock = vi.hoisted(() => {
   interface IpcRendererEvent {}
 
@@ -68,12 +76,8 @@ const electronMock = vi.hoisted(() => {
   const invokeCalls: string[] = [];
   const listeners = new Map<string, IpcRendererListener>();
   const sendCalls: SendCall[] = [];
-  const exposedNames: string[] = [];
   let exposedApi: BbDesktopApi | null = null;
   let exposedName: string | null = null;
-  let exposedSpellcheckApi: {
-    getCorrectionContext(word: string): unknown;
-  } | null = null;
   let zoomFactor = 1;
 
   return {
@@ -83,18 +87,12 @@ const electronMock = vi.hoisted(() => {
     get exposedName() {
       return exposedName;
     },
-    exposedNames,
-    get exposedSpellcheckApi() {
-      return exposedSpellcheckApi;
-    },
     invokeCalls,
     listeners,
     sendCalls,
     reset(): void {
       exposedApi = null;
       exposedName = null;
-      exposedSpellcheckApi = null;
-      exposedNames.length = 0;
       invokeCalls.length = 0;
       listeners.clear();
       sendCalls.length = 0;
@@ -105,22 +103,19 @@ const electronMock = vi.hoisted(() => {
     },
     contextBridge: {
       exposeInMainWorld(name: string, api: unknown): void {
-        exposedNames.push(name);
         if (name === "bbDesktop") {
           exposedName = name;
           exposedApi = api as BbDesktopApi;
-          return;
-        }
-        if (name !== "bbDesktop") {
-          exposedSpellcheckApi = api as {
-            getCorrectionContext(word: string): unknown;
-          };
         }
       },
     },
     ipcRenderer: {
-      invoke(channel: string): Promise<BbDesktopInfo | BbDesktopWindowState> {
+      invoke(channel: string): Promise<unknown> {
         invokeCalls.push(channel);
+        if (channel === "bb-desktop:get-server-choices")
+          return Promise.resolve([
+            { id: "builtin", name: "Local", active: true },
+          ]);
         if (channel === "bb-desktop:get-window-state") {
           return Promise.resolve(desktopWindowState);
         }
@@ -136,12 +131,6 @@ const electronMock = vi.hoisted(() => {
     webFrame: {
       getZoomFactor(): number {
         return zoomFactor;
-      },
-      getWordSuggestions(word: string): string[] {
-        return word === "recieve" ? ["receive", "relieve"] : [];
-      },
-      isWordMisspelled(word: string): boolean {
-        return word === "recieve";
       },
     },
   };
@@ -182,30 +171,49 @@ function emitIpcPayload(args: EmitIpcPayloadArgs): void {
 }
 
 describe("desktop preload browser API", () => {
-  it("exposes a narrow spellcheck helper for desktop context menus", async () => {
-    await loadPreload();
+  let api: BbDesktopApi;
 
-    expect(electronMock.exposedNames).toContain(
-      BB_DESKTOP_SPELLCHECK_GLOBAL_NAME,
-    );
-    expect(electronMock.exposedSpellcheckApi).not.toBeNull();
-    expect(
-      electronMock.exposedSpellcheckApi?.getCorrectionContext("recieve"),
-    ).toEqual({
-      dictionarySuggestions: ["receive", "relieve"],
-      misspelledWord: "recieve",
+  beforeEach(async () => {
+    api = await loadPreload();
+  }, 30_000);
+
+  it("validates server updates and unsubscribes while sending only opaque selection IDs", async () => {
+    expect(await api.getServerChoices?.()).toEqual([
+      { id: "builtin", name: "Local", active: true },
+    ]);
+    const updates = vi.fn();
+    const stop = api.onServerChoicesChange?.(updates);
+    emitIpcPayload({
+      channel: "bb-desktop:server-choices-changed",
+      payload: [
+        { id: "remote", name: "Remote", active: false, url: "private" },
+      ],
     });
-    expect(
-      electronMock.exposedSpellcheckApi?.getCorrectionContext("receive"),
-    ).toBeNull();
-    expect(
-      electronMock.exposedSpellcheckApi?.getCorrectionContext("two words"),
-    ).toBeNull();
-  }, 15_000);
+    expect(updates).not.toHaveBeenCalled();
+    emitIpcPayload({
+      channel: "bb-desktop:server-choices-changed",
+      payload: [{ id: "remote", name: "Remote", active: false }],
+    });
+    expect(updates).toHaveBeenCalledWith([
+      { id: "remote", name: "Remote", active: false },
+    ]);
+    stop?.();
+    emitIpcPayload({
+      channel: "bb-desktop:server-choices-changed",
+      payload: [],
+    });
+    expect(updates).toHaveBeenCalledTimes(1);
+    api.selectServer?.("remote");
+    expect(electronMock.sendCalls).toContainEqual({
+      channel: "bb-desktop:select-server",
+      payload: "remote",
+    });
+  });
 
   it("exposes only the typed browser commands and forwards them over fixed channels", async () => {
-    const api = await loadPreload();
     const attachRequest = {
+      threadId: "thread-1",
+      existingOnly: true as const,
       tabId: "browser:a",
       url: "http://localhost:5173/",
       bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -223,21 +231,47 @@ describe("desktop preload browser API", () => {
       tabId: "browser:a",
       visible: false,
     };
+    const findRequest = {
+      tabId: "browser:a",
+      text: "needle",
+      forward: true,
+      newSession: true,
+    };
+    const stopFindRequest = {
+      tabId: "browser:a",
+      action: "clearSelection" as const,
+    };
 
     expect(Object.keys(api.browser).sort()).toEqual([
       "attach",
       "detach",
+      "evaluate",
+      "findInPage",
+      "focus",
+      "getControl",
+      "getTarget",
       "goBack",
       "goForward",
+      "importCookies",
+      "listImportSources",
       "navigate",
+      "onControl",
+      "onFindResult",
+      "onFocus",
       "onOpenTab",
+      "onPageMessage",
+      "onReveal",
       "onScopedOpenTab",
       "onSnapshot",
       "onState",
+      "openFullDiskAccessSettings",
+      "releaseControl",
       "reload",
       "setBounds",
       "setVisible",
+      "setVisibleWithoutFocus",
       "stop",
+      "stopFindInPage",
     ]);
     expect(api.browser).not.toHaveProperty("send");
     expect(api.browser).not.toHaveProperty("invoke");
@@ -249,8 +283,14 @@ describe("desktop preload browser API", () => {
     api.browser.goForward("browser:a");
     api.browser.reload("browser:a");
     api.browser.stop("browser:a");
+    api.browser.focus?.("browser:a");
     api.browser.setBounds(boundsRequest);
     api.browser.setVisible(visibleRequest);
+    api.browser.setVisibleWithoutFocus?.(visibleRequest);
+    api.browser.findInPage?.(findRequest);
+    api.browser.stopFindInPage?.(stopFindRequest);
+    expect(api.focusWindow).toBeTypeOf("function");
+    api.focusWindow?.();
     api.setTheme("dark");
     await api.checkForUpdates();
     await expect(api.getWindowState?.()).resolves.toEqual({
@@ -285,6 +325,10 @@ describe("desktop preload browser API", () => {
         payload: { tabId: "browser:a" },
       },
       {
+        channel: BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+        payload: { tabId: "browser:a" },
+      },
+      {
         channel: BB_DESKTOP_BROWSER_SET_BOUNDS_CHANNEL,
         payload: boundsRequest,
       },
@@ -292,6 +336,19 @@ describe("desktop preload browser API", () => {
         channel: BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
         payload: visibleRequest,
       },
+      {
+        channel: BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
+        payload: visibleRequest,
+      },
+      {
+        channel: BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+        payload: findRequest,
+      },
+      {
+        channel: BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
+        payload: stopFindRequest,
+      },
+      { channel: BB_DESKTOP_FOCUS_WINDOW_CHANNEL, payload: undefined },
       { channel: BB_DESKTOP_SET_THEME_CHANNEL, payload: "dark" },
     ]);
     expect(electronMock.invokeCalls).toContain(BB_DESKTOP_GET_INFO_CHANNEL);
@@ -306,11 +363,11 @@ describe("desktop preload browser API", () => {
     );
   }, 10_000);
 
-  it("converts zoomed renderer bounds to native window coordinates", async () => {
-    const api = await loadPreload();
+  it("converts zoomed renderer bounds to native window coordinates", () => {
     electronMock.setZoomFactor(1.25);
 
     api.browser.attach({
+      threadId: "thread-1",
       tabId: "browser:zoomed",
       url: "https://example.com/",
       bounds: { x: 800, y: 40, width: 400, height: 600 },
@@ -325,6 +382,7 @@ describe("desktop preload browser API", () => {
       {
         channel: BB_DESKTOP_BROWSER_ATTACH_CHANNEL,
         payload: {
+          threadId: "thread-1",
           tabId: "browser:zoomed",
           url: "https://example.com/",
           bounds: { x: 1000, y: 50, width: 500, height: 750 },
@@ -341,12 +399,13 @@ describe("desktop preload browser API", () => {
     ]);
   });
 
-  it("validates browser event payloads before notifying renderer listeners", async () => {
-    const api = await loadPreload();
+  it("validates browser event payloads before notifying renderer listeners", () => {
     const states: BbDesktopBrowserState[] = [];
     const openTabs: BbDesktopBrowserOpenTabRequest[] = [];
     const scopedOpenTabs: BbDesktopBrowserScopedOpenTabRequest[] = [];
+    const focusedTabs: string[] = [];
     const snapshots: BbDesktopBrowserSnapshot[] = [];
+    const findResults: BbDesktopBrowserFindResult[] = [];
     let closeWindowRequestCount = 0;
     let openNewTabCount = 0;
     const appCommands: AppCommandId[] = [];
@@ -371,6 +430,13 @@ describe("desktop preload browser API", () => {
       tabId: "browser:a",
       dataUrl: null,
     };
+    const findResult: BbDesktopBrowserFindResult = {
+      tabId: "browser:a",
+      requestId: 3,
+      activeMatchOrdinal: 1,
+      matches: 4,
+      finalUpdate: true,
+    };
 
     api.browser.onState((nextState) => {
       states.push(nextState);
@@ -381,8 +447,14 @@ describe("desktop preload browser API", () => {
     api.browser.onScopedOpenTab?.((request) => {
       scopedOpenTabs.push(request);
     });
+    api.browser.onFocus?.((tabId) => {
+      focusedTabs.push(tabId);
+    });
     api.browser.onSnapshot?.((nextSnapshot) => {
       snapshots.push(nextSnapshot);
+    });
+    api.browser.onFindResult?.((result) => {
+      findResults.push(result);
     });
     api.onOpenNewTab?.(() => {
       openNewTabCount += 1;
@@ -411,8 +483,20 @@ describe("desktop preload browser API", () => {
       payload: { tabId: "", url: "https://example.com/scoped-popup" },
     });
     emitIpcPayload({
+      channel: BB_DESKTOP_BROWSER_FOCUSED_CHANNEL,
+      payload: { tabId: "", extra: true },
+    });
+    emitIpcPayload({
       channel: BB_DESKTOP_BROWSER_SNAPSHOT_CHANNEL,
       payload: { tabId: "browser:a", dataUrl: 42 },
+    });
+    emitIpcPayload({
+      channel: BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL,
+      payload: { ...findResult, matches: -1 },
+    });
+    emitIpcPayload({
+      channel: BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL,
+      payload: { ...findResult, selectionArea: {} },
     });
     emitIpcPayload({
       channel: BB_DESKTOP_WINDOW_STATE_CHANGED_CHANNEL,
@@ -431,8 +515,16 @@ describe("desktop preload browser API", () => {
       payload: scopedOpenTab,
     });
     emitIpcPayload({
+      channel: BB_DESKTOP_BROWSER_FOCUSED_CHANNEL,
+      payload: { tabId: "browser:a" },
+    });
+    emitIpcPayload({
       channel: BB_DESKTOP_BROWSER_SNAPSHOT_CHANNEL,
       payload: snapshot,
+    });
+    emitIpcPayload({
+      channel: BB_DESKTOP_BROWSER_FIND_RESULT_CHANNEL,
+      payload: findResult,
     });
     emitIpcPayload({
       channel: BB_DESKTOP_WINDOW_STATE_CHANGED_CHANNEL,
@@ -458,7 +550,9 @@ describe("desktop preload browser API", () => {
     expect(states).toEqual([state]);
     expect(openTabs).toEqual([openTab]);
     expect(scopedOpenTabs).toEqual([scopedOpenTab]);
+    expect(focusedTabs).toEqual(["browser:a"]);
     expect(snapshots).toEqual([snapshot]);
+    expect(findResults).toEqual([findResult]);
     expect(windowStates).toEqual([{ isFullScreen: true }]);
     expect(closeWindowRequestCount).toBe(1);
     expect(openNewTabCount).toBe(1);
@@ -469,9 +563,30 @@ describe("desktop preload browser API", () => {
     });
   });
 
-  it("answers unhandled close-window requests so main closes the window", async () => {
-    await loadPreload();
+  it("routes the log viewer request to main and mirrors its availability", async () => {
+    await api.openServerDaemonLogs?.();
+    expect(electronMock.invokeCalls).toContain(
+      BB_DESKTOP_OPEN_SERVER_DAEMON_LOGS_CHANNEL,
+    );
 
+    expect(api.serverDaemonLogsAvailable).toBeUndefined();
+    emitIpcPayload({
+      channel: BB_DESKTOP_INFO_CHANGED_CHANNEL,
+      payload: {
+        lastCheckedAt: null,
+        latestVersion: null,
+        pendingVersion: null,
+        platform: "macos",
+        serverDaemonLogsAvailable: true,
+        updateAvailable: false,
+        updateDownloaded: false,
+        version: "0.0.0-test",
+      },
+    });
+    expect(api.serverDaemonLogsAvailable).toBe(true);
+  });
+
+  it("answers unhandled close-window requests so main closes the window", () => {
     emitIpcPayload({
       channel: BB_DESKTOP_CLOSE_WINDOW_REQUEST_CHANNEL,
       payload: null,

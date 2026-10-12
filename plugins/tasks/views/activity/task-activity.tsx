@@ -1,42 +1,41 @@
 import { useMemo, useRef, useState } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import {
-  ArrowUp02Icon,
-  AttachmentIcon,
-  File01Icon,
-  Notification02Icon,
-  NotificationOff02Icon,
-} from "@hugeicons/core-free-icons";
-import { Button } from "@bb/shared-ui/button";
+import ArrowUp02Icon from "@hugeicons/core-free-icons/ArrowUp02Icon";
+import AttachmentIcon from "@hugeicons/core-free-icons/AttachmentIcon";
+import File01Icon from "@hugeicons/core-free-icons/File01Icon";
+import Notification02Icon from "@hugeicons/core-free-icons/Notification02Icon";
+import NotificationOff02Icon from "@hugeicons/core-free-icons/NotificationOff02Icon";
+import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { TasksEditor } from "../../editor/tasks-editor.js";
-import { useBbNavigate } from "@bb/plugin-sdk/app";
+import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import {
   useMentionItems,
   useTasksQuery,
   useTasksRpc,
 } from "../../shell/data.js";
-import {
-  attachmentDownloadUrl,
-  Lightbox,
-  uploadAttachment,
-} from "../detail/attachments.js";
+import { Lightbox } from "../detail/attachments.js";
 import {
   AttachmentChip,
+  settleStagedUploads,
   stageFiles,
+  uploadStagedAttachments,
+  useStagedAttachmentRetry,
   type StagedAttachment,
 } from "../../components/staged-attachments.js";
+import { attachmentDownloadUrl } from "../../shared/attachments.js";
 import type {
   Attachment,
   Comment,
   DisplayComment,
 } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   formatFileSize,
   formatRelativeTime,
@@ -51,31 +50,42 @@ interface FeedEntry {
   attachments: Attachment[];
 }
 
+export function activityFeedEntries(
+  comments: readonly DisplayComment[],
+  attachments: readonly Attachment[],
+): FeedEntry[] {
+  const attachmentsByCommentId = new Map<string, Attachment[]>();
+  for (const attachment of attachments) {
+    if (attachment.commentId === null) continue;
+    const entries = attachmentsByCommentId.get(attachment.commentId);
+    if (entries === undefined) {
+      attachmentsByCommentId.set(attachment.commentId, [attachment]);
+    } else {
+      entries.push(attachment);
+    }
+  }
+  return comments.map((comment) => ({
+    comment,
+    attachments: attachmentsByCommentId.get(comment.id) ?? [],
+  }));
+}
+
 function useActivityFeed(taskId: string) {
   return useTasksQuery<FeedEntry[]>(
     async (rpc) => {
-      const { comments } = await rpc.call("listComments", { taskId });
-      const attachments = await Promise.all(
-        comments.map((comment) =>
-          comment.kind === "system"
-            ? Promise.resolve<Attachment[]>([])
-            : rpc
-                .call("listAttachments", { commentId: comment.id })
-                .then((result) => result.attachments),
-        ),
-      );
-      return comments.map((comment, index) => ({
-        comment,
-        attachments: attachments[index] ?? [],
-      }));
+      const [{ comments }, { attachments }] = await Promise.all([
+        rpc.call("listComments", { taskId }),
+        rpc.call("listAttachments", { commentsOfTaskId: taskId }),
+      ]);
+      return activityFeedEntries(comments, attachments);
     },
-    // Attachment uploads publish tasks:changed, not comments:changed.
     ["comments:changed", "tasks:changed"],
     [taskId],
+    { relevantTaskIds: [taskId] },
   );
 }
 
-export type AgentNotificationTarget =
+type AgentNotificationTarget =
   | { kind: "ready"; title: string }
   | { kind: "none" }
   | { kind: "unavailable" };
@@ -131,14 +141,6 @@ function FileAttachmentCard({ attachment }: { attachment: Attachment }) {
   );
 }
 
-/**
- * Gallery thumbnail: shares the track's row height and keeps its natural
- * aspect ratio, center-cropping past a 0.62×–2.2× width clamp so panoramas
- * and tall phone shots stay on the shared row. The width cap sits on the
- * button (not just the img) because a percentage max-width is ignored during
- * intrinsic sizing — the figure must shrink-wrap the *cropped* width for the
- * centered caption to stay aligned with the visible image.
- */
 function ImageAttachmentFigure({
   attachment,
   onOpenImage,
@@ -161,8 +163,6 @@ function ImageAttachmentFigure({
           className="h-24 w-auto min-w-15 max-w-full cursor-zoom-in rounded-md border border-border bg-muted object-cover hover:border-input @2xl:h-32 @2xl:min-w-20"
         />
       </button>
-      {/* w-0 + min-w-full: the caption never inflates the figure, so it
-          truncates and centers at the image's own width. */}
       <figcaption
         title={attachment.fileName}
         className="mt-0.5 w-0 min-w-full truncate px-1 text-center text-2xs text-muted-foreground"
@@ -173,13 +173,6 @@ function ImageAttachmentFigure({
   );
 }
 
-/**
- * Two-track attachment layout: compact file cards first, then an image
- * gallery. Grouping by kind keeps file cards out of image wrap rows (a
- * single wrap's `align-items: stretch` is what inflated them to image
- * height); DOM order matches the rendered order, so keyboard and screen
- * reader traversal follow the visual reading order.
- */
 export function AttachmentTracks({
   attachments,
   onOpenImage,
@@ -277,7 +270,10 @@ function CommentCard({ entry, nowMs }: { entry: FeedEntry; nowMs: number }) {
           onOpenThread={(threadId) => navigate.toThread(threadId)}
         />
         {attachments.length > 0 ? (
-          <AttachmentTracks attachments={attachments} onOpenImage={setLightbox} />
+          <AttachmentTracks
+            attachments={attachments}
+            onOpenImage={setLightbox}
+          />
         ) : null}
         {lightbox ? (
           <Lightbox attachment={lightbox} onClose={() => setLightbox(null)} />
@@ -316,34 +312,9 @@ export function CommentComposer({ taskId, notificationTarget }: ComposerProps) {
   const removeFile = (id: number) =>
     setPendingFiles((files) => files.filter((entry) => entry.id !== id));
 
-  // Synchronous single-flight guard: double-activating Retry before React
-  // re-renders must not upload (and attach) the same file twice.
-  const retryingRef = useRef(new Set<number>());
-  const retryUpload = async (entry: StagedAttachment) => {
-    if (entry.owner === undefined || retryingRef.current.has(entry.id)) return;
-    retryingRef.current.add(entry.id);
-    setPendingFiles((files) =>
-      files.map((candidate) =>
-        candidate.id === entry.id ? { ...candidate, busy: true } : candidate,
-      ),
-    );
-    try {
-      await uploadAttachment(entry.file, entry.owner);
-      removeFile(entry.id);
-      setError(null);
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setPendingFiles((files) =>
-        files.map((candidate) =>
-          candidate.id === entry.id
-            ? { ...candidate, busy: false, error: message }
-            : candidate,
-        ),
-      );
-    } finally {
-      retryingRef.current.delete(entry.id);
-    }
-  };
+  const retryUpload = useStagedAttachmentRetry(setPendingFiles, () =>
+    setError(null),
+  );
 
   const send = async () => {
     if (!canSend || sendingRef.current) return;
@@ -360,41 +331,18 @@ export function CommentComposer({ taskId, notificationTarget }: ComposerProps) {
           allowEmptyBody: text.length === 0,
         })
       ).comment;
-      // The comment is now posted — clear the text so a later upload failure
-      // can't double-post it. Failed uploads stay behind as retryable chips.
       setBody("");
-      const failed: StagedAttachment[] = [];
-      for (const entry of staged) {
-        try {
-          await uploadAttachment(entry.file, { commentId: comment.id });
-        } catch (cause) {
-          failed.push({
-            ...entry,
-            status: "failed",
-            owner: { commentId: comment.id },
-            error: cause instanceof Error ? cause.message : String(cause),
-          });
-        }
-      }
-      // Sent entries leave the tray (failures come back as retryable chips);
-      // anything staged after send started is untouched.
-      setPendingFiles((files) =>
-        files.flatMap((entry) => {
-          const failure = failed.find((candidate) => candidate.id === entry.id);
-          if (failure) return [failure];
-          return staged.some((candidate) => candidate.id === entry.id)
-            ? []
-            : [entry];
-        }),
-      );
+      const failed = await uploadStagedAttachments(staged, {
+        commentId: comment.id,
+      });
+      setPendingFiles((files) => settleStagedUploads(files, staged, failed));
       if (failed.length > 0) {
         setError(
           `The comment posted, but ${failed.length} attachment${failed.length > 1 ? "s" : ""} failed to upload — retry below.`,
         );
       }
     } catch (cause) {
-      // Nothing posted: keep the draft and chips for another attempt.
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(errorMessage(cause));
     } finally {
       sendingRef.current = false;
       setSending(false);
@@ -492,12 +440,6 @@ export function AgentNotificationControl({
       : target.kind === "none"
         ? "No prior agent reply to notify"
         : "Latest responding agent can’t be notified";
-  // Subtle icon-only toggle that sits with the composer's other action buttons.
-  // The bell/bell-off glyph plus the ghost-button color carry the on/off state;
-  // the tooltip (and accessible name) name the destination so a long thread
-  // title never has to render inline. `aria-disabled` rather than `disabled`
-  // keeps the trigger hoverable so the tooltip can still explain why an
-  // unavailable target can't be notified.
   return (
     <TooltipProvider delayDuration={300}>
       <Tooltip>
@@ -532,17 +474,14 @@ export function AgentNotificationControl({
   );
 }
 
-export interface TaskActivityProps {
+interface TaskActivityProps {
   taskId: string;
-  /** Task key like TSK-4; reserved for deep links from feed entries. */
-  taskKey: string;
 }
 
-/** Activity feed + comment composer for the task detail page. */
 export function TaskActivity({ taskId }: TaskActivityProps) {
   const feed = useActivityFeed(taskId);
   const nowMs = useNowTick();
-  const entries = feed.data ?? [];
+  const entries = useMemo(() => feed.data ?? [], [feed.data]);
   const notificationTarget = useMemo(
     () => agentNotificationTarget(entries.map((entry) => entry.comment)),
     [entries],
@@ -584,5 +523,3 @@ export function TaskActivity({ taskId }: TaskActivityProps) {
     </section>
   );
 }
-
-export default TaskActivity;

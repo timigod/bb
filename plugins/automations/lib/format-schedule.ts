@@ -1,8 +1,7 @@
-// Cron/timezone humanization for the automations panel. Ported from the
-// kernel's apps/app/src/lib/format-schedule.ts so the plugin bundle is
-// self-contained (plugin code must not import from apps/app).
 import { toString as cronstrueToString } from "cronstrue";
 import type { AutomationTrigger } from "../src/rpc-types";
+
+export const PERSONAL_PROJECT_ID = "proj_personal";
 
 const SCHEDULE_RUN_FORMATTER = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -11,7 +10,7 @@ const SCHEDULE_RUN_FORMATTER = new Intl.DateTimeFormat(undefined, {
   minute: "2-digit",
 });
 
-export interface FormatScheduleStatusLabelArgs {
+interface FormatScheduleStatusLabelArgs {
   enabled: boolean;
   nextRunAt: number | null;
   trigger?: AutomationTrigger;
@@ -20,14 +19,14 @@ export interface FormatScheduleStatusLabelArgs {
   now?: number;
 }
 
-export interface OverviewScheduleMetadata {
+interface OverviewScheduleMetadata {
   isNextRun: boolean;
   text: string;
 }
 
 export type AutomationStatusFilter = "active" | "paused";
 
-export interface OneShotLifecycleArgs {
+interface OneShotLifecycleArgs {
   enabled: boolean;
   trigger: AutomationTrigger;
   runCount: number;
@@ -35,7 +34,7 @@ export interface OneShotLifecycleArgs {
   now?: number;
 }
 
-export type OneShotLifecycle =
+type OneShotLifecycle =
   | "scheduled"
   | "paused"
   | "expired"
@@ -54,47 +53,35 @@ const DAY_ABBREVIATION: Record<string, string> = {
   Saturday: "Sat",
 };
 
-/**
- * Compact human-readable recurrence for a cron expression, tuned for dense
- * lists: "9AM Mon-Fri", "5PM Fri", "Every 15 min". Post-processes cronstrue's
- * verbose phrasing. Falls back to a neutral label when the expression can't be
- * parsed.
- */
-export function formatCronCadence(cron: string): string {
+function formatCronCadence(cron: string): string {
   let text: string;
   try {
     text = cronstrueToString(cron, { verbose: false });
   } catch {
     return "Custom schedule";
   }
-  return (
-    text
-      // Drop cronstrue's leading "At " ("At 09:00 AM, …").
-      .replace(/^At /, "")
-      // Compact clock times: "09:00 AM" -> "9AM", "09:30 PM" -> "9:30PM".
-      .replace(
-        /\b0?(\d{1,2}):(\d{2})\s*(AM|PM)\b/g,
-        (_all, hour, minute, meridiem) =>
-          minute === "00"
-            ? `${hour}${meridiem}`
-            : `${hour}:${minute}${meridiem}`,
-      )
-      // Abbreviate day names to three letters.
-      .replace(
-        /\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/g,
-        (day) => DAY_ABBREVIATION[day] ?? day,
-      )
-      // Ranges, list joins, and filler.
-      .replace(/ through /g, "-")
-      .replace(/,? only on /g, " ")
-      .replace(/,? and /g, ", ")
-      // Units.
-      .replace(/\bminutes?\b/g, "min")
-      .replace(/\bseconds?\b/g, "sec")
-      // Collapse the comma between the time and the day spec into a space.
-      .replace(/([AP]M),\s+/g, "$1 ")
-      .trim()
-  );
+  return text
+    .replace(/^At /, "")
+    .replace(
+      /\b0?(\d{1,2}):(\d{2})\s*(AM|PM)\b/g,
+      (_all, hour, minute, meridiem) =>
+        minute === "00" ? `${hour}${meridiem}` : `${hour}:${minute}${meridiem}`,
+    )
+    .replace(
+      /\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/g,
+      (day) => DAY_ABBREVIATION[day] ?? day,
+    )
+    .replace(
+      /\bbetween (\d{1,2}(?::\d{2})?[AP]M) and (\d{1,2}(?::\d{2})?[AP]M)\b/g,
+      "$1-$2",
+    )
+    .replace(/ through /g, "-")
+    .replace(/,? only on /g, " ")
+    .replace(/,? and /g, ", ")
+    .replace(/\bminutes?\b/g, "min")
+    .replace(/\bseconds?\b/g, "sec")
+    .replace(/([AP]M),(?!\s+\d{1,2}(?::\d{2})?[AP]M\b)\s+/g, "$1 ")
+    .trim();
 }
 
 export function formatAutomationTrigger(trigger: AutomationTrigger): string {
@@ -130,15 +117,10 @@ export function oneShotLifecycleAllowsToggle(
   );
 }
 
-/** Compact absolute time for an upcoming run, e.g. "Jun 6, 9:00 AM". */
 export function formatScheduleRunTime(timestamp: number): string {
   return SCHEDULE_RUN_FORMATTER.format(new Date(timestamp));
 }
 
-/**
- * Right-aligned status text for an automation row: the next scheduled run when
- * enabled and scheduled, otherwise a neutral "Paused"/"Not scheduled" label.
- */
 export function formatScheduleStatusLabel({
   enabled,
   nextRunAt,
@@ -170,10 +152,6 @@ export function formatScheduleStatusLabel({
   return `Next ${formatScheduleRunTime(nextRunAt)}`;
 }
 
-/**
- * Row metadata removes status already carried by another row control or icon
- * and separates the upcoming-run label so the UI can give it a semantic icon.
- */
 export function formatOverviewScheduleMetadata(
   args: FormatScheduleStatusLabelArgs,
 ): OverviewScheduleMetadata | null {
@@ -192,15 +170,6 @@ export function formatOverviewScheduleMetadata(
   return { isNextRun: false, text: label };
 }
 
-/**
- * Detail pages omit labels another element on the same page already carries.
- *
- * "Paused" is carried by the lifecycle toggle. "Completed" is carried by the
- * Runs section directly below, which shows the finished run with its status
- * glyph, timestamp, and duration — strictly more than the word, in the place a
- * reader looks for it. The trigger item still says "One time", so the schedule
- * shape is not lost.
- */
 export function formatDetailScheduleStatusLabel(
   args: FormatScheduleStatusLabelArgs,
 ): string | null {

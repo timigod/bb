@@ -1,12 +1,12 @@
 ---
 name: memory
-description: Use durable BB memory when prior project knowledge or cross-project user preferences can improve the current task, and save durable new learning through the bb memory CLI.
+description: "Retrieve relevant durable BB memories or save verified knowledge useful to future threads."
 ---
 
 # BB memory
 
-This plugin is provider-independent. Recommend disabling provider-native
-memory under Settings → Providers to avoid duplicated or conflicting stores.
+This plugin is provider-independent. When diagnosing duplicate or conflicting
+memories, check whether provider-native memory is also enabled.
 
 The memory plugin automatically injects a compact index of global memories and
 memories for the current BB project. The index contains summaries only.
@@ -72,6 +72,18 @@ Forget a revoked or invalid memory with:
 bb memory forget <id> --expected-version <version> \
   --reason "<why it no longer applies>" --json
 ```
+
+## Flags
+
+`bb memory <command> --help` prints every flag with its limits, and the CLI
+reports all missing required flags in one error instead of one per run. Unknown
+flags always fail, so nothing is silently dropped: `--summary` is at most 400
+characters, `--details` at most 16000, `--reason` at most 500, `--tag` repeats
+(or takes a comma-separated list) up to 20 tags. `--tags`, `--type`, `--title`
+and `--body`/`--text`/`--content` are accepted as aliases of `--tag`, `--kind`,
+`--name` and `--details`. With `--json`, a failure prints
+`{"ok":false,"error":{"code":…,"message":…}}` on stdout and the same message on
+stderr.
 
 ## Quality and safety
 

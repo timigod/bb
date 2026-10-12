@@ -20,14 +20,13 @@ import {
 import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { threadQueryKey } from "@/hooks/queries/query-keys";
+import { useThread } from "@/hooks/queries/thread-queries";
+import { useUnarchiveThread } from "@/hooks/mutations/thread-state-mutations";
 import { splitLayoutAtom } from "@/lib/split-layout/atoms";
 import type { SplitLayout } from "@/lib/split-layout";
 import { PaneContext } from "./PaneContext";
+import { RouteNavigationProvider } from "@/components/ui/app-route-anchor";
 import { SplitThreadArea } from "./SplitThreadArea";
-
-vi.mock("@/hooks/useThreadSplitsEnabled", () => ({
-  useThreadSplitsEnabled: () => true,
-}));
 
 const ARCHIVED_AT = 1_700_000_000_000;
 
@@ -37,7 +36,6 @@ interface SeedThread {
   deletedAt: number | null;
 }
 
-// A deferred promise the test resolves/rejects to control the archive round-trip.
 let pendingArchive: {
   promise: Promise<void>;
   resolve: () => void;
@@ -59,11 +57,12 @@ vi.mock("@/hooks/useRealtimeSubscription", () => ({
   useThreadListRealtimeSubscription: () => undefined,
 }));
 
-// The real network transport never settles, so the mount refetch can't clobber
-// the seeded/optimistic cache state the test controls directly.
 vi.mock("@/lib/sdk", () => ({
   sdk: {
-    threads: { get: () => new Promise<never>(() => {}) },
+    threads: {
+      get: () => new Promise<never>(() => {}),
+      unarchive: () => pendingArchive!.promise,
+    },
   },
 }));
 
@@ -78,18 +77,17 @@ vi.mock("@/components/commands/AppCommandProvider", () => ({
 vi.mock("./ThreadDetailView", () => ({
   ThreadDetailView: ({ threadId }: { threadId: string }) => {
     const pane = useContext(PaneContext);
+    const { data: thread } = useThread(threadId);
     return (
       <div
         data-testid={`pane-${threadId}`}
         data-focused={pane?.isFocused ? "true" : "false"}
+        data-archived={thread?.archivedAt !== null ? "true" : "false"}
       />
     );
   },
 }));
 
-// Mirrors the real archive lifecycle's shape (optimistic archivedAt + a pending
-// mutation tagged archive_thread, rolled back on failure) — the exact two signals
-// PaneStaleWatcher gates on — without the full cache-owner list plumbing.
 function ArchiveHarness({ threadId }: { threadId: string }) {
   const queryClient = useQueryClient();
   const mutation = useMutation({
@@ -128,6 +126,19 @@ function LocationProbe() {
   return <div data-testid="location">{location.pathname}</div>;
 }
 
+function UnarchiveHarness() {
+  const mutation = useUnarchiveThread();
+  return (
+    <button
+      type="button"
+      data-testid="unarchive"
+      onClick={() => mutation.mutate({ id: "thr-b" })}
+    >
+      unarchive
+    </button>
+  );
+}
+
 function twoPaneLayout(focusedPaneId: "pane-1" | "pane-2"): SplitLayout {
   const content = (threadId: string) => ({
     kind: "thread" as const,
@@ -148,14 +159,14 @@ function twoPaneLayout(focusedPaneId: "pane-1" | "pane-2"): SplitLayout {
   };
 }
 
-function renderArchiveScenario() {
+function renderArchiveScenario(initialArchivedAt: number | null = null) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   for (const id of ["thr-a", "thr-b"]) {
     queryClient.setQueryData<SeedThread>(threadQueryKey(id), {
       id,
-      archivedAt: null,
+      archivedAt: id === "thr-b" ? initialArchivedAt : null,
       deletedAt: null,
     });
   }
@@ -165,9 +176,12 @@ function renderArchiveScenario() {
     <JotaiProvider store={store}>
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/threads/thr-b"]}>
-          <SplitThreadArea />
-          <LocationProbe />
-          <ArchiveHarness threadId="thr-b" />
+          <RouteNavigationProvider>
+            <SplitThreadArea />
+            <LocationProbe />
+            <ArchiveHarness threadId="thr-b" />
+            <UnarchiveHarness />
+          </RouteNavigationProvider>
         </MemoryRouter>
       </QueryClientProvider>
     </JotaiProvider>,
@@ -187,31 +201,75 @@ afterEach(() => {
 });
 
 describe("SplitThreadArea archive pruning", () => {
+  it("keeps the archived pane and its focus when unarchiving is rejected", async () => {
+    deferArchive();
+    const queryClient = renderArchiveScenario(ARCHIVED_AT);
+    expect(await screen.findByTestId("pane-thr-b")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("unarchive"));
+    await waitFor(() => expect(archivedAtOf(queryClient, "thr-b")).toBeNull());
+    await act(async () => pendingArchive!.reject(new Error("unarchive failed")));
+
+    await waitFor(() =>
+      expect(archivedAtOf(queryClient, "thr-b")).toBe(ARCHIVED_AT),
+    );
+    expect(screen.getByTestId("pane-thr-b").dataset.focused).toBe("true");
+    expect(screen.getByTestId("pane-thr-a")).toBeTruthy();
+    expect(screen.getByTestId("location").textContent).toBe("/threads/thr-b");
+  });
+
+  it("keeps an archived pane when its thread first loads, but closes it after unarchiving and archiving again", async () => {
+    deferArchive();
+    const queryClient = renderArchiveScenario(ARCHIVED_AT);
+    expect(await screen.findByTestId("pane-thr-b")).toBeTruthy();
+    expect(archivedAtOf(queryClient, "thr-b")).toBe(ARCHIVED_AT);
+
+    await act(async () => {
+      queryClient.setQueryData<SeedThread>(threadQueryKey("thr-b"), {
+        id: "thr-b",
+        archivedAt: null,
+        deletedAt: null,
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("pane-thr-b").dataset.archived).toBe("false"),
+    );
+    fireEvent.click(screen.getByTestId("archive"));
+    await waitFor(() =>
+      expect(archivedAtOf(queryClient, "thr-b")).toBe(ARCHIVED_AT),
+    );
+    expect(screen.getByTestId("pane-thr-b")).toBeTruthy();
+
+    await act(async () => pendingArchive!.resolve());
+
+    await waitFor(() => expect(screen.queryByTestId("pane-thr-b")).toBeNull());
+    expect(screen.getByTestId("pane-thr-a")).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByTestId("location").textContent).toBe("/threads/thr-a"),
+    );
+  });
+
   it("restores the pane, focus, and URL when a deferred archive is rejected", async () => {
     deferArchive();
     const queryClient = renderArchiveScenario();
     await screen.findByTestId("pane-thr-b");
 
     fireEvent.click(screen.getByTestId("archive"));
-    // The optimistic archive has landed, but the mutation is still in flight.
     await waitFor(() =>
       expect(archivedAtOf(queryClient, "thr-b")).toBe(ARCHIVED_AT),
     );
 
-    // Gate holds: an unconfirmed archive must not prune the pane.
     expect(screen.getByTestId("pane-thr-b")).toBeTruthy();
     expect(screen.getByTestId("pane-thr-a")).toBeTruthy();
     expect(screen.getByTestId("pane-thr-b").dataset.focused).toBe("true");
     expect(screen.getByTestId("location").textContent).toBe("/threads/thr-b");
 
-    // Reject after the optimistic update; rollback clears archivedAt.
     await act(async () => {
       pendingArchive!.reject(new Error("archive failed"));
       await Promise.resolve();
     });
     await waitFor(() => expect(archivedAtOf(queryClient, "thr-b")).toBeNull());
 
-    // Everything is restored: pane count, contents, focus, and URL.
     expect(screen.getByTestId("pane-thr-a")).toBeTruthy();
     expect(screen.getByTestId("pane-thr-b")).toBeTruthy();
     expect(screen.getByTestId("pane-thr-b").dataset.focused).toBe("true");
@@ -227,16 +285,13 @@ describe("SplitThreadArea archive pruning", () => {
     await waitFor(() =>
       expect(archivedAtOf(queryClient, "thr-b")).toBe(ARCHIVED_AT),
     );
-    // Still in flight → not yet pruned.
     expect(screen.getByTestId("pane-thr-b")).toBeTruthy();
 
-    // Confirm the archive; archivedAt stays set and no mutation is in flight.
     await act(async () => {
       pendingArchive!.resolve();
       await Promise.resolve();
     });
 
-    // The now-confirmed archived pane is pruned; focus + URL follow the survivor.
     await waitFor(() => expect(screen.queryByTestId("pane-thr-b")).toBeNull());
     expect(screen.getByTestId("pane-thr-a")).toBeTruthy();
     await waitFor(() =>

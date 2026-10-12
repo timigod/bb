@@ -1,6 +1,6 @@
 import { parse } from "yaml";
 
-export interface MarkdownDocument {
+interface MarkdownDocument {
   frontmatter: string;
   body: string;
   title: string | null;
@@ -23,16 +23,10 @@ function readLine(content: string, start: number): MarkdownLine {
   };
 }
 
-function isMapping(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Frontmatter is a YAML mapping. A document that merely opens with a thematic
- * break (`---`) followed by prose, a list, or invalid YAML is not frontmatter,
- * so the fenced block must parse to a mapping (or to nothing) before we hide it
- * from the editor. Returns null when the block is not frontmatter.
- */
 function parseFrontmatterMetadata(
   source: string,
 ): Record<string, unknown> | null {
@@ -43,7 +37,7 @@ function parseFrontmatterMetadata(
     return null;
   }
   if (metadata === null || metadata === undefined) return {};
-  return isMapping(metadata) ? metadata : null;
+  return isRecord(metadata) ? metadata : null;
 }
 
 function frontmatterTitle(metadata: Record<string, unknown>): string | null {

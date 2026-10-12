@@ -24,13 +24,13 @@ export function Overview() {
       </StoryRow>
       <StoryRow
         label="no project selected — required mode"
-        hint='allowNoProject=false (default): trigger falls back to the first project so it is never blank'
+        hint="allowNoProject=false (default): trigger falls back to the first project so it is never blank"
       >
         <ProjectSelector projects={projects} value={null} onChange={noop} />
       </StoryRow>
       <StoryRow
         label="no project selected — optional mode"
-        hint='allowNoProject=true: trigger shows "Work in a project" + FolderPlus icon, menu adds "Don&apos;t work in a project" item'
+        hint='allowNoProject=true: trigger shows "No project" + FolderMinus icon, menu adds "Don&apos;t work in a project" item'
       >
         <ProjectSelector
           projects={projects}

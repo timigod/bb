@@ -1,44 +1,19 @@
 import type { TaskSort } from "../shared/pagination.js";
-import type { PresetPermissionMode } from "../shared/contract.js";
+import type {
+  PRESET_ENVIRONMENT_KINDS,
+  PresetPermissionMode,
+  PresetReasoningLevel,
+  PresetServiceTier,
+  TASK_THREAD_LIVE_STATUSES,
+  TaskPriority,
+  TaskStatus,
+} from "../shared/contract.js";
 
-export const TASK_STATUSES = [
-  "backlog",
-  "todo",
-  "in_progress",
-  "in_review",
-  "done",
-  "canceled",
-] as const;
+export type { TaskPriority, TaskStatus };
 
-export type TaskStatus = (typeof TASK_STATUSES)[number];
-
-export const TASK_PRIORITIES = [
-  "urgent",
-  "high",
-  "medium",
-  "low",
-  "none",
-] as const;
-
-export type TaskPriority = (typeof TASK_PRIORITIES)[number];
-
-export const COMMENT_KINDS = ["user", "agent", "system"] as const;
-export type CommentKind = (typeof COMMENT_KINDS)[number];
-
-export const TASK_THREAD_LIVE_STATUSES = [
-  "starting",
-  "working",
-  "idle",
-  "completed",
-  "failed",
-] as const;
+type CommentKind = "user" | "agent" | "system";
 
 export type TaskThreadLiveStatus = (typeof TASK_THREAD_LIVE_STATUSES)[number];
-
-export const PRESET_ENVIRONMENT_KINDS = [
-  "project-default",
-  "new-worktree",
-] as const;
 
 export type PresetEnvironmentKind = (typeof PRESET_ENVIRONMENT_KINDS)[number];
 
@@ -128,7 +103,8 @@ export interface Preset {
   name: string;
   providerId: string;
   modelId: string;
-  reasoningLevel: string;
+  reasoningLevel: PresetReasoningLevel;
+  serviceTier: PresetServiceTier | null;
   permissionMode: PresetPermissionMode;
   environmentKind: PresetEnvironmentKind;
   baseBranch: string | null;
@@ -139,7 +115,6 @@ export interface Preset {
 }
 
 export interface CreateFolderInput {
-  id?: string;
   name: string;
   parentFolderId?: string | null;
 }
@@ -149,8 +124,13 @@ export interface UpdateFolderInput {
   parentFolderId?: string | null;
 }
 
+export interface DeleteFolderResult {
+  deleted: boolean;
+  movedProjectIds: string[];
+  movedFolderIds: string[];
+}
+
 export interface CreateProjectInput {
-  id?: string;
   name: string;
   prefix: string;
   color: string;
@@ -167,7 +147,6 @@ export interface UpdateProjectInput {
 }
 
 export interface CreateTaskInput {
-  id?: string;
   projectId: string;
   title: string;
   description?: string;
@@ -184,6 +163,11 @@ export interface UpdateTaskInput {
   priority?: TaskPriority;
   dueDate?: string | null;
   parentTaskId?: string | null;
+}
+
+export interface MoveTaskToProjectResult {
+  task: Task;
+  moved: Array<{ previousKey: string; task: Task }>;
 }
 
 export interface ListTasksFilters {
@@ -206,19 +190,11 @@ export interface ListTasksPage {
 
 export interface UpdateTaskPositionInput {
   status: TaskStatus;
-  /** The task immediately before this task in the destination column. */
   beforeTaskId?: string | null;
-  /** The task immediately after this task in the destination column. */
   afterTaskId?: string | null;
 }
 
-export interface SubtaskDoneCounts {
-  total: number;
-  done: number;
-}
-
 export interface CreateLabelInput {
-  id?: string;
   projectId: string;
   name: string;
   color: string;
@@ -230,23 +206,19 @@ export interface UpdateLabelInput {
 }
 
 export interface CreateCommentInput {
-  id?: string;
   taskId: string;
   kind: CommentKind;
   authorName: string;
   presetName?: string | null;
   threadId?: string | null;
   body: string;
-  notifiedCount?: number;
 }
 
 export interface UpdateCommentInput {
-  body?: string;
-  notifiedCount?: number;
+  notifiedCount: number;
 }
 
 export interface CreateAttachmentInput {
-  id?: string;
   taskId?: string | null;
   commentId?: string | null;
   fileName: string;
@@ -257,15 +229,10 @@ export interface CreateAttachmentInput {
 }
 
 export interface UpdateAttachmentInput {
-  fileName?: string;
-  mime?: string;
-  sizeBytes?: number;
-  blobPath?: string;
-  isImage?: boolean;
+  blobPath: string;
 }
 
 export interface UpsertTaskThreadInput {
-  id?: string;
   taskId: string;
   threadId: string;
   presetName: string;
@@ -273,18 +240,12 @@ export interface UpsertTaskThreadInput {
   liveStatus: TaskThreadLiveStatus;
 }
 
-export interface UpdateTaskThreadInput {
-  presetName?: string;
-  title?: string;
-  liveStatus?: TaskThreadLiveStatus;
-}
-
 export interface CreatePresetInput {
-  id?: string;
   name: string;
   providerId: string;
   modelId: string;
-  reasoningLevel: string;
+  reasoningLevel: PresetReasoningLevel;
+  serviceTier: PresetServiceTier | null;
   permissionMode: PresetPermissionMode;
   environmentKind: PresetEnvironmentKind;
   baseBranch: string | null;
@@ -297,7 +258,8 @@ export interface UpdatePresetInput {
   name?: string;
   providerId?: string;
   modelId?: string;
-  reasoningLevel?: string;
+  reasoningLevel?: PresetReasoningLevel;
+  serviceTier?: PresetServiceTier | null;
   permissionMode?: PresetPermissionMode;
   environmentKind?: PresetEnvironmentKind;
   baseBranch?: string | null;

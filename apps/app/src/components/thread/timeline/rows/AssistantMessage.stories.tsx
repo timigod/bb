@@ -9,13 +9,6 @@ export default {
   title: "thread/timeline/rows/Assistant Message",
 };
 
-// Match production PageShell: a wide outer scroll area carries
-// `@container/page`, and the inner centered div caps content at 760px.
-// Keeping these on separate elements is what gives MarkdownPreview's
-// `100cqw`-based breakout headroom — collapse them onto one element and
-// 100cqw equals the text column, so tables can't break out.
-// PAGE_SHELL_CONTENT_STYLE on the inner div sets `--md-content-w` so
-// narrow tables anchor flush with the prose, matching production.
 function TimelineStage({ children }: { children: React.ReactNode }) {
   return (
     <div className="@container/page w-full">
@@ -29,11 +22,6 @@ function TimelineStage({ children }: { children: React.ReactNode }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Real assistant messages pulled from live threads in ~/.bb-dev/bb.db.
-// ---------------------------------------------------------------------------
-
-// thr_zzvsfyn7rm — "Investigate User Manual Issue"
 const shortMessage = `Yes. As patched, it keeps the environment runtime entry and workspace watcher around until one of these happens:
 
 - explicit environment destroy
@@ -44,9 +32,6 @@ There is no regular idle sweep in the host daemon, so "forever for the daemon li
 
 I would not keep this patch as-is. The safer shape is to decouple this from provider process exit, but still bound it, for example with an idle watcher TTL or a frontend-driven watch lease. A simpler fallback is to refetch direct environment workspace status on window focus, but that would not be a real push notification.`;
 
-// thr_3vw9r8igrb — "Investigate File List Inconsistency". Real provider
-// merge-readiness report: H1/H2 headers, multiple tables, fenced code blocks
-// (shell, diff, ts), bold, inline code, em-dash separators, emoji markers.
 const longMessage = `# Merge-readiness report
 
 ## Branch / main / merge base
@@ -191,7 +176,7 @@ const mobileReviewRows: TimelineRow[] = [
     sourceSeqStart: 20,
     sourceSeqEnd: 20,
     role: "assistant",
-    text: "The mobile footer is ready. Earlier agent messages keep their actions in the overflow menu, while this final response exposes Copy and Fork inline.",
+    text: "The mobile footer is ready. Earlier agent messages keep their actions in the overflow menu, while this final response exposes Copy inline and keeps Fork in the overflow menu.",
   }),
 ];
 
@@ -207,13 +192,12 @@ export function Overview() {
             id="row_story_short"
             threadId="thr_story"
             turnId="turn_story_short"
-            sourceSeqStart={0}
-            sourceSeqEnd={0}
             text={shortMessage}
             attachments={null}
-            turnRequest={null}
             showActions={true}
             mobileActionDisplay="inline"
+            streaming={false}
+            timestamp={0}
           />
         </TimelineStage>
       </StoryRow>
@@ -227,13 +211,12 @@ export function Overview() {
             id="row_story_long"
             threadId="thr_story"
             turnId="turn_story_long"
-            sourceSeqStart={0}
-            sourceSeqEnd={0}
             text={longMessage}
             attachments={null}
-            turnRequest={null}
             showActions={true}
             mobileActionDisplay="inline"
+            streaming={false}
+            timestamp={0}
           />
         </TimelineStage>
       </StoryRow>
@@ -241,79 +224,106 @@ export function Overview() {
   );
 }
 
+const overflowStoryPluginActions = [
+  {
+    key: "story/summarize",
+    pluginId: null,
+    icon: "Sparkles",
+    label: "Summarize",
+    onSelect: noop,
+  },
+  {
+    key: "story/translate",
+    pluginId: null,
+    icon: "Globe",
+    label: "Translate",
+    onSelect: noop,
+  },
+  {
+    key: "story/save",
+    pluginId: null,
+    icon: "Bookmark",
+    label: "Save to notes",
+    onSelect: noop,
+  },
+  {
+    key: "story/pin",
+    pluginId: null,
+    icon: "Pin",
+    label: "Pin message",
+    onSelect: noop,
+  },
+  {
+    key: "story/share",
+    pluginId: null,
+    icon: "Share",
+    label: "Share",
+    onSelect: noop,
+  },
+];
+
+export function ActionOverflow() {
+  return (
+    <StoryCard>
+      <StoryRow
+        label="wide column"
+        hint="native + five plugin actions all fit inline"
+      >
+        <TimelineStage>
+          <div className="[&_button]:opacity-100">
+            <ConversationMessageContent
+              role="assistant"
+              id="row_story_overflow_wide"
+              threadId="thr_story"
+              turnId="turn_story_overflow_wide"
+              text="Done — the migration ran cleanly on all three environments."
+              attachments={null}
+              showActions={true}
+              mobileActionDisplay="inline"
+              streaming={false}
+              timestamp={0}
+              onAddToChat={noop}
+              onFork={noop}
+              pluginActions={overflowStoryPluginActions}
+            />
+          </div>
+        </TimelineStage>
+      </StoryRow>
+      <StoryRow
+        label="narrow column"
+        hint="a 160px column collapses trailing actions into the overflow menu"
+      >
+        <div className="w-[160px] [&_button]:opacity-100">
+          <ConversationMessageContent
+            role="assistant"
+            id="row_story_overflow_narrow"
+            threadId="thr_story"
+            turnId="turn_story_overflow_narrow"
+            text="Done — migration complete."
+            attachments={null}
+            showActions={true}
+            mobileActionDisplay="inline"
+            streaming={false}
+            timestamp={0}
+            onAddToChat={noop}
+            onFork={noop}
+            pluginActions={overflowStoryPluginActions}
+          />
+        </div>
+      </StoryRow>
+    </StoryCard>
+  );
+}
+
 export function MobileActionsAndSelection() {
   return (
-    <div className="mobile-agent-actions-review mx-auto w-full max-w-[390px] rounded-lg border border-border bg-background p-4">
-      <style>{`
-      /* Force the coarse-pointer presentation for desktop story review. The
-         production component still owns the real mobile media queries. */
-      .mobile-agent-actions-review
-        :is(
-          [data-timeline-row-id="mobile_actions_earlier_agent_message"],
-          [data-timeline-row-id="mobile_actions_earlier_user_message"]
-        )
-        [aria-label="Copy message"],
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_earlier_agent_message"]
-        [aria-label="Fork into new thread"],
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_earlier_agent_message"]
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_earlier_user_message"]
-        [aria-label="Add to chat"] {
-        display: none;
-      }
-
-      .mobile-agent-actions-review
-        :is(
-          [data-timeline-row-id="mobile_actions_earlier_agent_message"],
-          [data-timeline-row-id="mobile_actions_earlier_user_message"]
-        )
-        [aria-label="Message actions"] {
-        display: inline-flex;
-      }
-
-      .mobile-agent-actions-review
-        :is(
-          [data-timeline-row-id="mobile_actions_latest_agent_message"],
-          [data-timeline-row-id="mobile_actions_latest_user_message"]
-        )
-        [aria-label="Copy message"],
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_agent_message"]
-        [aria-label="Fork into new thread"],
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_agent_message"]
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_user_message"]
-        [aria-label="Add to chat"] {
-        width: 1.75rem;
-        height: 1.75rem;
-        opacity: 1;
-      }
-
-      .mobile-agent-actions-review
-        :is(
-          [data-timeline-row-id="mobile_actions_latest_agent_message"],
-          [data-timeline-row-id="mobile_actions_latest_user_message"]
-        )
-        [aria-label="Copy message"] svg,
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_agent_message"]
-        [aria-label="Fork into new thread"] svg,
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_agent_message"]
-      .mobile-agent-actions-review
-        [data-timeline-row-id="mobile_actions_latest_user_message"]
-        [aria-label="Add to chat"] svg {
-        width: 1rem;
-        height: 1rem;
-      }
-    `}</style>
+    <div className="mx-auto w-full max-w-[390px] rounded-lg border border-border bg-background p-4">
       <p className="mb-4 text-xs leading-relaxed text-muted-foreground">
         Earlier user and agent messages: overflow menu. Latest user and agent
-        messages: compact inline actions. Drag-select with a mouse or long-press
-        agent text on touch to exercise the floating selection menu.
+        messages: Copy and an overflow menu. Fork is in the agent overflow menu.
+        Use a compact touch viewport to review mobile actions. Drag-select with a
+        mouse or long-press agent text on touch to exercise the floating selection
+        menu.
       </p>
       <ThreadTimelineRows
         canSpawnChild

@@ -2,15 +2,13 @@ import { useEffect, useState } from "react";
 import type { TimelineRow } from "@bb/server-contract";
 import { ThreadTimelineRows } from "@/components/thread/timeline";
 import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
+import { explorationRow, type ExplorationStep } from "./streaming-story-rows";
 
 export default {
   title: "thread/timeline/Streaming",
 };
 
 const baseProps = {
-  // Active scope so the trailing row is the active-latest frontier and
-  // auto-expands while streaming (matches production behavior on a running
-  // thread).
   threadRuntimeDisplayStatus: "active" as const,
   workspaceRootPath: undefined,
 };
@@ -19,10 +17,6 @@ const THREAD_ID = "thr_streaming";
 const TURN_ID = "019dd185-ef12-7d50-aa48-47882e9c8aaf";
 
 function TimelineStage({ children }: { children: React.ReactNode }) {
-  // Reserve 360px upfront so streaming content growing inside the row
-  // doesn't shove the rest of the page around tick by tick. Matches the
-  // 288px detail cap + ~72px row chrome so the row is fully claimed at
-  // tick 0.
   return <div className="min-h-[360px] w-full max-w-[760px]">{children}</div>;
 }
 
@@ -35,9 +29,6 @@ function StreamingLabel({
   hint: string;
   onRestart: () => void;
 }) {
-  // Stacks the row title, hint, and Restart button inside the StoryRow's
-  // label cell. Putting the button under the label rather than next to the
-  // timeline keeps the controls aligned even as the timeline body grows.
   return (
     <span className="flex flex-col items-start gap-2">
       <span className="text-sm text-muted-foreground">{title}</span>
@@ -75,13 +66,6 @@ function useStreamingTick(
   }, [totalSteps, intervalMs, restartKey]);
   return step;
 }
-
-// ---------------------------------------------------------------------------
-// Variant 1 — provisioning. The system row's detail streams in line-by-line
-// while status stays "pending"; once the last line lands, status flips to
-// "completed" and the title switches from "Provisioning thread" to
-// "Provisioned thread".
-// ---------------------------------------------------------------------------
 
 const PROVISIONING_LINES: readonly string[] = [
   "Creating worktree (305ms)",
@@ -152,11 +136,6 @@ function ProvisioningStreaming({ restartKey }: { restartKey: number }) {
     </TimelineStage>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Variant 2 — running command output. Status pending while output streams in;
-// flips to "completed" with exit code 0 once the last chunk lands.
-// ---------------------------------------------------------------------------
 
 const COMMAND_OUTPUT_CHUNKS: readonly string[] = [
   "• turbo 2.8.3\n",
@@ -231,52 +210,23 @@ function RunningCommandStreaming({ restartKey }: { restartKey: number }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Variant 3 — exploring bundle. New `Read`/`Grep` tool rows append one at a
-// time. Once two or more land in the trailing run, the projection groups
-// them under an "exploration" bundle-summary that shimmers active-latest.
-// ---------------------------------------------------------------------------
-
-interface ExplorationStep {
-  callId: string;
-  toolName: "Read" | "Grep" | "Glob";
-  toolArgs: Record<string, string | number>;
-  intent:
-    | { type: "read"; name: string; path: string }
-    | { type: "search"; query: string; path: string }
-    | { type: "list_files"; path: string };
-}
-
 const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   {
     callId: "stream_read_assist",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "packages/core-ui/src/assistant-stream-projection.ts",
-    },
     intent: {
       type: "read",
-      name: "assistant-stream-projection.ts",
       path: "packages/core-ui/src/assistant-stream-projection.ts",
     },
   },
   {
     callId: "stream_read_index",
-    toolName: "Read",
-    toolArgs: { file_path: "packages/core-ui/src/index.ts" },
     intent: {
       type: "read",
-      name: "index.ts",
       path: "packages/core-ui/src/index.ts",
     },
   },
   {
     callId: "stream_grep_finalized",
-    toolName: "Grep",
-    toolArgs: {
-      pattern: "finalizedReasoningMessageKeys",
-      path: "packages/core-ui/src",
-    },
     intent: {
       type: "search",
       query: "finalizedReasoningMessageKeys",
@@ -285,24 +235,17 @@ const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "stream_glob_tests",
-    toolName: "Glob",
-    toolArgs: { pattern: "packages/core-ui/test/*.test.ts" },
     intent: { type: "list_files", path: "packages/core-ui/test" },
   },
   {
     callId: "stream_read_to_view",
-    toolName: "Read",
-    toolArgs: { file_path: "packages/core-ui/src/to-view-messages.ts" },
     intent: {
       type: "read",
-      name: "to-view-messages.ts",
       path: "packages/core-ui/src/to-view-messages.ts",
     },
   },
   {
     callId: "stream_grep_active_thinking",
-    toolName: "Grep",
-    toolArgs: { pattern: "activeThinking", path: "packages/core-ui/src" },
     intent: {
       type: "search",
       query: "activeThinking",
@@ -311,18 +254,13 @@ const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "stream_read_timeline_view",
-    toolName: "Read",
-    toolArgs: { file_path: "packages/thread-view/src/timeline-view.ts" },
     intent: {
       type: "read",
-      name: "timeline-view.ts",
       path: "packages/thread-view/src/timeline-view.ts",
     },
   },
   {
     callId: "stream_grep_closed_turn_ids",
-    toolName: "Grep",
-    toolArgs: { pattern: "closedTurnIds", path: "packages/core-ui/src" },
     intent: {
       type: "search",
       query: "closedTurnIds",
@@ -331,38 +269,24 @@ const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "stream_read_build_thread_timeline",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "packages/thread-view/src/build-thread-timeline.ts",
-    },
     intent: {
       type: "read",
-      name: "build-thread-timeline.ts",
       path: "packages/thread-view/src/build-thread-timeline.ts",
     },
   },
   {
     callId: "stream_glob_thread_view_tests",
-    toolName: "Glob",
-    toolArgs: { pattern: "packages/thread-view/test/*.test.ts" },
     intent: { type: "list_files", path: "packages/thread-view/test" },
   },
   {
     callId: "stream_read_format_timeline_text",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "packages/thread-view/src/format-timeline-text.ts",
-    },
     intent: {
       type: "read",
-      name: "format-timeline-text.ts",
       path: "packages/thread-view/src/format-timeline-text.ts",
     },
   },
   {
     callId: "stream_grep_open_step",
-    toolName: "Grep",
-    toolArgs: { pattern: "openStep", path: "packages/thread-view/src" },
     intent: {
       type: "search",
       query: "openStep",
@@ -371,20 +295,13 @@ const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "stream_read_completed_turn_grouping",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "packages/thread-view/src/completed-turn-grouping.ts",
-    },
     intent: {
       type: "read",
-      name: "completed-turn-grouping.ts",
       path: "packages/thread-view/src/completed-turn-grouping.ts",
     },
   },
   {
     callId: "stream_grep_step_summary",
-    toolName: "Grep",
-    toolArgs: { pattern: "step-summary", path: "packages/thread-view/src" },
     intent: {
       type: "search",
       query: "step-summary",
@@ -393,52 +310,14 @@ const EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
 ];
 
-function exploringRow(step: ExplorationStep, seq: number): TimelineRow {
-  return {
-    id: `streaming-exploring:${step.callId}`,
-    threadId: THREAD_ID,
-    turnId: TURN_ID,
-    sourceSeqStart: seq,
-    sourceSeqEnd: seq,
-    startedAt: seq,
-    createdAt: seq,
-    kind: "work",
-    workKind: "tool",
-    status: "completed",
-    callId: step.callId,
-    toolName: step.toolName,
-    toolArgs: step.toolArgs,
-    output: "",
-    completedAt: seq,
-    approvalStatus: null,
-    activityIntents: [
-      step.intent.type === "read"
-        ? {
-            type: "read",
-            command: step.toolName,
-            name: step.intent.name,
-            path: step.intent.path,
-          }
-        : step.intent.type === "search"
-          ? {
-              type: "search",
-              command: step.toolName,
-              query: step.intent.query,
-              path: step.intent.path,
-            }
-          : {
-              type: "list_files",
-              command: step.toolName,
-              path: step.intent.path,
-            },
-    ],
-  };
-}
-
 function ExploringBundleStreaming({ restartKey }: { restartKey: number }) {
   const step = useStreamingTick(EXPLORATION_STEPS.length, 250, restartKey);
   const rows = EXPLORATION_STEPS.slice(0, step).map((stepData, index) =>
-    exploringRow(stepData, index + 1),
+    explorationRow(stepData, index + 1, {
+      idPrefix: "streaming-exploring",
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+    }),
   );
   return (
     <TimelineStage>
@@ -447,11 +326,7 @@ function ExploringBundleStreaming({ restartKey }: { restartKey: number }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-
 export function RowDetails() {
-  // Each variant gets its own restart counter; bumping it remounts the
-  // streaming effect and resets `step` to 0.
   const [provisioningKey, setProvisioningKey] = useState(0);
   const [commandKey, setCommandKey] = useState(0);
   const [exploringKey, setExploringKey] = useState(0);

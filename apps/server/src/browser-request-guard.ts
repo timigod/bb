@@ -1,10 +1,11 @@
+import { isIP } from "node:net";
 import {
   buildLocalAppOrigins,
   type BuildLocalAppOriginsArgs,
 } from "@bb/config/local-app-origins";
 import type { ServerRuntimeConfig } from "./types.js";
 
-export interface BrowserRequestGuardDeps {
+interface BrowserRequestGuardDeps {
   config: Pick<ServerRuntimeConfig, "serverPort" | "appUrl" | "devAppPort">;
 }
 
@@ -25,7 +26,7 @@ interface BrowserRequestContext {
   };
 }
 
-function allowedAppOrigins(deps: BrowserRequestGuardDeps): Set<string> {
+export function allowedAppOrigins(deps: BrowserRequestGuardDeps): Set<string> {
   const args: BuildLocalAppOriginsArgs = {
     serverPort: deps.config.serverPort,
   };
@@ -35,7 +36,11 @@ function allowedAppOrigins(deps: BrowserRequestGuardDeps): Set<string> {
   if (deps.config.devAppPort !== undefined) {
     args.devAppPort = deps.config.devAppPort;
   }
-  return new Set(buildLocalAppOrigins(args));
+  return new Set(
+    buildLocalAppOrigins(args).filter(
+      (origin) => origin.startsWith("http://") || origin.startsWith("https://"),
+    ),
+  );
 }
 
 function knownAppPorts(deps: BrowserRequestGuardDeps): Set<number> {
@@ -46,7 +51,7 @@ function knownAppPorts(deps: BrowserRequestGuardDeps): Set<number> {
   return ports;
 }
 
-function effectivePort(url: URL): number | null {
+export function effectivePort(url: URL): number | null {
   if (url.port.length > 0) {
     const port = Number(url.port);
     return Number.isInteger(port) ? port : null;
@@ -61,9 +66,13 @@ function effectivePort(url: URL): number | null {
 }
 
 function parseRequestHost(host: string, protocol: string): URL | null {
+  if (!/^(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::[0-9]+)?$/iu.test(host)) {
+    return null;
+  }
   try {
     const url = new URL(`${protocol}//${host}`);
-    return url.username.length === 0 &&
+    return effectivePort(url) !== 0 &&
+      url.username.length === 0 &&
       url.password.length === 0 &&
       url.pathname === "/" &&
       url.search.length === 0 &&
@@ -73,6 +82,36 @@ function parseRequestHost(host: string, protocol: string): URL | null {
   } catch {
     return null;
   }
+}
+
+function isTrustedHostname(
+  hostname: string,
+  deps: BrowserRequestGuardDeps,
+): boolean {
+  const address = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname;
+  return (
+    hostname === "localhost" ||
+    isIP(address) !== 0 ||
+    [...allowedAppOrigins(deps)].some(
+      (origin) => new URL(origin).hostname === hostname,
+    )
+  );
+}
+
+export function requestHostProblem(
+  context: BrowserRequestContext,
+  deps: BrowserRequestGuardDeps,
+): BrowserRequestProblem | null {
+  const host = context.req.header("host") ?? new URL(context.req.url).host;
+  const target = parseRequestHost(host, "http:");
+  if (target !== null && isTrustedHostname(target.hostname, deps)) {
+    return null;
+  }
+  return {
+    status: 403,
+    error:
+      'Host must be localhost, an IP address, or the hostname configured in BB_APP_URL. To allow your custom hostname, run "npx bb-app config set BB_APP_URL https://bb.example.com" on the machine running BB (including the desktop app), replacing https://bb.example.com with your app URL, then reload this page.',
+  };
 }
 
 function requestTargets(context: BrowserRequestContext): URL[] {
@@ -119,7 +158,9 @@ function isTrustedOrigin(
     return true;
   }
 
-  const targets = requestTargets(context);
+  const targets = requestTargets(context).filter((target) =>
+    isTrustedHostname(target.hostname, deps),
+  );
   if (targets.some((target) => target.origin === originUrl.origin)) {
     return true;
   }
@@ -138,12 +179,6 @@ function isJsonContentType(contentType: string | undefined): boolean {
   );
 }
 
-/**
- * Guards privileged local-browser boundaries without imposing credentials on
- * non-browser clients. Browsers send Origin; Node SDK, CLI, and server-to-server
- * callers commonly do not. Dynamic LAN/dev origins must share the request host
- * and use a configured BB port, while configured app origins match exactly.
- */
 export function browserRequestProblem(
   context: BrowserRequestContext,
   deps: BrowserRequestGuardDeps,

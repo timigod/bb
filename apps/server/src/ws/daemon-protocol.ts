@@ -1,24 +1,43 @@
+import { reportEnvironmentHookProgress } from "../services/environments/environment-hooks.js";
+import { syncDesktopBrowserTabs } from "../services/desktop-browsers.js";
 import { heartbeatSession } from "@bb/db";
 import {
   hasHostDaemonWebSocketProtocol,
   hostDaemonDaemonWsMessageSchema,
+  type HostDaemonDaemonWsMessage,
 } from "@bb/host-daemon-contract";
 import { ApiError } from "../errors.js";
 import { verifyAuthenticatedDaemon } from "../internal/auth.js";
-import type { AppDeps } from "../types.js";
+import type {
+  AppDeps,
+  LoggedPendingInteractionWorkSessionDeps,
+  WorkSessionDeps,
+} from "../types.js";
 import { runtimeErrorLogFields } from "../services/lib/error-log-fields.js";
-import { schedulePrimaryHostCaffeinateReconciliation } from "../services/system/app-settings.js";
 import {
   getInactiveSessionLogFields,
   requireAuthorizedOpenSession,
 } from "../internal/session-state.js";
-import { handleDaemonSocketClosed } from "../internal/session-owner-side-effects.js";
+import {
+  handleDaemonSessionSilent,
+  handleDaemonSocketClosed,
+  handleDaemonSocketOpened,
+} from "../internal/session-owner-side-effects.js";
+import { HEARTBEAT_INTERVAL_MS, LEASE_TIMEOUT_MS } from "../constants.js";
 import {
   notifyDaemonEnvironmentChange,
   recordDaemonEnvironmentMetadataChange,
 } from "../internal/environment-changes.js";
+import { requestQueuedMessageDispatch } from "../services/threads/queued-message-dispatch.js";
 import { runEventLoopWorkSync } from "../services/system/event-loop-work.js";
-import { decodeSocketPayload } from "./decode-payload.js";
+import { parseSocketMessage } from "./decode-payload.js";
+import type { PluginService } from "../services/plugins/plugin-service.js";
+import type { ServerMoveCoordinator } from "../services/server-move/coordinator.js";
+import {
+  isServerMoveFrozen,
+  isServerMoveSnapshotFenced,
+} from "../services/server-move/freeze-state.js";
+import { resumeEnvironmentProvisioningForHost } from "../services/environments/environment-engine.js";
 
 interface DaemonSocket {
   close(code?: number, reason?: string): void;
@@ -67,21 +86,20 @@ export async function validateDaemonWebSocket(
   };
 }
 
+export const SERVER_MOVE_FENCED_DAEMON_MESSAGE_TYPES: ReadonlySet<
+  HostDaemonDaemonWsMessage["type"]
+> = new Set([
+  "environment-metadata-change",
+  "desktop-browser.changed",
+  "plugin-host.signal",
+  "plugin-host.worker-exited",
+  "terminal.opened",
+  "terminal.exited",
+]);
+
 export function onDaemonSocketOpen(
-  deps: Pick<
-    AppDeps,
-    | "config"
-    | "db"
-    | "hub"
-    | "lifecycleDedupers"
-    | "logger"
-    | "machineAuth"
-    | "pendingInteractions"
-    | "skillTreeRegistry"
-    | "sharedPorts"
-    | "telemetry"
-    | "terminalSessions"
-  >,
+  deps: LoggedPendingInteractionWorkSessionDeps &
+    Pick<AppDeps, "hub" | "logger" | "sharedPorts" | "terminalSessions">,
   args: { hostId: string; sessionId: string; socket: DaemonSocket },
 ): void {
   deps.logger.info(
@@ -89,78 +107,121 @@ export function onDaemonSocketOpen(
     "Daemon WebSocket opened",
   );
   deps.hub.registerDaemon(args.sessionId, args.hostId, args.socket);
+  handleDaemonSocketOpened(deps, { hostId: args.hostId });
   deps.sharedPorts.pushCurrentSharedPortsForHost(args.hostId);
-  deps.terminalSessions.expireDisconnectedHostTerminals({
-    daemonSessionId: args.sessionId,
+  if (!isServerMoveSnapshotFenced(deps.db)) {
+    deps.terminalSessions.reconcileDisconnectedHostTerminals({
+      daemonSessionId: args.sessionId,
+      hostId: args.hostId,
+    });
+  }
+  if (isServerMoveFrozen(deps.db)) {
+    return;
+  }
+  // A dispatch that arrived while this machine was away parked its row on a
+  // `host-offline` wait with no schedule, so no sweep can see it — the
+  // machine coming back is that wait's release signal, and this socket
+  // opening is where core hears it.
+  requestQueuedMessageDispatch(deps, {
     hostId: args.hostId,
+    kind: "host-connected",
   });
-  schedulePrimaryHostCaffeinateReconciliation(deps, {
-    reason: "daemon-open",
+  void resumeEnvironmentProvisioningForHost(deps, {
+    hostId: args.hostId,
+  }).catch((error) => {
+    deps.logger.warn(
+      {
+        err: error,
+        hostId: args.hostId,
+        sessionId: args.sessionId,
+      },
+      "Environment provisioning reconnect resume failed",
+    );
   });
 }
 
 export function onDaemonSocketMessage(
-  deps: Pick<
-    AppDeps,
-    "config" | "db" | "hub" | "logger" | "sharedPorts" | "terminalSessions"
-  >,
+  deps: WorkSessionDeps & Pick<AppDeps, "sharedPorts" | "terminalSessions">,
   args: DaemonSocketMessageArgs,
+  plugins?: Pick<PluginService, "handleHostSignal" | "handleHostWorkerExit">,
+  serverMove?: Pick<ServerMoveCoordinator, "handleProgress">,
 ): void {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(decodeSocketPayload(args.raw));
-  } catch {
-    args.socket.close(1008, "invalid-message");
-    return;
-  }
-
-  const result = hostDaemonDaemonWsMessageSchema.safeParse(decoded);
-  if (!result.success) {
-    args.socket.close(1008, "invalid-message");
+  deps.hub.recordDaemonActivity(args.sessionId);
+  const message = parseSocketMessage(
+    args.socket,
+    args.raw,
+    hostDaemonDaemonWsMessageSchema,
+  );
+  if (message === null) {
     return;
   }
 
   try {
-    runEventLoopWorkSync(`ws:daemon ${result.data.type}`, () => {
+    runEventLoopWorkSync(`ws:daemon ${message.type}`, () => {
       const session = requireAuthorizedOpenSession(deps.db, {
         hostId: args.hostId,
         sessionId: args.sessionId,
       });
-      heartbeatSession(
-        deps.db,
-        session.id,
-        Math.max(
-          Date.now() + session.leaseTimeoutMs,
-          session.leaseExpiresAt + 1,
-        ),
-      );
-      if (result.data.type === "environment-change") {
+      const now = Date.now();
+      if (
+        message.type === "heartbeat" ||
+        now < session.updatedAt ||
+        now - session.updatedAt >= session.heartbeatIntervalMs ||
+        session.leaseExpiresAt <= now + session.heartbeatIntervalMs
+      ) {
+        heartbeatSession(
+          deps.db,
+          session.id,
+          Math.max(now + session.leaseTimeoutMs, session.leaseExpiresAt + 1),
+        );
+      }
+      if (
+        isServerMoveSnapshotFenced(deps.db) &&
+        SERVER_MOVE_FENCED_DAEMON_MESSAGE_TYPES.has(message.type)
+      ) {
+        if (message.type === "terminal.opened") {
+          deps.terminalSessions.refuseDaemonTerminalOpen({
+            message,
+            sessionId: args.sessionId,
+          });
+        }
+        deps.logger.debug(
+          {
+            hostId: args.hostId,
+            messageType: message.type,
+            sessionId: args.sessionId,
+          },
+          "Ignoring a daemon change while the server is moving",
+        );
+        return;
+      }
+      if (message.type === "environment-change") {
         notifyDaemonEnvironmentChange(deps, {
           hostId: args.hostId,
-          environmentId: result.data.environmentId,
-          change: result.data.change,
+          environmentId: message.environmentId,
+          change: message.change,
         });
         return;
       }
-      if (result.data.type === "environment-metadata-change") {
+      if (message.type === "environment-metadata-change") {
         recordDaemonEnvironmentMetadataChange(deps, {
           hostId: args.hostId,
-          environmentId: result.data.environmentId,
-          workspace: result.data.workspace,
+          environmentId: message.environmentId,
+          workspace: message.workspace,
         });
         return;
       }
-      if (result.data.type === "host-rpc.response") {
+      if (message.type === "host-rpc.response") {
         const disposition = deps.hub.recordHostOnlineRpcResponse({
-          message: result.data,
+          message,
           sessionId: args.sessionId,
         });
         if (!disposition.handled && disposition.reason === "session_mismatch") {
           deps.logger.warn(
             {
-              commandType: result.data.commandType,
+              commandType: message.commandType,
               expectedSessionId: disposition.expectedSessionId,
-              requestId: result.data.requestId,
+              requestId: message.requestId,
               sessionId: args.sessionId,
             },
             "Ignoring host RPC response from mismatched daemon session",
@@ -168,8 +229,8 @@ export function onDaemonSocketMessage(
         } else if (!disposition.handled) {
           deps.logger.debug(
             {
-              commandType: result.data.commandType,
-              requestId: result.data.requestId,
+              commandType: message.commandType,
+              requestId: message.requestId,
               sessionId: args.sessionId,
             },
             "Ignoring stale host RPC response",
@@ -177,20 +238,70 @@ export function onDaemonSocketMessage(
         }
         return;
       }
-      if (result.data.type === "connect-tunnel.identity") {
-        deps.sharedPorts.recordTunnelIdentity(
-          args.hostId,
-          result.data.identity,
+      if (message.type === "connect-tunnel.identity") {
+        deps.sharedPorts.recordTunnelIdentity(args.hostId, message.identity);
+        return;
+      }
+      if (message.type === "desktop-browser.changed") {
+        const scope = {
+          hostId: args.hostId,
+          instanceId: message.instanceId,
+          generation: message.generation,
+          threadId: message.threadId,
+        };
+        const logDropped = (error: unknown) => {
+          deps.logger.warn(
+            {
+              sessionId: args.sessionId,
+              ...scope,
+              ...runtimeErrorLogFields(deps.config, error),
+            },
+            "Dropping desktop browser snapshot the server cannot apply",
+          );
+        };
+        void syncDesktopBrowserTabs(deps, scope, message.tabs).catch(
+          logDropped,
         );
         return;
       }
-      if (result.data.type !== "heartbeat") {
-        deps.terminalSessions.handleDaemonTerminalMessage({
-          hostId: args.hostId,
-          message: result.data,
-          sessionId: args.sessionId,
+      if (message.type === "plugin-host.worker-exited") {
+        plugins?.handleHostWorkerExit({
+          authenticatedHostId: args.hostId,
+          pluginId: message.pluginId,
+          generation: message.generation,
         });
+        return;
       }
+      if (message.type === "environment.hook.progress") {
+        reportEnvironmentHookProgress(deps, args.hostId, message);
+        return;
+      }
+      if (message.type === "server_move.progress") {
+        serverMove?.handleProgress(args.hostId, message);
+        return;
+      }
+      if (message.type === "plugin-host.signal") {
+        plugins?.handleHostSignal({
+          authenticatedHostId: args.hostId,
+          pluginId: message.pluginId,
+          generation: message.generation,
+          signal: message.signal,
+          payload: message.payload,
+        });
+        return;
+      }
+      if (message.type === "heartbeat") {
+        args.socket.send(JSON.stringify({ type: "heartbeat-ack" }));
+        return;
+      }
+      if (message.type === "machine.shutdown-ack") {
+        return;
+      }
+      deps.terminalSessions.handleDaemonTerminalMessage({
+        hostId: args.hostId,
+        message,
+        sessionId: args.sessionId,
+      });
     });
   } catch (error) {
     if (error instanceof ApiError && error.body.code === "inactive_session") {
@@ -221,24 +332,36 @@ export function onDaemonSocketMessage(
     deps.logger.warn(
       {
         sessionId: args.sessionId,
+        messageType: message.type,
         ...runtimeErrorLogFields(deps.config, error),
       },
-      "Daemon heartbeat rejected, closing socket",
+      "Daemon message rejected, closing socket",
     );
     args.socket.close(1008, "inactive-session");
   }
 }
 
+const DAEMON_LIVENESS_CHECK_INTERVAL_MS = HEARTBEAT_INTERVAL_MS;
+const DAEMON_LIVENESS_MAX_QUIET_CHECKS = Math.ceil(
+  LEASE_TIMEOUT_MS / DAEMON_LIVENESS_CHECK_INTERVAL_MS,
+);
+
+export function startDaemonLivenessChecks(
+  deps: LoggedPendingInteractionWorkSessionDeps & Pick<AppDeps, "sharedPorts">,
+): () => void {
+  const interval = setInterval(() => {
+    for (const sessionId of deps.hub.takeSilentDaemonSessionIds(
+      DAEMON_LIVENESS_MAX_QUIET_CHECKS,
+    )) {
+      handleDaemonSessionSilent(deps, { sessionId });
+    }
+  }, DAEMON_LIVENESS_CHECK_INTERVAL_MS);
+  interval.unref();
+  return () => clearInterval(interval);
+}
+
 export function onDaemonSocketClose(
-  deps: Pick<
-    AppDeps,
-    | "db"
-    | "hub"
-    | "logger"
-    | "pendingInteractions"
-    | "sharedPorts"
-    | "terminalSessions"
-  >,
+  deps: LoggedPendingInteractionWorkSessionDeps & Pick<AppDeps, "sharedPorts">,
   sessionId: string,
 ): void {
   handleDaemonSocketClosed(deps, {

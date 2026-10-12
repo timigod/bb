@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { useResizeObserver } from "usehooks-ts";
 import { Button } from "@bb/shared-ui/button";
 import {
@@ -14,6 +14,10 @@ import {
   DropdownMenuTrigger,
 } from "@bb/shared-ui/dropdown-menu";
 import { Icon } from "@bb/shared-ui/icon";
+import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
+import { Input } from "@bb/shared-ui/input";
+import { Skeleton } from "@bb/shared-ui/skeleton";
+import { DiffStatsTally } from "@/components/ui/diff-stats-tally.js";
 import {
   formatChangeSummary,
   renderChangeSummary,
@@ -36,7 +40,6 @@ export type GitDiffDisplayModeChangeHandler = (
 export interface GitDiffSelectionOption {
   value: string;
   label: string;
-  /** When set, rendered in monospace before the label (e.g. a short commit SHA). */
   monoPrefix?: string;
 }
 
@@ -45,7 +48,6 @@ interface GitDiffSelectorProps {
   options: readonly GitDiffSelectionOption[];
   onChange: (value: string) => void;
   disabled?: boolean;
-  /** Width of the surrounding diff panel, used to cap the open menu's width. */
   panelWidthPx: number;
 }
 
@@ -93,9 +95,6 @@ function GitDiffSelector({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="start"
-        // Match the panel width so the menu lines up with the diff cards below,
-        // but stay at least GIT_DIFF_SELECTOR_MENU_MIN_WIDTH so labels stay
-        // readable when the panel is narrow. Viewport-capped as a safety net.
         className="min-w-[var(--radix-dropdown-menu-trigger-width)]"
         style={{
           maxWidth: `min(var(--radix-popper-available-width), max(${GIT_DIFF_SELECTOR_MENU_MIN_WIDTH}, ${panelWidthPx}px))`,
@@ -136,18 +135,80 @@ function GitDiffSelector({
   );
 }
 
-export interface GitDiffToolbarProps {
+interface GitDiffFileFilterInputProps {
+  value: string;
+  onChange: (value: string | null) => void;
+}
+
+function GitDiffFileFilterInput({
+  value,
+  onChange,
+}: GitDiffFileFilterInputProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const isPointerCoarse = usePointerCoarse();
+
+  useEffect(() => {
+    if (!isPointerCoarse) {
+      inputRef.current?.focus();
+    }
+  }, [isPointerCoarse]);
+
+  return (
+    <div className="relative mt-2">
+      <span className="pointer-events-none absolute inset-y-0 left-2.25 flex w-8 items-center justify-center text-muted-foreground">
+        <Icon name="Filter" className="size-3.5" />
+      </span>
+      <Input
+        ref={inputRef}
+        aria-label="Filter changed files by path"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        className={cn(
+          "h-8 rounded-lg border-border pl-12 pr-8 text-xs focus-visible:ring-0 max-md:pointer-coarse:h-10 max-md:pointer-coarse:text-base",
+        )}
+        placeholder="Filter files, e.g. *.md, docs/**, !*.test.ts"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onChange(null);
+          }
+        }}
+      />
+      {value ? (
+        <button
+          type="button"
+          className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center text-muted-foreground hover:text-foreground"
+          aria-label="Clear file filter"
+          onClick={() => {
+            onChange("");
+            inputRef.current?.focus();
+          }}
+        >
+          <Icon name="X" className={COARSE_POINTER_COMPACT_ICON_SIZE_CLASS} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+interface GitDiffToolbarProps {
   selectionValue: string;
   selectionOptions: readonly GitDiffSelectionOption[];
   onSelectionChange: (value: string) => void;
-  /** Disables the selector while data is loading or unavailable. */
   isSelectorDisabled: boolean;
 
   stats: GitDiffStats;
+  isStatsLoading: boolean;
+  totalFilesCount: number;
+  isTruncated: boolean;
 
-  /** Whether the collapse-all action would expand or collapse next. */
+  fileFilter: string | null;
+  onFileFilterChange: (value: string | null) => void;
+
   areAllFilesCollapsed: boolean;
-  /** Disabled when there are no parsed files (or while loading). */
   isCollapseAllDisabled: boolean;
   onToggleAllCollapsed: () => void;
 
@@ -164,6 +225,11 @@ export function GitDiffToolbar({
   onSelectionChange,
   isSelectorDisabled,
   stats,
+  isStatsLoading,
+  totalFilesCount,
+  isTruncated,
+  fileFilter,
+  onFileFilterChange,
   areAllFilesCollapsed,
   isCollapseAllDisabled,
   onToggleAllCollapsed,
@@ -178,11 +244,22 @@ export function GitDiffToolbar({
     box: "content-box",
   });
   const changeTally = { ...stats, lineStatsComplete: true };
+  const completeSummary = formatChangeSummary(changeTally);
+  const truncatedFilesLabel = `${stats.filesCount}+ file${stats.filesCount === 1 ? "" : "s"}`;
+  const hasShownLineChanges = stats.insertions > 0 || stats.deletions > 0;
+  const isFiltering = Boolean(fileFilter?.trim());
+  const filteredFilesLabel = `${stats.filesCount} of ${totalFilesCount}${isTruncated ? "+" : ""} files`;
 
   return (
     <div ref={rootRef} className="px-4 pb-3 pt-3">
-      <div className="flex min-w-0 items-center gap-3">
-        <div className="min-w-0 flex-1">
+      <div
+        className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2"
+        data-testid="git-diff-toolbar-layout"
+      >
+        <div
+          className="min-w-0 basis-48 grow-[999]"
+          data-testid="git-diff-toolbar-selector-slot"
+        >
           <GitDiffSelector
             value={selectionValue}
             options={selectionOptions}
@@ -191,62 +268,63 @@ export function GitDiffToolbar({
             panelWidthPx={rootWidth}
           />
         </div>
-        <span
-          className={cn(
-            "min-w-0 shrink truncate text-muted-foreground",
-            COARSE_POINTER_TEXT_SM_CLASS,
-          )}
-          title={formatChangeSummary(changeTally)}
+        <div
+          className="flex min-w-0 flex-1 basis-auto items-center gap-3"
+          data-testid="git-diff-toolbar-details"
         >
-          {renderChangeSummary(changeTally)}
-        </span>
-        <div className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
+          <span
             className={cn(
-              COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
-              "text-muted-foreground",
+              "min-w-0 shrink truncate pl-2.5 text-muted-foreground",
+              COARSE_POINTER_TEXT_SM_CLASS,
             )}
-            onClick={onToggleAllCollapsed}
-            disabled={isCollapseAllDisabled}
-            aria-label={
-              areAllFilesCollapsed ? "Expand all files" : "Collapse all files"
+            data-testid="git-diff-toolbar-summary"
+            title={
+              isFiltering
+                ? `${stats.filesCount} of ${totalFilesCount}${isTruncated ? "+" : ""} changed files match the filter`
+                : isTruncated
+                  ? `Showing the first ${stats.filesCount} changed file${stats.filesCount === 1 ? "" : "s"}; shown slice: ${stats.insertions} insertion${stats.insertions === 1 ? "" : "s"}, ${stats.deletions} deletion${stats.deletions === 1 ? "" : "s"}`
+                  : completeSummary
             }
           >
-            {areAllFilesCollapsed ? (
-              <Icon name="ChevronsDown" />
+            {isStatsLoading ? (
+              <Skeleton
+                role="status"
+                aria-label="Loading changes"
+                className="inline-block h-3 w-24 rounded-sm align-middle"
+              />
+            ) : isFiltering ? (
+              <>
+                {filteredFilesLabel}
+                {hasShownLineChanges ? (
+                  <>
+                    {" · "}
+                    <DiffStatsTally
+                      insertions={stats.insertions}
+                      deletions={stats.deletions}
+                    />
+                  </>
+                ) : null}
+              </>
+            ) : isTruncated ? (
+              <>
+                {truncatedFilesLabel}
+                {hasShownLineChanges ? (
+                  <>
+                    {" · shown "}
+                    <DiffStatsTally
+                      insertions={stats.insertions}
+                      deletions={stats.deletions}
+                    />
+                  </>
+                ) : null}
+              </>
             ) : (
-              <Icon name="ChevronsUp" />
+              renderChangeSummary(changeTally)
             )}
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className={cn(
-              COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
-              "text-muted-foreground",
-            )}
-            onClick={() =>
-              onLineOverflowModeChange(
-                getNextCodeOverflowMode(lineOverflowMode),
-              )
-            }
-            aria-label={
-              lineOverflowMode === "wrap"
-                ? "Disable diff line wrap"
-                : "Wrap diff lines"
-            }
-            aria-pressed={lineOverflowMode === "wrap"}
-          >
-            <Icon name="TextWrap" />
-          </Button>
+          </span>
           <div
-            className="inline-flex items-center gap-1 rounded-lg border border-border p-0.5"
-            role="tablist"
-            aria-label="Diff view mode"
+            className="ml-auto flex min-w-0 shrink-0 items-center justify-end gap-1"
+            data-testid="git-diff-toolbar-actions"
           >
             <Button
               type="button"
@@ -256,11 +334,15 @@ export function GitDiffToolbar({
                 COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
                 "text-muted-foreground",
               )}
-              onClick={() => onDisplayModeChange("unified")}
-              aria-label="Stacked diff view"
-              aria-pressed={displayMode === "unified"}
+              onClick={() =>
+                onFileFilterChange(fileFilter === null ? "" : null)
+              }
+              aria-label={
+                fileFilter === null ? "Filter files" : "Close file filter"
+              }
+              aria-pressed={fileFilter !== null}
             >
-              <Icon name="Rows2" />
+              <Icon name="Filter" />
             </Button>
             <Button
               type="button"
@@ -270,15 +352,83 @@ export function GitDiffToolbar({
                 COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
                 "text-muted-foreground",
               )}
-              onClick={() => onDisplayModeChange("split")}
-              aria-label="Split diff view"
-              aria-pressed={displayMode === "split"}
+              onClick={onToggleAllCollapsed}
+              disabled={isCollapseAllDisabled}
+              aria-label={
+                areAllFilesCollapsed ? "Expand all files" : "Collapse all files"
+              }
             >
-              <Icon name="Columns2" />
+              {areAllFilesCollapsed ? (
+                <Icon name="ChevronsDown" />
+              ) : (
+                <Icon name="ChevronsUp" />
+              )}
             </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className={cn(
+                COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
+                "text-muted-foreground",
+              )}
+              onClick={() =>
+                onLineOverflowModeChange(
+                  getNextCodeOverflowMode(lineOverflowMode),
+                )
+              }
+              aria-label={
+                lineOverflowMode === "wrap"
+                  ? "Disable diff line wrap"
+                  : "Wrap diff lines"
+              }
+              aria-pressed={lineOverflowMode === "wrap"}
+            >
+              <Icon name="TextWrap" />
+            </Button>
+            <div
+              className="inline-flex items-center gap-1 rounded-lg border border-border p-0.5"
+              role="tablist"
+              aria-label="Diff view mode"
+            >
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className={cn(
+                  COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
+                  "text-muted-foreground",
+                )}
+                onClick={() => onDisplayModeChange("unified")}
+                aria-label="Stacked diff view"
+                aria-pressed={displayMode === "unified"}
+              >
+                <Icon name="Rows2" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className={cn(
+                  COARSE_POINTER_COMPACT_ICON_BUTTON_CLASS,
+                  "text-muted-foreground",
+                )}
+                onClick={() => onDisplayModeChange("split")}
+                aria-label="Split diff view"
+                aria-pressed={displayMode === "split"}
+              >
+                <Icon name="Columns2" />
+              </Button>
+            </div>
           </div>
         </div>
       </div>
+      {fileFilter !== null ? (
+        <GitDiffFileFilterInput
+          value={fileFilter}
+          onChange={onFileFilterChange}
+        />
+      ) : null}
     </div>
   );
 }

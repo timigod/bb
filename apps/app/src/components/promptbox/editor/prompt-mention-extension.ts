@@ -8,7 +8,7 @@ import { PromptMentionPillNodeView } from "./PromptMentionPillNodeView";
 import { parsePromptEditorMentionAttrs } from "./prompt-editor-serialization";
 import {
   PROMPT_MENTION_PILL_CLASS,
-  promptMentionIconLabel,
+  promptMentionDisplayLabel,
   promptMentionTooltipLabel,
 } from "@/components/promptbox/mentions/prompt-mention-display";
 import { promptMentionClipboardDataAttributes } from "@/components/promptbox/mentions/prompt-mention-clipboard";
@@ -25,8 +25,7 @@ function renderMentionText({ node }: MentionRenderArgs): string {
 }
 
 function renderMentionLabel(attrs: ParsedMentionAttrs): string {
-  if (!attrs) return "@mention";
-  return `${promptMentionIconLabel(attrs.resource)}: ${attrs.resource.label}`;
+  return attrs ? promptMentionDisplayLabel(attrs.resource) : "@mention";
 }
 
 function renderMentionTitle(attrs: ParsedMentionAttrs): string {
@@ -49,10 +48,6 @@ export const PromptMentionExtension = Mention.extend({
   addNodeView() {
     return ReactNodeViewRenderer(PromptMentionPillNodeView);
   },
-  // Mention SVG icons never receive the browser's native `::selection` paint,
-  // so a text selection that spans a pill highlights its label but not its
-  // icon. Mark every mention node fully inside the selection so the node view
-  // can paint the whole pill as one selected unit.
   addProseMirrorPlugins() {
     const parentPlugins = this.parent?.() ?? [];
     const mentionName = this.name;

@@ -1,1 +1,1 @@
-export const ARCHIVED_THREADS_PAGE_SIZE = 100;
+export const ARCHIVED_THREADS_PAGE_SIZE = 50;

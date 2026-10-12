@@ -6,18 +6,16 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from "../../shared/contract.js";
-import { uploadAttachment } from "../detail/attachments.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   AttachmentChip,
+  settleStagedUploads,
   stageFiles,
+  uploadStagedAttachments,
+  useStagedAttachmentRetry,
   type StagedAttachment,
 } from "../../components/staged-attachments.js";
-import {
-  listAllTasks,
-  useProjects,
-  useTasksQuery,
-  useTasksRpc,
-} from "../../shell/data.js";
+import { useProjects, useTasksQuery, useTasksRpc } from "../../shell/data.js";
 import { useTasksNavigation } from "../../shell/routes.js";
 import { TasksEditor } from "../../editor/tasks-editor.js";
 import {
@@ -26,15 +24,12 @@ import {
   DialogDescription,
   DialogFooter,
   DialogTitle,
-} from "@bb/shared-ui/dialog";
+} from "@/components/ui/dialog";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@bb/shared-ui/select";
-import { Popover, PopoverContent, PopoverTrigger } from "@bb/shared-ui/popover";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   Command,
   CommandEmpty,
@@ -42,44 +37,116 @@ import {
   CommandInput,
   CommandItem,
   CommandList,
-} from "@bb/shared-ui/command";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/command";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import { CheckboxField, DEFAULT_COLOR } from "./shared.js";
-
-export const STATUS_LABELS: Record<TaskStatus, string> = {
-  backlog: "Backlog",
-  todo: "Todo",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  done: "Done",
-  canceled: "Canceled",
-};
-
-export const PRIORITY_LABELS: Record<TaskPriority, string> = {
-  urgent: "Urgent",
-  high: "High",
-  medium: "Medium",
-  low: "Low",
-  none: "No priority",
-};
+import {
+  clearNewTaskDraft,
+  hasDraftContent,
+  loadNewTaskDraft,
+  storeNewTaskDraft,
+  type NewTaskDraft,
+} from "./new-task-draft.js";
+import { PRIORITY_LABELS, STATUS_LABELS } from "../list/lib.js";
 
 const CHIP_TRIGGER =
   "h-7 w-auto gap-1.5 rounded-md px-2 text-xs text-muted-foreground";
 
-export interface NewTaskDialogProps {
+function TaskFieldPicker<Value extends string>({
+  dialogOpen,
+  label,
+  value,
+  options,
+  onValueChange,
+}: {
+  dialogOpen: boolean;
+  label: string;
+  value: Value | null;
+  options: ReadonlyArray<{
+    value: Value;
+    label: string;
+    color?: string;
+    keywords?: string[];
+  }>;
+  onValueChange: (value: Value) => void;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  useEffect(() => {
+    if (!dialogOpen) setPickerOpen(false);
+  }, [dialogOpen]);
+  const selected = options.find((option) => option.value === value);
+  return (
+    <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          aria-label={label}
+          variant="outline"
+          size="sm"
+          className={cn(CHIP_TRIGGER, "max-w-44 border-input font-normal")}
+        >
+          <span className="truncate">{selected?.label ?? label}</span>
+          <Icon name="ChevronDown" className="size-4 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-56 p-0" align="start">
+        <Command>
+          <CommandInput placeholder={`Choose ${label.toLowerCase()}…`} />
+          <CommandList>
+            <CommandEmpty>No matching options.</CommandEmpty>
+            <CommandGroup>
+              {options.map((option) => (
+                <CommandItem
+                  key={option.value}
+                  value={option.value}
+                  keywords={[option.label, ...(option.keywords ?? [])]}
+                  onSelect={() => {
+                    if (option.value !== value) onValueChange(option.value);
+                    setPickerOpen(false);
+                  }}
+                >
+                  {option.color ? (
+                    <span
+                      aria-hidden
+                      className="size-2.5 rounded-sm"
+                      style={{ backgroundColor: option.color }}
+                    />
+                  ) : null}
+                  <span className="flex-1 truncate">{option.label}</span>
+                  {option.value === value ? (
+                    <Icon name="Check" className="size-3.5" />
+                  ) : null}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function blankDraft(
+  projectId: string | null,
+  defaultStatus: TaskStatus | undefined,
+): NewTaskDraft {
+  return {
+    projectId,
+    title: "",
+    description: "",
+    status: defaultStatus ?? "todo",
+    priority: "none",
+    labelIds: [],
+    dueDate: "",
+  };
+}
+
+interface NewTaskDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Pre-selected project, or null when opened from All tasks / Active. */
   projectId: string | null;
-  /** Status the new task starts in, e.g. the board column that opened the dialog. */
   defaultStatus?: TaskStatus;
-  /**
-   * When set the dialog opens as "Add sub-task" with this parent pre-selected
-   * and the project locked to the parent's (sub-tasks must share it).
-   */
-  defaultParentTaskId?: string;
 }
 
 export function NewTaskDialog({
@@ -87,100 +154,113 @@ export function NewTaskDialog({
   onOpenChange,
   projectId,
   defaultStatus,
-  defaultParentTaskId,
 }: NewTaskDialogProps) {
   const rpc = useTasksRpc();
   const navigation = useTasksNavigation();
   const projects = useProjects();
-  const subtaskMode = defaultParentTaskId !== undefined;
 
-  const [selectedProjectId, setSelectedProjectId] = useState(projectId);
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [status, setStatus] = useState<TaskStatus>(defaultStatus ?? "todo");
-  const [priority, setPriority] = useState<TaskPriority>("none");
-  const [labelIds, setLabelIds] = useState<string[]>([]);
-  const [dueDate, setDueDate] = useState("");
-  const [parentTaskId, setParentTaskId] = useState<string | null>(
-    defaultParentTaskId ?? null,
+  const [draft, setDraft] = useState(() =>
+    blankDraft(projectId, defaultStatus),
   );
-  const [parentPickerOpen, setParentPickerOpen] = useState(false);
   const [createMore, setCreateMore] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [labelQuery, setLabelQuery] = useState("");
   const [creatingLabel, setCreatingLabel] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<StagedAttachment[]>([]);
-  // Set once createTask succeeded but some attachment uploads failed: the
-  // dialog switches to a recovery view so nothing is double-created or lost.
   const [createdTask, setCreatedTask] = useState<Task | null>(null);
   const titleRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Each open starts a fresh draft seeded from the invoking context.
+  const updateDraft = (
+    change: (current: NewTaskDraft) => Partial<NewTaskDraft>,
+  ) =>
+    setDraft((current) => {
+      const resolved = {
+        ...current,
+        projectId: effectiveProjectId,
+        labelIds: labels.data
+          ? current.labelIds.filter((id) =>
+              labels.data?.some((label) => label.id === id),
+            )
+          : current.labelIds,
+      };
+      const next = { ...resolved, ...change(resolved) };
+      storeNewTaskDraft(next);
+      return next;
+    });
+
   useEffect(() => {
     if (!open) return;
-    setSelectedProjectId(projectId);
-    setTitle("");
-    setDescription("");
-    setStatus(defaultStatus ?? "todo");
-    setPriority("none");
-    setLabelIds([]);
-    setDueDate("");
-    setParentTaskId(defaultParentTaskId ?? null);
+    const restored = loadNewTaskDraft();
+    setDraft(restored ?? blankDraft(projectId, defaultStatus));
     setLabelQuery("");
     setPendingFiles([]);
     setCreatedTask(null);
     setError(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react/exhaustive-deps
   }, [open]);
 
+  const { title, description, status, priority, dueDate } = draft;
   const projectList = projects.data ?? [];
-  const effectiveProjectId =
-    selectedProjectId ?? projectId ?? projectList[0]?.id ?? null;
   const project =
-    projectList.find((entry) => entry.id === effectiveProjectId) ?? null;
+    projectList.find((entry) => entry.id === draft.projectId) ??
+    projectList.find((entry) => entry.id === projectId) ??
+    projectList[0] ??
+    null;
+  const effectiveProjectId = project?.id ?? null;
 
-  const labels = useTasksQuery(
-    async (rpc) =>
-      effectiveProjectId
+  useEffect(() => {
+    if (!open || draft.projectId !== null || effectiveProjectId === null)
+      return;
+    setDraft((current) => {
+      if (current.projectId !== null) return current;
+      const next = { ...current, projectId: effectiveProjectId };
+      storeNewTaskDraft(next);
+      return next;
+    });
+  }, [open, draft.projectId, effectiveProjectId]);
+
+  const labelsQuery = useTasksQuery(
+    async (rpc) => ({
+      projectId: effectiveProjectId,
+      labels: effectiveProjectId
         ? (await rpc.call("listLabels", { projectId: effectiveProjectId }))
             .labels
         : [],
+    }),
     ["projects:changed"],
     [effectiveProjectId],
   );
-  const parentCandidates = useTasksQuery(
-    async (rpc) =>
-      effectiveProjectId && subtaskMode
-        ? listAllTasks(rpc, {
-            projectId: effectiveProjectId,
-            parentTaskId: null,
-          })
-        : [],
-    ["tasks:changed"],
-    [effectiveProjectId, subtaskMode],
-  );
-  const parentTask =
-    (parentCandidates.data ?? []).find((task) => task.id === parentTaskId) ??
-    null;
-
-  const changeProject = (id: string) => {
-    setSelectedProjectId(id);
-    // Labels and parents are project-scoped; keeping them would trip the
-    // server's project-mismatch checks.
-    setLabelIds([]);
-    if (!subtaskMode) setParentTaskId(null);
+  const labels = {
+    ...labelsQuery,
+    data:
+      labelsQuery.data?.projectId === effectiveProjectId
+        ? labelsQuery.data.labels
+        : undefined,
   };
+  const labelIds = draft.labelIds.filter((id) =>
+    labels.data?.some((label) => label.id === id),
+  );
+
+  const changeProject = (id: string) =>
+    updateDraft(() => ({ projectId: id, labelIds: [] }));
 
   const toggleLabel = (labelId: string) =>
-    setLabelIds((current) =>
-      current.includes(labelId)
-        ? current.filter((id) => id !== labelId)
-        : [...current, labelId],
-    );
+    updateDraft((current) => ({
+      labelIds: current.labelIds.includes(labelId)
+        ? current.labelIds.filter((id) => id !== labelId)
+        : [...current.labelIds, labelId],
+    }));
 
-  // Inline label creation from the picker when the query matches nothing.
+  const discardDraft = () => {
+    clearNewTaskDraft();
+    setDraft(blankDraft(projectId, defaultStatus));
+    setPendingFiles([]);
+    setError(null);
+    titleRef.current?.focus();
+  };
+
   const createLabelFromQuery = async () => {
     const name = labelQuery.trim();
     if (!name || effectiveProjectId === null || creatingLabel) return;
@@ -192,21 +272,17 @@ export function NewTaskDialog({
         color: DEFAULT_COLOR,
       });
       labels.refresh();
-      setLabelIds((current) => [...current, label.id]);
+      updateDraft((current) => ({
+        labelIds: [...current.labelIds, label.id],
+      }));
       setLabelQuery("");
     } catch (createError) {
-      setError(
-        createError instanceof Error
-          ? createError.message
-          : String(createError),
-      );
+      setError(errorMessage(createError));
     } finally {
       setCreatingLabel(false);
     }
   };
 
-  // The submit flow snapshots pendingFiles, so the tray is frozen while a
-  // create/upload pass runs: nothing may be staged or removed mid-flight.
   const stageMore = (files: File[]) => {
     if (files.length === 0 || submitting || createdTask !== null) return;
     setPendingFiles((current) => [...current, ...stageFiles(files)]);
@@ -217,57 +293,23 @@ export function NewTaskDialog({
     setPendingFiles((files) => files.filter((entry) => entry.id !== id));
   };
 
-  // Synchronous single-flight guard: double-activating Retry before React
-  // re-renders must not upload (and attach) the same file twice.
-  const retryingRef = useRef(new Set<number>());
-  const retryUpload = async (entry: StagedAttachment) => {
-    if (entry.owner === undefined || retryingRef.current.has(entry.id)) return;
-    retryingRef.current.add(entry.id);
-    setPendingFiles((files) =>
-      files.map((candidate) =>
-        candidate.id === entry.id ? { ...candidate, busy: true } : candidate,
-      ),
-    );
-    try {
-      await uploadAttachment(entry.file, entry.owner);
-      setPendingFiles((files) =>
-        files.filter((candidate) => candidate.id !== entry.id),
-      );
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      setPendingFiles((files) =>
-        files.map((candidate) =>
-          candidate.id === entry.id
-            ? { ...candidate, busy: false, error: message }
-            : candidate,
-        ),
-      );
-    } finally {
-      retryingRef.current.delete(entry.id);
-    }
-  };
+  const retryUpload = useStagedAttachmentRetry(setPendingFiles);
 
   const finish = (task: Task) => {
     onOpenChange(false);
     navigation.go({ kind: "task", taskKey: task.key });
   };
 
-  // While recovery chips are pending, Escape/overlay/close must not discard
-  // them silently — leaving requires the explicit skip action below.
   const requestClose = (next: boolean) => {
     if (!next && createdTask !== null && pendingFiles.length > 0) return;
     onOpenChange(next);
   };
 
-  // Recovery resolves itself: once every failed upload was retried or
-  // explicitly removed, the created task opens like a normal success.
   useEffect(() => {
     if (createdTask && pendingFiles.length === 0) finish(createdTask);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react/exhaustive-deps
   }, [createdTask, pendingFiles.length]);
 
-  // Oversized chips must be removed first — creating around them would
-  // silently drop files the user staged.
   const hasOversized = pendingFiles.some(
     (entry) => entry.status === "oversized",
   );
@@ -275,6 +317,9 @@ export function NewTaskDialog({
     effectiveProjectId !== null &&
     title.trim().length > 0 &&
     !submitting &&
+    !labels.isLoading &&
+    labels.data !== undefined &&
+    labels.error === null &&
     !hasOversized &&
     createdTask === null;
 
@@ -290,62 +335,38 @@ export function NewTaskDialog({
         status,
         priority,
         dueDate: dueDate === "" ? null : dueDate,
-        parentTaskId,
+        parentTaskId: null,
         labelIds,
       });
       if (!result.ok) {
         setError(result.error.message);
         return;
       }
-      // The task now exists; upload the staged files to it. Failures become
-      // retryable chips bound to the created task instead of vanishing.
+      clearNewTaskDraft();
       const staged = pendingFiles.filter((entry) => entry.status === "staged");
-      const failed: StagedAttachment[] = [];
-      for (const entry of staged) {
-        try {
-          await uploadAttachment(entry.file, { taskId: result.task.id });
-        } catch (cause) {
-          failed.push({
-            ...entry,
-            status: "failed",
-            owner: { taskId: result.task.id },
-            error: cause instanceof Error ? cause.message : String(cause),
-          });
-        }
-      }
+      const failed = await uploadStagedAttachments(staged, {
+        taskId: result.task.id,
+      });
       if (failed.length > 0) {
-        // Uploaded entries leave the tray; failures come back as retryable
-        // chips. Oversized (never-sendable) chips stay visible for removal.
-        setPendingFiles((files) =>
-          files.flatMap((entry) => {
-            const failure = failed.find(
-              (candidate) => candidate.id === entry.id,
-            );
-            if (failure) return [failure];
-            return staged.some((candidate) => candidate.id === entry.id)
-              ? []
-              : [entry];
-          }),
-        );
+        setPendingFiles((files) => settleStagedUploads(files, staged, failed));
         setCreatedTask(result.task);
         return;
       }
       if (createMore) {
-        setTitle("");
-        setDescription("");
-        setLabelIds([]);
-        setDueDate("");
+        setDraft((current) => ({
+          ...current,
+          title: "",
+          description: "",
+          labelIds: [],
+          dueDate: "",
+        }));
         setPendingFiles([]);
         titleRef.current?.focus();
       } else {
         finish(result.task);
       }
     } catch (submitError) {
-      setError(
-        submitError instanceof Error
-          ? submitError.message
-          : String(submitError),
-      );
+      setError(errorMessage(submitError));
     } finally {
       setSubmitting(false);
     }
@@ -362,7 +383,7 @@ export function NewTaskDialog({
   return (
     <Dialog open={open} onOpenChange={requestClose}>
       <DialogContent
-        className="max-w-xl gap-0 p-0"
+        className="flex max-h-[85dvh] min-h-0 max-w-xl flex-col gap-0 p-0"
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
@@ -370,8 +391,6 @@ export function NewTaskDialog({
           }
         }}
         onPaste={(event) => {
-          // The description editor stages files itself (and prevents the
-          // default); this catches pastes everywhere else in the dialog.
           if (event.defaultPrevented || submitting || createdTask !== null)
             return;
           const files = [...(event.clipboardData?.files ?? [])];
@@ -380,7 +399,7 @@ export function NewTaskDialog({
           stageMore(files);
         }}
       >
-        <DialogTitle className="flex items-center gap-2 px-4 pt-4 text-xs font-normal text-muted-foreground">
+        <DialogTitle className="flex shrink-0 items-center gap-2 px-4 pt-4 text-xs font-normal text-muted-foreground">
           {project ? (
             <span
               aria-hidden
@@ -388,14 +407,14 @@ export function NewTaskDialog({
               style={{ backgroundColor: project.color }}
             />
           ) : null}
-          {subtaskMode ? "New sub-task" : "New task"}
+          New task
           {project ? ` · ${project.name}` : ""}
         </DialogTitle>
         <DialogDescription className="sr-only">
           Create a task with a title, description, attributes, and attachments.
         </DialogDescription>
         {createdTask ? (
-          <div className="px-4 pt-2">
+          <div className="min-h-0 flex-auto overflow-y-auto px-4 pt-2">
             <p role="alert" className="text-sm">
               Task <span className="font-medium">{createdTask.key}</span> was
               created, but {failedCount} attachment
@@ -421,34 +440,43 @@ export function NewTaskDialog({
             </div>
           </div>
         ) : null}
-        <div className={cn("px-4 pt-2", createdTask && "hidden")}>
+        <div
+          className={cn(
+            "flex min-h-0 flex-auto flex-col px-4 pt-2",
+            createdTask && "hidden",
+          )}
+        >
           <input
             ref={titleRef}
             autoFocus
             value={title}
-            onChange={(event) => setTitle(event.target.value)}
+            onChange={(event) => {
+              const next = event.target.value;
+              updateDraft(() => ({ title: next }));
+            }}
             onKeyDown={(event) => {
-              // Plain Enter submits from the title (Cmd/Ctrl+Enter works
-              // anywhere in the dialog via the DialogContent handler).
               if (event.key === "Enter" && !event.nativeEvent.isComposing) {
                 event.preventDefault();
+                event.stopPropagation();
                 void submit();
               }
             }}
             placeholder="Task title"
             aria-label="Task title"
-            className="w-full bg-transparent text-base font-semibold text-foreground outline-none placeholder:text-muted-foreground"
+            className="w-full shrink-0 bg-transparent text-base font-semibold text-foreground outline-none placeholder:text-muted-foreground"
           />
           <TasksEditor
             variant="comment"
             value={description}
-            onChange={setDescription}
+            onChange={(markdown) =>
+              updateDraft(() => ({ description: markdown }))
+            }
             placeholder="Description — rich text, round-trips as markdown for agents"
-            className="mt-2 min-h-16"
+            className="mt-2 min-h-16 flex-auto overflow-y-auto"
             onAttachFiles={stageMore}
           />
           {pendingFiles.length > 0 ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
+            <div className="mt-2 flex max-h-24 shrink-0 flex-wrap gap-1.5 overflow-y-auto">
               {pendingFiles.map((entry) => (
                 <AttachmentChip
                   key={entry.id}
@@ -460,74 +488,49 @@ export function NewTaskDialog({
             </div>
           ) : null}
           {hasOversized ? (
-            <p className="mt-2 text-xs text-destructive">
+            <p className="mt-2 shrink-0 text-xs text-destructive">
               Remove attachments over the 25 MB limit before creating the task.
             </p>
           ) : null}
         </div>
         <div
           className={cn(
-            "flex flex-wrap items-center gap-1.5 px-4 pt-3",
+            "flex shrink-0 flex-wrap items-center gap-1.5 px-4 pt-3",
             createdTask && "hidden",
           )}
         >
-          {!subtaskMode ? (
-            <Select
-              value={effectiveProjectId ?? undefined}
-              onValueChange={changeProject}
-            >
-              <SelectTrigger
-                aria-label="Project"
-                className={cn(CHIP_TRIGGER, "max-w-44")}
-              >
-                <SelectValue placeholder="Project" />
-              </SelectTrigger>
-              <SelectContent>
-                {projectList.map((entry) => (
-                  <SelectItem key={entry.id} value={entry.id}>
-                    <span className="flex items-center gap-2">
-                      <span
-                        aria-hidden
-                        className="size-2.5 rounded-sm"
-                        style={{ backgroundColor: entry.color }}
-                      />
-                      {entry.name}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          ) : null}
-          <Select
+          <TaskFieldPicker
+            dialogOpen={open}
+            label="Project"
+            value={effectiveProjectId}
+            options={projectList.map((entry) => ({
+              value: entry.id,
+              label: entry.name,
+              color: entry.color,
+              keywords: [entry.prefix],
+            }))}
+            onValueChange={changeProject}
+          />
+          <TaskFieldPicker<TaskStatus>
+            dialogOpen={open}
+            label="Status"
             value={status}
-            onValueChange={(value) => setStatus(value as TaskStatus)}
-          >
-            <SelectTrigger aria-label="Status" className={CHIP_TRIGGER}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {TASK_STATUSES.map((value) => (
-                <SelectItem key={value} value={value}>
-                  {STATUS_LABELS[value]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select
+            options={TASK_STATUSES.map((value) => ({
+              value,
+              label: STATUS_LABELS[value],
+            }))}
+            onValueChange={(status) => updateDraft(() => ({ status }))}
+          />
+          <TaskFieldPicker<TaskPriority>
+            dialogOpen={open}
+            label="Priority"
             value={priority}
-            onValueChange={(value) => setPriority(value as TaskPriority)}
-          >
-            <SelectTrigger aria-label="Priority" className={CHIP_TRIGGER}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {TASK_PRIORITIES.map((value) => (
-                <SelectItem key={value} value={value}>
-                  {PRIORITY_LABELS[value]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            options={TASK_PRIORITIES.map((value) => ({
+              value,
+              label: PRIORITY_LABELS[value],
+            }))}
+            onValueChange={(priority) => updateDraft(() => ({ priority }))}
+          />
           <Popover>
             <PopoverTrigger asChild>
               <Button
@@ -612,61 +615,23 @@ export function NewTaskDialog({
           <input
             type="date"
             value={dueDate}
-            onChange={(event) => setDueDate(event.target.value)}
+            onChange={(event) => {
+              const next = event.target.value;
+              updateDraft(() => ({ dueDate: next }));
+            }}
             aria-label="Due date"
             className="h-7 rounded-md border border-input bg-transparent px-2 text-xs text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
-          {subtaskMode ? (
-            <Popover open={parentPickerOpen} onOpenChange={setParentPickerOpen}>
-              <PopoverTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className={cn(CHIP_TRIGGER, "border-input font-normal")}
-                >
-                  <Icon name="CornerDownRight" className="size-3" />
-                  {parentTask ? `Sub-task of ${parentTask.key}` : "Parent task"}
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent className="w-72 p-0" align="start">
-                <Command>
-                  <CommandInput placeholder="Choose parent task…" />
-                  <CommandList>
-                    <CommandEmpty>No tasks in this project.</CommandEmpty>
-                    <CommandGroup>
-                      {(parentCandidates.data ?? []).map((task) => (
-                        <CommandItem
-                          key={task.id}
-                          value={`${task.key} ${task.title}`}
-                          onSelect={() => {
-                            setParentTaskId(task.id);
-                            setParentPickerOpen(false);
-                          }}
-                        >
-                          <span className="shrink-0 font-medium text-muted-foreground">
-                            {task.key}
-                          </span>
-                          <span className="min-w-0 flex-1 truncate">
-                            {task.title}
-                          </span>
-                          {task.id === parentTaskId ? (
-                            <Icon name="Check" className="size-3.5" />
-                          ) : null}
-                        </CommandItem>
-                      ))}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
-          ) : null}
         </div>
-        {error ? (
-          <p role="alert" className="px-4 pt-2 text-xs text-destructive">
-            {error}
+        {error || labels.error ? (
+          <p
+            role="alert"
+            className="shrink-0 px-4 pt-2 text-xs text-destructive"
+          >
+            {error ?? labels.error}
           </p>
         ) : null}
-        <DialogFooter className="mt-4 flex-row items-center border-t border-border-hairline px-4 py-3 sm:justify-between">
+        <DialogFooter className="mt-4 shrink-0 flex-row items-center border-t border-border-hairline px-4 py-3 sm:justify-between">
           {createdTask ? (
             <>
               <span />
@@ -682,9 +647,17 @@ export function NewTaskDialog({
                 label="Create more"
               />
               <div className="flex items-center gap-1.5">
-                {/* Same muted icon-only affordance as the detail editor and
-                    comment composer; lives beside the primary action so the
-                    chip row never wraps just for it. */}
+                {hasDraftContent(draft) ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={submitting}
+                    className="text-muted-foreground"
+                    onClick={discardDraft}
+                  >
+                    Discard draft
+                  </Button>
+                ) : null}
                 <button
                   type="button"
                   title="Attach files"
@@ -712,7 +685,7 @@ export function NewTaskDialog({
                   disabled={!canSubmit}
                   onClick={() => void submit()}
                 >
-                  {subtaskMode ? "Create sub-task" : "Create task"}
+                  Create task
                 </Button>
               </div>
             </>

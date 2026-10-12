@@ -1,25 +1,68 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
-  waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  resetPluginLogoStoreForTest,
+  setPluginLogoUrls,
+} from "@/lib/plugin-logos";
 import { COMPACT_VIEWPORT_QUERY } from "@bb/shared-ui/hooks/use-compact-viewport";
 import { POINTER_COARSE_QUERY } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import {
+  computeMessageActionRowLayout,
   findMessageActionTooltipCollisionBoundary,
   MessageActionBar,
 } from "./MessageActionBar";
 
+const TIMESTAMP = Date.UTC(2026, 8, 30, 16, 5);
+
 afterEach(() => {
   cleanup();
+  resetPluginLogoStoreForTest();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
+
+function installControlledResizeObserver() {
+  const observations: { callback: ResizeObserverCallback; node: Element }[] =
+    [];
+  class ControlledResizeObserver {
+    readonly #callback: ResizeObserverCallback;
+    constructor(callback: ResizeObserverCallback) {
+      this.#callback = callback;
+    }
+    observe(node: Element) {
+      observations.push({ callback: this.#callback, node });
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", ControlledResizeObserver);
+  return {
+    reportWidth(width: number) {
+      act(() => {
+        for (const { callback, node } of observations) {
+          callback(
+            [
+              {
+                target: node,
+                contentRect: { width, height: 20 },
+              } as unknown as ResizeObserverEntry,
+            ],
+            undefined as unknown as ResizeObserver,
+          );
+        }
+      });
+    },
+  };
+}
 
 function mockMobileCoarsePointer() {
   vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
@@ -32,6 +75,13 @@ function mockMobileCoarsePointer() {
     removeEventListener: () => {},
     dispatchEvent: () => false,
   }));
+}
+
+function openDesktopMenu() {
+  fireEvent.pointerDown(
+    screen.getByRole("button", { name: "Message actions" }),
+  );
+  return screen.getByRole("menu");
 }
 
 describe("MessageActionBar", () => {
@@ -51,73 +101,33 @@ describe("MessageActionBar", () => {
     ).toBeUndefined();
   });
 
-  it("renders the send-to-main action and fires its handler when supplied", () => {
-    const onSendToMain = vi.fn();
-    render(
-      <MessageActionBar
-        messageText="An answer worth keeping."
-        alignment="start"
-        mobileActionDisplay="overflow"
-        onSendToMain={onSendToMain}
-      />,
+  it("keeps candidates inline in priority order and reserves the menu for trailing actions", () => {
+    const resizeObserver = installControlledResizeObserver();
+    setPluginLogoUrls(
+      new Map([
+        [
+          "demo",
+          {
+            displayName: "Demo",
+            icon: "Check",
+            compactIconUrl: "/demo.svg",
+            logoUrl: null,
+            logoDarkUrl: null,
+            icons: new Map(),
+          },
+        ],
+      ]),
     );
-
-    const button = screen.getByRole("button", {
-      name: "Send to main thread",
-    });
-    expect(button.className).toContain("cursor-pointer");
-    fireEvent.click(button);
-    expect(onSendToMain).toHaveBeenCalledTimes(1);
-  });
-
-  it("orders agent actions as copy, add, then fork", () => {
+    const onPluginSelect = vi.fn();
+    const onCopyLink = vi.fn();
     const { container } = render(
       <MessageActionBar
+        timestamp={TIMESTAMP}
         messageText="An answer."
         alignment="start"
         mobileActionDisplay="inline"
-        onAddToChat={vi.fn()}
-        onFork={vi.fn()}
-      />,
-    );
-
-    expect(
-      [...container.querySelectorAll<HTMLButtonElement>("button[aria-label]")]
-        .map((button) => button.getAttribute("aria-label"))
-        .filter((label) => label !== "Message actions"),
-    ).toEqual(["Copy message", "Add to chat", "Fork into new thread"]);
-  });
-
-  it("keeps the same agent action order in the mobile overflow", () => {
-    mockMobileCoarsePointer();
-    render(
-      <MessageActionBar
-        messageText="An answer."
-        alignment="start"
-        mobileActionDisplay="overflow"
-        onAddToChat={vi.fn()}
-        onFork={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Message actions" }));
-    const content =
-      document.body.querySelector<HTMLElement>('[data-side="top"]');
-    if (!content) throw new Error("Missing mobile message action menu");
-    expect(
-      within(content)
-        .getAllByRole("button")
-        .map((button) => button.textContent),
-    ).toEqual(["Copy message", "Add to chat", "Fork into new thread"]);
-  });
-
-  it("renders plugin actions after the native ones and fires their handlers", () => {
-    const onSelect = vi.fn();
-    const { container } = render(
-      <MessageActionBar
-        messageText="An answer."
-        alignment="start"
-        mobileActionDisplay="inline"
+        onEdit={vi.fn()}
+        onCopyLink={onCopyLink}
         onAddToChat={vi.fn()}
         onFork={vi.fn()}
         pluginActions={[
@@ -126,93 +136,246 @@ describe("MessageActionBar", () => {
             pluginId: "demo",
             icon: "Zap",
             label: "Summarize",
-            onSelect,
+            onSelect: onPluginSelect,
           },
         ]}
       />,
     );
+    resizeObserver.reportWidth(100);
 
     expect(
       [...container.querySelectorAll<HTMLButtonElement>("button[aria-label]")]
         .map((button) => button.getAttribute("aria-label"))
         .filter((label) => label !== "Message actions"),
-    ).toEqual([
-      "Copy message",
-      "Add to chat",
-      "Fork into new thread",
-      "Summarize",
-    ]);
+    ).toEqual(["Copy message", "Edit message", "Summarize"]);
+    expect(
+      screen
+        .getByRole("button", { name: "Summarize" })
+        .querySelector('[data-icon="Zap"]'),
+    ).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Summarize" }));
-    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onPluginSelect).toHaveBeenCalledTimes(1);
+
+    const menu = openDesktopMenu();
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Copy link", "Add to chat", "Fork into new thread"]);
+    expect(menu.getAttribute("data-side")).toBe("bottom");
+    fireEvent.click(
+      within(menu).getByRole("menuitem", { name: "Copy link" }),
+    );
+    expect(onCopyLink).toHaveBeenCalledTimes(1);
   });
 
-  it("renders an action bar for a plugin-action-only message", () => {
+  it("moves candidates that do not fit into the menu from the end", () => {
+    const resizeObserver = installControlledResizeObserver();
     render(
       <MessageActionBar
-        messageText=""
-        alignment="start"
+        timestamp={TIMESTAMP}
+        messageText="An answer."
+        alignment="end"
         mobileActionDisplay="inline"
+        onEdit={vi.fn()}
+        onCopyLink={vi.fn()}
+        onAddToChat={vi.fn()}
+        onFork={vi.fn()}
         pluginActions={[
           {
             key: "demo/summarize/1",
-            pluginId: "demo",
-            icon: null,
+            pluginId: null,
+            icon: "Zap",
             label: "Summarize",
+            onSelect: vi.fn(),
+          },
+          {
+            key: "demo/translate/1",
+            pluginId: null,
+            icon: "Languages",
+            label: "Translate",
             onSelect: vi.fn(),
           },
         ]}
       />,
     );
-    expect(screen.getByRole("button", { name: "Summarize" })).toBeTruthy();
+    resizeObserver.reportWidth(72);
+
+    expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit message" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Summarize" })).toBeNull();
+
+    expect(
+      within(openDesktopMenu())
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "Copy link",
+      "Summarize",
+      "Translate",
+      "Add to chat",
+      "Fork into new thread",
+    ]);
   });
 
-  it("includes plugin actions in the mobile overflow menu", () => {
-    mockMobileCoarsePointer();
-    const onSelect = vi.fn();
+  it("puts every candidate in the menu when none fit", () => {
+    const resizeObserver = installControlledResizeObserver();
     render(
       <MessageActionBar
+        timestamp={TIMESTAMP}
+        messageText="An answer."
+        alignment="end"
+        mobileActionDisplay="inline"
+        onEdit={vi.fn()}
+        onAddToChat={vi.fn()}
+        onFork={vi.fn()}
+      />,
+    );
+    resizeObserver.reportWidth(30);
+
+    expect(screen.queryByRole("button", { name: "Copy message" })).toBeNull();
+    expect(
+      within(openDesktopMenu())
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "Copy message",
+      "Edit message",
+      "Add to chat",
+      "Fork into new thread",
+    ]);
+  });
+
+  it("shows a timestamp-only footer in the menu", () => {
+    render(
+      <MessageActionBar
+        timestamp={TIMESTAMP}
         messageText="An answer."
         alignment="start"
-        mobileActionDisplay="overflow"
-        onAddToChat={vi.fn()}
-        pluginActions={[
-          {
-            key: "demo/summarize/1",
-            pluginId: "demo",
-            icon: "Zap",
-            label: "Summarize",
-            onSelect,
-          },
-        ]}
+        mobileActionDisplay="inline"
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Message actions" }));
-    const content =
-      document.body.querySelector<HTMLElement>('[data-side="top"]');
-    if (!content) throw new Error("Missing mobile message action menu");
-    fireEvent.click(within(content).getByRole("button", { name: "Summarize" }));
-    expect(onSelect).toHaveBeenCalledTimes(1);
+    const menu = openDesktopMenu();
+    const metadata = menu.querySelector<HTMLElement>("[data-message-metadata]");
+    const time = within(metadata!).getByRole("time");
+    expect(time.getAttribute("datetime")).toBe("2026-09-30T16:05:00.000Z");
+    expect(time.textContent).not.toBe("");
+    expect(metadata?.textContent).not.toMatch(/model|reasoning/i);
   });
 
-  it("renders add-to-chat as an icon action and passes the message text", () => {
-    const onAddToChat = vi.fn();
+  it("lists every action in the latest touch message drawer even when actions fit inline", async () => {
+    mockMobileCoarsePointer();
+    const resizeObserver = installControlledResizeObserver();
+    const onFork = vi.fn();
+    const onPluginSelect = vi.fn();
+    render(
+      <main data-testid="app-root">
+        <MessageActionBar
+          timestamp={TIMESTAMP}
+          messageText="An answer."
+          alignment="start"
+          mobileActionDisplay="inline"
+          onEdit={vi.fn()}
+          onAddToChat={vi.fn()}
+          onFork={onFork}
+          pluginActions={[
+            {
+              key: "demo/summarize/1",
+              pluginId: null,
+              icon: "Zap",
+              label: "Summarize",
+              onSelect: onPluginSelect,
+            },
+          ]}
+        />
+      </main>,
+    );
+    resizeObserver.reportWidth(200);
+
+    expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit message" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Summarize" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Message actions" }));
+
+    const drawer = await screen.findByRole("dialog", {
+      name: "Message actions",
+    });
+    const menuItems = await within(drawer).findAllByRole("menuitem");
+    expect(menuItems.map((item) => item.textContent)).toEqual([
+      "Copy message",
+      "Edit message",
+      "Summarize",
+      "Add to chat",
+      "Fork into new thread",
+    ]);
+    resizeObserver.reportWidth(60);
+    expect(screen.queryByRole("button", { name: "Summarize" })).toBeNull();
+    expect(
+      within(drawer)
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      "Copy message",
+      "Edit message",
+      "Summarize",
+      "Add to chat",
+      "Fork into new thread",
+    ]);
+    expect(document.body.querySelector('[data-side="top"]')).toBeNull();
+    expect(screen.getByTestId("app-root").hasAttribute("inert")).toBe(false);
+    expect(screen.getByTestId("app-root").hasAttribute("aria-hidden")).toBe(
+      false,
+    );
+    fireEvent.click(
+      within(drawer).getByRole("menuitem", { name: "Fork into new thread" }),
+    );
+    expect(onFork).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Message actions" }));
+    fireEvent.click(
+      await within(drawer).findByRole("menuitem", { name: "Summarize" }),
+    );
+    expect(onPluginSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows only the menu trigger on older touch messages", async () => {
+    mockMobileCoarsePointer();
+    const onCopyLink = vi.fn();
     render(
       <MessageActionBar
-        messageText="Quote this message."
-        alignment="end"
+        timestamp={TIMESTAMP}
+        messageText="An earlier answer."
+        alignment="start"
         mobileActionDisplay="overflow"
-        onAddToChat={onAddToChat}
+        onEdit={vi.fn()}
+        onCopyLink={onCopyLink}
+        onAddToChat={vi.fn()}
+        onFork={vi.fn()}
       />,
     );
 
-    const button = screen.getByRole("button", { name: "Add to chat" });
-    expect(button.className).toContain("cursor-pointer");
-    fireEvent.click(button);
-    expect(onAddToChat).toHaveBeenCalledWith("Quote this message.");
+    expect(screen.queryByRole("button", { name: "Copy message" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit message" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Message actions" }));
+
+    const drawer = await screen.findByRole("dialog", {
+      name: "Message actions",
+    });
+    const menuItems = await within(drawer).findAllByRole("menuitem");
+    expect(menuItems.map((item) => item.textContent)).toEqual([
+      "Copy link",
+      "Copy message",
+      "Edit message",
+      "Add to chat",
+      "Fork into new thread",
+    ]);
+    fireEvent.click(
+      within(drawer).getByRole("menuitem", { name: "Copy link" }),
+    );
+    expect(onCopyLink).toHaveBeenCalledTimes(1);
   });
 
-  it("passes add-to-chat attachments with the message text", () => {
+  it("passes message text and attachments from Add to chat", () => {
     const onAddToChat = vi.fn();
     const attachment = {
       type: "localFile" as const,
@@ -222,21 +385,24 @@ describe("MessageActionBar", () => {
     };
     render(
       <MessageActionBar
+        timestamp={TIMESTAMP}
         messageText="Quote this message."
         alignment="end"
-        mobileActionDisplay="overflow"
+        mobileActionDisplay="inline"
         addToChatAttachments={[attachment]}
         onAddToChat={onAddToChat}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Add to chat" }));
+    fireEvent.click(
+      within(openDesktopMenu()).getByRole("menuitem", { name: "Add to chat" }),
+    );
     expect(onAddToChat).toHaveBeenCalledWith("Quote this message.", [
       attachment,
     ]);
   });
 
-  it("renders add-to-chat for attachment-only messages", () => {
+  it("offers Add to chat for attachment-only messages", () => {
     const onAddToChat = vi.fn();
     const attachment = {
       type: "localImage" as const,
@@ -246,168 +412,119 @@ describe("MessageActionBar", () => {
     };
     render(
       <MessageActionBar
+        timestamp={TIMESTAMP}
         messageText=""
         alignment="end"
-        mobileActionDisplay="overflow"
+        mobileActionDisplay="inline"
         addToChatAttachments={[attachment]}
         onAddToChat={onAddToChat}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Add to chat" }));
+    fireEvent.click(
+      within(openDesktopMenu()).getByRole("menuitem", { name: "Add to chat" }),
+    );
     expect(onAddToChat).toHaveBeenCalledWith("", [attachment]);
   });
 
-  it("omits the send-to-main action when no handler is supplied", () => {
+  it("offers Copy for an image-only message", () => {
     render(
       <MessageActionBar
-        messageText="An answer."
-        alignment="start"
-        mobileActionDisplay="overflow"
-      />,
-    );
-
-    expect(
-      screen.queryByRole("button", { name: "Send to main thread" }),
-    ).toBeNull();
-  });
-
-  it("send-to-main is not gated by the fork/side-chat depth `disabled` flag", () => {
-    const onSendToMain = vi.fn();
-    render(
-      <MessageActionBar
-        messageText="An answer."
-        alignment="start"
-        mobileActionDisplay="overflow"
-        onSendToMain={onSendToMain}
-        disabled
-      />,
-    );
-
-    const button = screen.getByRole("button", { name: "Send to main thread" });
-    expect(button.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(button);
-    expect(onSendToMain).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses a single overflow trigger on coarse pointers", () => {
-    render(
-      <MessageActionBar
-        messageText="An answer."
-        alignment="start"
-        mobileActionDisplay="overflow"
-        onFork={vi.fn()}
-      />,
-    );
-
-    const button = screen.getByRole("button", { name: "Fork into new thread" });
-    expect(button.className).toContain("max-md:pointer-coarse:hidden");
-
-    const overflowTrigger = screen.getByRole("button", {
-      name: "Message actions",
-    });
-    expect(overflowTrigger.className).toContain("cursor-pointer");
-    expect(overflowTrigger.className).toContain("hidden");
-    expect(overflowTrigger.className).toContain(
-      "max-md:pointer-coarse:inline-flex",
-    );
-    expect(overflowTrigger.className).not.toContain("opacity-0");
-  });
-
-  it("uses an anchored popover instead of a bottom drawer on mobile", () => {
-    mockMobileCoarsePointer();
-    const onAddToChat = vi.fn();
-    render(
-      <MessageActionBar
-        messageText="Quote this message."
+        timestamp={TIMESTAMP}
+        messageText=""
+        copyImageUrl="/attachments/screenshot.png"
         alignment="end"
-        mobileActionDisplay="overflow"
-        onAddToChat={onAddToChat}
-      />,
-    );
-
-    const trigger = screen.getByRole("button", { name: "Message actions" });
-    expect(trigger.hasAttribute("data-no-sidebar-swipe")).toBe(true);
-    fireEvent.click(trigger);
-
-    const content =
-      document.body.querySelector<HTMLElement>('[data-side="top"]');
-    expect(content).not.toBeNull();
-    expect(content!.getAttribute("data-bb-portaled-overlay")).toBe("");
-    expect(document.body.querySelector("[data-vaul-drawer]")).toBeNull();
-
-    fireEvent.click(
-      within(content!).getByRole("button", { name: "Add to chat" }),
-    );
-
-    expect(onAddToChat).toHaveBeenCalledWith("Quote this message.");
-    expect(document.body.querySelector('[data-side="top"]')).toBeNull();
-  });
-
-  it("confirms a mobile overflow copy on the trigger instead of toasting", async () => {
-    mockMobileCoarsePointer();
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
-    render(
-      <MessageActionBar
-        messageText="Copy this answer."
-        alignment="start"
-        mobileActionDisplay="overflow"
-      />,
-    );
-
-    const trigger = screen.getByRole("button", { name: "Message actions" });
-    fireEvent.click(trigger);
-    const content =
-      document.body.querySelector<HTMLElement>('[data-side="top"]');
-    if (!content) throw new Error("Missing mobile message action menu");
-    fireEvent.click(
-      within(content).getByRole("button", { name: "Copy message" }),
-    );
-
-    await waitFor(() =>
-      expect(writeText).toHaveBeenCalledWith("Copy this answer."),
-    );
-    expect(trigger.querySelector('[data-icon="Check"]')).not.toBeNull();
-  });
-
-  it("forks from the inline mobile action", () => {
-    const onFork = vi.fn();
-    render(
-      <MessageActionBar
-        messageText="The latest answer."
-        alignment="start"
         mobileActionDisplay="inline"
-        onFork={onFork}
       />,
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Fork into new thread" }),
-    );
-
-    expect(onFork).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
   });
 
-  it("shows compact inline mobile actions without an overflow menu when requested", () => {
+  it("marks the action row while the menu is open", () => {
     render(
       <MessageActionBar
-        messageText="The latest answer."
-        alignment="start"
+        timestamp={TIMESTAMP}
+        messageText="An answer."
+        alignment="end"
         mobileActionDisplay="inline"
-        onFork={vi.fn()}
       />,
     );
+    const trigger = screen.getByRole("button", { name: "Message actions" });
+    const row = trigger.parentElement;
 
-    for (const name of ["Copy message", "Fork into new thread"]) {
-      const button = screen.getByRole("button", { name });
-      expect(button.className).toContain("max-md:pointer-coarse:size-7");
-      expect(button.className).toContain("max-md:pointer-coarse:opacity-100");
-      expect(button.className).not.toContain("max-md:pointer-coarse:hidden");
-    }
+    expect(row?.hasAttribute("data-menu-open")).toBe(false);
+    fireEvent.pointerDown(trigger);
+    expect(row?.hasAttribute("data-menu-open")).toBe(true);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    expect(row?.hasAttribute("data-menu-open")).toBe(false);
+  });
+});
 
+describe("computeMessageActionRowLayout", () => {
+  const metrics = { actionWidth: 20 };
+
+  it("renders every candidate inline before the slot is measured", () => {
     expect(
-      screen.queryByRole("button", { name: "Message actions" }),
-    ).toBeNull();
+      computeMessageActionRowLayout({
+        actionCount: 5,
+        availableWidth: undefined,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 5, overflowCount: 0 });
+  });
+
+  it("reserves space for the always-present menu trigger", () => {
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 3,
+        availableWidth: 100,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 3, overflowCount: 0 });
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 3,
+        availableWidth: 99,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 2, overflowCount: 1 });
+  });
+
+  it("moves candidates into overflow from the end", () => {
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 3,
+        availableWidth: 72,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 2, overflowCount: 1 });
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 3,
+        availableWidth: 71,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 1, overflowCount: 2 });
+  });
+
+  it("puts every candidate in the menu when none fit beside the trigger", () => {
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 3,
+        availableWidth: 30,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 0, overflowCount: 3 });
+  });
+
+  it("returns an empty layout for zero candidates", () => {
+    expect(
+      computeMessageActionRowLayout({
+        actionCount: 0,
+        availableWidth: 400,
+        ...metrics,
+      }),
+    ).toEqual({ inlineCount: 0, overflowCount: 0 });
   });
 });

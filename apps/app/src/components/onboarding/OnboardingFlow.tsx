@@ -1,615 +1,958 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
-import type { OnboardingAgent } from "@bb/server-contract";
-import type { DiscoveredRepo } from "@bb/host-daemon-contract";
-import { Badge } from "@bb/shared-ui/badge";
-import { Button } from "@bb/shared-ui/button";
-import { Checkbox } from "@bb/shared-ui/checkbox";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation } from "react-router-dom";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@bb/shared-ui/dialog";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
-import { copyToClipboardWithToast } from "@/lib/clipboard";
-import { getProviderIconInfo } from "@/lib/provider-icon";
-import { useLocalPathPicker } from "@/hooks/useLocalPathPicker";
+  findLocalPathProjectSourceForHost,
+  isActiveTerminalSessionStatus,
+  mobileAppDownloads,
+} from "@bb/domain";
+import type { TerminalOutputChunk, TerminalSession } from "@bb/server-contract";
+import { useMediaQuery } from "@bb/shared-ui/hooks/use-media-query";
+import { AddMachineDialog } from "@/components/dialogs/AddMachineDialog";
 import { ProjectPathDialog } from "@/components/dialogs/ProjectPathDialog";
+import { PluginSettingsSections } from "@/components/plugin/PluginSettingsSections";
+import { useSetPluginEnabled } from "@/components/plugin/useSetPluginEnabled";
 import {
-  useOnboardingAgents,
-  useOnboardingRepos,
+  buildProviderCliIssue,
+  hasProviderCliAction,
+  useProviderCliInstallRunner,
+} from "@/components/provider-cli/provider-cli-install";
+import {
+  openProviderCliInstallLog,
+  providerCliJobKey,
+} from "@/components/provider-cli/provider-cli-install-store";
+import { ThreadTerminalView } from "@/components/thread/terminal/ThreadTerminalView";
+import { appToast } from "@/components/ui/app-toast";
+import { applyPluginInstallJob } from "@/hooks/cache-owners/plugin-cache-owner";
+import { useCreateProject } from "@/hooks/mutations/project-mutations";
+import {
+  useHostDiscoveredRepos,
+  useHosts,
+  usePrimaryHost,
+} from "@/hooks/queries/host-queries";
+import {
+  usePluginCatalogSearch,
+  type PluginCatalogSearchEntry,
+} from "@/hooks/queries/plugin-catalog-queries";
+import {
+  startCatalogPluginInstall,
+  useCatalogEntryInstallJob,
+} from "@/hooks/queries/plugin-install-job-queries";
+import { usePluginList } from "@/hooks/queries/plugin-settings-queries";
+import { useSidebarNavigation } from "@/hooks/queries/sidebar-navigation-query";
+import { terminalOutputTailQueryKey } from "@/hooks/queries/query-keys";
+import {
+  useHostProviderCliStatus,
+  useSystemConfig,
+  useSystemProviderStates,
+  useSystemProviders,
 } from "@/hooks/queries/system-queries";
+import {
+  useCloseTerminal,
+  useCreateTerminal,
+} from "@/hooks/queries/thread-terminal-queries";
+import { useDesktopWindowState } from "@/hooks/useDesktopWindowState";
+import { useHostDaemon } from "@/hooks/useHostDaemon";
+import { useQuickCreateProjectController } from "@/hooks/useQuickCreateProject";
+import {
+  getBbDesktopInfo,
+  shouldReserveMacosTrafficLights,
+} from "@/lib/bb-desktop";
+import { decodeBase64Bytes } from "@/lib/base64-bytes";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { sdk } from "@/lib/sdk";
+import { formatRelativeTime } from "@/lib/relative-time";
+import { openUrlInExternalBrowser } from "@/lib/url-open-routing";
+import {
+  AgentSignInGuide,
+  AgentStep,
+  DevicesStep,
+  OnboardingLayout,
+  OnboardingPluginCard,
+  OnboardingPluginGrid,
+  OnboardingPluginGridSkeleton,
+  ProjectsStep,
+  type OnboardingAgent,
+  type OnboardingRepo,
+} from "./OnboardingViews";
+import {
+  CONNECT_PLUGIN_ID,
+  ONBOARDING_PLUGINS,
+  ONBOARDING_PLUGIN_MARKETPLACE,
+  connectAccessUrl,
+  defaultSelectedRepoPaths,
+  hasReadyAgent,
+  parseSignInOutput,
+  resolveAgentSetupState,
+  resolveSignInCommand,
+  shortRemoteName,
+  type OnboardingStepId,
+} from "./onboarding-model";
 
-/**
- * First-run onboarding.
- *
- * Two steps in a modal over the real app shell. The first is a *confirmation*
- * whenever the machine already has a usable agent — bb runs the coding agent
- * CLIs that are already installed and bills inference to those plans, so the
- * honest thing to do is state that rather than ask a question. Only a machine
- * with nothing installed is asked to install something.
- *
- * Escape and the close button both exit to the app; outside-click is blocked so
- * a stray click cannot dismiss setup mid-install.
- */
+const SIGN_IN_POLL_INTERVAL_MS = 3_000;
+const SIGN_IN_TERMINAL_COLS = 200;
+const SIGN_IN_TERMINAL_ROWS = 14;
+const SIGN_IN_OUTPUT_POLL_INTERVAL_MS = 1_000;
+const SIGN_IN_OUTPUT_TAIL_BYTES = 64 * 1024;
+const SIGN_IN_TERMINAL_FALLBACK_DELAY_MS = 6_000;
+const INSTALL_FAILED_MESSAGE = "Install failed";
+const PLUGIN_TOGGLE_SETTLE_TIMEOUT_MS = 10_000;
 
-export type OnboardingAgentState = "connected" | "signed_out" | "none";
-
-export interface OnboardingFlowProps {
-  /** Adds the selected projects; resolves once they exist. */
-  onAddProjects: (repos: readonly DiscoveredRepo[]) => Promise<void>;
-  /** Called when the flow finishes or is dismissed — persists the flag. */
-  onClose: (outcome: {
-    completed: boolean;
-    step: "agents" | "projects";
-    projectsAdded: number;
-    agentState: OnboardingAgentState;
-  }) => void;
-  /** Reports funnel events; the app wires this to the server's telemetry. */
-  onEvent?: (event: OnboardingUiEvent) => void;
-
-  /** Starts the managed CLI install; resolves when the job is queued. */
-  onInstallAgent: (agent: OnboardingAgent) => void;
-  /** Set of provider ids with an install running or queued. */
-  installing: ReadonlySet<string>;
+function decodeTerminalChunks(chunks: readonly TerminalOutputChunk[]): string {
+  const decoder = new TextDecoder();
+  return chunks
+    .map((chunk) =>
+      decoder.decode(decodeBase64Bytes(chunk.dataBase64), { stream: true }),
+    )
+    .join("");
 }
 
-export type OnboardingUiEvent =
-  | { name: "started"; agentState: OnboardingAgentState; agentCount: number }
-  | { name: "step_completed"; step: "agents" | "projects" }
-  /** Distinct from completion so the funnel can tell the two apart. */
-  | { name: "step_skipped"; step: "agents" | "projects" };
-
-/** The real brand mark the rest of the app uses for this provider. */
-function ProviderMark({ providerId }: { providerId: string }) {
-  const info = getProviderIconInfo(providerId);
-  if (!info) {
-    return (
-      <Icon
-        name="Code"
-        className="size-4 shrink-0 text-subtle-foreground"
-        aria-hidden
-      />
-    );
-  }
-  const Mark = info.icon;
-  return <Mark className="size-4 shrink-0 text-subtle-foreground" />;
-}
-
-function Card({ children }: { children: ReactNode }) {
-  return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
-      {children}
-    </div>
+function encodeTerminalInput(text: string): string {
+  return btoa(
+    Array.from(new TextEncoder().encode(text), (byte) =>
+      String.fromCharCode(byte),
+    ).join(""),
   );
 }
 
-/** Two-step progress, sized for a dialog footer. */
-function StepDots({ current }: { current: number }) {
-  return (
-    <div
-      className="flex items-center gap-1"
-      aria-label={`Step ${current + 1} of 2`}
-    >
-      {[0, 1].map((index) => (
-        <span
-          key={index}
-          className={cn(
-            "h-1.5 rounded-full transition-all",
-            index === current ? "w-4 bg-foreground" : "w-1.5 bg-muted",
-          )}
-        />
-      ))}
-    </div>
-  );
-}
-
-function agentStateOf(
-  agents: readonly OnboardingAgent[],
-): OnboardingAgentState {
-  if (agents.some((agent) => agent.status === "connected")) return "connected";
-  if (agents.some((agent) => agent.status !== "not_installed"))
-    return "signed_out";
-  return "none";
-}
-
-function AgentRows({
-  agents,
-  onInstall,
-  installing,
-  expandedSignIn,
-  onToggleSignIn,
-  onRecheck,
+function AgentSignInContainer({
+  agentName,
+  session,
+  alternate,
+  onUseAlternate,
+  onExit,
 }: {
-  agents: readonly OnboardingAgent[];
-  onInstall: (agent: OnboardingAgent) => void;
-  installing: ReadonlySet<string>;
-  expandedSignIn: string | null;
-  onToggleSignIn: (providerId: string | null) => void;
-  onRecheck: () => void;
+  agentName: string;
+  session: TerminalSession;
+  alternate: { label: string; method: SignInMethod } | null;
+  onUseAlternate: (method: SignInMethod) => void;
+  onExit: (exitCode: number | null) => void;
 }) {
+  const outputQuery = useQuery({
+    queryKey: terminalOutputTailQueryKey(session.id),
+    queryFn: ({ signal }) =>
+      sdk.terminals.output({
+        terminalId: session.id,
+        tailBytes: SIGN_IN_OUTPUT_TAIL_BYTES,
+        signal,
+      }),
+    refetchInterval: SIGN_IN_OUTPUT_POLL_INTERVAL_MS,
+    gcTime: 0,
+    retry: false,
+  });
+  const output = outputQuery.data;
+  const guide = useMemo(
+    () =>
+      output === undefined
+        ? null
+        : parseSignInOutput(decodeTerminalChunks(output.chunks)),
+    [output],
+  );
+  const [code, setCode] = useState("");
+  const [codeSubmitted, setCodeSubmitted] = useState(false);
+  const [terminalChoice, setTerminalChoice] = useState<boolean | null>(null);
+  const [fallbackDue, setFallbackDue] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setFallbackDue(true),
+      SIGN_IN_TERMINAL_FALLBACK_DELAY_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, []);
+  const terminalVisible =
+    terminalChoice ?? (fallbackDue && (guide === null || guide.url === null));
+
+  const exited =
+    output !== undefined && !isActiveTerminalSessionStatus(output.status);
+  const exitCode = output?.exitCode ?? null;
+  useEffect(() => {
+    if (exited) onExit(exitCode);
+  }, [exitCode, exited, onExit]);
+
+  const submitCode = () => {
+    const trimmed = code.trim();
+    if (trimmed.length === 0) return;
+    setCodeSubmitted(true);
+    sdk.terminals
+      .input({
+        terminalId: session.id,
+        dataBase64: encodeTerminalInput(`${trimmed}\r`),
+      })
+      .catch(() => {
+        setCodeSubmitted(false);
+        appToast.error("Couldn't send the code. Try again.");
+      });
+  };
+
   return (
-    <Card>
-      {agents.map((agent) => {
-        const isInstalling = installing.has(agent.providerId);
-        const connected = agent.status === "connected";
-        const needsAuth =
-          !isInstalling &&
-          (agent.status === "unauthenticated" || agent.status === "expired");
-        const expanded = expandedSignIn === agent.providerId;
-        const label = isInstalling
-          ? "Installing…"
-          : connected
-            ? "Connected"
-            : agent.status === "expired"
-              ? "Session expired"
-              : agent.status === "unauthenticated"
-                ? "Not signed in"
-                : "Not installed";
-        return (
-          <div key={agent.providerId}>
-            <div
-              className={cn(
-                // Fixed row height so every row shares one rhythm.
-                "flex h-14 items-center gap-3 border-b border-border-hairline px-4 last:border-b-0",
-                needsAuth && "bg-surface-attention",
-              )}
-            >
-              <ProviderMark providerId={agent.providerId} />
-              <div className="min-w-0 flex-1">
-                <div className="text-sm">{agent.displayName}</div>
-                {agent.accountEmail === null ? null : (
-                  <div className="truncate text-xs text-subtle-foreground">
-                    {agent.accountEmail}
-                  </div>
-                )}
-              </div>
-              {/* Fixed column so plan badges share one right edge, and rows
-                  without a plan keep the same gutter. Only Claude Code, Codex,
-                  and Cursor can report a plan; the rest get no badge rather
-                  than a fabricated one. */}
-              <span className="flex w-24 shrink-0 justify-end">
-                {agent.planLabel === null ? null : (
-                  <Badge variant="secondary" className="font-normal">
-                    {agent.planLabel}
-                  </Badge>
-                )}
-              </span>
-              <span
-                className={cn(
-                  "flex w-36 shrink-0 items-center justify-end gap-1.5 text-right text-xs whitespace-nowrap",
-                  // In-progress is neutral: only a state the user must act on
-                  // earns the warning colour.
-                  isInstalling
-                    ? "text-subtle-foreground"
-                    : connected
-                      ? "text-success"
-                      : "text-warning-text",
-                )}
-              >
-                {label}
-                {isInstalling ? (
-                  <Icon
-                    name="Spinner"
-                    className="size-3.5 animate-spin"
-                    aria-hidden
-                  />
-                ) : null}
-              </span>
-              <div className="w-20 shrink-0">
-                {needsAuth && agent.loginCommand !== null ? (
-                  <Button
-                    size="sm"
-                    className="w-full"
-                    onClick={() =>
-                      onToggleSignIn(expanded ? null : agent.providerId)
-                    }
-                  >
-                    Sign in
-                  </Button>
-                ) : agent.status === "not_installed" &&
-                  agent.canInstall &&
-                  !isInstalling ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="w-full"
-                    onClick={() => onInstall(agent)}
-                  >
-                    Install
-                  </Button>
-                ) : null}
-              </div>
-            </div>
-            {expanded && agent.loginCommand !== null ? (
-              /* bb deliberately does not drive another tool's login: it shows
-                 the agent's own command and re-checks, so credentials never
-                 pass through bb. */
-              <div className="space-y-2 border-b border-border-hairline bg-surface-recessed px-4 py-3">
-                <p className="text-xs text-subtle-foreground">
-                  Run this in a terminal, then come back:
-                </p>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 truncate rounded-md border border-border bg-card px-2.5 py-1.5 font-mono text-xs">
-                    {agent.loginCommand}
-                  </code>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      void copyToClipboardWithToast(agent.loginCommand ?? "", {
-                        successMessage: null,
-                        errorMessage: null,
-                      });
-                    }}
-                  >
-                    Copy
-                  </Button>
-                  <Button size="sm" onClick={onRecheck}>
-                    I&apos;ve signed in
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-          </div>
-        );
-      })}
-    </Card>
+    <AgentSignInGuide
+      agentName={agentName}
+      guide={guide}
+      code={code}
+      codeSubmitted={codeSubmitted}
+      terminalVisible={terminalVisible}
+      terminal={
+        <ThreadTerminalView autoFocus={false} isPanelOpen session={session} />
+      }
+      onCodeChange={(next) => {
+        setCode(next);
+        setCodeSubmitted(false);
+      }}
+      onSubmitCode={submitCode}
+      onOpenUrl={openUrlInExternalBrowser}
+      onCopy={(text) => void copyToClipboardWithToast(text)}
+      onToggleTerminal={() => setTerminalChoice(!terminalVisible)}
+      alternateLabel={alternate?.label ?? null}
+      onUseAlternate={() => {
+        if (alternate !== null) onUseAlternate(alternate.method);
+      }}
+    />
   );
 }
 
-export function OnboardingFlow({
-  onAddProjects,
-  onClose,
-  onEvent,
-  onInstallAgent,
-  installing,
-}: OnboardingFlowProps) {
-  const [step, setStep] = useState<0 | 1>(0);
-  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [expandedSignIn, setExpandedSignIn] = useState<string | null>(null);
-  /** Folders the user picked by hand, shown and checked alongside the scan. */
-  const [addedRepos, setAddedRepos] = useState<readonly DiscoveredRepo[]>([]);
-  const [addError, setAddError] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
-  const [startedReported, setStartedReported] = useState(false);
+interface StepChrome {
+  compact: boolean;
+  reserveMacosTrafficLights: boolean;
+  onSelectStep: (step: OnboardingStepId) => void;
+  onSkipAll: () => void;
+}
 
-  // Poll only while the agents step is visible; the projects step has no use
-  // for it and each read is several host round-trips.
-  const agentsQuery = useOnboardingAgents({ poll: step === 0 });
-  // Re-read after a terminal sign-in rather than waiting out the poll. Using the
-  // query's own refetch keeps cache writes inside the query layer.
-  const recheck = useCallback(() => {
-    void agentsQuery.refetch();
-  }, [agentsQuery]);
-  const reposQuery = useOnboardingRepos({ enabled: step === 1 });
-
-  const agents = useMemo(
-    () => agentsQuery.data?.agents ?? [],
-    [agentsQuery.data],
+async function closeAbandonedSignInTerminals({
+  hostId,
+  title,
+}: {
+  hostId: string;
+  title: string;
+}): Promise<void> {
+  const listing = await sdk.terminals
+    .list({ scope: { kind: "host_path", hostId } })
+    .catch(() => null);
+  const abandoned = (listing?.sessions ?? []).filter(
+    (session) =>
+      session.title === title && isActiveTerminalSessionStatus(session.status),
   );
-  const agentState = agentStateOf(agents);
-  const scanningAgents = agentsQuery.isPending;
+  await Promise.all(
+    abandoned.map((session) =>
+      sdk.terminals
+        .close({ mode: "force", terminalId: session.id })
+        .catch(() => null),
+    ),
+  );
+}
 
-  // Only a machine with nothing installed is asked to install something.
-  const nothingInstalled =
-    !scanningAgents &&
-    agents.length > 0 &&
-    agents.every((agent) => agent.status === "not_installed");
-  const canContinue =
-    !scanningAgents && agents.some((agent) => agent.status === "connected");
+type SignInMethod = "local" | "remote";
 
-  useEffect(() => {
-    if (startedReported || scanningAgents) return;
-    // A failed probe is not evidence of an empty machine; reporting it would
-    // inflate `agent_state: none`, the metric this event exists to answer.
-    if (agentsQuery.isError || agentsQuery.data === undefined) return;
-    setStartedReported(true);
-    onEvent?.({
-      name: "started",
-      agentState,
-      agentCount: agents.filter((agent) => agent.status !== "not_installed")
-        .length,
-    });
-  }, [
-    agentState,
-    agents,
-    agentsQuery.data,
-    agentsQuery.isError,
-    onEvent,
-    scanningAgents,
-    startedReported,
-  ]);
+interface SignInSession {
+  providerId: string;
+  session: TerminalSession;
+  method: SignInMethod;
+  hasAlternateMethod: boolean;
+}
 
-  const repos = useMemo<readonly DiscoveredRepo[]>(() => {
-    const discovered = reposQuery.data?.repos ?? [];
-    const seen = new Set(discovered.map((repo) => repo.path));
-    // Hand-picked folders lead: the user just chose them.
-    return [
-      ...addedRepos.filter((repo) => !seen.has(repo.path)),
-      ...discovered,
-    ];
-  }, [addedRepos, reposQuery.data]);
-
-  // Same path-entry surface the rest of the app uses (native picker on a
-  // single-machine desktop, in-app browser otherwise). Onboarding's submit adds
-  // the folder to this step's list instead of creating a project immediately,
-  // so one "Add projects" click still creates everything at once.
-  const pathPicker = useLocalPathPicker({
-    isPending: false,
-    submit: ({ path, closeDialog }) => {
-      const name = path.split("/").filter(Boolean).pop() ?? path;
-      setAddedRepos((current) =>
-        current.some((repo) => repo.path === path)
-          ? current
-          : [
-              ...current,
-              {
-                path,
-                name,
-                lastActivityAt: new Date().toISOString(),
-                originUrl: null,
-                agentSeen: false,
-                agentSeenAt: null,
-              },
-            ],
-      );
-      setSelected((current) => new Set(current).add(path));
-      closeDialog();
-    },
+function AgentStepContainer({
+  chrome,
+  hostId,
+  hostName,
+  onContinue,
+}: {
+  chrome: StepChrome;
+  hostId: string | null;
+  hostName: string | null;
+  onContinue: () => void;
+}) {
+  const statesQuery = useSystemProviderStates({
+    enabled: hostId !== null,
+    ...(hostId === null ? {} : { hostId }),
   });
+  const providersQuery = useSystemProviders(
+    hostId === null ? { enabled: false } : { hostId },
+  );
+  const cliStatusQuery = useHostProviderCliStatus({ hostId });
+  const installRunner = useProviderCliInstallRunner();
+  const { isLocalDaemonHost } = useHostDaemon();
+  const createTerminal = useCreateTerminal();
+  const closeTerminal = useCloseTerminal();
+  const [signIn, setSignIn] = useState<SignInSession | null>(null);
+  const [signInFailedProviderId, setSignInFailedProviderId] = useState<
+    string | null
+  >(null);
+  const signInRef = useRef<SignInSession | null>(null);
+  const { refetch: refetchStates } = statesQuery;
+  const { mutate: closeTerminalMutate } = closeTerminal;
+  const { mutateAsync: createTerminalAsync } = createTerminal;
 
-  // Pre-check repos an agent has already worked in — that is the strongest
-  // signal the user wants them in bb — and fall back to the most recent.
-  useEffect(() => {
-    if (reposQuery.data === undefined) return;
-    setSelected((current) => {
-      if (current.size > 0) return current;
-      const seen = repos.filter((repo) => repo.agentSeen).map((r) => r.path);
-      return new Set(
-        seen.length > 0 ? seen : repos.slice(0, 2).map((r) => r.path),
-      );
-    });
-  }, [repos, reposQuery.data]);
+  const endSignIn = useCallback(() => {
+    const current = signInRef.current;
+    if (current === null) return;
+    signInRef.current = null;
+    setSignIn(null);
+    closeTerminalMutate({ mode: "force", terminalId: current.session.id });
+    void refetchStates();
+  }, [closeTerminalMutate, refetchStates]);
 
-  const finish = useCallback(
-    (completed: boolean, atStep: "agents" | "projects", added: number) => {
-      onClose({ completed, step: atStep, projectsAdded: added, agentState });
+  const signInRequestRef = useRef(0);
+  useEffect(
+    () => () => {
+      signInRequestRef.current += 1;
+      endSignIn();
     },
-    [agentState, onClose],
+    [endSignIn],
   );
 
-  const toggleRepo = useCallback((path: string) => {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
+  const handleSignInExit = useCallback(
+    (exitCode: number | null) => {
+      const current = signInRef.current;
+      if (current !== null && exitCode !== 0) {
+        setSignInFailedProviderId(current.providerId);
+      }
+      endSignIn();
+    },
+    [endSignIn],
+  );
 
-  const addProjects = useCallback(async () => {
-    const chosen = repos.filter((repo) => selected.has(repo.path));
-    setAdding(true);
-    setAddError(null);
+  useEffect(() => {
+    if (signIn === null) return;
+    const interval = window.setInterval(() => {
+      void refetchStates();
+    }, SIGN_IN_POLL_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [refetchStates, signIn]);
+
+  const states = statesQuery.data?.providers;
+  const signingInProviderId = signIn?.providerId ?? null;
+  const signingInProviderReady =
+    signingInProviderId !== null &&
+    states?.find((state) => state.providerId === signingInProviderId)
+      ?.status === "ready";
+  useEffect(() => {
+    if (signingInProviderReady) endSignIn();
+  }, [endSignIn, signingInProviderReady]);
+
+  const { runningJobKey } = installRunner;
+  useEffect(() => {
+    if (runningJobKey === null) void refetchStates();
+  }, [refetchStates, runningJobKey]);
+
+  const startSignIn = async (
+    providerId: string,
+    requestedMethod?: SignInMethod,
+  ) => {
+    const state = states?.find((entry) => entry.providerId === providerId);
+    if (hostId === null || !state) return;
+    const method =
+      requestedMethod ?? (isLocalDaemonHost(hostId) ? "local" : "remote");
+    const command = resolveSignInCommand(state, method === "local");
+    if (command === null) return;
+    endSignIn();
+    setSignInFailedProviderId(null);
+    signInRequestRef.current += 1;
+    const request = signInRequestRef.current;
+    const title = `Sign in to ${state.displayName}`;
+    await closeAbandonedSignInTerminals({ hostId, title });
+    let session: TerminalSession;
     try {
-      await onAddProjects(chosen);
-      onEvent?.({ name: "step_completed", step: "projects" });
-      finish(true, "projects", chosen.length);
+      session = await createTerminalAsync({
+        cols: SIGN_IN_TERMINAL_COLS,
+        rows: SIGN_IN_TERMINAL_ROWS,
+        title,
+        start: { mode: "command", command },
+        target: { kind: "host_path", hostId, cwd: null },
+      });
+    } catch {
+      return;
+    }
+    if (signInRequestRef.current !== request) {
+      void sdk.terminals
+        .close({ mode: "force", terminalId: session.id })
+        .catch(() => null);
+      return;
+    }
+    const next: SignInSession = {
+      providerId,
+      session,
+      method,
+      hasAlternateMethod:
+        state.localLoginCommand !== null &&
+        state.loginCommand !== null &&
+        state.localLoginCommand !== state.loginCommand,
+    };
+    signInRef.current = next;
+    setSignIn(next);
+  };
+
+  const startInstall = (providerId: string) => {
+    const status = cliStatusQuery.data?.[providerId];
+    if (hostId === null || status === undefined) return;
+    const issue = buildProviderCliIssue({ provider: providerId, status });
+    if (issue === null || !hasProviderCliAction(issue)) return;
+    installRunner.startInstall({ hostId, issue });
+  };
+
+  const viewInstallLog = (providerId: string) => {
+    if (hostId === null) return;
+    const failure = installRunner.failuresByJobKey.get(
+      providerCliJobKey(hostId, providerId),
+    );
+    if (failure === undefined) return;
+    openProviderCliInstallLog(failure.logDialogState);
+  };
+
+  const agents: OnboardingAgent[] | null =
+    hostId === null || states === undefined
+      ? null
+      : states.map((health) => {
+          const info = providersQuery.data?.find(
+            (provider) => provider.id === health.providerId,
+          );
+          const jobKey = providerCliJobKey(hostId, health.providerId);
+          const signingIn = signIn?.providerId === health.providerId;
+          return {
+            id: health.providerId,
+            name: health.displayName,
+            provider: info ?? { id: health.providerId, logoUrl: null },
+            state: resolveAgentSetupState({
+              health,
+              cliStatus: cliStatusQuery.data?.[health.providerId],
+              installing:
+                installRunner.runningJobKey === jobKey ||
+                installRunner.queuedJobKeys.has(jobKey),
+              installFailure: installRunner.failuresByJobKey.has(jobKey)
+                ? INSTALL_FAILED_MESSAGE
+                : null,
+              signingIn,
+              signInFailed: signInFailedProviderId === health.providerId,
+              installInfoPending: cliStatusQuery.isPending,
+            }),
+            expanded:
+              signingIn && signIn !== null ? (
+                <AgentSignInContainer
+                  key={signIn.session.id}
+                  agentName={health.displayName}
+                  session={signIn.session}
+                  alternate={
+                    signIn.hasAlternateMethod
+                      ? signIn.method === "local"
+                        ? {
+                            label: "Use a one-time code instead",
+                            method: "remote",
+                          }
+                        : {
+                            label: "Use browser sign-in instead",
+                            method: "local",
+                          }
+                      : null
+                  }
+                  onUseAlternate={(method) =>
+                    void startSignIn(health.providerId, method)
+                  }
+                  onExit={handleSignInExit}
+                />
+              ) : undefined,
+          };
+        });
+
+  const agentReady = hasReadyAgent(states);
+  const agentBlocked = agents === null ? statesQuery.isError : !agentReady;
+  return (
+    <OnboardingLayout
+      {...chrome}
+      step="agent"
+      title="Connect a coding agent"
+      description="bb runs the agents you already use. You need one that is installed and signed in on this computer."
+      footerNote={
+        agentBlocked ? "Threads can't start until one agent is ready." : null
+      }
+      primaryLabel="Continue"
+      primaryDisabled={!agentReady}
+      secondaryLabel={agentBlocked ? "Skip for now" : undefined}
+      onPrimary={onContinue}
+      onSecondary={onContinue}
+    >
+      <AgentStep
+        machineName={hostName}
+        agents={agents}
+        onSignIn={(providerId) => void startSignIn(providerId)}
+        onInstall={startInstall}
+        onViewInstallLog={viewInstallLog}
+        onCancelSignIn={endSignIn}
+        onRecheck={() => {
+          void refetchStates();
+          void cliStatusQuery.refetch();
+        }}
+      />
+    </OnboardingLayout>
+  );
+}
+
+function ProjectsStepContainer({
+  chrome,
+  hostId,
+  projectIdsAtOpen,
+  onBack,
+  onContinue,
+}: {
+  chrome: StepChrome;
+  hostId: string | null;
+  projectIdsAtOpen: ReadonlySet<string> | null;
+  onBack: () => void;
+  onContinue: () => void;
+}) {
+  const reposQuery = useHostDiscoveredRepos(hostId);
+  const createProject = useCreateProject();
+  const quickCreateProject = useQuickCreateProjectController();
+  const navigationQuery = useSidebarNavigation();
+  const [selection, setSelection] = useState<ReadonlySet<string> | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [rescanning, setRescanning] = useState(false);
+  const [now] = useState(() => Date.now());
+
+  const { refetch: refetchRepos } = reposQuery;
+  const navigationProjects = navigationQuery.data?.projects;
+  const hostProjects = useMemo(
+    () =>
+      hostId === null
+        ? []
+        : (navigationProjects ?? []).flatMap((project) => {
+            const source = findLocalPathProjectSourceForHost(
+              project.sources,
+              hostId,
+            );
+            return source === undefined
+              ? []
+              : [{ id: project.id, name: project.name, path: source.path }];
+          }),
+    [hostId, navigationProjects],
+  );
+  const scannedRepos = reposQuery.data?.repos;
+  const discovered = useMemo(
+    () =>
+      scannedRepos?.map((repo) =>
+        repo.projectId !== null
+          ? repo
+          : {
+              ...repo,
+              projectId:
+                hostProjects.find((project) => project.path === repo.path)
+                  ?.id ?? null,
+            },
+      ),
+    [hostProjects, scannedRepos],
+  );
+  const selectedPaths = useMemo(() => {
+    const importable = new Set(
+      (discovered ?? [])
+        .filter((repo) => repo.projectId === null)
+        .map((repo) => repo.path),
+    );
+    const chosen = selection ?? defaultSelectedRepoPaths(discovered ?? [], now);
+    return new Set([...chosen].filter((path) => importable.has(path)));
+  }, [discovered, now, selection]);
+  const repos = useMemo((): OnboardingRepo[] => {
+    const discoveredPaths = new Set(
+      (discovered ?? []).map((repo) => repo.path),
+    );
+    return [
+      ...hostProjects
+        .filter(
+          (project) =>
+            !discoveredPaths.has(project.path) &&
+            projectIdsAtOpen !== null &&
+            !projectIdsAtOpen.has(project.id),
+        )
+        .map((project) => ({
+          id: `project:${project.id}`,
+          name: project.name,
+          path: project.path,
+          lastActive: "",
+          remote: null,
+          added: true,
+        })),
+      ...(discovered ?? []).map((repo) => ({
+        id: repo.path,
+        name: repo.name,
+        path: repo.path,
+        lastActive: formatRelativeTime({
+          timestamp: Date.parse(repo.lastActivityAt),
+          now,
+        }),
+        remote: shortRemoteName(repo.originUrl),
+        added: repo.projectId !== null,
+      })),
+    ];
+  }, [discovered, hostProjects, now, projectIdsAtOpen]);
+
+  const importSelected = async () => {
+    if (hostId === null || discovered === undefined) return;
+    const chosen = discovered.filter(
+      (repo) => repo.projectId === null && selectedPaths.has(repo.path),
+    );
+    setImporting(true);
+    try {
+      for (const repo of chosen) {
+        await createProject.mutateAsync({
+          name: repo.name,
+          source: { type: "local_path", hostId, path: repo.path },
+        });
+      }
+    } catch {
+      return;
+    } finally {
+      setImporting(false);
+      void refetchRepos();
+    }
+    onContinue();
+  };
+
+  const scanning = hostId === null || reposQuery.isPending || rescanning;
+  return (
+    <OnboardingLayout
+      {...chrome}
+      step="projects"
+      title="Add your projects"
+      description="Git repos on this computer that you've worked in over the last 30 days."
+      primaryLabel={
+        scanning || selectedPaths.size === 0
+          ? "Continue"
+          : `Import ${selectedPaths.size} ${selectedPaths.size === 1 ? "project" : "projects"}`
+      }
+      primaryDisabled={scanning}
+      primaryBusy={importing}
+      secondaryLabel="Skip"
+      onPrimary={() => {
+        if (selectedPaths.size === 0) onContinue();
+        else void importSelected();
+      }}
+      onSecondary={onContinue}
+      onBack={onBack}
+    >
+      <ProjectsStep
+        status={
+          scanning
+            ? { kind: "scanning" }
+            : reposQuery.isError
+              ? {
+                  kind: "error",
+                  message: "bb couldn't scan this computer for git repos.",
+                }
+              : { kind: "results", truncated: reposQuery.data.truncated }
+        }
+        repos={repos}
+        selectedIds={selectedPaths}
+        onToggle={(path) => {
+          const next = new Set(selectedPaths);
+          if (next.has(path)) next.delete(path);
+          else next.add(path);
+          setSelection(next);
+        }}
+        onSelectAll={() =>
+          setSelection(
+            new Set(
+              (discovered ?? [])
+                .filter((repo) => repo.projectId === null)
+                .map((repo) => repo.path),
+            ),
+          )
+        }
+        onSelectNone={() => setSelection(new Set())}
+        onAddFolder={quickCreateProject.openCreateDialog}
+        onRetry={() => {
+          setRescanning(true);
+          void refetchRepos().finally(() => setRescanning(false));
+        }}
+      />
+      <ProjectPathDialog
+        target={quickCreateProject.projectPathDialog.target}
+        pending={quickCreateProject.isCreating}
+        platform={quickCreateProject.platform}
+        hostId={quickCreateProject.hostId}
+        hostName={quickCreateProject.hostName}
+        hosts={quickCreateProject.hosts}
+        onOpenChange={quickCreateProject.projectPathDialog.onOpenChange}
+        onSubmit={quickCreateProject.submitProjectPath}
+      />
+    </OnboardingLayout>
+  );
+}
+
+function PluginCardContainer({
+  entry,
+  enabled,
+  onChanged,
+}: {
+  entry: PluginCatalogSearchEntry;
+  enabled: boolean;
+  onChanged: () => Promise<void>;
+}) {
+  const queryClient = useQueryClient();
+  const setPluginEnabled = useSetPluginEnabled();
+  const installJob = useCatalogEntryInstallJob(entry);
+  const [working, setWorking] = useState(false);
+  const [target, setTarget] = useState<boolean | null>(null);
+  if (target !== null && target === enabled) {
+    setTarget(null);
+  }
+  const busy = working || installJob !== null;
+  const settling = target !== null && target !== enabled;
+  useEffect(() => {
+    if (!settling || busy) return;
+    const timer = window.setTimeout(
+      () => setTarget(null),
+      PLUGIN_TOGGLE_SETTLE_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [busy, settling]);
+
+  const toggle = async (next: boolean) => {
+    setTarget(next);
+    setWorking(true);
+    try {
+      if (next && !entry.installed) {
+        const job = await startCatalogPluginInstall(fetch, {
+          entryId: entry.entryId,
+          marketplace: entry.marketplace,
+        });
+        applyPluginInstallJob({ queryClient, job });
+      } else {
+        await setPluginEnabled(entry.pluginId, next);
+      }
+      await onChanged();
     } catch (error) {
-      // Keep the dialog open and say so, rather than stranding the user with a
-      // half-added set and no explanation.
-      setAddError(
+      setTarget(null);
+      appToast.error(
         error instanceof Error
           ? error.message
-          : "Could not add every project. Try again.",
+          : `Failed to update ${entry.displayName}.`,
       );
     } finally {
-      setAdding(false);
+      setWorking(false);
     }
-  }, [finish, onAddProjects, onEvent, repos, selected]);
-
-  const title =
-    step === 0
-      ? nothingInstalled
-        ? "Install a coding agent"
-        : "bb uses your existing coding agents"
-      : "Add your projects";
-
-  const description =
-    step === 0
-      ? nothingInstalled
-        ? "bb has no inference of its own. It runs coding agent CLIs on your computer and bills usage to their plans. Install one to get started."
-        : "It runs the agents below locally, so inference is billed to their plans."
-      : "bb works inside your code. Add the folders you want it to work in. You can add more any time.";
+  };
 
   return (
-    <Dialog
-      open
-      onOpenChange={(next) => {
-        if (next) return;
-        finish(false, step === 0 ? "agents" : "projects", 0);
+    <OnboardingPluginCard
+      name={entry.displayName}
+      description={entry.description}
+      icon={{
+        icon: entry.icon,
+        iconUrl: entry.iconUrl,
+        iconTinted: entry.iconTinted,
       }}
-    >
-      <DialogContent
-        className="max-w-[640px] gap-0 p-0 outline-none"
-        onInteractOutside={(event) => event.preventDefault()}
-      >
-        <DialogHeader className="px-6 pt-6 pb-4">
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
-
-        <div className="max-h-[420px] overflow-y-auto px-6 pb-5">
-          {step === 0 ? (
-            scanningAgents ? (
-              <div className="flex items-center gap-2 py-6 text-sm text-subtle-foreground">
-                <Icon
-                  name="Spinner"
-                  className="size-4 animate-spin"
-                  aria-hidden
-                />
-                Checking which coding agents are installed…
-              </div>
-            ) : (
-              <AgentRows
-                agents={
-                  nothingInstalled
-                    ? agents.filter((agent) => agent.canInstall)
-                    : agents.filter((agent) => agent.status !== "not_installed")
-                }
-                expandedSignIn={expandedSignIn}
-                installing={installing}
-                onInstall={onInstallAgent}
-                onRecheck={recheck}
-                onToggleSignIn={setExpandedSignIn}
-              />
-            )
-          ) : (
-            <div className="space-y-2.5">
-              <p className="text-xs text-subtle-foreground">
-                {reposQuery.isPending
-                  ? "Searching ~ for git repos…"
-                  : `Found ${reposQuery.data?.repos.length ?? 0} repos you edited in the last 30 days`}
-              </p>
-              {reposQuery.isPending ? null : (
-                <Card>
-                  {repos.map((repo) => (
-                    <div
-                      key={repo.path}
-                      onClick={() => toggleRepo(repo.path)}
-                      className={cn(
-                        "flex h-14 cursor-pointer items-center gap-3 border-b border-border-hairline px-4 last:border-b-0",
-                        // Hover only applies to unselected rows. `state-hover`
-                        // replaces the background rather than layering over it,
-                        // so applying both made a hovered selected row read
-                        // *lighter* than its selected neighbours.
-                        selected.has(repo.path)
-                          ? "bg-surface-selected"
-                          : "hover:bg-state-hover",
-                      )}
-                    >
-                      <Checkbox
-                        checked={selected.has(repo.path)}
-                        aria-label={`Add ${repo.name}`}
-                      />
-                      <Icon
-                        name="FolderGit"
-                        className="size-4 shrink-0 text-subtle-foreground"
-                        aria-hidden
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm">{repo.name}</div>
-                        <div className="truncate font-mono text-xs text-subtle-foreground">
-                          {repo.path}
-                        </div>
-                      </div>
-                      <span className="text-xs text-subtle-foreground">
-                        {new Date(repo.lastActivityAt).toLocaleDateString()}
-                      </span>
-                    </div>
-                  ))}
-                </Card>
-              )}
-              <Card>
-                <div
-                  onClick={() => pathPicker.openPathEntry({ kind: "create" })}
-                  className="flex h-14 cursor-pointer items-center gap-3 px-4 hover:bg-state-hover"
-                >
-                  <Icon
-                    name="FolderPlus"
-                    className="size-4 shrink-0 text-subtle-foreground"
-                    aria-hidden
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm">Add a folder</div>
-                    <div className="text-xs text-subtle-foreground">
-                      Choose a project outside your home directory
-                    </div>
-                  </div>
-                  <span className="text-xs text-subtle-foreground">
-                    Browse…
-                  </span>
-                </div>
-              </Card>
-              {addError === null ? null : (
-                <p className="text-xs text-destructive-text">{addError}</p>
-              )}
-            </div>
-          )}
-        </div>
-
-        <DialogFooter className="items-center border-t border-border-hairline bg-surface-raised px-6 py-3 sm:justify-between">
-          <div className="flex items-center gap-2.5">
-            <StepDots current={step} />
-            <span className="text-xs text-subtle-foreground">
-              {step === 0
-                ? canContinue
-                  ? ""
-                  : nothingInstalled
-                    ? "Install an agent to continue"
-                    : "Sign in to at least one agent to continue"
-                : selected.size > 0
-                  ? `${selected.size} project${selected.size > 1 ? "s" : ""} selected`
-                  : "You can add projects any time"}
-            </span>
-          </div>
-          <div className="flex gap-2">
-            {step === 0 ? (
-              <>
-                {canContinue ? null : (
-                  <Button
-                    variant="ghost"
-                    onClick={() => {
-                      onEvent?.({ name: "step_skipped", step: "agents" });
-                      setStep(1);
-                    }}
-                  >
-                    Skip for now
-                  </Button>
-                )}
-                <Button
-                  disabled={!canContinue}
-                  onClick={() => {
-                    onEvent?.({ name: "step_completed", step: "agents" });
-                    setStep(1);
-                  }}
-                >
-                  Continue
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button variant="ghost" onClick={() => setStep(0)}>
-                  Back
-                </Button>
-                <Button disabled={adding} onClick={() => void addProjects()}>
-                  {adding
-                    ? "Adding…"
-                    : selected.size === 0
-                      ? "Skip for now"
-                      : "Add projects"}
-                </Button>
-              </>
-            )}
-          </div>
-        </DialogFooter>
-      </DialogContent>
-
-      {/* Rendered inside the onboarding dialog's tree so it portals above it. */}
-      <ProjectPathDialog
-        hostId={pathPicker.hostId}
-        hostName={pathPicker.hostName}
-        pending={false}
-        platform={pathPicker.platform}
-        target={pathPicker.projectPathDialog.target}
-        onOpenChange={pathPicker.projectPathDialog.onOpenChange}
-        onSubmit={pathPicker.submitProjectPath}
-      />
-    </Dialog>
+      enabled={target ?? enabled}
+      pending={busy || settling}
+      unavailableReason={
+        entry.installed || entry.compatible
+          ? null
+          : (entry.incompatibleReason ?? "Not available on this server.")
+      }
+      onToggle={(next) => void toggle(next)}
+    />
   );
+}
+
+function PluginsStepContainer({
+  chrome,
+  onBack,
+  onContinue,
+}: {
+  chrome: StepChrome;
+  onBack: () => void;
+  onContinue: () => void;
+}) {
+  const catalogQuery = usePluginCatalogSearch("", { enabled: true });
+  const listQuery = usePluginList({ enabled: true });
+  const { refetch: refetchCatalog } = catalogQuery;
+  const { refetch: refetchList } = listQuery;
+  const refresh = useCallback(async () => {
+    await Promise.all([refetchCatalog(), refetchList()]);
+  }, [refetchCatalog, refetchList]);
+
+  const installedPlugins = listQuery.data?.plugins;
+  const installedCount = installedPlugins?.length ?? 0;
+  useEffect(() => {
+    void refetchCatalog();
+  }, [installedCount, refetchCatalog]);
+
+  const entries = useMemo(() => {
+    const all = catalogQuery.data?.entries;
+    if (all === undefined) return null;
+    return ONBOARDING_PLUGINS.flatMap(({ entryId }) => {
+      const entry = all.find(
+        (candidate) =>
+          candidate.marketplace === ONBOARDING_PLUGIN_MARKETPLACE &&
+          candidate.entryId === entryId,
+      );
+      return entry === undefined ? [] : [entry];
+    });
+  }, [catalogQuery.data?.entries]);
+
+  return (
+    <OnboardingLayout
+      {...chrome}
+      step="plugins"
+      title="Make bb yours"
+      description="Most of bb is plugins. These ones are off until you want them, and you can change your mind in Plugins."
+      primaryLabel="Continue"
+      secondaryLabel="Skip"
+      onPrimary={onContinue}
+      onSecondary={onContinue}
+      onBack={onBack}
+    >
+      <OnboardingPluginGrid compact={chrome.compact}>
+        {entries === null ? (
+          <OnboardingPluginGridSkeleton count={ONBOARDING_PLUGINS.length} />
+        ) : (
+          entries.map((entry) => (
+            <PluginCardContainer
+              key={entry.entryId}
+              entry={entry}
+              enabled={
+                entry.installed &&
+                (installedPlugins?.find(
+                  (plugin) => plugin.id === entry.pluginId,
+                )?.enabled ??
+                  false)
+              }
+              onChanged={refresh}
+            />
+          ))
+        )}
+      </OnboardingPluginGrid>
+    </OnboardingLayout>
+  );
+}
+
+function DevicesStepContainer({
+  chrome,
+  hostId,
+  onBack,
+  onFinish,
+}: {
+  chrome: StepChrome;
+  hostId: string | null;
+  onBack: () => void;
+  onFinish: () => void;
+}) {
+  const configQuery = useSystemConfig();
+  const hostsQuery = useHosts();
+  const [connectSetupOpen, setConnectSetupOpen] = useState(false);
+  const [addMachineOpen, setAddMachineOpen] = useState(false);
+  const location = useLocation();
+  const [initialPathname] = useState(location.pathname);
+  const navigatedAway = location.pathname !== initialPathname;
+  useEffect(() => {
+    if (navigatedAway) onFinish();
+  }, [navigatedAway, onFinish]);
+  const otherMachineCount = (hostsQuery.data ?? []).filter(
+    (host) => host.id !== hostId,
+  ).length;
+
+  return (
+    <OnboardingLayout
+      {...chrome}
+      step="devices"
+      title="Use bb from anywhere"
+      description="All optional. Everything here also lives in Settings → Machines."
+      primaryLabel="Start using bb"
+      onPrimary={onFinish}
+      onBack={onBack}
+    >
+      <DevicesStep
+        connect={connectAccessUrl(configQuery.data?.serverAccess)}
+        connectSetup={<PluginSettingsSections pluginId={CONNECT_PLUGIN_ID} />}
+        connectSetupOpen={connectSetupOpen}
+        otherMachineCount={otherMachineCount}
+        mobileLinks={mobileAppDownloads}
+        onToggleConnectSetup={() => setConnectSetupOpen((open) => !open)}
+        onCopyConnectUrl={(url) => void copyToClipboardWithToast(url)}
+        onAddMachine={() => setAddMachineOpen(true)}
+      />
+      <AddMachineDialog
+        open={addMachineOpen}
+        onOpenChange={setAddMachineOpen}
+      />
+    </OnboardingLayout>
+  );
+}
+
+const STEP_ORDER: readonly OnboardingStepId[] = [
+  "agent",
+  "projects",
+  "plugins",
+  "devices",
+];
+
+export function OnboardingFlow({
+  initialStep,
+  onClose,
+}: {
+  initialStep: OnboardingStepId;
+  onClose: () => void;
+}) {
+  const [step, setStep] = useState(initialStep);
+  const navigationProjects = useSidebarNavigation().data?.projects;
+  const [projectIdsAtOpen, setProjectIdsAtOpen] =
+    useState<ReadonlySet<string> | null>(null);
+  if (projectIdsAtOpen === null && navigationProjects !== undefined) {
+    setProjectIdsAtOpen(
+      new Set(navigationProjects.map((project) => project.id)),
+    );
+  }
+  const primaryHost = usePrimaryHost();
+  const hostId = primaryHost?.id ?? null;
+  useHostDiscoveredRepos(hostId);
+  const compact = useMediaQuery("(max-width: 640px)");
+  const [desktopInfo] = useState(getBbDesktopInfo);
+  const windowState = useDesktopWindowState();
+  const chrome: StepChrome = {
+    compact,
+    reserveMacosTrafficLights: shouldReserveMacosTrafficLights({
+      desktopInfo,
+      windowState,
+    }),
+    onSelectStep: setStep,
+    onSkipAll: onClose,
+  };
+  const goTo = (offset: number) => () => {
+    const next = STEP_ORDER[STEP_ORDER.indexOf(step) + offset];
+    if (next !== undefined) setStep(next);
+  };
+
+  switch (step) {
+    case "agent":
+      return (
+        <AgentStepContainer
+          chrome={chrome}
+          hostId={hostId}
+          hostName={primaryHost?.name ?? null}
+          onContinue={goTo(1)}
+        />
+      );
+    case "projects":
+      return (
+        <ProjectsStepContainer
+          chrome={chrome}
+          hostId={hostId}
+          projectIdsAtOpen={projectIdsAtOpen}
+          onBack={goTo(-1)}
+          onContinue={goTo(1)}
+        />
+      );
+    case "plugins":
+      return (
+        <PluginsStepContainer
+          chrome={chrome}
+          onBack={goTo(-1)}
+          onContinue={goTo(1)}
+        />
+      );
+    case "devices":
+      return (
+        <DevicesStepContainer
+          chrome={chrome}
+          hostId={hostId}
+          onBack={goTo(-1)}
+          onFinish={onClose}
+        />
+      );
+  }
 }

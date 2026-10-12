@@ -1,4 +1,4 @@
-import { getHost, upsertHost } from "@bb/db";
+import { upsertHost } from "@bb/db";
 import { isLoopbackAddress } from "@bb/config/loopback";
 import {
   hostDaemonEnrollKeyRequestSchema,
@@ -15,8 +15,7 @@ import {
   getTrustedRemoteAddress,
   type GateAuthHeaderReader,
 } from "../request-context.js";
-import { assertMatchingExistingHostType } from "../services/hosts/host-type-guard.js";
-import { issuePersistentHostEnrollKey } from "../services/hosts/host-enrollment.js";
+import { issueHostEnrollKey } from "../services/hosts/host-enrollment.js";
 import { requireBearerToken } from "./auth.js";
 
 function assertLoopbackRequest(remoteAddress: string | undefined): void {
@@ -32,11 +31,10 @@ function assertLoopbackRequest(remoteAddress: string | undefined): void {
 
 export function resolveReportedConnectMachineId(
   context: GateAuthHeaderReader,
-  reportedMachineId: string | undefined,
 ): string | undefined {
-  if (getGateAuthKind(context) !== "machine") return reportedMachineId;
+  if (getGateAuthKind(context) !== "machine") return undefined;
   const gateMachineId = getGateMachineId(context);
-  if (gateMachineId === null || reportedMachineId !== gateMachineId) {
+  if (gateMachineId === null) {
     throw new ApiError(
       403,
       "connect_machine_id_mismatch",
@@ -64,7 +62,7 @@ export function registerInternalHostRoutes(app: Hono, deps: AppDeps): void {
         );
       }
       assertLoopbackRequest(getTrustedRemoteAddress(context));
-      const issued = await issuePersistentHostEnrollKey(deps, {
+      const issued = await issueHostEnrollKey(deps, {
         enrollSource: "loopback",
         ...(payload.hostId ? { hostId: payload.hostId } : {}),
       });
@@ -84,31 +82,20 @@ export function registerInternalHostRoutes(app: Hono, deps: AppDeps): void {
     "/hosts/enroll",
     hostDaemonEnrollRequestSchema,
     async (context, payload) => {
-      const connectMachineId = resolveReportedConnectMachineId(
-        context,
-        payload.connectMachineId,
-      );
+      const connectMachineId = resolveReportedConnectMachineId(context);
       const token = requireBearerToken(context.req.header("authorization"));
       const enrollment = await deps.machineAuth.enrollHost({
-        allowPublicEnrollment: true,
         hostId: payload.hostId,
-        hostType: payload.hostType,
         token,
       });
 
       if (!enrollment) {
         throw new ApiError(401, "unauthorized", "Unauthorized");
       }
-      assertMatchingExistingHostType({
-        existingHost: getHost(deps.db, enrollment.metadata.hostId),
-        requestedHostType: enrollment.metadata.hostType,
-      });
-
       upsertHost(deps.db, deps.hub, {
         ...(connectMachineId !== undefined ? { connectMachineId } : {}),
         id: enrollment.metadata.hostId,
         name: payload.hostName,
-        type: enrollment.metadata.hostType,
       });
 
       return context.json(

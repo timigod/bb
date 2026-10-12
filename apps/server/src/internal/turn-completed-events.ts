@@ -1,7 +1,4 @@
-import {
-  getThread,
-  hasRootStoredTurnStarted,
-} from "@bb/db";
+import { getThread, hasRootStoredTurnStarted } from "@bb/db";
 import {
   requireThreadEventScopeTurnId,
   type ThreadEvent,
@@ -34,7 +31,7 @@ function lifecycleEventForTurnCompletion(
 }
 
 export function applyTurnCompletedEvent(
-  deps: Pick<AppDeps, "db" | "hub" | "logger">,
+  deps: Pick<AppDeps, "db" | "hub" | "logger" | "providerRegistry">,
   payload: Extract<ThreadEvent, { type: "turn/completed" }>,
 ): ApplyTurnCompletedEventResult {
   const thread = getThread(deps.db, payload.threadId);

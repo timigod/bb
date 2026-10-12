@@ -1,17 +1,5 @@
 import type { ThreadEvent } from "@bb/domain";
 
-/**
- * Tracks background tasks that are still open per thread, from the same
- * normalized event stream the runtime forwards to the server.
- *
- * Background tasks outlive the turn that spawned them, so a thread can be idle
- * while its workflow or backgrounded command is still running inside the
- * provider process. Turn state alone therefore cannot tell a caller whether
- * shutting the runtime down would destroy live work — this can.
- *
- * Ambient (`skipTranscript`) tasks count too: they are hidden from the
- * transcript, not detached from the process that would be killed.
- */
 export class RuntimeBackgroundWorkState {
   private readonly openTaskIdsByThreadId = new Map<string, Set<string>>();
 
@@ -27,9 +15,16 @@ export class RuntimeBackgroundWorkState {
     return this.openTaskIdsByThreadId.size > 0;
   }
 
+  hasOpenThreadWork(threadId: string): boolean {
+    return (this.openTaskIdsByThreadId.get(threadId)?.size ?? 0) > 0;
+  }
+
   observe(event: ThreadEvent): void {
-    if (event.type === "item/started") {
-      if (event.item.type === "backgroundTask") {
+    if (event.type === "item/started" || event.type === "item/completed") {
+      if (
+        event.item.type === "backgroundTask" ||
+        event.item.type === "delegation"
+      ) {
         this.setTaskOpen({
           isOpen: event.item.status === "pending",
           taskId: event.item.id,
@@ -41,7 +36,9 @@ export class RuntimeBackgroundWorkState {
 
     if (
       event.type === "item/backgroundTask/progress" ||
-      event.type === "item/backgroundTask/completed"
+      event.type === "item/backgroundTask/completed" ||
+      event.type === "item/delegation/progress" ||
+      event.type === "item/delegation/completed"
     ) {
       this.setTaskOpen({
         isOpen: event.item.status === "pending",

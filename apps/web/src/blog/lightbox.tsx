@@ -9,18 +9,20 @@ export function LightboxImage({
   alt,
   className,
   loading = "lazy",
+  size: knownSize,
 }: {
   src: string;
   alt: string;
   className?: string;
   loading?: "eager" | "lazy";
+  size?: { width: number; height: number };
 }) {
   const [open, setOpen] = useState(false);
   const labelId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const size = getImageSize(src);
+  const size = knownSize ?? getImageSize(src);
 
   const close = useCallback(() => {
     setOpen(false);
@@ -44,7 +46,6 @@ export function LightboxImage({
       if (!dialog) {
         return;
       }
-      // Keep the focus inside the dialog while it covers the page.
       const items = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
       if (items.length === 0) {
         event.preventDefault();
@@ -77,7 +78,9 @@ export function LightboxImage({
       <button
         ref={triggerRef}
         type="button"
-        className={className ? `lightbox-trigger ${className}` : "lightbox-trigger"}
+        className={
+          className ? `lightbox-trigger ${className}` : "lightbox-trigger"
+        }
         onClick={() => setOpen(true)}
       >
         <img

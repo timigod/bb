@@ -1,4 +1,6 @@
 import path from "node:path";
+import { isPathWithinDirectory } from "@bb/process-utils";
+import { RootSubscription } from "./root-subscription.js";
 import { watchPathChanges } from "./watch-path.js";
 import { watchWorkspaceStatus } from "./watch-status.js";
 import type {
@@ -8,6 +10,7 @@ import type {
   ThreadStorageWatchTarget,
   WatchDataDirSkillsRootArgs,
   WatchThreadStorageRootArgs,
+  WatchPathRootArgs,
   WatchWorkspaceArgs,
 } from "./host-watcher-types.js";
 
@@ -19,11 +22,6 @@ interface ThreadStoragePathArgs {
 interface ThreadStoragePath {
   parts: string[];
   threadId: string;
-}
-
-interface DataDirSkillsPathArgs {
-  changedPath: string;
-  dataDirSkillsRootPath: string;
 }
 
 interface CollectThreadStorageObservedChangesArgs {
@@ -62,17 +60,6 @@ function toThreadStoragePath(
   };
 }
 
-function isDataDirSkillsPath(args: DataDirSkillsPathArgs): boolean {
-  const relativePath = path.relative(
-    args.dataDirSkillsRootPath,
-    args.changedPath,
-  );
-  return (
-    relativePath.length === 0 ||
-    (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
-  );
-}
-
 export function collectThreadStorageObservedChanges(
   args: CollectThreadStorageObservedChangesArgs,
 ): ThreadStorageObservedChange[] {
@@ -93,10 +80,10 @@ export function collectThreadStorageObservedChanges(
   }
 
   return Array.from(storageChanges.values()).map((target) => ({
-      kind: "thread-storage-changed",
-      environmentId: target.environmentId,
-      threadId: target.threadId,
-    }));
+    kind: "thread-storage-changed",
+    environmentId: target.environmentId,
+    threadId: target.threadId,
+  }));
 }
 
 export function collectDataDirSkillsObservedChanges(
@@ -104,10 +91,7 @@ export function collectDataDirSkillsObservedChanges(
 ): InjectedSkillsObservedChange[] {
   const changedPaths = args.changedPaths
     .filter((changedPath) =>
-      isDataDirSkillsPath({
-        changedPath,
-        dataDirSkillsRootPath: args.dataDirSkillsRootPath,
-      }),
+      isPathWithinDirectory(args.dataDirSkillsRootPath, changedPath),
     )
     .sort();
   if (changedPaths.length === 0) {
@@ -191,9 +175,39 @@ function watchDataDirSkillsRoot(
   });
 }
 
+function watchPathRoot(args: WatchPathRootArgs): () => Promise<void> {
+  const subscription = new RootSubscription({
+    rootPath: path.resolve(args.rootPath),
+    subscribeOptions:
+      args.ignoredPaths.length === 0
+        ? undefined
+        : { ignore: [...args.ignoredPaths] },
+    retryDelayMs: 250,
+    maxRetryDelayMs: 30_000,
+    onEvents: (events) => {
+      args.onChange(
+        events.map((event) => ({
+          path: path.isAbsolute(event.path)
+            ? path.normalize(event.path)
+            : path.resolve(args.rootPath, event.path),
+          type: event.type,
+        })),
+      );
+    },
+    onReady: args.onReady,
+    onDroppedEvents: args.onRescanRequired,
+    onWatchError: (message) => {
+      args.onWatchError({ rootPath: args.rootPath, message });
+    },
+  });
+  subscription.start();
+  return () => subscription.dispose();
+}
+
 export function createParcelHostWatcher(): HostWatcher {
   return {
     watchWorkspace,
+    watchPathRoot,
     watchThreadStorageRoot,
     watchDataDirSkillsRoot,
   };

@@ -1,10 +1,11 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   closeAutomationRun,
   disableAutomationsForDeletedThread,
   getAutomation,
-  getRunningAutomationRunByThread,
+  listRunningAutomationRuns,
+  listRunningAutomationRunsByThread,
   markAutomationThread,
   setAutomationEnabled,
   setAutomationRunThread,
@@ -15,15 +16,28 @@ import {
 import { publishAutomationChange } from "./realtime.js";
 import { executeStoredScript, mapScriptResultToRun } from "./script-runner.js";
 import type { AutomationExecution } from "./rpc-types.js";
+import type {
+  ProjectsSdk,
+  ScriptWorkingDirectoryResolver,
+} from "./working-directory.js";
 
-export type RunFailureHandler = (error: unknown) => void;
+type RunFailureHandler = (error: unknown) => void;
 type AgentThreadsSdk = {
-  get(args: Parameters<BbPluginApi["sdk"]["threads"]["get"]>[0]): Promise<unknown>;
-  send(args: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<unknown>;
-  spawn(args: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]): Promise<unknown>;
+  get(
+    args: Parameters<BbPluginApi["sdk"]["threads"]["get"]>[0],
+  ): Promise<unknown>;
+  send(
+    args: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0],
+  ): Promise<unknown>;
+  spawn(
+    args: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0],
+  ): Promise<unknown>;
 };
-type AgentRunApi = Pick<BbPluginApi, "realtime" | "log"> & {
+export type AgentRunApi = Pick<BbPluginApi, "realtime" | "log"> & {
   sdk: { threads: AgentThreadsSdk };
+};
+export type ScriptRunApi = Pick<BbPluginApi, "realtime" | "log"> & {
+  sdk: { projects: ProjectsSdk };
 };
 
 const sdkThreadSchema = z
@@ -31,7 +45,14 @@ const sdkThreadSchema = z
     id: z.string(),
     archivedAt: z.number().nullable(),
     deletedAt: z.number().nullable(),
-    status: z.enum(["idle", "active", "starting", "stopping", "error"]),
+    status: z.enum([
+      "pending",
+      "idle",
+      "active",
+      "starting",
+      "stopping",
+      "error",
+    ]),
   })
   .passthrough();
 type SdkThread = z.infer<typeof sdkThreadSchema>;
@@ -43,16 +64,19 @@ const projectGoneErrorSchema = z
   })
   .passthrough();
 
-function errorMessage(error: unknown): string {
+const threadGoneErrorSchema = z
+  .object({ status: z.literal(404) })
+  .passthrough();
+
+function isThreadGoneError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return threadGoneErrorSchema.safeParse(error).success;
+}
+
+export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * Thread creation rejects 404 project_not_found/project_unavailable when the
- * automation's project was deleted. Detected structurally (the SDK's
- * BbHttpError carries status + code) because the bundled plugin cannot
- * instanceof-match the host's error class.
- */
 function isProjectGoneError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return projectGoneErrorSchema.safeParse(error).success;
@@ -97,10 +121,17 @@ export async function executeAgentRun(
       await bb.sdk.threads.spawn({
         projectId: args.automation.projectId,
         environment: args.execution.environment,
-        prompt: args.execution.prompt,
+        prompt: renderAutomationDueMessage({
+          automationId: args.automation.id,
+          prompt: args.execution.prompt,
+        }),
         title: args.automation.name,
         providerId: args.execution.providerId,
         model: args.execution.model,
+        reasoningLevel: args.execution.reasoningLevel,
+        ...(args.execution.serviceTier === undefined
+          ? {}
+          : { serviceTier: args.execution.serviceTier }),
         permissionMode: args.execution.permissionMode,
       }),
     );
@@ -121,12 +152,6 @@ export async function executeAgentRun(
   }
 }
 
-/**
- * Failure policy for agent dispatch: a deleted project is terminal (the
- * project never comes back), so disable the automation and close the run
- * instead of invoking the caller's rollback — which would re-arm the past
- * next_run_at and fail again every sweep.
- */
 function settleDispatchFailure(
   bb: Pick<BbPluginApi, "log">,
   db: Db,
@@ -167,6 +192,7 @@ async function reuseTargetThreadForRun(
       await bb.sdk.threads.get({ threadId: args.targetThreadId }),
     );
   } catch (error) {
+    if (!isThreadGoneError(error)) throw error;
     closeRunForUnusableTargetThread(bb, db, {
       ...args,
       detail: errorMessage(error),
@@ -209,12 +235,6 @@ async function reuseTargetThreadForRun(
   });
 }
 
-/**
- * The target thread is gone or unusable — a deliberate disable, not a
- * transient dispatch failure: close the run failed and leave the automation
- * disabled instead of invoking the schedule rollback (which would re-enable
- * and re-arm it).
- */
 function closeRunForUnusableTargetThread(
   bb: Pick<BbPluginApi, "log">,
   db: Db,
@@ -237,7 +257,7 @@ function closeRunForUnusableTargetThread(
 }
 
 export async function executeScriptRun(
-  bb: Pick<BbPluginApi, "realtime" | "log">,
+  bb: ScriptRunApi,
   db: Db,
   args: {
     pluginDataDir: string;
@@ -246,6 +266,7 @@ export async function executeScriptRun(
     execution: Extract<AutomationExecution, { mode: "script" }>;
     onFailure: RunFailureHandler;
     serverUrl: string;
+    resolveWorkingDirectory: ScriptWorkingDirectoryResolver;
   },
 ): Promise<void> {
   try {
@@ -259,6 +280,15 @@ export async function executeScriptRun(
       });
       return;
     }
+    const workingDir = await args.resolveWorkingDirectory(
+      args.automation.projectId,
+      args.execution.workingDirectory,
+    );
+    if (workingDir === null) {
+      throw new Error(
+        `Project ${args.automation.projectId} has no source on the bb server host`,
+      );
+    }
     const result = await executeStoredScript({
       pluginDataDir: args.pluginDataDir,
       automationId: args.automation.id,
@@ -269,10 +299,9 @@ export async function executeScriptRun(
       timeoutMs: args.execution.timeoutMs,
       env: args.execution.env,
       serverUrl: args.serverUrl,
+      workingDir,
     });
     const mapped = mapScriptResultToRun(result);
-    // Close with the completion time, not dispatch time — scripts run for
-    // up to 15 minutes and the duration surfaces in the run history.
     closeAutomationRun(db, {
       runId: args.run.id,
       status: mapped.status,
@@ -300,22 +329,124 @@ export function closeAutomationRunForSettledThread(
   db: Db,
   args: { threadId: string; status: "idle" | "failed"; error?: string | null },
 ): void {
-  const run = getRunningAutomationRunByThread(db, args.threadId);
-  if (!run) return;
-  const closed = closeAutomationRun(db, {
-    runId: run.id,
-    status: args.status === "idle" ? "succeeded" : "failed",
-    error: args.status === "idle" ? null : (args.error ?? "Turn failed"),
-    threadId: args.threadId,
-    now: Date.now(),
-  });
-  if (!closed) return;
-  const automation = getAutomation(db, closed.automationId);
-  if (automation) {
-    publishAutomationChange(bb, automation.projectId, [
+  const runs = listRunningAutomationRunsByThread(db, args.threadId);
+  const now = Date.now();
+  const changedProjects = new Set<string>();
+  for (const run of runs) {
+    const closed = closeAutomationRun(db, {
+      runId: run.id,
+      status: args.status === "idle" ? "succeeded" : "failed",
+      error: args.status === "idle" ? null : (args.error ?? "Turn failed"),
+      threadId: args.threadId,
+      now,
+    });
+    if (!closed) continue;
+    const automation = getAutomation(db, closed.automationId);
+    if (automation) changedProjects.add(automation.projectId);
+  }
+  for (const projectId of changedProjects) {
+    publishAutomationChange(bb, projectId, [
       "automations-changed",
       "automation-runs-changed",
     ]);
+  }
+}
+
+type ReconcileOutcome =
+  | { status: "succeeded" }
+  | { status: "failed"; error: string }
+  | { status: "skipped"; skipReason: string };
+
+export async function reconcileRunningAutomationRuns(
+  bb: AgentRunApi,
+  db: Db,
+): Promise<void> {
+  const changedProjects = new Set<string>();
+  for (const run of listRunningAutomationRuns(db)) {
+    const outcome = await reconcileOutcome(bb, run);
+    if (outcome === null) continue;
+    const closed = closeAutomationRun(db, {
+      runId: run.id,
+      ...outcome,
+      now: Date.now(),
+    });
+    if (!closed) continue;
+    const automation = getAutomation(db, closed.automationId);
+    if (automation) changedProjects.add(automation.projectId);
+    bb.log.info(
+      `Automation run ${run.id} settled as ${outcome.status} on startup: ${
+        outcome.status === "succeeded"
+          ? "its thread is idle"
+          : outcome.status === "failed"
+            ? outcome.error
+            : outcome.skipReason
+      }`,
+    );
+  }
+  for (const projectId of changedProjects) {
+    publishAutomationChange(bb, projectId, [
+      "automations-changed",
+      "automation-runs-changed",
+    ]);
+  }
+}
+
+async function reconcileOutcome(
+  bb: AgentRunApi,
+  run: AutomationRunRow,
+): Promise<ReconcileOutcome | null> {
+  if (run.runMode === "script") {
+    return {
+      status: "skipped",
+      skipReason:
+        "interrupted: the server restarted while the script was running",
+    };
+  }
+  if (run.threadId === null) {
+    return {
+      status: "skipped",
+      skipReason:
+        "interrupted: the server restarted before a thread was attached",
+    };
+  }
+  let thread: SdkThread;
+  try {
+    thread = sdkThreadSchema.parse(
+      await bb.sdk.threads.get({ threadId: run.threadId }),
+    );
+  } catch (error) {
+    if (isThreadGoneError(error)) {
+      return {
+        status: "skipped",
+        skipReason: `interrupted: thread ${run.threadId} no longer exists`,
+      };
+    }
+    bb.log.warn(
+      `Could not check thread ${run.threadId} for running automation run ${run.id}; leaving it running: ${errorMessage(error)}`,
+    );
+    return null;
+  }
+  if (thread.deletedAt !== null || thread.archivedAt !== null) {
+    return {
+      status: "skipped",
+      skipReason: `interrupted: thread ${run.threadId} was ${
+        thread.deletedAt !== null ? "deleted" : "archived"
+      }`,
+    };
+  }
+  switch (thread.status) {
+    case "idle":
+      return { status: "succeeded" };
+    case "error":
+      return {
+        status: "failed",
+        error: "Turn failed while the automations plugin was not running",
+      };
+    case "pending":
+    case "starting":
+    case "active":
+    case "stopping":
+      return null;
   }
 }
 

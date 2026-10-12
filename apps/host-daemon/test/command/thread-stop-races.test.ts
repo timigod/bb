@@ -1,25 +1,31 @@
+import { readFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { writeFile } from "node:fs/promises";
-import type {
-  AgentRuntime,
-  AgentRuntimeProcessExitInfo,
+import { fileURLToPath } from "node:url";
+import {
+  createAgentRuntime,
+  type AgentRuntime,
+  type AgentRuntimeProcessExitInfo,
 } from "@bb/agent-runtime";
 import {
-  createAgentRuntimeWithAdapters,
-  createFakeAdapter,
-  type ProviderAdapter,
-  type ProviderAdapterFactory,
+  createScriptedEchoRequestRecord,
+  type ScriptedEchoLaunchScript,
+  type ScriptedEchoRequestRecord,
 } from "@bb/agent-runtime/test";
+import { buildPluginHost, resolvePluginBuildToolchain } from "@bb/plugin-build";
 import {
   encodeClientTurnRequestIdNumber,
   type ClientTurnRequestId,
   type ThreadEvent,
 } from "@bb/domain";
-import type { HostDaemonOnlineRpcResponseMessage } from "@bb/host-daemon-contract";
+import type {
+  HostDaemonBridgeLaunch,
+  HostDaemonOnlineRpcResponseMessage,
+} from "@bb/host-daemon-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { dispatchCommand } from "../../src/command-dispatch.js";
 import {
-  noopEventSink,
+  resolveRuntimeBridgeLaunch,
   type CommandDispatchOptions,
   type CommandOf,
 } from "../../src/command-dispatch-support.js";
@@ -30,33 +36,22 @@ import {
   createFakeWorkspace,
   makeDispatchOptions,
   makeTempDir,
+  noopEventSink,
   unexpectedProjectAttachmentFetch,
+  unexpectedProviderMaintenance,
+  fetchDispatchTestArtifact,
 } from "./dispatch-helpers.js";
-
-/**
- * Race coverage for the thread.stop dispatch flow against the REAL agent
- * runtime (fake provider adapter, real provider subprocess): the stop wait is
- * event-driven via runtime.waitForActiveTurn, crash clearing is owned by the
- * runtime, and repeated stops are idempotent.
- */
 
 const ENVIRONMENT_ID = "env-stop-race";
 const THREAD_STOP_ACTIVE_TURN_WAIT_MS = 5_000;
 
-type RecordedAdapterCommand = Parameters<
-  ProviderAdapter["buildCommandPlan"]
->[0];
-
-interface RaceHarnessArgs {
-  adapterFactory?: ProviderAdapterFactory;
-}
-
 interface RaceHarness {
   dispatchOptions: CommandDispatchOptions;
   events: ThreadEvent[];
-  exits: AgentRuntimeProcessExitInfo[];
+  launch: HostDaemonBridgeLaunch;
   manager: RuntimeManager;
-  recordedCommands: RecordedAdapterCommand[];
+  unexpectedProcessExit: Promise<AgentRuntimeProcessExitInfo>;
+  record: ScriptedEchoRequestRecord;
   requireRuntime: () => AgentRuntime;
   workspacePath: string;
 }
@@ -65,54 +60,13 @@ interface ThreadStartArgs {
   threadId: string;
   providerId?: string;
   inputText?: string;
+  bridgeLaunch?: HostDaemonBridgeLaunch;
 }
 
 interface TurnSubmitArgs {
   threadId: string;
   inputText: string;
 }
-
-const CRASH_MID_TURN_PROVIDER_SCRIPT = `
-const readline = require("node:readline");
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
-    return;
-  }
-  if (message.method === "thread/start") {
-    const threadId = message.params.threadId;
-    send({
-      jsonrpc: "2.0",
-      id: message.id,
-      result: { providerThreadId: "prov-crash" },
-    });
-    send({
-      jsonrpc: "2.0",
-      method: "thread/identity",
-      params: { threadId, providerThreadId: "prov-crash" },
-    });
-    return;
-  }
-  if (message.method === "turn/start") {
-    const threadId = message.params.threadId;
-    send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
-    send({
-      jsonrpc: "2.0",
-      method: "turn/started",
-      params: { threadId, turnId: "turn-1", providerThreadId: "prov-crash" },
-    });
-    // Die mid-turn, after the turn/started handoff has been flushed.
-    setTimeout(() => process.exit(1), 50);
-  }
-});
-`;
 
 const managers: RuntimeManager[] = [];
 let nextClientRequestIdValue = 1;
@@ -132,47 +86,84 @@ function nextClientRequestId(): ClientTurnRequestId {
   return requestId;
 }
 
-function withRecordedCommands(
-  adapter: ProviderAdapter,
-  recordedCommands: RecordedAdapterCommand[],
-): ProviderAdapter {
-  return {
-    ...adapter,
-    buildCommandPlan(command) {
-      recordedCommands.push(command);
-      return adapter.buildCommandPlan(command);
-    },
-  };
-}
-
-/** Lets queued microtasks (the dispatch chain up to its turn waiter) run. */
 function flushMicrotasks(): Promise<void> {
   return new Promise((resolve) => {
     setImmediate(resolve);
   });
 }
 
-async function createRaceHarness(
-  args: RaceHarnessArgs = {},
-): Promise<RaceHarness> {
+let scriptedEchoArtifact: Promise<{
+  bytes: Uint8Array;
+  digest: string;
+}> | null = null;
+
+function buildScriptedEchoArtifact(): Promise<{
+  bytes: Uint8Array;
+  digest: string;
+}> {
+  scriptedEchoArtifact ??= (async () => {
+    const rootDir = fileURLToPath(
+      new URL("../../../../tests/scripted-echo-provider", import.meta.url),
+    );
+    const toolchain = await resolvePluginBuildToolchain(
+      path.join(os.tmpdir(), "bb-plugin-build-toolchain"),
+    );
+    const build = await buildPluginHost(rootDir, "0.0.0-test", toolchain);
+    return {
+      bytes: await readFile(build.jsPath),
+      digest: build.artifactDigest,
+    };
+  })();
+  return scriptedEchoArtifact;
+}
+
+async function scriptedEchoDispatchLaunch(
+  options: { pluginId?: string; scripted?: ScriptedEchoLaunchScript } = {},
+): Promise<HostDaemonBridgeLaunch> {
+  const artifact = await buildScriptedEchoArtifact();
+  return {
+    pluginId: options.pluginId ?? "provider-scripted-echo",
+    source: {
+      kind: "artifact",
+      digest: artifact.digest,
+      byteLength: artifact.bytes.byteLength,
+    },
+    providerOptions:
+      options.scripted === undefined
+        ? {}
+        : { scripted: JSON.parse(JSON.stringify(options.scripted)) },
+    envPassthrough: [],
+    capabilities: {
+      providerInstallation: false,
+      supportsServiceTier: false,
+      permissionModes: ["accept-edits", "auto", "full"],
+      supportsThreadArchive: true,
+      supportsThreadRename: true,
+      fork: "checkpoint",
+    },
+  };
+}
+
+async function createRaceHarness(): Promise<RaceHarness> {
   const workspacePath = await makeTempDir("bb-stop-race-workspace-");
   const events: ThreadEvent[] = [];
-  const exits: AgentRuntimeProcessExitInfo[] = [];
-  const recordedCommands: RecordedAdapterCommand[] = [];
-  const adapterFactory: ProviderAdapterFactory =
-    args.adapterFactory ?? (() => createFakeAdapter());
+  const record = createScriptedEchoRequestRecord();
+  let resolveUnexpectedProcessExit: (
+    info: AgentRuntimeProcessExitInfo,
+  ) => void = () => undefined;
+  const unexpectedProcessExit = new Promise<AgentRuntimeProcessExitInfo>(
+    (resolve) => {
+      resolveUnexpectedProcessExit = resolve;
+    },
+  );
   let runtime: AgentRuntime | null = null;
   const manager = new RuntimeManager({
     provisionWorkspace: async () =>
       createFakeWorkspace(workspacePath).workspace,
     createRuntime: (options) => {
-      runtime = createAgentRuntimeWithAdapters({
+      runtime = createAgentRuntime({
         ...options,
-        adapterFactory: (providerId, factoryOptions) =>
-          withRecordedCommands(
-            adapterFactory(providerId, factoryOptions),
-            recordedCommands,
-          ),
+        env: { ...options.env, ...record.env },
       });
       return runtime;
     },
@@ -180,23 +171,37 @@ async function createRaceHarness(
       events.push(event);
     },
     onProcessExit: (info) => {
-      exits.push(info);
+      if (!info.expected) {
+        resolveUnexpectedProcessExit(info);
+      }
     },
   });
   managers.push(manager);
 
+  const artifact = await buildScriptedEchoArtifact();
+  const dataDir = await makeTempDir("bb-stop-race-daemon-data-");
   return {
-    dispatchOptions: makeDispatchOptions({ runtimeManager: manager }),
+    dispatchOptions: makeDispatchOptions({
+      runtimeManager: manager,
+      dataDir,
+      fetchPluginHostArtifact: async ({ digest }) => {
+        if (digest !== artifact.digest) {
+          throw new Error(`unknown plugin host artifact ${digest}`);
+        }
+        return artifact.bytes;
+      },
+    }),
     events,
-    exits,
+    launch: await scriptedEchoDispatchLaunch(),
     manager,
-    recordedCommands,
+    record,
     requireRuntime: () => {
       if (!runtime) {
         throw new Error("Runtime has not been created yet");
       }
       return runtime;
     },
+    unexpectedProcessExit,
     workspacePath,
   };
 }
@@ -206,12 +211,12 @@ function threadStartCommand(
   args: ThreadStartArgs,
 ): CommandOf<"thread.start"> {
   return {
+    bridgeLaunch: args.bridgeLaunch ?? harness.launch,
     type: "thread.start",
     environmentId: ENVIRONMENT_ID,
     threadId: args.threadId,
     workspaceContext: {
       workspacePath: harness.workspacePath,
-      workspaceProvisionType: "unmanaged",
     },
     projectId: "project-stop-race",
     providerId: args.providerId ?? "fake",
@@ -224,7 +229,7 @@ function threadStartCommand(
       model: "fake-model",
       serviceTier: "default",
       reasoningLevel: "medium",
-      workflowsEnabled: false,
+      providerOptions: {},
       permissionMode: "full",
       permissionScope: "full",
       approvalReviewer: null,
@@ -232,6 +237,7 @@ function threadStartCommand(
     },
     instructions: "Be a helpful coding agent.",
     dynamicTools: [],
+    contributedEnv: [],
     injectedSkillSources: [],
     instructionMode: "append",
   };
@@ -242,6 +248,7 @@ function turnSubmitCommand(
   args: TurnSubmitArgs,
 ): CommandOf<"turn.submit"> {
   return {
+    bridgeLaunch: harness.launch,
     type: "turn.submit",
     environmentId: ENVIRONMENT_ID,
     threadId: args.threadId,
@@ -251,22 +258,23 @@ function turnSubmitCommand(
       model: "fake-model",
       serviceTier: "default",
       reasoningLevel: "medium",
-      workflowsEnabled: false,
+      providerOptions: {},
       permissionMode: "full",
       permissionScope: "full",
       approvalReviewer: null,
       permissionEscalation: null,
     },
     resumeContext: {
+      bridgeLaunch: harness.launch,
       workspaceContext: {
         workspacePath: harness.workspacePath,
-        workspaceProvisionType: "unmanaged",
       },
       projectId: "project-stop-race",
       providerId: "fake",
       providerThreadId: "prov-1",
       instructions: "Be a helpful coding agent.",
       dynamicTools: [],
+      contributedEnv: [],
       injectedSkillSources: [],
       instructionMode: "append",
     },
@@ -277,15 +285,17 @@ function turnSubmitCommand(
 function threadStopCommand(threadId: string): CommandOf<"thread.stop"> {
   return {
     type: "thread.stop",
+    intent: "interrupt",
     environmentId: ENVIRONMENT_ID,
     threadId,
   };
 }
 
-function recordedThreadStops(harness: RaceHarness): RecordedAdapterCommand[] {
-  return harness.recordedCommands.filter(
-    (command) => command.type === "thread/stop",
-  );
+function recordedThreadStops(harness: RaceHarness): Record<string, unknown>[] {
+  return harness.record
+    .read()
+    .filter((request) => request.method === "thread/stop")
+    .map((request) => request.params ?? {});
 }
 
 function routerStop(
@@ -312,8 +322,6 @@ describe("thread.stop race semantics", () => {
     expect(runtime.hasThread("t-race")).toBe(true);
     expect(runtime.getActiveTurnId("t-race")).toBeNull();
 
-    // Stop arrives while no turn is active yet: it must wait for the
-    // turn/started observation, not poll and not give up.
     const stopPromise = dispatchCommand(
       threadStopCommand("t-race"),
       harness.dispatchOptions,
@@ -321,7 +329,6 @@ describe("thread.stop race semantics", () => {
     await flushMicrotasks();
     expect(recordedThreadStops(harness)).toHaveLength(0);
 
-    // The turn now starts; its turn/started observation must release the stop.
     const submitPromise = dispatchCommand(
       turnSubmitCommand(harness, {
         threadId: "t-race",
@@ -330,12 +337,12 @@ describe("thread.stop race semantics", () => {
       harness.dispatchOptions,
     );
     await expect(stopPromise).resolves.toEqual({ providerCheckpointId: null });
-    await expect(submitPromise).resolves.toEqual({ appliedAs: "new-turn" });
+    await expect(submitPromise).resolves.toEqual({ trace: { spans: [] } });
 
     expect(recordedThreadStops(harness)).toEqual([
       expect.objectContaining({
-        type: "thread/stop",
         threadId: "t-race",
+        intent: "interrupt",
         activeTurnId: "turn-1",
       }),
     ]);
@@ -359,8 +366,6 @@ describe("thread.stop race semantics", () => {
     const runtime = harness.requireRuntime();
     expect(runtime.getActiveTurnId("t-idle")).toBeNull();
 
-    // No turn ever starts, so the stop waits the full timeout. Fake timers
-    // advance past it without spending the 5s in test time.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const stopPromise = dispatchCommand(
       threadStopCommand("t-idle"),
@@ -371,11 +376,10 @@ describe("thread.stop race semantics", () => {
     vi.useRealTimers();
 
     await expect(stopPromise).resolves.toEqual({ providerCheckpointId: null });
-    // The stop reached the provider as a no-turn stop and released the thread.
     expect(recordedThreadStops(harness)).toEqual([
       expect.objectContaining({
-        type: "thread/stop",
         threadId: "t-idle",
+        intent: "release",
         activeTurnId: null,
       }),
     ]);
@@ -386,54 +390,46 @@ describe("thread.stop race semantics", () => {
   });
 
   it("clears the active turn when the provider crashes mid-turn so a later stop noops", async () => {
-    const crashDir = await makeTempDir("bb-stop-race-crash-");
-    const crashScriptPath = path.join(crashDir, "crash-mid-turn-provider.cjs");
-    await writeFile(crashScriptPath, CRASH_MID_TURN_PROVIDER_SCRIPT, "utf8");
-    const harness = await createRaceHarness({
-      adapterFactory: (providerId) =>
-        providerId === "crasher"
-          ? createFakeAdapter({ id: "crasher", scriptPath: crashScriptPath })
-          : createFakeAdapter(),
+    const harness = await createRaceHarness();
+    const crasherLaunch = await scriptedEchoDispatchLaunch({
+      pluginId: "provider-crasher",
+      scripted: { exitAfter: "turn/start" },
     });
-    // A healthy sibling provider keeps the environment entry alive across
-    // the crash, so the follow-up stop exercises the dispatch path.
-    await dispatchCommand(
-      threadStartCommand(harness, { threadId: "t-healthy" }),
+    const entry = await harness.manager.ensureEnvironment({
+      environmentId: ENVIRONMENT_ID,
+      workspacePath: harness.workspacePath,
+    });
+    const healthyLaunch = await resolveRuntimeBridgeLaunch(
+      harness.launch,
       harness.dispatchOptions,
     );
-    await dispatchCommand(
+    const healthyStart = entry.runtime.ensureProvider({
+      providerId: "fake",
+      bridgeLaunch: healthyLaunch,
+    });
+    const crashStart = dispatchCommand(
       threadStartCommand(harness, {
         threadId: "t-crash",
         providerId: "crasher",
         inputText: "boom",
+        bridgeLaunch: crasherLaunch,
       }),
       harness.dispatchOptions,
     );
-    const runtime = harness.requireRuntime();
+    await Promise.all([healthyStart, crashStart]);
 
-    await vi.waitFor(
-      () => {
-        expect(
-          harness.exits.some((info) => info.providerId === "crasher"),
-        ).toBe(true);
-      },
-      { timeout: 5_000 },
-    );
-    const crashExit = harness.exits.find(
-      (info) => info.providerId === "crasher",
-    );
-    // The exit snapshot proves the thread was mid-turn when the process died.
-    expect(crashExit?.threads).toEqual([
+    const crashExit = await harness.unexpectedProcessExit;
+    expect(crashExit.providerId).toBe("crasher");
+    expect(crashExit.threads).toEqual([
       expect.objectContaining({
         threadId: "t-crash",
-        providerThreadId: "prov-crash",
-        activeTurnId: "turn-1",
+        providerThreadId: "prov-1",
+        activeTurnId: expect.any(String),
       }),
     ]);
-    // The runtime's own exit handling is the only clearing of that state.
+    const runtime = harness.requireRuntime();
     expect(runtime.getActiveTurnId("t-crash")).toBeNull();
     expect(runtime.hasThread("t-crash")).toBe(false);
-    // The daemon synthesized the failure for the orphaned turn.
     expect(harness.events).toContainEqual(
       expect.objectContaining({
         type: "turn/completed",
@@ -441,11 +437,11 @@ describe("thread.stop race semantics", () => {
         status: "failed",
       }),
     );
+    expect(await harness.manager.getOrAwait(ENVIRONMENT_ID)).toBe(entry);
 
     await expect(
       dispatchCommand(threadStopCommand("t-crash"), harness.dispatchOptions),
     ).resolves.toEqual({ providerCheckpointId: null });
-    // The stop never reached a provider: the crashed thread is unknown.
     expect(recordedThreadStops(harness)).toHaveLength(0);
   });
 
@@ -455,6 +451,8 @@ describe("thread.stop race semantics", () => {
       dataDir: "/tmp/bb-stop-race-data",
       eventSink: noopEventSink,
       fetchProjectAttachment: unexpectedProjectAttachmentFetch,
+      fetchPluginHostArtifact: fetchDispatchTestArtifact,
+      ...unexpectedProviderMaintenance,
       logger: { debug: () => undefined, warn: () => undefined },
       runtimeManager: harness.manager,
       threadStorageRootPath: "/tmp/bb-stop-race-thread-storage",
@@ -469,7 +467,7 @@ describe("thread.stop race semantics", () => {
     const runtime = harness.requireRuntime();
     await vi.waitFor(
       () => {
-        expect(runtime.getActiveTurnId("t-double")).toBe("turn-1");
+        expect(runtime.getActiveTurnId("t-double")).not.toBeNull();
       },
       { timeout: 5_000 },
     );
@@ -481,8 +479,6 @@ describe("thread.stop race semantics", () => {
 
     expect(firstStop.ok).toBe(true);
     expect(secondStop.ok).toBe(true);
-    // Only one stop reached the provider; the loser saw the thread already
-    // forgotten and nooped.
     expect(recordedThreadStops(harness)).toHaveLength(1);
     expect(
       harness.events.filter(

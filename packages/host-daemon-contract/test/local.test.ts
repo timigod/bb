@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   HOST_DAEMON_PROTOCOL_VERSION,
   PATHS_EXIST_MAX_PATHS,
+  hostAuthStateSchema,
   hostPlatformSchema,
   pathsExistRequestSchema,
   pathsExistResponseSchema,
@@ -11,15 +12,35 @@ import {
   statusResponseSchema,
 } from "../src/index.js";
 
+describe("hostAuthStateSchema", () => {
+  it("persists host identity without a host type", () => {
+    expect(
+      hostAuthStateSchema.parse({
+        hostId: "host_modal",
+        hostKey: "secret",
+      }),
+    ).toEqual({
+      hostId: "host_modal",
+      hostKey: "secret",
+    });
+  });
+});
+
 describe("hostPlatformSchema", () => {
   it("accepts the supported platform values", () => {
-    for (const value of ["darwin", "linux", "wsl", "unknown"] as const) {
+    for (const value of [
+      "darwin",
+      "linux",
+      "wsl",
+      "win32",
+      "unknown",
+    ] as const) {
       expect(hostPlatformSchema.parse(value)).toBe(value);
     }
   });
 
   it("rejects other strings", () => {
-    expect(() => hostPlatformSchema.parse("win32")).toThrow();
+    expect(() => hostPlatformSchema.parse("freebsd")).toThrow();
     expect(() => hostPlatformSchema.parse("")).toThrow();
   });
 });
@@ -110,13 +131,12 @@ describe("provider CLI schemas", () => {
           installAction: {
             kind: "install",
             label: "Install",
-            commandKind: "exec",
             command: "npm install -g @openai/codex@latest",
           },
           needsUpdate: false,
           versionUnsupported: false,
         },
-        claudeCode: {
+        "claude-code": {
           displayName: "Claude Code",
           executableName: "claude",
           executablePath: "/opt/homebrew/bin/claude",
@@ -130,13 +150,12 @@ describe("provider CLI schemas", () => {
           installAction: {
             kind: "update",
             label: "Update",
-            commandKind: "exec",
             command: "claude update",
           },
           needsUpdate: true,
           versionUnsupported: false,
         },
-        cursor: {
+        "acp-cursor": {
           displayName: "Cursor",
           executableName: "agent",
           executablePath: null,
@@ -150,14 +169,13 @@ describe("provider CLI schemas", () => {
           installAction: {
             kind: "install",
             label: "Install",
-            commandKind: "shell",
             command:
               'tmp=$(mktemp "${TMPDIR:-/tmp}/provider-cli-install.XXXXXX") && trap \'rm -f "$tmp"\' EXIT && curl -fsSL https://cursor.com/install -o "$tmp" && bash "$tmp"',
           },
           needsUpdate: false,
           versionUnsupported: false,
         },
-      }).claudeCode.needsUpdate,
+      })["claude-code"].needsUpdate,
     ).toBe(true);
 
     expect(
@@ -176,13 +194,12 @@ describe("provider CLI schemas", () => {
           installAction: {
             kind: "update",
             label: "Update",
-            commandKind: "exec",
             command: "codex update",
           },
           needsUpdate: false,
           versionUnsupported: true,
         },
-        claudeCode: {
+        "claude-code": {
           displayName: "Claude Code",
           executableName: "claude",
           executablePath: null,
@@ -196,14 +213,13 @@ describe("provider CLI schemas", () => {
           installAction: {
             kind: "install",
             label: "Install",
-            commandKind: "shell",
             command:
               'tmp=$(mktemp "${TMPDIR:-/tmp}/provider-cli-install.XXXXXX") && trap \'rm -f "$tmp"\' EXIT && curl -fsSL https://claude.ai/install.sh -o "$tmp" && bash "$tmp"',
           },
           needsUpdate: false,
           versionUnsupported: false,
         },
-        cursor: {
+        "acp-cursor": {
           displayName: "Cursor",
           executableName: "agent",
           executablePath: "/Users/me/.local/bin/agent",
@@ -218,8 +234,8 @@ describe("provider CLI schemas", () => {
           needsUpdate: false,
           versionUnsupported: false,
         },
-      }).claudeCode.installAction,
-    ).toMatchObject({ commandKind: "shell" });
+      })["claude-code"].installAction,
+    ).toMatchObject({ kind: "install" });
   });
 
   it("accepts install requests and streamed install events", () => {
@@ -232,7 +248,7 @@ describe("provider CLI schemas", () => {
     expect(
       providerCliInstallEventSchema.parse({
         type: "output",
-        provider: "claudeCode",
+        provider: "claude-code",
         stream: "stderr",
         text: "installing\n",
       }),

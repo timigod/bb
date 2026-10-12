@@ -1,4 +1,4 @@
-function oneLine(value: unknown): string {
+export function oneLine(value: unknown): string {
   return String(value ?? "")
     .replace(/[\r\n\t]+/gu, " ")
     .replace(/\s+/gu, " ")
@@ -43,8 +43,4 @@ export function bytes(value: number): string {
   if (value < 1_024) return `${value} B`;
   if (value < 1_024 * 1_024) return `${(value / 1_024).toFixed(1)} KB`;
   return `${(value / (1_024 * 1_024)).toFixed(1)} MB`;
-}
-
-export function json(value: unknown): string {
-  return JSON.stringify(value);
 }

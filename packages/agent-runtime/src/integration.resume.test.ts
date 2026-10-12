@@ -1,5 +1,3 @@
-/** Provider integration tests using createAgentRuntime. */
-
 import { describe, expect, it } from "vitest";
 import type { ThreadEvent } from "@bb/domain";
 import {
@@ -24,10 +22,9 @@ const CODEX_PING_REQUIRED_INSTRUCTIONS =
 
 for (const providerId of providers) {
   describe.concurrent(`${providerId} provider`, () => {
-    // 9. Resumes a thread across process lifetimes.
     it("resumes a thread across process lifetimes", async () => {
       const ctx1 = createTestRuntime(providerId);
-      let providerThreadId: string | undefined;
+      let providerThreadId: string;
       let firstRuntimeEvents: ThreadEvent[] = [];
       const firstThreadId = newThreadId();
       let ctx1Shutdown = false;
@@ -46,7 +43,7 @@ for (const providerId of providers) {
           options,
         });
 
-        providerThreadId = startResult.providerThreadId || undefined;
+        providerThreadId = startResult.providerThreadId;
 
         await ctx1.runtime.runTurn({
           clientRequestId: "creq_2222222222",
@@ -67,22 +64,9 @@ for (const providerId of providers) {
         });
         firstRuntimeEvents = [...ctx1.events];
 
-        // Capture providerThreadId from thread/identity event if the response
-        // didn't include one (claude-code sends it asynchronously).
-        if (!providerThreadId) {
-          const identityEvent = ctx1.events.find(
-            (e) => e.type === "thread/identity",
-          );
-          if (identityEvent && identityEvent.type === "thread/identity") {
-            providerThreadId = identityEvent.providerThreadId;
-          }
-        }
-
-        // Shutdown first runtime (simulates process death)
         await ctx1.runtime.shutdown();
         ctx1Shutdown = true;
 
-        // Create a new runtime and attempt to resume in the same workspace.
         const ctx2 = createTestRuntime(providerId, {
           workspacePath: ctx1.tmpDir,
         });
@@ -137,7 +121,6 @@ for (const providerId of providers) {
 }
 
 describe.concurrent("codex resume scenarios", () => {
-  // Resume with dynamic tools
   it("preserves dynamic tools across resume", async () => {
     const providerId = "codex";
     let toolCalledInRuntime1 = false;
@@ -155,7 +138,6 @@ describe.concurrent("codex resume scenarios", () => {
       },
     ];
 
-    // Runtime 1: start thread with dynamic tools, run a turn using the tool
     const ctx1 = createTestRuntime(providerId, {
       onToolCall: async (req) => {
         if (req.tool === "bb_test_ping") {
@@ -172,7 +154,7 @@ describe.concurrent("codex resume scenarios", () => {
       },
     });
 
-    let providerThreadId: string | undefined;
+    let providerThreadId: string;
     const firstThreadId = newThreadId();
 
     try {
@@ -190,7 +172,7 @@ describe.concurrent("codex resume scenarios", () => {
         dynamicTools,
       });
 
-      providerThreadId = startResult.providerThreadId || undefined;
+      providerThreadId = startResult.providerThreadId;
 
       await ctx1.runtime.runTurn({
         clientRequestId: "creq_2222222224",
@@ -216,15 +198,6 @@ describe.concurrent("codex resume scenarios", () => {
         label: "runtime 1 turn/completed",
       });
 
-      if (!providerThreadId) {
-        const identityEvent = ctx1.events.find(
-          (e) => e.type === "thread/identity",
-        );
-        if (identityEvent && identityEvent.type === "thread/identity") {
-          providerThreadId = identityEvent.providerThreadId;
-        }
-      }
-
       await ctx1.runtime.shutdown();
     } finally {
       cleanup(ctx1);
@@ -232,7 +205,6 @@ describe.concurrent("codex resume scenarios", () => {
 
     expect(toolCalledInRuntime1).toBe(true);
 
-    // Runtime 2: resume thread with same dynamic tools, run a turn asking to use the tool again
     const ctx2 = createTestRuntime(providerId, {
       onToolCall: async (req) => {
         if (req.tool === "bb_test_ping") {
@@ -269,7 +241,9 @@ describe.concurrent("codex resume scenarios", () => {
         clientRequestId: "creq_2222222225",
         threadId,
         input: [
-          promptTextInput({ text: "Call the bb_test_ping tool again right now." }),
+          promptTextInput({
+            text: "Call the bb_test_ping tool again right now.",
+          }),
         ],
         options,
       });
@@ -289,13 +263,11 @@ describe.concurrent("codex resume scenarios", () => {
     }
   }, 45_000);
 
-  // Memory across resumes
   it("recalls information after resume", async () => {
     const providerId = "codex";
 
-    // Runtime 1: start thread, ask to remember a word
     const ctx1 = createTestRuntime(providerId);
-    let providerThreadId: string | undefined;
+    let providerThreadId: string;
     const firstThreadId = newThreadId();
 
     try {
@@ -312,7 +284,7 @@ describe.concurrent("codex resume scenarios", () => {
         options,
       });
 
-      providerThreadId = startResult.providerThreadId || undefined;
+      providerThreadId = startResult.providerThreadId;
 
       await ctx1.runtime.runTurn({
         clientRequestId: "creq_2222222226",
@@ -332,21 +304,11 @@ describe.concurrent("codex resume scenarios", () => {
         label: "runtime 1 turn/completed",
       });
 
-      if (!providerThreadId) {
-        const identityEvent = ctx1.events.find(
-          (e) => e.type === "thread/identity",
-        );
-        if (identityEvent && identityEvent.type === "thread/identity") {
-          providerThreadId = identityEvent.providerThreadId;
-        }
-      }
-
       await ctx1.runtime.shutdown();
     } finally {
       cleanup(ctx1);
     }
 
-    // Runtime 2: resume thread, ask what the word was
     const ctx2 = createTestRuntime(providerId);
     try {
       const threadId = newThreadId();
@@ -389,7 +351,6 @@ describe.concurrent("codex resume scenarios", () => {
     }
   }, 45_000);
 
-  // Memory + dynamic tools across runtime shutdown
   it(
     "preserves memory and dynamic tools across runtime restart",
     async () => {
@@ -409,7 +370,6 @@ describe.concurrent("codex resume scenarios", () => {
         },
       ];
 
-      // Runtime 1: start thread, remember word and call tool
       const ctx1 = createTestRuntime(providerId, {
         onToolCall: async (req) => {
           if (req.tool === "bb_test_ping") {
@@ -426,7 +386,7 @@ describe.concurrent("codex resume scenarios", () => {
         },
       });
 
-      let providerThreadId: string | undefined;
+      let providerThreadId: string;
       const firstThreadId = newThreadId();
 
       try {
@@ -445,7 +405,7 @@ describe.concurrent("codex resume scenarios", () => {
           dynamicTools,
         });
 
-        providerThreadId = startResult.providerThreadId || undefined;
+        providerThreadId = startResult.providerThreadId;
 
         await ctx1.runtime.runTurn({
           clientRequestId: "creq_2222222228",
@@ -473,15 +433,6 @@ describe.concurrent("codex resume scenarios", () => {
           label: "runtime 1 turn/completed",
         });
 
-        if (!providerThreadId) {
-          const identityEvent = ctx1.events.find(
-            (e) => e.type === "thread/identity",
-          );
-          if (identityEvent && identityEvent.type === "thread/identity") {
-            providerThreadId = identityEvent.providerThreadId;
-          }
-        }
-
         await ctx1.runtime.shutdown();
       } finally {
         cleanup(ctx1);
@@ -489,7 +440,6 @@ describe.concurrent("codex resume scenarios", () => {
 
       expect(toolCalledInRuntime1).toBe(true);
 
-      // Runtime 2: resume thread, ask what word was remembered, call tool again
       const ctx2 = createTestRuntime(providerId, {
         onToolCall: async (req) => {
           if (req.tool === "bb_test_ping") {

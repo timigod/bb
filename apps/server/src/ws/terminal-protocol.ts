@@ -4,7 +4,7 @@ import {
 } from "@bb/server-contract";
 import { ApiError } from "../errors.js";
 import type { AppDeps } from "../types.js";
-import { decodeSocketPayload } from "./decode-payload.js";
+import { parseSocketMessage } from "./decode-payload.js";
 
 type TerminalProtocolDeps = Pick<AppDeps, "terminalSessions">;
 
@@ -14,17 +14,16 @@ interface TerminalSocket {
 }
 
 interface TerminalSocketOpenArgs {
+  outputAcks: boolean;
   socket: TerminalSocket;
   sinceSeq: number;
   terminalId: string;
-  threadId: string | null;
 }
 
 interface TerminalSocketMessageArgs {
   raw: unknown;
   socket: TerminalSocket;
   terminalId: string;
-  threadId: string | null;
 }
 
 interface TerminalSocketCloseArgs {
@@ -52,31 +51,38 @@ function closeTerminalSocketWithError(args: TerminalSocketErrorArgs): void {
   args.socket.close(1008, args.code);
 }
 
+function closeTerminalSocketForError(
+  socket: TerminalSocket,
+  error: unknown,
+): void {
+  if (error instanceof ApiError) {
+    closeTerminalSocketWithError({
+      socket,
+      code: error.body.code,
+      message: error.body.message,
+    });
+    return;
+  }
+  closeTerminalSocketWithError({
+    socket,
+    code: "terminal_socket_error",
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
+
 export function onTerminalSocketOpen(
   deps: TerminalProtocolDeps,
   args: TerminalSocketOpenArgs,
 ): void {
   try {
     deps.terminalSessions.attachBrowserTerminal({
+      outputAcks: args.outputAcks,
       socket: args.socket,
       sinceSeq: args.sinceSeq,
       terminalId: args.terminalId,
-      threadId: args.threadId,
     });
   } catch (error) {
-    if (error instanceof ApiError) {
-      closeTerminalSocketWithError({
-        socket: args.socket,
-        code: error.body.code,
-        message: error.body.message,
-      });
-      return;
-    }
-    closeTerminalSocketWithError({
-      socket: args.socket,
-      code: "terminal_socket_error",
-      message: error instanceof Error ? error.message : String(error),
-    });
+    closeTerminalSocketForError(args.socket, error);
   }
 }
 
@@ -84,41 +90,23 @@ export function onTerminalSocketMessage(
   deps: TerminalProtocolDeps,
   args: TerminalSocketMessageArgs,
 ): void {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(decodeSocketPayload(args.raw));
-  } catch {
-    args.socket.close(1008, "invalid-message");
-    return;
-  }
-
-  const result = terminalClientMessageSchema.safeParse(decoded);
-  if (!result.success) {
-    args.socket.close(1008, "invalid-message");
+  const message = parseSocketMessage(
+    args.socket,
+    args.raw,
+    terminalClientMessageSchema,
+  );
+  if (message === null) {
     return;
   }
 
   try {
     deps.terminalSessions.handleBrowserTerminalMessage({
-      message: result.data,
+      message,
       socket: args.socket,
       terminalId: args.terminalId,
-      threadId: args.threadId,
     });
   } catch (error) {
-    if (error instanceof ApiError) {
-      closeTerminalSocketWithError({
-        socket: args.socket,
-        code: error.body.code,
-        message: error.body.message,
-      });
-      return;
-    }
-    closeTerminalSocketWithError({
-      socket: args.socket,
-      code: "terminal_socket_error",
-      message: error instanceof Error ? error.message : String(error),
-    });
+    closeTerminalSocketForError(args.socket, error);
   }
 }
 

@@ -1,21 +1,14 @@
 import { z } from "zod";
+import { isRelativeProviderSkillRootPath } from "./provider-skill-roots.js";
 import { reasoningLevelSchema } from "./shared-types.js";
 
 const providerSkillRootPathSchema = z
   .string()
   .min(1)
-  .refine((value) => {
-    const normalized = value.replaceAll("\\", "/");
-    return (
-      !normalized.startsWith("/") &&
-      !/^[a-zA-Z]:\//u.test(normalized) &&
-      normalized
-        .split("/")
-        .every(
-          (segment) => segment !== "" && segment !== "." && segment !== "..",
-        )
-    );
-  }, "Skill roots must be relative paths without dot segments");
+  .refine(
+    isRelativeProviderSkillRootPath,
+    "Skill roots must be relative paths without dot segments",
+  );
 
 const uniqueProviderSkillRootPathsSchema = z
   .array(providerSkillRootPathSchema)
@@ -28,7 +21,6 @@ const uniqueProviderSkillRootPathsSchema = z
     }
   });
 
-/** Provider-native skill roots relative to the target host or workspace. */
 export const providerNativeSkillRootsSchema = z
   .object({
     user: uniqueProviderSkillRootPathsSchema.default([]),
@@ -39,7 +31,7 @@ export type ProviderNativeSkillRoots = z.infer<
   typeof providerNativeSkillRootsSchema
 >;
 
-export const acpReasoningCliLevelValueOverridesSchema = z.partialRecord(
+const acpReasoningCliLevelValueOverridesSchema = z.record(
   reasoningLevelSchema,
   z.string().min(1),
 );
@@ -72,7 +64,6 @@ export const acpReasoningCliSchema = z
       });
     }
   });
-export type AcpReasoningCli = z.infer<typeof acpReasoningCliSchema>;
 
 export const acpNativeReasoningSchema = z
   .object({
@@ -102,7 +93,6 @@ export const acpNativeReasoningSchema = z
       });
     }
   });
-export type AcpNativeReasoning = z.infer<typeof acpNativeReasoningSchema>;
 
 const acpPermissionCliArgsSchema = z.array(z.string().min(1)).min(1);
 
@@ -126,4 +116,3 @@ export const acpPermissionCliSchema = z
       });
     }
   });
-export type AcpPermissionCli = z.infer<typeof acpPermissionCliSchema>;

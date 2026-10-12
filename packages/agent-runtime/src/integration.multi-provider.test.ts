@@ -1,5 +1,3 @@
-/** Provider integration tests using createAgentRuntime. */
-
 import { describe, expect, it } from "vitest";
 import {
   cleanup,
@@ -16,7 +14,6 @@ import { promptTextInput } from "./test/prompt-input.js";
 const CODEX_CONCURRENT_TURN_TIMEOUT_MS = 60_000;
 
 describe.concurrent("cross-provider and multi-thread scenarios", () => {
-  // Multi-thread: single provider, single runtime
   describe.concurrent("multi-thread scenarios", () => {
     it("runs multiple threads on the same codex runtime", async () => {
       const ctx = createTestRuntime("codex");
@@ -45,18 +42,21 @@ describe.concurrent("cross-provider and multi-thread scenarios", () => {
           options,
         });
 
-        // Run turns concurrently
         await Promise.all([
           ctx.runtime.runTurn({
             clientRequestId: "creq_2222222245",
             threadId: threadA,
-            input: [promptTextInput({ text: "Reply with exactly: THREAD_A_OK" })],
+            input: [
+              promptTextInput({ text: "Reply with exactly: THREAD_A_OK" }),
+            ],
             options,
           }),
           ctx.runtime.runTurn({
             clientRequestId: "creq_2222222246",
             threadId: threadB,
-            input: [promptTextInput({ text: "Reply with exactly: THREAD_B_OK" })],
+            input: [
+              promptTextInput({ text: "Reply with exactly: THREAD_B_OK" }),
+            ],
             options,
           }),
         ]);
@@ -86,7 +86,6 @@ describe.concurrent("cross-provider and multi-thread scenarios", () => {
     }, 90_000);
   });
 
-  // Multi-provider: single runtime
   describe.concurrent("multi-provider scenarios", () => {
     it("uses multiple providers in a single runtime", async () => {
       const ctx = createTestRuntime("codex");
@@ -120,7 +119,6 @@ describe.concurrent("cross-provider and multi-thread scenarios", () => {
           options: claudeOptions,
         });
 
-        // Run turns concurrently on both providers
         await Promise.all([
           ctx.runtime.runTurn({
             clientRequestId: "creq_2222222247",
@@ -143,7 +141,6 @@ describe.concurrent("cross-provider and multi-thread scenarios", () => {
           label: "both providers turn/completed",
         });
 
-        // Verify events came from both threads
         const codexEvents = ctx.events.filter(
           (e) => "threadId" in e && e.threadId === codexThread,
         );
@@ -161,9 +158,7 @@ describe.concurrent("cross-provider and multi-thread scenarios", () => {
 });
 
 describe.concurrent("multi-provider resume scenarios", () => {
-  // Matrix test: multiple threads, multiple providers, with resume
   it("handles multiple threads across providers with resume", async () => {
-    // Runtime 1: start threads on codex and claude-code, remember different words
     const ctx1 = createTestRuntime("codex");
     const codexThreadId1 = newThreadId();
     const claudeThreadId1 = newThreadId();
@@ -202,7 +197,6 @@ describe.concurrent("multi-provider resume scenarios", () => {
       codexProviderThreadId = codexStart.providerThreadId || undefined;
       claudeProviderThreadId = claudeStart.providerThreadId || undefined;
 
-      // Run turns concurrently: codex remembers APPLE, claude-code remembers ORANGE
       await Promise.all([
         ctx1.runtime.runTurn({
           clientRequestId: "creq_2222222249",
@@ -233,7 +227,6 @@ describe.concurrent("multi-provider resume scenarios", () => {
         label: "both threads turn/completed",
       });
 
-      // Capture providerThreadIds from identity events if needed
       if (!codexProviderThreadId) {
         const identityEvent = ctx1.events.find(
           (e) =>
@@ -260,7 +253,6 @@ describe.concurrent("multi-provider resume scenarios", () => {
       await ctx1.runtime.shutdown();
       ctx1Shutdown = true;
 
-      // Runtime 2: resume both threads in the same workspace.
       const ctx2 = createTestRuntime("codex", { workspacePath: ctx1.tmpDir });
       const codexThreadId2 = newThreadId();
       const claudeThreadId2 = newThreadId();

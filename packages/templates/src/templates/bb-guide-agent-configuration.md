@@ -28,8 +28,11 @@ Workspace instructions (.bb/AGENTS.md):
   Only the plural AGENTS.md is read, only from the exact data-dir and
   workspace-root .bb/ locations above (bb does not walk parent directories), and
   an empty file is ignored. This is bb's own provider-agnostic instruction
-  injection, separate from provider-native files such as CLAUDE.md or a
-  repo-root AGENTS.md.
+  injection, separate from provider-native instruction files. Codex reads a
+  repo-root AGENTS.md. Claude Code 2.1.277 and later also reads AGENTS.md when
+  no project or ancestor CLAUDE.md or CLAUDE.local.md takes precedence. Older
+  Claude Code versions and sessions without its built-in AGENTS.md support
+  still require CLAUDE.md.
 
 Skills (.bb/skills/):
 
@@ -41,11 +44,11 @@ Skills (.bb/skills/):
 
   bb resolves skills from three sources, in increasing precedence:
 
-    builtin    Skills bundled with bb.
+    plugin     Skills from enabled plugins, including the bundled BB guide.
     user       <dataDir>/skills (e.g. ~/.bb/skills).
     project    <workspace>/.bb/skills.
 
-  A project skill overrides a user or builtin skill with the same name. Two
+  A project skill overrides a user or plugin skill with the same name. Two
   skills with the same name within one source collide and are both dropped.
 
   Use `bb skill list` to inspect installed and discovered skills and copy the
@@ -75,3 +78,28 @@ Skills (.bb/skills/):
   the settings row shows the same as a badge.
 
   Use the skill-creator skill to author and iterate on skills.
+
+BB guide plugin:
+
+  The enabled-by-default BB guide plugin owns the BB introduction and the
+  bb-cli, bb-plugin-authoring, skill-creator, and submit-a-plugin skills. Settings → Installed
+  plugins → BB guide exposes introduction, a master skills switch, and one
+  switch per skill. All default to true. Use:
+
+    bb plugin config bb-guide set introduction false
+    bb plugin config bb-guide set skills false
+    bb plugin config bb-guide set bbCli false
+    bb plugin config bb-guide set pluginAuthoring false
+    bb plugin config bb-guide set skillCreator false
+    bb plugin config bb-guide set submitPlugin false
+
+  Changes apply when agent configuration is next assembled. They do not erase
+  existing conversation text or disable independently installed copies.
+
+Connect agent instructions:
+
+  Settings → Installed plugins → Connect → Tell agents about remote access
+  controls the message telling remotely used agents to expose public server
+  links. It defaults to true and still requires active/recent remote usage.
+  Use `bb plugin config connect set sendRemoteInstructions false` to turn it
+  off. Port sharing remains available.

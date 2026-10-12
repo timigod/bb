@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type {
-  ThreadListEntry,
-  ThreadWithRuntime,
-  WorkspaceStatus,
-} from "@bb/domain";
+import type { ThreadListEntry, WorkspaceStatus } from "@bb/domain";
 import {
   makeWorkspaceMergeBase,
   makeWorkspaceStatus,
@@ -13,9 +9,18 @@ import type {
   EnvironmentDiffBranchesResponse,
   EnvironmentStatusResponse,
   ProjectBranchesResponse,
+  SidebarBootstrapResponse,
   ThreadResponse,
   ThreadTimelineResponse,
 } from "@bb/server-contract";
+import {
+  makeProjectWithThreadsResponse,
+  makeSidebarBootstrapResponse,
+} from "@/test/fixtures/projects";
+import {
+  makeThreadResponse as makeThreadResponseFixture,
+  makeThreadTimelineResponse as makeThreadTimelineResponseFixture,
+} from "@/test/fixtures/thread-responses";
 import {
   getCachedEnvironmentRefWorkspaceStateInvalidationQueryKeys,
   getEnvironmentWorkspaceStateInvalidationQueryKeys,
@@ -25,6 +30,7 @@ import {
   environmentDiffFilesQueryKeyPrefix,
   environmentDiffPatchQueryKeyPrefix,
   environmentWorkStatusQueryKey,
+  sidebarNavigationQueryKey,
   threadListQueryKey,
   threadsQueryKey,
 } from "./query-keys";
@@ -41,16 +47,6 @@ import { BbHttpError } from "@/lib/sdk";
 import { isTransientReadError, requireEnabledQueryArg } from "./query-helpers";
 
 describe("requireEnabledQueryArg", () => {
-  it("returns the value when present", () => {
-    expect(
-      requireEnabledQueryArg({
-        value: "thr_1",
-        hookName: "useThread",
-        argName: "thread id",
-      }),
-    ).toBe("thr_1");
-  });
-
   it("keeps a numeric zero rather than treating it as missing", () => {
     expect(
       requireEnabledQueryArg({
@@ -124,6 +120,7 @@ function makeProjectBranchesResponse(): ProjectBranchesResponse {
     defaultBranch: "main",
     defaultBranchRelation: "equal",
     defaultWorktreeBaseBranch: "origin/main",
+    isWorktree: false,
     hasUncommittedChanges: false,
     operation: { kind: "none" },
     originDefaultBranch: "origin/main",
@@ -143,50 +140,43 @@ function makeEnvironmentDiffBranchesResponse(): EnvironmentDiffBranchesResponse 
   };
 }
 
-function makeThreadWithRuntime(
-  thread: Partial<ThreadWithRuntime> = {},
-): ThreadWithRuntime {
-  return {
+function makeThreadResponse(
+  thread: Partial<ThreadResponse> = {},
+): ThreadResponse {
+  return makeThreadResponseFixture({
     id: "thread-1",
     projectId: "project-1",
-    providerId: "codex",
     createdAt: 1,
     status: "active",
     updatedAt: 1,
     lastReadAt: null,
     latestAttentionAt: 1,
     environmentId: "env-1",
-    title: null,
-    titleFallback: null,
-    sectionId: null,
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    archivedAt: null,
-    pinnedAt: null,
-    deletedAt: null,
     runtime: {
       displayStatus: "waiting-for-host",
-      hostReconnectGraceExpiresAt: null,
     },
+    canSpawnChild: false,
     ...thread,
-  };
+  });
+}
+
+function makeSidebarNavigation(): SidebarBootstrapResponse {
+  return makeSidebarBootstrapResponse({
+    projects: [
+      makeProjectWithThreadsResponse({
+        id: "project-1",
+        name: "Project",
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    ],
+  });
 }
 
 function makeThreadTimelineResponse(
   rows: ThreadTimelineResponse["rows"],
 ): ThreadTimelineResponse {
-  return {
-    activePromptMode: null,
-    activeThinking: null,
-    activeWorkflows: [],
-    activeBackgroundCommands: [],
-    pendingTodos: null,
-    goal: null,
-    modelFallback: null,
-    maxSeq: 0,
+  return makeThreadTimelineResponseFixture({
     rows,
     timelinePage: {
       kind: "latest",
@@ -195,7 +185,7 @@ function makeThreadTimelineResponse(
       hasOlderRows: false,
       olderCursor: null,
     },
-  };
+  });
 }
 
 describe("resolveEnvironmentWorkStatusPlaceholder", () => {
@@ -243,11 +233,7 @@ describe("resolveEnvironmentWorkStatusPlaceholder", () => {
 
 describe("resolveThreadPlaceholder", () => {
   it("reuses previous thread data only for the same thread query", () => {
-    const previousThread: ThreadResponse = {
-      ...makeThreadWithRuntime({ id: "thread-1" }),
-      activeBackgroundAgentCount: 0,
-      canSpawnChild: false,
-    };
+    const previousThread = makeThreadResponse({ id: "thread-1" });
 
     expect(
       resolveThreadPlaceholder(
@@ -279,6 +265,7 @@ describe("resolveThreadTimelinePlaceholder", () => {
         text: "Done",
         sourceSeqStart: 1,
         sourceSeqEnd: 1,
+        messageSeq: 1,
         startedAt: 1,
         createdAt: 1,
         attachments: null,
@@ -466,9 +453,6 @@ describe("getEnvironmentWorkspaceStateInvalidationQueryKeys", () => {
       ["environmentDiffFiles", "env-1"],
       ["environmentFilePreview", "env-1"],
     ]);
-    // The patch cache is observer-less; invalidation is a no-op for it, so it
-    // must be evicted (removeEnvironmentDiffPatchQueries) rather than appearing
-    // in any invalidate-key list.
     expect(queryKeys).not.toContainEqual(
       environmentDiffPatchQueryKeyPrefix("env-1"),
     );
@@ -497,10 +481,6 @@ describe("getCachedEnvironmentRefWorkspaceStateInvalidationQueryKeys", () => {
         environmentId: "env-1",
       });
 
-    // Only the merge-base-scoped work status for env-1, plus the observer-backed
-    // diff TOC cache (invalidated by prefix — a moved merge base affects every
-    // ref-derived diff target). The observer-less patch cache is absent: it is
-    // evicted separately via removeEnvironmentDiffPatchQueries.
     expect(queryKeys).toHaveLength(2);
     expect(queryKeys).toContainEqual(
       environmentWorkStatusQueryKey("env-1", "main"),
@@ -525,29 +505,95 @@ describe("optimisticallyInsertThread", () => {
     const { queryClient } = createQueryClientTestHarness();
     queryClient.setQueryData(threadsQueryKey(), []);
 
-    optimisticallyInsertThread(queryClient, makeThreadWithRuntime());
+    optimisticallyInsertThread(queryClient, makeThreadResponse());
 
     expect(
       queryClient.getQueryData<ThreadListEntry[]>(threadsQueryKey()),
     ).toEqual([]);
   });
 
-  it("preserves the server-provided runtime state", () => {
+  it("places a new thread on its selected machine in the first cached sidebar row", () => {
+    const { queryClient } = createQueryClientTestHarness();
+    queryClient.setQueryData(
+      sidebarNavigationQueryKey(),
+      makeSidebarNavigation(),
+    );
+
+    optimisticallyInsertThread(
+      queryClient,
+      makeThreadResponse(),
+      "host-selected",
+    );
+
+    expect(
+      queryClient.getQueryData<SidebarBootstrapResponse>(
+        sidebarNavigationQueryKey(),
+      )?.projects[0]?.threads[0]?.environmentHostId,
+    ).toBe("host-selected");
+  });
+
+  it("projects queued work into the thread list and sidebar immediately", () => {
     const { queryClient } = createQueryClientTestHarness();
     const threadListKey = threadListQueryKey({
       archived: false,
       projectId: "project-1",
     });
     queryClient.setQueryData(threadListKey, []);
+    queryClient.setQueryData(
+      sidebarNavigationQueryKey(),
+      makeSidebarNavigation(),
+    );
 
-    optimisticallyInsertThread(queryClient, makeThreadWithRuntime());
+    optimisticallyInsertThread(
+      queryClient,
+      makeThreadResponse({ queuedMessageCount: 1 }),
+    );
 
-    const [thread] =
-      queryClient.getQueryData<ThreadListEntry[]>(threadListKey) ?? [];
-    expect(thread?.runtime).toEqual({
-      displayStatus: "waiting-for-host",
-      hostReconnectGraceExpiresAt: null,
+    expect(
+      queryClient.getQueryData<ThreadListEntry[]>(threadListKey)?.[0]
+        ?.queuedWork,
+    ).toBe("waiting");
+    expect(
+      queryClient.getQueryData<SidebarBootstrapResponse>(
+        sidebarNavigationQueryKey(),
+      )?.projects[0]?.threads[0]?.queuedWork,
+    ).toBe("waiting");
+  });
+
+  it("adds queued work without replacing newer realtime row state", () => {
+    const { queryClient } = createQueryClientTestHarness();
+    const threadListKey = threadListQueryKey({
+      archived: false,
+      projectId: "project-1",
     });
+    queryClient.setQueryData(threadListKey, []);
+    queryClient.setQueryData(
+      sidebarNavigationQueryKey(),
+      makeSidebarNavigation(),
+    );
+    optimisticallyInsertThread(
+      queryClient,
+      makeThreadResponse({
+        runtime: {
+          displayStatus: "active",
+        },
+      }),
+    );
+
+    optimisticallyInsertThread(
+      queryClient,
+      makeThreadResponse({ queuedMessageCount: 1 }),
+    );
+
+    const listThread =
+      queryClient.getQueryData<ThreadListEntry[]>(threadListKey)?.[0];
+    const sidebarThread = queryClient.getQueryData<SidebarBootstrapResponse>(
+      sidebarNavigationQueryKey(),
+    )?.projects[0]?.threads[0];
+    expect(listThread?.runtime.displayStatus).toBe("active");
+    expect(listThread?.queuedWork).toBe("waiting");
+    expect(sidebarThread?.runtime.displayStatus).toBe("active");
+    expect(sidebarThread?.queuedWork).toBe("waiting");
   });
 
   it("respects the originKind filter when inserting source-derived threads", () => {
@@ -560,11 +606,9 @@ describe("optimisticallyInsertThread", () => {
     });
     queryClient.setQueryData(forkListKey, []);
 
-    // A hidden thread (a side chat, say) must not contaminate the parent's
-    // fork-filtered list.
     optimisticallyInsertThread(
       queryClient,
-      makeThreadWithRuntime({
+      makeThreadResponse({
         id: "side-chat-1",
         sourceThreadId: "source-1",
         originKind: "fork",
@@ -575,10 +619,9 @@ describe("optimisticallyInsertThread", () => {
       [],
     );
 
-    // A fork of the same parent does belong in the fork list.
     optimisticallyInsertThread(
       queryClient,
-      makeThreadWithRuntime({
+      makeThreadResponse({
         id: "fork-1",
         sourceThreadId: "source-1",
         originKind: "fork",

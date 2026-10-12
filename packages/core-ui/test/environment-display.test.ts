@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { Environment } from "@bb/domain";
 import {
   formatEnvironmentDisplay,
+  resolveEnvironmentDisplayName,
   type EnvironmentDisplayHostContext,
+  type EnvironmentDisplayProvider,
+  type EnvironmentDisplayProviderLookup,
 } from "../src/environment-display.js";
 
 const localHostContext: EnvironmentDisplayHostContext = {
@@ -15,6 +18,26 @@ const remoteHostContext: EnvironmentDisplayHostContext = {
   identity: null,
 };
 
+const worktreeProvider: EnvironmentDisplayProvider = {
+  id: "git-worktree",
+  displayName: "Worktree",
+  icon: "FolderGit",
+};
+
+const worktreeProviderLookup: EnvironmentDisplayProviderLookup = {
+  status: "loaded",
+  provider: worktreeProvider,
+};
+
+const noProviderLookup: EnvironmentDisplayProviderLookup = {
+  status: "loaded",
+  provider: null,
+};
+
+const loadingProviderLookup: EnvironmentDisplayProviderLookup = {
+  status: "loading",
+};
+
 function makeEnvironment(overrides?: Partial<Environment>): Environment {
   return {
     id: "env_test",
@@ -22,15 +45,20 @@ function makeEnvironment(overrides?: Partial<Environment>): Environment {
     projectId: "proj_test",
     hostId: "host_test",
     path: "/workspace",
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
-    workspaceProvisionType: "unmanaged",
     baseBranch: null,
     branchName: null,
     defaultBranch: null,
     mergeBaseBranch: null,
     status: "ready",
+    environmentProviderId: null,
+    environmentProviderSelection: null,
+    environmentProviderInstanceKey: null,
+    lifecycle: { phase: "active", retireAt: null, teardown: null },
+    hostLifecycle: "active",
+    managed: false,
+    workspaceProvisionType: null,
     createdAt: 0,
     updatedAt: 0,
     ...overrides,
@@ -38,151 +66,271 @@ function makeEnvironment(overrides?: Partial<Environment>): Environment {
 }
 
 describe("formatEnvironmentDisplay", () => {
-  describe("display labels", () => {
-    it("returns 'Working locally' for unmanaged workspace", () => {
-      const result = formatEnvironmentDisplay({
-        environment: makeEnvironment(),
-        host: localHostContext,
-      });
-      expect(result).toEqual({
+  describe("label precedence", () => {
+    it("falls back to the mode label for a project checkout with nothing to name", () => {
+      expect(
+        formatEnvironmentDisplay({
+          environment: makeEnvironment(),
+          host: localHostContext,
+          providerLookup: noProviderLookup,
+        }),
+      ).toEqual({
         modeLabel: "Working locally",
         compactModeLabel: "Local",
+        providerLabel: null,
+        lifecycle: null,
         id: "env_test",
-        mode: "direct",
-        workspaceDisplayKind: "other",
       });
     });
 
-    it("returns a remote label for remote unmanaged workspace", () => {
+    it("falls back to the remote mode label on a remote machine", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment(),
         host: remoteHostContext,
+        providerLookup: noProviderLookup,
       });
-      expect(result).toEqual({
-        modeLabel: "Working remotely",
-        compactModeLabel: "Remote",
-        id: "env_test",
-        mode: "direct",
-        workspaceDisplayKind: "other",
-      });
+      expect(result.modeLabel).toBe("Working remotely");
+      expect(result.compactModeLabel).toBe("Remote");
     });
 
-    it("returns 'Worktree' for worktree workspace", () => {
+    it("labels a branch-bearing row by its provider, since the branch is shown beside it", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
-          isWorktree: true,
-          workspaceProvisionType: "managed-worktree",
+          branchName: "bb/feature",
+          environmentProviderId: "git-worktree",
         }),
-        host: remoteHostContext,
+        host: localHostContext,
+        providerLookup: worktreeProviderLookup,
       });
-      expect(result).toEqual({
-        modeLabel: "Worktree",
-        compactModeLabel: "Worktree",
-        id: "env_test",
-        mode: "worktree",
-        workspaceDisplayKind: "managed-worktree",
-      });
+      expect(result.modeLabel).toBe("Worktree");
+      expect(result.compactModeLabel).toBe("Worktree");
     });
 
-    it("uses a custom environment name when one is present", () => {
+    it("prefers the environment name over the branch name", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
-          isWorktree: true,
           name: "Review workspace",
-          workspaceProvisionType: "managed-worktree",
+          branchName: "bb/feature",
+          environmentProviderId: "git-worktree",
         }),
-        host: remoteHostContext,
+        host: localHostContext,
+        providerLookup: worktreeProviderLookup,
       });
-
       expect(result.modeLabel).toBe("Review workspace");
       expect(result.compactModeLabel).toBe("Review workspace");
     });
 
-    it("does not compact custom names that resemble generated labels", () => {
+    it("uses the provider display name when the row has no name or branch", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
-          name: "Working locally copy",
+          environmentProviderId: "modal-sandbox",
         }),
         host: remoteHostContext,
+        providerLookup: {
+          status: "loaded",
+          provider: {
+            id: "modal-sandbox",
+            displayName: "Modal sandbox",
+            icon: null,
+          },
+        },
       });
-
-      expect(result.modeLabel).toBe("Working locally copy");
-      expect(result.compactModeLabel).toBe("Working locally copy");
+      expect(result.modeLabel).toBe("Modal sandbox");
+      expect(result.compactModeLabel).toBe("Modal sandbox");
     });
 
-    it("uses local direct-workspace display for personal environments", () => {
+    it("falls back to the bare provider id when the plugin is not registered", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
-          isGitRepo: false,
-          workspaceProvisionType: "personal",
+          environmentProviderId: "modal-sandbox",
         }),
-        host: localHostContext,
+        host: remoteHostContext,
+        providerLookup: noProviderLookup,
       });
-      expect(result).toMatchObject({
-        modeLabel: "Working locally",
-        compactModeLabel: "Local",
-        mode: "direct",
-        workspaceDisplayKind: "other",
+      expect(result.modeLabel).toBe("modal-sandbox");
+      expect(result.providerLabel).toBe("modal-sandbox");
+    });
+
+    it("names nothing until the provider list has loaded", () => {
+      const result = formatEnvironmentDisplay({
+        environment: makeEnvironment({
+          environmentProviderId: "modal-sandbox",
+        }),
+        host: remoteHostContext,
+        providerLookup: loadingProviderLookup,
       });
+      expect(result.providerLabel).toBeNull();
+      expect(result.modeLabel).toBe("Working remotely");
     });
   });
 
-  describe("provisioning", () => {
-    it("reports 'Provisioning' for a worktree env before discovery populates isWorktree", () => {
+  describe("lifecycle", () => {
+    it("reports 'Provisioning' before the provider label applies", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
           status: "provisioning",
-          workspaceProvisionType: "managed-worktree",
-          isWorktree: false,
+          environmentProviderId: "git-worktree",
+          branchName: "bb/feature",
         }),
         host: remoteHostContext,
+        providerLookup: worktreeProviderLookup,
       });
       expect(result.modeLabel).toBe("Provisioning");
       expect(result.compactModeLabel).toBe("Provisioning");
-      // Discovered structural properties are not yet known mid-provision.
-      expect(result.mode).toBe("direct");
+      expect(result.lifecycle).toBe("provisioning");
     });
 
-    it("reports 'Provisioning' for a prepared managed worktree before the workspace path exists", () => {
+    it("reports an unavailable environment for a gone worktree instead of 'Provisioning' (#1789)", () => {
       const result = formatEnvironmentDisplay({
         environment: makeEnvironment({
-          status: "ready",
           path: null,
-          workspaceProvisionType: "managed-worktree",
-          isWorktree: false,
+          status: "destroyed",
+          environmentProviderId: "git-worktree",
         }),
-        host: remoteHostContext,
-      });
-      expect(result).toEqual({
-        modeLabel: "Provisioning",
-        compactModeLabel: "Provisioning",
-        id: "env_test",
-        mode: "direct",
-        workspaceDisplayKind: "managed-worktree",
-      });
-    });
-
-    it("reports 'Provisioning' for a local unmanaged env", () => {
-      const result = formatEnvironmentDisplay({
-        environment: makeEnvironment({ status: "provisioning" }),
         host: localHostContext,
+        providerLookup: worktreeProviderLookup,
       });
-      expect(result.modeLabel).toBe("Provisioning");
-      expect(result.compactModeLabel).toBe("Provisioning");
+      expect(result.modeLabel).toBe("Environment unavailable");
+      expect(result.compactModeLabel).toBe("Environment unavailable");
+      expect(result.lifecycle).toBe("destroyed");
     });
 
-    it("reports 'Provisioning' before local or remote display applies", () => {
+    it.each([
+      ["removed", "Unavailable — machine removed"],
+      ["removing", "Machine removal in progress"],
+      ["cleanup-failed", "Machine cleanup failed"],
+    ] as const)(
+      "prioritizes a %s machine over a retained workspace name",
+      (hostLifecycle, label) => {
+        const result = formatEnvironmentDisplay({
+          environment: makeEnvironment({
+            name: "Review workspace",
+            status: "ready",
+            hostLifecycle,
+          }),
+          host: remoteHostContext,
+          providerLookup: noProviderLookup,
+        });
+        expect(result.modeLabel).toBe(label);
+        expect(result.lifecycle).toBe(hostLifecycle);
+      },
+    );
+
+    it("keeps a custom name ahead of the lifecycle label", () => {
       const result = formatEnvironmentDisplay({
-        environment: makeEnvironment({ status: "provisioning" }),
-        host: remoteHostContext,
+        environment: makeEnvironment({
+          name: "Review workspace",
+          status: "provisioning",
+        }),
+        host: localHostContext,
+        providerLookup: noProviderLookup,
       });
-      expect(result).toEqual({
-        modeLabel: "Provisioning",
-        compactModeLabel: "Provisioning",
-        id: "env_test",
-        mode: "direct",
-        workspaceDisplayKind: "other",
-      });
+      expect(result.modeLabel).toBe("Review workspace");
+      expect(result.lifecycle).toBe("provisioning");
     });
+  });
+});
+
+describe("resolveEnvironmentDisplayName", () => {
+  it("returns null when a row has no name, branch or provider", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: null,
+          environmentProviderId: null,
+        },
+        noProviderLookup,
+      ),
+    ).toBeNull();
+  });
+
+  it("returns the bare provider id for an unregistered provider", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: null,
+          environmentProviderId: "modal-sandbox",
+        },
+        noProviderLookup,
+      ),
+    ).toBe("modal-sandbox");
+  });
+
+  it("still names a loading row by its branch", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: "bb/feature",
+          path: null,
+          environmentProviderId: "modal-sandbox",
+        },
+        loadingProviderLookup,
+      ),
+    ).toBe("bb/feature");
+  });
+
+  it("names a branchless provider row by its provider, not its workspace folder", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: "/Users/bb/.bb/plugins/environment-personal-workspace/host-data/workspaces/thr_k72wqg7tcs/",
+          environmentProviderId: "personal-workspace",
+        },
+        {
+          status: "loaded",
+          provider: {
+            id: "personal-workspace",
+            displayName: "Personal workspace",
+            icon: null,
+          },
+        },
+      ),
+    ).toBe("Personal workspace");
+  });
+
+  it("hides a workspace folder that is only an internal instance key", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: "C:\\bb\\workspaces\\thr_win",
+          environmentProviderId: "personal-workspace",
+        },
+        loadingProviderLookup,
+      ),
+    ).toBeNull();
+  });
+
+  it("names a provider-less directory attachment by its folder", () => {
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: "/Users/bb/Projects/notes/",
+          environmentProviderId: null,
+        },
+        noProviderLookup,
+      ),
+    ).toBe("notes");
+    expect(
+      resolveEnvironmentDisplayName(
+        {
+          name: null,
+          branchName: null,
+          path: "C:\\Users\\bb\\notes",
+          environmentProviderId: null,
+        },
+        noProviderLookup,
+      ),
+    ).toBe("notes");
   });
 });

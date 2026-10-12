@@ -1,3 +1,5 @@
+import { calculateExponentialBackoffDelay } from "@bb/domain";
+import { spawnPortableProcess } from "@bb/process-utils";
 import { resolveSupervisorPidPath } from "./dev-restart-utils.js";
 import {
   removePidFileSync,
@@ -7,7 +9,6 @@ import {
 import {
   installTerminationSignalForwarding,
   killProcessIfRunning,
-  spawnScriptProcess,
   type ForwardedSignal,
   type ProcessExitResult,
   waitForProcessExit,
@@ -40,12 +41,6 @@ export interface DevSupervisorUnexpectedRestartBackoff {
   initialDelayMs: number;
   maxDelayMs: number;
   stableChildRuntimeMs: number;
-}
-
-export interface CalculateUnexpectedRestartDelayArgs {
-  attempt: number;
-  initialDelayMs: number;
-  maxDelayMs: number;
 }
 
 export type DevSupervisorTimerCallback = () => void;
@@ -121,15 +116,6 @@ function formatExit(code: number, signal: NodeJS.Signals | null): string {
 
 function isChildRunning(child: DevSupervisorChildProcess): boolean {
   return child.exitCode === null && child.signalCode === null;
-}
-
-export function calculateUnexpectedRestartDelay(
-  args: CalculateUnexpectedRestartDelayArgs,
-): number {
-  return Math.min(
-    args.initialDelayMs * 2 ** Math.max(args.attempt - 1, 0),
-    args.maxDelayMs,
-  );
 }
 
 function formatDurationMs(delayMs: number): string {
@@ -210,7 +196,7 @@ function createNodeTimer(
 function spawnNodeChildProcess(
   request: DevSupervisorChildSpawnRequest,
 ): DevSupervisorChildProcess {
-  const child = spawnScriptProcess({
+  const child = spawnPortableProcess({
     args: request.args,
     command: request.command,
     cwd: request.cwd,
@@ -389,9 +375,9 @@ export async function runDevSupervisorWithRuntime(
       childRuntimeMs >= unexpectedRestartBackoff.stableChildRuntimeMs
         ? 1
         : unexpectedRestartAttempt + 1;
-    const restartDelayMs = calculateUnexpectedRestartDelay({
+    const restartDelayMs = calculateExponentialBackoffDelay({
       attempt: unexpectedRestartAttempt,
-      initialDelayMs: unexpectedRestartBackoff.initialDelayMs,
+      baseDelayMs: unexpectedRestartBackoff.initialDelayMs,
       maxDelayMs: unexpectedRestartBackoff.maxDelayMs,
     });
     runtime.writeStderr(
@@ -405,8 +391,6 @@ export async function runDevSupervisorWithRuntime(
     }
 
     if (restartRequested) {
-      // Manual restarts represent fresh operator intent, even if they arrive
-      // while we are already backing off after a crash.
       restartRequested = false;
       unexpectedRestartAttempt = 0;
     }

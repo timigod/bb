@@ -5,6 +5,7 @@ import {
   formatSurface,
   renderExistingServerDialogHtml,
 } from "../src/existing-server-dialog.js";
+import { BUILTIN_SERVER_NAME } from "../src/server-target.js";
 
 const NOW = new Date("2026-08-03T12:00:00.000Z");
 
@@ -64,6 +65,7 @@ describe("renderExistingServerDialogHtml", () => {
     expect(html).toContain("/Users/example/.bb");
     expect(html).toContain("0.34.0");
     expect(html).toContain("30 min ago by a terminal (pid 4242)");
+    expect(html).toContain(`bb is already running on ${BUILTIN_SERVER_NAME}`);
   });
 
   it("hides the stop option for a bb that cannot be identified", () => {
@@ -76,7 +78,6 @@ describe("renderExistingServerDialogHtml", () => {
     expect(html).toContain('data-choice="connect"');
     expect(html).toContain('data-choice="quit"');
     expect(html).not.toContain('data-choice="replace"');
-    // The warning only makes sense next to a stop button.
     expect(html).not.toContain("agent threads stop too");
   });
 

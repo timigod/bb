@@ -1,12 +1,12 @@
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import {
   generatedSkillsRootPath,
   pluginCommandsSkillDir,
 } from "../../../src/services/plugins/plugin-commands-skill.js";
-import { resolveInjectedSkillSources } from "../../../src/services/skills/injected-skills.js";
+import { resolveSkillCatalogEntries } from "../../../src/services/skills/injected-skills.js";
 import {
   createTestAppHarness,
   testLogger,
@@ -126,11 +126,11 @@ describe("plugin CLI commands (bb.cli.register + endpoints + skill + logs)", () 
               usage: "bb acme issues [--json]",
             },
           ],
+          rendersHelp: false,
         },
       ],
       mentionProviders: [],
     });
-    // bb plugin list shows the registered command too.
     const entry = harness.pluginService.list().find((p) => p.id === "acme");
     expect(entry?.cliCommand).toEqual({ name: "acme", summary: "Acme tools" });
   });
@@ -269,21 +269,39 @@ describe("plugin CLI commands (bb.cli.register + endpoints + skill + logs)", () 
     expect(unknown.stderr).toContain('unknown plugin "nope"');
   });
 
-  it("rejects reserved and invalid CLI command names at load", async () => {
+  it("keeps a core-name collision callable by plugin id", async () => {
     const reserved = await writePlugin(
       join(harness.config.dataDir, "fixtures"),
       {
         name: "bb-plugin-shadower",
         serverSource: `
           export default function plugin(bb: any) {
-            bb.cli.register({ name: "thread", summary: "s", run: async () => ({ exitCode: 0 }) });
+            bb.cli.register({ name: "thread", summary: "s", commands: [{ name: "inspect", summary: "Inspect", usage: "bb thread inspect" }], run: async () => ({ exitCode: 0, stdout: "thread" }) });
           }
         `,
       },
     );
     const entry = await harness.pluginService.installPath(reserved);
-    expect(entry.status).toBe("error");
-    expect(entry.statusDetail).toContain("reserved");
+    expect(entry.status).toBe("running");
+    const warnings = (await harness.pluginService.readLogTail("shadower", 10))
+      ?.map((line) => JSON.parse(line) as { level: string; message: string })
+      .filter((line) => line.level === "warn")
+      .map(({ level, message }) => ({ level, message }));
+    expect(warnings).toEqual([
+      {
+        level: "warn",
+        message:
+          'CLI command "thread" collides with core command "bb thread"; core keeps the short form. Use "bb plugin run shadower" to invoke this plugin.',
+      },
+    ]);
+    expect(
+      await (await runCli(harness, "shadower", { argv: [] })).json(),
+    ).toMatchObject({ exitCode: 0, stdout: "thread" });
+    const skill = await readFile(
+      join(pluginCommandsSkillDir(harness.config.dataDir), "SKILL.md"),
+      "utf8",
+    );
+    expect(skill).toContain("bb plugin run shadower inspect");
 
     const invalid = await writePlugin(
       join(harness.config.dataDir, "fixtures"),
@@ -336,20 +354,17 @@ describe("plugin CLI commands (bb.cli.register + endpoints + skill + logs)", () 
     expect(content).toContain("## bb acme — Acme tools");
     expect(content).toContain("bb acme issues [--json]");
 
-    // The generated root resolves through the injected-skill machinery.
-    const sources = resolveInjectedSkillSources(testLogger, {
+    const sources = resolveSkillCatalogEntries(testLogger, {
       additionalSkillsRootPaths: [
         generatedSkillsRootPath(harness.config.dataDir),
       ],
-      builtinSkillsRootPath: join(harness.config.dataDir, "builtin-skills"),
       dataDir: harness.config.dataDir,
       skillTreeRegistry: harness.deps.skillTreeRegistry,
-    });
+    }).map((entry) => entry.runtimeSource);
     const skill = sources.find((source) => source.name === "plugin-commands");
     expect(skill?.sourceType).toBe("data-dir");
     expect(skill).toMatchObject({ kind: "tree", entryPath: "SKILL.md" });
 
-    // Reload against changed sources rewrites the skill.
     await writeFile(
       join(rootDir, "server.ts"),
       `

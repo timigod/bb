@@ -1,15 +1,17 @@
 import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
 import path from "node:path";
-import { calculateExponentialBackoffDelay } from "@bb/domain";
+import {
+  calculateExponentialBackoffDelay,
+  createDebouncedCallbackScheduler,
+} from "@bb/domain";
 import {
   RootSubscription,
   type ParcelWatcherEventBatch,
 } from "./root-subscription.js";
-import { createDebouncedCallbackScheduler } from "./watch-callback-scheduler.js";
 import { pathExists } from "./path-exists.js";
 import { toWatchErrorMessage } from "./watch-error.js";
 import {
+  canonicalizePath,
   collectWorkspaceStatusChanges,
   resolveMetadataWatchSpecs,
   type WatchSubscriptionSpec,
@@ -25,12 +27,14 @@ const WORKSPACE_STATUS_WATCH_DEBOUNCE_MS = 75;
 const WORKSPACE_STATUS_WATCH_MAX_WAIT_MS = 500;
 const WORKSPACE_STATUS_WATCH_RETRY_DELAY_MS = 250;
 const WORKSPACE_STATUS_WATCH_MAX_RETRY_DELAY_MS = 30_000;
-// Metadata setup runs `git`. When a worktree is deleted out from under us,
-// that command fails every time, so without a cap we re-spawn git forever.
-// Give up after a bounded number of attempts; the server recreates this watch
-// (resetting the count) when the watch set changes.
 const WORKSPACE_STATUS_WATCH_MAX_SETUP_RETRY_ATTEMPTS = 10;
 const WORKSPACE_ROOT_ALWAYS_IGNORED_PATHS = [".git"];
+const WORKSPACE_ROOT_ALWAYS_IGNORED_GLOBS = [
+  "*/**/.git/**",
+  "**/node_modules/**",
+  "**/.cache/**",
+  "**/__pycache__/**",
+];
 const WORKSPACE_ROOT_IGNORE_STATUS_TIMEOUT_MS = 5_000;
 const WORKSPACE_ROOT_IGNORE_STATUS_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
@@ -101,10 +105,21 @@ function collectIgnoredDirectoryPaths(statusOutput: string): string[] {
   return Array.from(ignoredDirectoryPaths).sort();
 }
 
+function createGitWorkspaceRootIgnores(): string[] {
+  return [
+    ...WORKSPACE_ROOT_ALWAYS_IGNORED_PATHS,
+    ...WORKSPACE_ROOT_ALWAYS_IGNORED_GLOBS,
+  ];
+}
+
+function createPlainWorkspaceRootIgnores(): string[] {
+  return [...WORKSPACE_ROOT_ALWAYS_IGNORED_GLOBS];
+}
+
 function mergeWorkspaceRootIgnores(gitIgnoredPaths: string[]): string[] {
   const ignoredPaths = new Set<string>();
   for (const ignoredPath of [
-    ...WORKSPACE_ROOT_ALWAYS_IGNORED_PATHS,
+    ...createGitWorkspaceRootIgnores(),
     ...gitIgnoredPaths,
   ]) {
     ignoredPaths.add(ignoredPath);
@@ -139,20 +154,12 @@ async function createWorkspaceRootWatchSpec(
   };
 }
 
-async function resolveWatchRootPath(rootPath: string): Promise<string> {
-  try {
-    return await fs.realpath(rootPath);
-  } catch {
-    return rootPath;
-  }
-}
-
 function isPathInsideDotGit(cwd: string, candidatePath: string): boolean {
   const relativePath = path.relative(cwd, candidatePath);
   return relativePath === ".git" || relativePath.startsWith(`.git${path.sep}`);
 }
 
-export class WorkspaceStatusWatcher {
+class WorkspaceStatusWatcher {
   private readonly changedPaths = new Set<string>();
   private readonly changeKinds = new Set<WorkspaceStatusWatchChangeKind>();
   private disposed = false;
@@ -214,15 +221,14 @@ export class WorkspaceStatusWatcher {
   }
 
   private async startAsync(): Promise<void> {
-    const rootPath = await resolveWatchRootPath(this.args.cwd);
+    const rootPath = await canonicalizePath(this.args.cwd);
     if (this.disposed) {
       return;
     }
     if (!(await pathExists(path.join(this.args.cwd, ".git")))) {
-      // A plain workspace can become a repository after `git init`. Watch the
-      // root without excluding `.git` until that marker appears.
       this.startWatchSubscription({
         kind: "workspace-root",
+        options: { ignore: createPlainWorkspaceRootIgnores() },
         rootPath,
       });
       return;
@@ -266,12 +272,9 @@ export class WorkspaceStatusWatcher {
         return;
       }
       this.reportWorkspaceRootSetupError(rootPath, error);
-      // Ignore discovery is an optimization, not a correctness gate. Keep the
-      // workspace live with the mandatory `.git` exclusion even when Git is
-      // too slow or its metadata is temporarily unavailable.
       this.startWatchSubscription({
         kind: "workspace-root",
-        options: { ignore: [...WORKSPACE_ROOT_ALWAYS_IGNORED_PATHS] },
+        options: { ignore: createGitWorkspaceRootIgnores() },
         rootPath,
       });
     }
@@ -291,8 +294,6 @@ export class WorkspaceStatusWatcher {
       },
       onReady: spec.kind === "workspace-root" ? this.args.onReady : undefined,
       onDroppedEvents: () => {
-        // Dropped events are recoverable for workspace status: conservatively
-        // mark the whole spec changed so consumers re-read current state.
         this.queueConservativeWorkspaceStatusChange(spec);
       },
       onWatchError: (message) => {

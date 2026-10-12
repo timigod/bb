@@ -6,45 +6,15 @@ import type {
   WorkflowProgressSnapshot,
 } from "@bb/domain";
 import { ThreadWorkflowCard } from "./ThreadWorkflowCard";
+import { ThreadWorkflowStack } from "./ThreadWorkflowStack";
 import { workflowRow } from "@/test/fixtures/thread-timeline-rows";
 import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
+import { FauxComposer, ResponsiveStage } from "./banner-story-stages";
 
 export default {
   title: "promptbox/banner/Workflow Card",
 };
 
-type StageSize = "desktop" | "mobile";
-
-function Stage({
-  children,
-  size,
-}: {
-  children: React.ReactNode;
-  size: StageSize;
-}) {
-  return (
-    <div
-      data-promptbox-shell=""
-      className={
-        size === "desktop" ? "min-w-0 flex-1" : "w-[20rem] shrink-0"
-      }
-    >
-      {children}
-    </div>
-  );
-}
-
-function ResponsiveStage({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex w-full min-w-0 items-start gap-3 overflow-x-auto">
-      <Stage size="desktop">{children}</Stage>
-      <Stage size="mobile">{children}</Stage>
-    </div>
-  );
-}
-
-// Mirrors the mockup: a six-agent Investigate phase (all done) plus a
-// single-agent Synthesize phase still running.
 const investigationSnapshot: WorkflowProgressSnapshot = {
   phases: [
     { index: 1, title: "Investigate" },
@@ -96,15 +66,11 @@ const runningWorkflow = workflowRow({
   taskStatus: "running",
   workflowName: "bb-plugin-investigation",
   description: "Investigate the plugin subsystem",
-  // ~5m26s ago, so the live duration reads like the mockup.
   startedAt: Date.now() - 326_000,
   workflow: investigationSnapshot,
   usage: { totalTokens: 633_400, toolUses: 261, durationMs: 326_000 },
 });
 
-// A long workflow (~40 phases) so the banner's max-height/scroll and per-phase
-// collapse are exercised. Phases before the active one are done, the active one
-// has a running agent, and the rest are queued.
 const PHASE_VERBS = [
   "Scan",
   "Map",
@@ -151,7 +117,7 @@ function buildManyPhasesSnapshot(
   for (let p = 1; p <= phaseCount; p++) {
     const title = phaseTitle(p - 1);
     phases.push({ index: p, title });
-    const agentCount = ((p - 1) % 3) + 1; // 1..3 agents per phase
+    const agentCount = ((p - 1) % 3) + 1;
     for (let a = 0; a < agentCount; a++) {
       const done = p < activePhase;
       const running = p === activePhase && a === 0;
@@ -200,9 +166,6 @@ const manyPhasesWorkflow = workflowRow({
   usage: { totalTokens: 4_210_000, toolUses: 1_284, durationMs: 1_472_000 },
 });
 
-// A second concurrent run, so the stack of cards a thread shows while it drives
-// several workflows at once can be reviewed. Shorter and earlier in its run than
-// `runningWorkflow` so the two cards do not read as duplicates.
 const secondRunningWorkflow = workflowRow({
   id: "thr_fixture:workflow:balance:running",
   status: "pending",
@@ -252,21 +215,6 @@ const secondRunningWorkflow = workflowRow({
   },
   usage: { totalTokens: 119_600, toolUses: 31, durationMs: 94_000 },
 });
-
-function FauxComposer() {
-  return (
-    <div className="rounded-lg border border-border bg-popover p-3">
-      <div className="pb-3 text-sm text-subtle-foreground">
-        Reply to the agent…
-      </div>
-      <div className="flex items-center gap-2">
-        <span className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground">
-          opus
-        </span>
-      </div>
-    </div>
-  );
-}
 
 function ToggleableCard({
   workflow,
@@ -362,20 +310,68 @@ export function Overview() {
   );
 }
 
+function ToggleableStack({
+  workflows,
+}: {
+  workflows: readonly (typeof runningWorkflow)[];
+}) {
+  const [isStackExpanded, setIsStackExpanded] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  return (
+    <ThreadWorkflowStack
+      workflows={workflows}
+      isStackExpanded={isStackExpanded}
+      onToggleStack={() => setIsStackExpanded((value) => !value)}
+      expandedWorkflowIds={expandedIds}
+      onToggleWorkflow={(id) =>
+        setExpandedIds((current) => {
+          const next = new Set(current);
+          if (!next.delete(id)) next.add(id);
+          return next;
+        })
+      }
+    />
+  );
+}
+
+const concurrentWorkflows = [
+  secondRunningWorkflow,
+  runningWorkflow,
+  {
+    ...secondRunningWorkflow,
+    id: "thr_fixture:workflow:balance:running-2",
+    workflowName: "bb-balance-pass-2",
+  },
+  {
+    ...runningWorkflow,
+    id: "thr_fixture:workflow:investigation:running-2",
+    workflowName: "bb-plugin-investigation-2",
+  },
+];
+
 export function ConcurrentWorkflows() {
   return (
     <StoryCard>
       <StoryRow
         label="two running"
-        hint="one card per running workflow, newest first; each expands independently"
+        hint="two or more running workflows auto-collapse into a stack: the newest card in front with a +N count and peeking edges; tapping it fans out into individual cards with an up chevron below them to restack"
       >
         <ResponsiveStage>
           <div className="flex flex-col gap-2">
-            <ToggleableCard
-              workflow={secondRunningWorkflow}
-              initialExpanded={false}
-            />
-            <ToggleableCard workflow={runningWorkflow} initialExpanded={false} />
+            <ToggleableStack workflows={concurrentWorkflows.slice(0, 2)} />
+            <FauxComposer />
+          </div>
+        </ResponsiveStage>
+      </StoryRow>
+      <StoryRow
+        label="four running"
+        hint="at most two peeking edges, however many workflows are running"
+      >
+        <ResponsiveStage>
+          <div className="flex flex-col gap-2">
+            <ToggleableStack workflows={concurrentWorkflows} />
             <FauxComposer />
           </div>
         </ResponsiveStage>

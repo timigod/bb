@@ -1,11 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
-import { flushSync } from "react-dom";
-import * as PopoverPrimitive from "@radix-ui/react-popover";
+import { createContext, useCallback, useRef, useState } from "react";
 import { CopyButton } from "../../ui/copy-button.js";
 import { Icon } from "@bb/shared-ui/icon";
 import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
 import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
-import { preventOverlayTriggerSelection } from "@bb/shared-ui/overlay-trigger";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import {
   DropdownMenu,
@@ -19,13 +16,12 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@bb/shared-ui/tooltip";
+import { HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS } from "@bb/shared-ui/hover-reveal";
 import { cn } from "@bb/shared-ui/lib/utils";
-import type { PromptDraftAttachment } from "@/lib/prompt-draft";
-import { usePortalScopeProps } from "@/lib/portal-scope";
-import { PluginIcon, pluginIconName } from "@/components/plugin/PluginIcon";
+import type { PromptDraftAttachment } from "@bb/client-core";
+import { PluginItemIcon, pluginIconName } from "@/components/plugin/PluginIcon";
 import type { ThreadTimelinePluginMessageAction } from "./types.js";
 
-/** Plugin-action icon: branding icon when the plugin is known, hint otherwise. */
 function PluginActionIcon({
   pluginId,
   icon,
@@ -42,156 +38,165 @@ function PluginActionIcon({
       aria-hidden="true"
     />
   ) : (
-    <PluginIcon pluginId={pluginId} icon={icon} className={className} />
+    <PluginItemIcon pluginId={pluginId} icon={icon} className={className} />
   );
 }
 
 interface MessageActionBarProps {
+  timestamp: number;
   messageText: string;
   alignment: "start" | "end";
   mobileActionDisplay: "inline" | "overflow";
   addToChatAttachments?: readonly PromptDraftAttachment[];
+  copyImageUrl?: string;
   onAddToChat?: (
     text: string,
     attachments?: readonly PromptDraftAttachment[],
   ) => void;
+  onCopyLink?: () => void;
   onEdit?: () => void;
   onFork?: () => void;
-  /**
-   * Hand this message back to the main thread. Supplied only inside a side chat
-   * (the main timeline has no main thread to send to). Not gated by `disabled`,
-   * which only greys the child-spawning fork action.
-   */
-  onSendToMain?: () => void;
   disabled?: boolean;
-  /** Plugin-contributed actions, rendered after the native ones. */
   pluginActions?: readonly ThreadTimelinePluginMessageAction[];
 }
 
 interface MessageOverflowAction {
-  icon: "Copy" | "Edit" | "MessageSquarePlus" | "Fork" | "ArrowTurnBackward";
-  /** Set on plugin-contributed actions; renders PluginActionIcon over `icon`. */
+  icon: "Copy" | "Link" | "Edit" | "MessageSquarePlus" | "Fork";
   plugin?: { pluginId: string | null; icon: string | null };
-  /** Render key when `label` may not be unique (plugin actions). */
   key?: string;
   label: string;
   onSelect: () => void;
   disabled?: boolean;
   copyText?: string;
+  copyImageUrl?: string;
   kind?: "copy";
 }
 
-interface MobileMessageOverflowPopoverProps {
-  actions: readonly MessageOverflowAction[];
-  alignment: MessageActionBarProps["alignment"];
-}
-
-function MobileMessageOverflowPopover({
-  actions,
-  alignment,
-}: MobileMessageOverflowPopoverProps) {
-  const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const portalScopeProps = usePortalScopeProps();
-  useEffect(() => {
-    if (!copied) return;
-    const timeoutId = window.setTimeout(() => setCopied(false), 2000);
-    return () => window.clearTimeout(timeoutId);
-  }, [copied]);
-  const selectAction = useCallback((action: MessageOverflowAction) => {
-    // Close before an action navigates or replaces the active panel.
-    flushSync(() => setOpen(false));
-    action.onSelect();
-  }, []);
-
-  return (
-    <PopoverPrimitive.Root open={open} onOpenChange={setOpen}>
-      <PopoverPrimitive.Trigger asChild>
-        <button
-          type="button"
-          className={MOBILE_OVERFLOW_TRIGGER_CLASS}
-          aria-label="Message actions"
-          data-no-sidebar-swipe=""
-          onMouseDown={preventOverlayTriggerSelection}
-        >
-          <Icon
-            name={copied ? "Check" : "MoreHorizontal"}
-            className={cn(
-              "size-3",
-              copied && "animate-in zoom-in-50 duration-150",
-            )}
-          />
-        </button>
-      </PopoverPrimitive.Trigger>
-      <PopoverPrimitive.Portal>
-        <PopoverPrimitive.Content
-          {...portalScopeProps}
-          side="top"
-          align={alignment === "end" ? "end" : "start"}
-          sideOffset={6}
-          collisionPadding={8}
-          className={MOBILE_OVERFLOW_CONTENT_CLASS}
-          onOpenAutoFocus={(event) => event.preventDefault()}
-          onCloseAutoFocus={(event) => event.preventDefault()}
-        >
-          {actions.map((action) => (
-            <button
-              key={action.key ?? action.label}
-              type="button"
-              className={MOBILE_OVERFLOW_ITEM_CLASS}
-              disabled={action.disabled}
-              onClick={() => {
-                if (action.kind === "copy") {
-                  void copyToClipboardWithToast(action.copyText ?? "", {
-                    successMessage: null,
-                    errorMessage: "Failed to copy",
-                  }).then((didCopy) => {
-                    if (!didCopy) return;
-                    setCopied(true);
-                    flushSync(() => setOpen(false));
-                  });
-                  return;
-                }
-                selectAction(action);
-              }}
-            >
-              {action.plugin ? (
-                <PluginActionIcon
-                  pluginId={action.plugin.pluginId}
-                  icon={action.plugin.icon}
-                  className="size-3.5"
-                />
-              ) : (
-                <Icon name={action.icon} className="size-3.5 shrink-0" />
-              )}
-              {action.label}
-            </button>
-          ))}
-        </PopoverPrimitive.Content>
-      </PopoverPrimitive.Portal>
-    </PopoverPrimitive.Root>
+function MessageActionIcon({
+  action,
+  className,
+  ariaHidden,
+}: {
+  action: MessageOverflowAction;
+  className?: string;
+  ariaHidden?: "true";
+}) {
+  return action.plugin ? (
+    <PluginActionIcon
+      pluginId={action.plugin.pluginId}
+      icon={action.plugin.icon}
+      className={className}
+    />
+  ) : (
+    <Icon name={action.icon} className={className} aria-hidden={ariaHidden} />
   );
 }
 
-// Shared hover-reveal classes for every action in the bar: hidden until the
-// surrounding named `group/message` row is hovered or a child control takes
-// keyboard focus (`group-focus-within`, matching disclosure.tsx so tabbing onto
-// an action button reveals the bar). The fork button mirrors CopyButton's own
-// classes so they read as one consistent affordance.
+const DESKTOP_ACTION_WIDTH_PX = 20;
+const TOUCH_ACTION_WIDTH_PX = 28;
+const ACTION_ROW_GAP_PX = 8;
+const OVERFLOW_TRIGGER_GAP_PX = 4;
+const OVERFLOW_TRIGGER_TIGHTEN_CLASS = "-ml-1";
+
+interface MessageActionRowLayout {
+  inlineCount: number;
+  overflowCount: number;
+}
+
+export function computeMessageActionRowLayout({
+  actionCount,
+  availableWidth,
+  actionWidth,
+}: {
+  actionCount: number;
+  availableWidth: number | undefined;
+  actionWidth: number;
+}): MessageActionRowLayout {
+  if (actionCount <= 0) {
+    return { inlineCount: 0, overflowCount: 0 };
+  }
+  if (availableWidth === undefined) {
+    return { inlineCount: actionCount, overflowCount: 0 };
+  }
+  const inlineCount = Math.max(
+    0,
+    Math.min(
+      actionCount,
+      Math.floor(
+        (availableWidth -
+          actionWidth -
+          OVERFLOW_TRIGGER_GAP_PX +
+          ACTION_ROW_GAP_PX) /
+          (actionWidth + ACTION_ROW_GAP_PX),
+      ),
+    ),
+  );
+  return { inlineCount, overflowCount: actionCount - inlineCount };
+}
+
+export function useMeasuredWidth({
+  enabled,
+  resolveTarget,
+}: {
+  enabled: boolean;
+  resolveTarget?: (node: HTMLElement) => Element | null;
+}): {
+  measureRef: (node: HTMLElement | null) => void;
+  width: number | undefined;
+} {
+  const [width, setWidth] = useState<number | undefined>(undefined);
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const measureRef = useCallback(
+    (node: HTMLElement | null) => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+      if (!enabled || node === null || typeof ResizeObserver === "undefined") {
+        return;
+      }
+      const target = resolveTarget ? resolveTarget(node) : node;
+      if (target === null) {
+        return;
+      }
+      const observer = new ResizeObserver(([entry]) => {
+        const inlineSize =
+          entry.contentBoxSize?.[0]?.inlineSize ?? entry.contentRect.width;
+        setWidth(Math.floor(inlineSize));
+      });
+      observer.observe(target);
+      observerRef.current = observer;
+    },
+    [enabled, resolveTarget],
+  );
+  return { measureRef, width };
+}
+
+export interface SharedMessageColumnWidth {
+  width: number | undefined;
+}
+
+export const MessageColumnWidthContext =
+  createContext<SharedMessageColumnWidth | null>(null);
+
 const ACTION_BUTTON_CLASS =
   "inline-flex size-5 cursor-pointer items-center justify-center text-muted-foreground hover:text-foreground disabled:pointer-events-none disabled:opacity-40";
-const HOVER_REVEAL_CLASS =
-  "opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100";
+const HOVER_REVEAL_CLASS = cn(
+  "opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100",
+  HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS,
+);
 const MOBILE_INLINE_ACTION_CLASS =
-  "max-md:pointer-coarse:size-7 max-md:pointer-coarse:opacity-100 max-md:pointer-coarse:disabled:opacity-40 max-md:pointer-coarse:[&_svg]:size-4";
+  "max-md:pointer-coarse:size-7 max-md:pointer-coarse:[&_[data-icon-root]]:size-4";
 const MOBILE_OVERFLOW_ACTION_CLASS = "max-md:pointer-coarse:hidden";
-const MOBILE_OVERFLOW_TRIGGER_CLASS =
-  "hidden size-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground data-[state=open]:bg-state-active data-[state=open]:text-foreground max-md:pointer-coarse:inline-flex max-md:pointer-coarse:[&_svg]:size-4";
 const ACTION_TOOLTIP_SIDE = "bottom";
-const MOBILE_OVERFLOW_CONTENT_CLASS =
-  "z-50 flex max-h-[50dvh] w-44 flex-col gap-0.5 overflow-y-auto rounded-md border bg-popover p-0.5 text-popover-foreground shadow-md outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95";
-const MOBILE_OVERFLOW_ITEM_CLASS =
-  "flex min-h-8 w-full cursor-pointer items-center gap-2 rounded px-2 py-1 text-left text-xs text-foreground transition-colors hover:bg-surface-recessed focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring active:bg-state-active disabled:pointer-events-none disabled:opacity-40 select-none";
+const MENU_CONTENT_WIDTH_CLASS = "max-w-[min(16rem,calc(100vw-1rem))]";
+
+const ACTION_ROW_CLASS =
+  "absolute top-0 flex max-w-full items-center gap-2 overflow-hidden data-[menu-open]:[&_button]:opacity-100";
+
+const BUBBLE_ALIGN_INSET_CLASS = "pr-[13px] max-md:pointer-coarse:pr-[11px]";
+const BUBBLE_ALIGN_OFFSET_CLASS =
+  "right-[13px] max-md:pointer-coarse:right-[11px]";
+const PROSE_ALIGN_INSET_CLASS = "-ml-1 max-md:pointer-coarse:-ml-1.5";
+export const PROSE_COLUMN_INSET_CLASS = "px-2";
 
 export function findMessageActionTooltipCollisionBoundary(
   node: HTMLElement | null,
@@ -199,39 +204,147 @@ export function findMessageActionTooltipCollisionBoundary(
   return node?.closest<HTMLElement>("[data-thread-window]") ?? undefined;
 }
 
-/**
- * Hover-revealed footer of per-message actions. Renders an action only when it
- * is meaningful: copy when there is text, add-to-chat when a composer owns the
- * draft, and fork when its handler is supplied. `disabled` greys the fork
- * button (e.g. at the depth cap) while leaving copy and add-to-chat usable.
- */
+function DesktopMessageAction({
+  action,
+  className,
+  collisionBoundary,
+}: {
+  action: MessageOverflowAction;
+  className: string;
+  collisionBoundary: HTMLElement | undefined;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        {action.kind === "copy" ? (
+          <CopyButton
+            text={action.copyText ?? ""}
+            imageUrl={action.copyImageUrl}
+            label={action.label}
+            className={className}
+          />
+        ) : (
+          <button
+            type="button"
+            className={cn(ACTION_BUTTON_CLASS, className)}
+            onClick={action.onSelect}
+            disabled={action.disabled}
+            aria-label={action.label}
+          >
+            <MessageActionIcon action={action} className="size-3" />
+          </button>
+        )}
+      </TooltipTrigger>
+      <TooltipContent
+        side={ACTION_TOOLTIP_SIDE}
+        collisionBoundary={collisionBoundary}
+      >
+        {action.label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function MessageActionMenuItems({
+  actions,
+}: {
+  actions: readonly MessageOverflowAction[];
+}) {
+  return actions.map((action) => (
+    <DropdownMenuItem
+      key={action.key ?? action.label}
+      disabled={action.disabled}
+      onSelect={action.onSelect}
+      textValue={action.label}
+    >
+      <MessageActionIcon action={action} ariaHidden="true" />
+      {action.label}
+    </DropdownMenuItem>
+  ));
+}
+
+function formatMessageDay(date: Date, now: Date): string {
+  if (date.toDateString() === now.toDateString()) {
+    return "Today";
+  }
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() !== now.getFullYear() ? { year: "numeric" } : {}),
+  });
+}
+
+export function formatShortMessageTime(timestamp: number, now: Date): string {
+  const date = new Date(timestamp);
+  const time = date.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  return date.toDateString() === now.toDateString()
+    ? time
+    : `${formatMessageDay(date, now)}, ${time}`;
+}
+
+function MessageTimestampFooter({ timestamp }: { timestamp: number }) {
+  const date = new Date(timestamp);
+  const time = date.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const fullDate = date.toLocaleString(undefined, {
+    dateStyle: "full",
+    timeStyle: "long",
+  });
+  return (
+    <div
+      className="mt-1 border-t border-border px-2 pt-2 pb-1 text-xs text-subtle-foreground"
+      data-message-metadata=""
+    >
+      <time dateTime={date.toISOString()} title={fullDate}>
+        {formatMessageDay(date, new Date())}, {time}
+      </time>
+    </div>
+  );
+}
+
 export function MessageActionBar({
+  timestamp,
   messageText,
   alignment,
   mobileActionDisplay,
   addToChatAttachments = [],
+  copyImageUrl,
   onAddToChat,
+  onCopyLink,
   onEdit,
   onFork,
-  onSendToMain,
   disabled,
   pluginActions = [],
 }: MessageActionBarProps) {
   const isCompactViewport = useIsCompactViewport();
   const isPointerCoarse = usePointerCoarse();
-  const hasCopy = messageText.length > 0;
+  const hasCopy = messageText.length > 0 || copyImageUrl !== undefined;
   const hasAddToChat =
     (hasCopy || addToChatAttachments.length > 0) && onAddToChat !== undefined;
   const [collisionBoundary, setCollisionBoundary] = useState<
     HTMLElement | undefined
   >();
+  const isCompactTouch = isCompactViewport && isPointerCoarse;
+  const { measureRef, width: availableWidth } = useMeasuredWidth({
+    enabled: !(isCompactTouch && mobileActionDisplay === "overflow"),
+  });
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const slotRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      measureRef(node);
+      setCollisionBoundary(findMessageActionTooltipCollisionBoundary(node));
+    },
+    [measureRef],
+  );
   const mobileDirectActionClass =
     mobileActionDisplay === "inline"
       ? MOBILE_INLINE_ACTION_CLASS
       : MOBILE_OVERFLOW_ACTION_CLASS;
-  const containerRef = useCallback((node: HTMLDivElement | null) => {
-    setCollisionBoundary(findMessageActionTooltipCollisionBoundary(node));
-  }, []);
   const handleAddToChat = useCallback(() => {
     if (!onAddToChat) return;
     if (addToChatAttachments.length > 0) {
@@ -240,7 +353,7 @@ export function MessageActionBar({
     }
     onAddToChat(messageText);
   }, [addToChatAttachments, messageText, onAddToChat]);
-  const overflowActions: MessageOverflowAction[] = [
+  const inlineCandidates: MessageOverflowAction[] = [
     ...(hasCopy
       ? [
           {
@@ -249,9 +362,11 @@ export function MessageActionBar({
             onSelect: () => {
               void copyToClipboardWithToast(messageText, {
                 errorMessage: "Failed to copy",
+                imageUrl: copyImageUrl,
               });
             },
             copyText: messageText,
+            copyImageUrl,
             kind: "copy" as const,
           },
         ]
@@ -265,21 +380,21 @@ export function MessageActionBar({
           },
         ]
       : []),
+    ...pluginActions.map((action) => ({
+      icon: "Copy" as const,
+      plugin: { pluginId: action.pluginId, icon: action.icon },
+      key: action.key,
+      label: action.label,
+      onSelect: action.onSelect,
+    })),
+  ];
+  const trailingMenuActions: MessageOverflowAction[] = [
     ...(hasAddToChat
       ? [
           {
             icon: "MessageSquarePlus" as const,
             label: "Add to chat",
             onSelect: handleAddToChat,
-          },
-        ]
-      : []),
-    ...(onSendToMain
-      ? [
-          {
-            icon: "ArrowTurnBackward" as const,
-            label: "Send to main thread",
-            onSelect: onSendToMain,
           },
         ]
       : []),
@@ -293,225 +408,127 @@ export function MessageActionBar({
           },
         ]
       : []),
-    ...pluginActions.map((action) => ({
-      // Unused when `plugin` is set; a valid member keeps the type narrow.
-      icon: "Copy" as const,
-      plugin: { pluginId: action.pluginId, icon: action.icon },
-      key: action.key,
-      label: action.label,
-      onSelect: action.onSelect,
-    })),
   ];
-  const useMobileOverflowPopover = isCompactViewport && isPointerCoarse;
+  const layout = computeMessageActionRowLayout({
+    actionCount: inlineCandidates.length,
+    availableWidth,
+    actionWidth: isCompactTouch
+      ? TOUCH_ACTION_WIDTH_PX
+      : DESKTOP_ACTION_WIDTH_PX,
+  });
+  const inlineCount =
+    isCompactTouch && mobileActionDisplay === "overflow"
+      ? 0
+      : layout.inlineCount;
+  const menuActions = [
+    ...(onCopyLink
+      ? [
+          {
+            icon: "Link" as const,
+            label: "Copy link",
+            onSelect: onCopyLink,
+          },
+        ]
+      : []),
+    ...inlineCandidates.slice(isCompactViewport ? 0 : inlineCount),
+    ...trailingMenuActions,
+  ];
 
-  if (
-    !hasCopy &&
-    !onEdit &&
-    !hasAddToChat &&
-    !onFork &&
-    !onSendToMain &&
-    pluginActions.length === 0
-  ) {
-    return null;
-  }
+  const rowClass = cn(
+    ACTION_ROW_CLASS,
+    alignment === "end"
+      ? BUBBLE_ALIGN_OFFSET_CLASS
+      : cn("left-0", PROSE_ALIGN_INSET_CLASS),
+  );
+  const slotClass = cn(
+    "relative w-full",
+    alignment === "end" && BUBBLE_ALIGN_INSET_CLASS,
+  );
 
   return (
     <TooltipProvider delayDuration={300}>
       <div
-        ref={containerRef}
-        className={cn(
-          "flex items-center gap-2",
-          alignment === "end" ? "justify-end" : "justify-start",
-        )}
+        ref={slotRef}
+        className={cn(slotClass, "h-5 max-md:pointer-coarse:h-7")}
       >
-        {hasCopy ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <CopyButton
-                text={messageText}
-                label="Copy message"
-                className={cn(HOVER_REVEAL_CLASS, mobileDirectActionClass)}
-              />
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              Copy message
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        {onEdit ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  mobileDirectActionClass,
-                )}
-                onClick={onEdit}
-                aria-label="Edit message"
-              >
-                <Icon name="Edit" className="size-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              Edit message
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        {hasAddToChat ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  mobileDirectActionClass,
-                )}
-                onClick={handleAddToChat}
-                aria-label="Add to chat"
-              >
-                <Icon name="MessageSquarePlus" className="size-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              Add to chat
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        {onSendToMain ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  mobileDirectActionClass,
-                )}
-                onClick={onSendToMain}
-                aria-label="Send to main thread"
-              >
-                <Icon name="ArrowTurnBackward" className="size-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              Send to main thread
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        {onFork ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  mobileDirectActionClass,
-                )}
-                onClick={onFork}
-                disabled={disabled}
-                aria-label="Fork into new thread"
-              >
-                <Icon name="Fork" className="size-3" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              Fork into new thread
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
-        {pluginActions.map((action) => (
-          <Tooltip key={action.key}>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  ACTION_BUTTON_CLASS,
-                  HOVER_REVEAL_CLASS,
-                  mobileDirectActionClass,
-                )}
-                onClick={action.onSelect}
-                aria-label={action.label}
-              >
-                <PluginActionIcon
-                  pluginId={action.pluginId}
-                  icon={action.icon}
-                  className="size-3"
-                />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side={ACTION_TOOLTIP_SIDE}
-              collisionBoundary={collisionBoundary}
-            >
-              {action.label}
-            </TooltipContent>
-          </Tooltip>
-        ))}
-        {mobileActionDisplay === "overflow" ? (
-          useMobileOverflowPopover ? (
-            <MobileMessageOverflowPopover
-              actions={overflowActions}
-              alignment={alignment}
+        <div className={rowClass} data-menu-open={isMenuOpen ? "" : undefined}>
+          {isCompactTouch ? (
+            <MobileInlineActions
+              actions={inlineCandidates.slice(0, inlineCount)}
             />
           ) : (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className={MOBILE_OVERFLOW_TRIGGER_CLASS}
-                  aria-label="Message actions"
-                  data-no-sidebar-swipe=""
-                >
-                  <Icon name="MoreHorizontal" className="size-3" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align={alignment === "end" ? "end" : "start"}
-                mobileTitle="Message actions"
-                className="w-48"
+            inlineCandidates
+              .slice(0, inlineCount)
+              .map((action) => (
+                <DesktopMessageAction
+                  key={action.key ?? action.label}
+                  action={action}
+                  className={cn(HOVER_REVEAL_CLASS, mobileDirectActionClass)}
+                  collisionBoundary={collisionBoundary}
+                />
+              ))
+          )}
+          <DropdownMenu onOpenChange={setIsMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  ACTION_BUTTON_CLASS,
+                  HOVER_REVEAL_CLASS,
+                  MOBILE_INLINE_ACTION_CLASS,
+                  inlineCount > 0 && OVERFLOW_TRIGGER_TIGHTEN_CLASS,
+                  "data-[state=open]:text-foreground data-[state=open]:opacity-100",
+                )}
+                aria-label="Message actions"
+                data-no-sidebar-swipe=""
               >
-                {overflowActions.map((action) => (
-                  <DropdownMenuItem
-                    key={action.key ?? action.label}
-                    disabled={action.disabled}
-                    onSelect={action.onSelect}
-                    textValue={action.label}
-                  >
-                    {action.plugin ? (
-                      <PluginActionIcon
-                        pluginId={action.plugin.pluginId}
-                        icon={action.plugin.icon}
-                      />
-                    ) : (
-                      <Icon name={action.icon} aria-hidden="true" />
-                    )}
-                    {action.label}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )
-        ) : null}
+                <Icon name="MoreHorizontal" className="size-3" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align={alignment === "end" ? "end" : "start"}
+              mobileTitle="Message actions"
+              className={MENU_CONTENT_WIDTH_CLASS}
+            >
+              <MessageActionMenuItems actions={menuActions} />
+              <MessageTimestampFooter timestamp={timestamp} />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       </div>
     </TooltipProvider>
+  );
+}
+
+function MobileInlineActions({
+  actions,
+}: {
+  actions: readonly MessageOverflowAction[];
+}) {
+  return actions.map((action) =>
+    action.kind === "copy" ? (
+      <CopyButton
+        key={action.key ?? action.label}
+        text={action.copyText ?? ""}
+        imageUrl={action.copyImageUrl}
+        label={action.label}
+        className={cn(HOVER_REVEAL_CLASS, MOBILE_INLINE_ACTION_CLASS)}
+      />
+    ) : (
+      <button
+        key={action.key ?? action.label}
+        type="button"
+        className={cn(
+          ACTION_BUTTON_CLASS,
+          HOVER_REVEAL_CLASS,
+          MOBILE_INLINE_ACTION_CLASS,
+        )}
+        onClick={action.onSelect}
+        disabled={action.disabled}
+        aria-label={action.label}
+      >
+        <MessageActionIcon action={action} className="size-3" />
+      </button>
+    ),
   );
 }

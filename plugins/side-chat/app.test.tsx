@@ -1,12 +1,8 @@
 // @vitest-environment jsdom
-// Frontend tests: slot registrations, the reply action's fork+open flow, and
-// the panel's ThreadChat wiring (ReplyingTo header, send-to-main action).
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
-// Load through the thunk so the test runtime is installed before app.tsx
-// binds `definePluginApp`; pull the pure helpers from the same evaluation.
 const app = await loadPluginApp(() => import("./app"));
 const { parsePanelParams } = await import("./app");
 
@@ -87,8 +83,10 @@ describe("reply-in-side-chat message action", () => {
         role: "assistant",
         text: "whole message text",
         sourceSeqEnd: 42,
+        experimental_messageSeq: 42,
       },
       openPanel,
+      composer: null,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -138,12 +136,12 @@ describe("reply-in-side-chat message action", () => {
         role: "assistant" as const,
         text: "whole message text",
         sourceSeqEnd: 42,
+        experimental_messageSeq: 42,
       },
       openPanel,
+      composer: null,
     };
 
-    // Double click before the backend responds: both invocations share one
-    // in-flight open, so exactly one fork is created and one tab opened.
     const first = app.messageActions[0]!.run(context);
     const second = app.messageActions[0]!.run(context);
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -154,7 +152,6 @@ describe("reply-in-side-chat message action", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(openPanel).toHaveBeenCalledTimes(1);
 
-    // Settled: a later deliberate re-open is a fresh flight again.
     await app.messageActions[0]!.run(context);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -171,9 +168,11 @@ describe("reply-in-side-chat message action", () => {
         role: "assistant",
         text: "whole message text",
         sourceSeqEnd: 42,
+        experimental_messageSeq: 42,
       },
       selectedText: "just this part",
       openPanel,
+      composer: null,
     });
 
     expect(openPanel).toHaveBeenCalledWith(
@@ -206,15 +205,11 @@ describe("SideChatPanel", () => {
     expect(chat.getAttribute("data-thread-id")).toBe("thr_fork");
     expect(chat.getAttribute("data-variant")).toBe("compact");
     expect(chat.getAttribute("data-layout")).toBe("contained");
-    // The side chat sets its own permission mode rather than mirroring the
-    // thread it forked from.
     expect(chat.getAttribute("data-permission-policy")).toBe("editable");
     expect(chat.getAttribute("data-message-actions")).toBe("send-to-main");
 
     const leading = slot.getByTestId("bb-thread-chat-leading-content");
     expect(leading.textContent).toContain("Replying to");
-    // The anchor renders through the host Markdown component (SDK stub emits
-    // the raw source) so the header matches chat-message typography.
     const markdown = leading.querySelector("[data-testid='bb-markdown']");
     expect(markdown?.textContent).toContain("**anchor**");
 
@@ -222,30 +217,25 @@ describe("SideChatPanel", () => {
     expect(action.getAttribute("data-roles")).toBe("assistant");
   });
 
-  it("send-to-main queues the message text on the source thread", async () => {
-    const sendToMain = vi.fn(() => ({ ok: true }));
+  it("send-to-main queues the message text on the source thread through the public API", async () => {
+    const create = vi.fn(async () => ({ id: "qm_1" }) as never);
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_src", params },
-      { rpc: { sendToMain } },
+      { rpc: {}, sdk: { threads: { queuedMessages: { create } } } },
     );
 
     fireEvent.click(slot.getByTestId("bb-thread-chat-action-send-to-main"));
 
     await waitFor(() => {
-      expect(slot.rpcCalls).toEqual([
-        {
-          method: "sendToMain",
-          input: {
-            sourceThreadId: "thr_src",
-            senderThreadId: "thr_fork",
-            text: "test message text",
-          },
-        },
-      ]);
+      expect(create).toHaveBeenCalledWith({
+        threadId: "thr_src",
+        input: [{ type: "text", text: "test message text", mentions: [] }],
+        senderThreadId: "thr_fork",
+      });
     });
+    expect(slot.rpcCalls).toEqual([]);
   });
-
 
   it("reports a missing thread reference for malformed params", () => {
     const slot = renderSlot(

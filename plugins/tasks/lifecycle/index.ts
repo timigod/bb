@@ -1,18 +1,10 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
-import type { TasksApiStore } from "../api";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { publishCommentsChanged, type TasksApiStore } from "../api";
 import type { TaskThread, TaskThreadLiveStatus } from "../db";
-import {
-  createSystemComment,
-  publishCommentsChanged,
-  publishThreadsChanged,
-} from "../delegate";
+import { createSystemComment, publishThreadsChanged } from "../delegate";
+import { errorMessage } from "../shared/errors";
 
-const TERMINAL_LIVE_STATUSES = new Set<TaskThreadLiveStatus>([
-  "completed",
-  "failed",
-]);
-export const THREAD_STATUS_RECONCILE_INTERVAL_MS = 5 * 60_000;
-export const THREAD_STATUS_IDLE_INTERVAL_MS = 60_000;
+const TERMINAL_LIVE_STATUSES = new Set<TaskThreadLiveStatus>(["completed"]);
 
 type SdkThread = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>;
 
@@ -21,6 +13,7 @@ function liveStatusFromThread(thread: SdkThread): TaskThreadLiveStatus {
   if (thread.deletedAt !== null) return "completed";
 
   switch (thread.status) {
+    case "pending":
     case "starting":
       return "starting";
     case "active":
@@ -31,23 +24,23 @@ function liveStatusFromThread(thread: SdkThread): TaskThreadLiveStatus {
   }
 }
 
-function trackedThreads(store: TasksApiStore, threadId?: string): TaskThread[] {
+function trackedThreads(store: TasksApiStore): TaskThread[] {
   const tracked: TaskThread[] = [];
   for (const task of store.tasks.listTasks()) {
     for (const thread of store.tasks.listTaskThreads(task.id)) {
-      if (threadId === undefined || thread.threadId === threadId) {
-        tracked.push(thread);
-      }
+      tracked.push(thread);
     }
   }
   return tracked;
 }
 
-function terminalCommentBody(
+function statusCommentBody(
   thread: TaskThread,
   liveStatus: Extract<TaskThreadLiveStatus, "completed" | "failed">,
 ): string {
-  return `Thread "${thread.title}" ${liveStatus} — final message posted · ${thread.threadId}`;
+  const outcome =
+    liveStatus === "completed" ? "completed — final message posted" : "failed";
+  return `Thread "${thread.title}" ${outcome} · ${thread.threadId}`;
 }
 
 function sdkErrorCode(error: unknown): string | undefined {
@@ -77,7 +70,7 @@ function transitionThread(
         taskId: thread.taskId,
         presetName: thread.presetName,
         threadId: thread.threadId,
-        body: terminalCommentBody(thread, liveStatus),
+        body: statusCommentBody(thread, liveStatus),
       });
     }
   });
@@ -92,7 +85,7 @@ function transitionTrackedThread(
   threadId: string,
   liveStatus: TaskThreadLiveStatus,
 ): void {
-  for (const thread of trackedThreads(store, threadId)) {
+  for (const thread of store.tasks.listTaskThreadsByThreadId(threadId)) {
     transitionThread(bb, store, thread, liveStatus);
   }
 }
@@ -113,9 +106,9 @@ async function reconcileTrackedThread(
       return;
     }
     bb.log.warn(
-      `Could not reconcile task thread ${trackedThread.threadId}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `Could not reconcile task thread ${trackedThread.threadId}: ${errorMessage(
+        error,
+      )}`,
     );
   }
 }
@@ -131,30 +124,6 @@ async function reconcileTrackedThreads(
   for (const trackedThread of nonTerminalThreads) {
     await reconcileTrackedThread(bb, store, trackedThread);
   }
-}
-
-function hasNonTerminalTrackedThreads(store: TasksApiStore): boolean {
-  return trackedThreads(store).some(
-    (thread) => !TERMINAL_LIVE_STATUSES.has(thread.liveStatus),
-  );
-}
-
-function waitForNextReconciliation(
-  signal: AbortSignal,
-  intervalMs: number,
-): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, intervalMs);
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 export async function registerLifecycle(
@@ -177,29 +146,5 @@ export async function registerLifecycle(
     transitionTrackedThread(bb, store, thread.id, "completed");
   });
 
-  // Lifecycle events cover live transitions without a full-SDK subscription.
-  // Reconciliation remains a low-frequency recovery path for transitions that
-  // happen while the plugin is unloaded or while a replacement is loading.
-  bb.background.service("thread-status-reconcile", {
-    async start(signal) {
-      while (!signal.aborted) {
-        if (!hasNonTerminalTrackedThreads(store)) {
-          await waitForNextReconciliation(
-            signal,
-            THREAD_STATUS_IDLE_INTERVAL_MS,
-          );
-          continue;
-        }
-        await waitForNextReconciliation(
-          signal,
-          THREAD_STATUS_RECONCILE_INTERVAL_MS,
-        );
-        if (signal.aborted) break;
-        await reconcileTrackedThreads(bb, store);
-      }
-    },
-  });
-
-  await reconcileTrackedThreads(bb, store);
   await reconcileTrackedThreads(bb, store);
 }

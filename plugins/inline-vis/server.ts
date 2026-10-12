@@ -1,29 +1,21 @@
-// bb-plugin-inline-vis — reference messageDirective that previews a workspace
-// HTML file inside an assistant message.
-//
-// The frontend directive mounts when the model emits:
-//   ::inline-vis{file="demo.html"}
-// and calls `prepareHtmlPreview` with the message's threadId plus the file
-// attribute. This backend preflights the file for a clean inline error; the
-// frontend then points its iframe at bb's path-shaped worktree preview route so
-// relative assets work exactly as they do in the sidebar HTML preview.
 import path from "node:path";
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type MarkdownProps,
+} from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-/** Match the generic sidebar HTML preview's 5 MiB document cap. */
-export const MAX_HTML_BYTES = 5 * 1024 * 1024;
+export const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
 
-const HTML_EXTENSIONS = new Set([".html", ".htm"]);
+type PreviewKind = "html" | "markdown";
 
-export interface PrepareHtmlPreviewInput {
-  threadId: string;
-  file: string;
-}
-
-export interface PrepareHtmlPreviewResult {
-  file: string;
-}
+const PREVIEW_KIND_BY_EXTENSION: ReadonlyMap<string, PreviewKind> = new Map([
+  [".html", "html"],
+  [".htm", "html"],
+  [".md", "markdown"],
+  [".markdown", "markdown"],
+]);
 
 function requireNonEmptyString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -36,19 +28,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Validate a workspace-relative HTML path. Rejects absolute paths, traversal,
- * and non-html extensions before any filesystem access.
- */
-export function requireWorkspaceHtmlFile(value: unknown): string {
+function previewKind(file: string): PreviewKind {
+  const extension = path.posix.extname(file).toLowerCase();
+  const kind = PREVIEW_KIND_BY_EXTENSION.get(extension);
+  if (kind === undefined) {
+    throw new Error(
+      `"file" must end with .html, .htm, .md, or .markdown, got ${JSON.stringify(file)}`,
+    );
+  }
+  return kind;
+}
+
+export function requireRelativePreviewFile(value: unknown): string {
   const file = requireNonEmptyString(value, "file");
   if (path.isAbsolute(file)) {
-    throw new Error(`"file" must be workspace-relative, not absolute: ${file}`);
+    throw new Error(`"file" must be source-relative, not absolute: ${file}`);
   }
-  // Normalize separators and reject Windows drive / UNC-style absolute forms
-  // that `path.isAbsolute` may miss on POSIX hosts.
   if (/^[a-zA-Z]:[\\/]/.test(file) || file.startsWith("\\\\")) {
-    throw new Error(`"file" must be workspace-relative, not absolute: ${file}`);
+    throw new Error(`"file" must be source-relative, not absolute: ${file}`);
   }
   const slashNormalized = file.replace(/\\/g, "/");
   if (slashNormalized.split("/").includes("..")) {
@@ -62,22 +59,13 @@ export function requireWorkspaceHtmlFile(value: unknown): string {
     normalized === "." ||
     normalized.startsWith("/")
   ) {
-    throw new Error(`"file" must not escape the workspace: ${file}`);
+    throw new Error(`"file" must not escape its source: ${file}`);
   }
-  const ext = path.posix.extname(normalized).toLowerCase();
-  if (!HTML_EXTENSIONS.has(ext)) {
-    throw new Error(
-      `"file" must end with .html or .htm, got ${JSON.stringify(file)}`,
-    );
-  }
+  previewKind(normalized);
   return normalized;
 }
 
-/**
- * Resolve `relativeFile` beneath `rootPath` and prove it stays contained.
- * Returns the absolute path suitable for `bb.sdk.files.read`.
- */
-export function resolveContainedHtmlPath(
+export function resolveContainedPreviewPath(
   rootPath: string,
   relativeFile: string,
 ): string {
@@ -89,26 +77,9 @@ export function resolveContainedHtmlPath(
     relative.startsWith(`..${path.sep}`) ||
     path.isAbsolute(relative)
   ) {
-    throw new Error(`"file" must not escape the workspace: ${relativeFile}`);
+    throw new Error(`"file" must not escape its source: ${relativeFile}`);
   }
   return absolute;
-}
-
-function parsePrepareHtmlPreviewInput(input: unknown): PrepareHtmlPreviewInput {
-  if (!isRecord(input)) {
-    throw new Error("expected { threadId: string, file: string }");
-  }
-  // Reject unknown keys so the contract stays explicit.
-  const allowed = new Set(["threadId", "file"]);
-  for (const key of Object.keys(input)) {
-    if (!allowed.has(key)) {
-      throw new Error(`unknown input field: ${JSON.stringify(key)}`);
-    }
-  }
-  return {
-    threadId: requireNonEmptyString(input.threadId, "threadId"),
-    file: requireWorkspaceHtmlFile(input.file),
-  };
 }
 
 function httpStatus(error: unknown): number | null {
@@ -119,57 +90,108 @@ function httpStatus(error: unknown): number | null {
   return typeof status === "number" ? status : null;
 }
 
+const previewTargetSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("workspace"),
+      environmentId: z.string(),
+      path: z.string(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("thread-storage"),
+      threadId: z.string(),
+      path: z.string(),
+    })
+    .strict(),
+]);
+
 export const inlineVisRpcContract = defineRpcContract({
-  prepareHtmlPreview: {
+  preparePreview: {
     input: z
       .object({
         threadId: z.string().trim().min(1),
-        file: z.string().transform((value) => requireWorkspaceHtmlFile(value)),
+        file: z
+          .string()
+          .transform((value) => requireRelativePreviewFile(value)),
+        source: z
+          .string()
+          .trim()
+          .pipe(z.enum(["workspace", "thread-storage"]))
+          .default("workspace"),
       })
       .strict(),
-    output: z.object({ file: z.string() }).strict(),
+    output: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("not-found"), file: z.string() }).strict(),
+      z
+        .object({
+          kind: z.literal("html"),
+          file: z.string(),
+          source: z.enum(["workspace", "thread-storage"]),
+          target: previewTargetSchema,
+          url: z.string(),
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("markdown"),
+          file: z.string(),
+          source: z.enum(["workspace", "thread-storage"]),
+          target: previewTargetSchema,
+          rootPath: z.string(),
+          content: z.string(),
+        })
+        .strict(),
+    ]),
   },
 });
 
 export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(inlineVisRpcContract, {
-    /**
-     * Preflight a workspace-relative HTML file for the inline-vis message
-     * directive. Input is untyped on the wire — narrowed immediately. The
-     * existing worktree preview route serves the iframe and its relative assets.
-     */
-    async prepareHtmlPreview({
-      threadId,
-      file,
-    }): Promise<PrepareHtmlPreviewResult> {
-      const thread = await bb.sdk.threads.get({
-        threadId,
-        include: "environment",
-      });
+    async preparePreview({ threadId, file, source }) {
+      let rootPath: string;
+      let hostId: string;
+      let target: NonNullable<MarkdownProps["experimental_document"]>["target"];
 
-      if (!("environment" in thread)) {
-        throw new Error(
-          "Thread environment was not returned — inline-vis needs a live environment.",
-        );
+      if (source === "thread-storage") {
+        const storage = await bb.sdk.threads.storageLocation({ threadId });
+        rootPath = storage.storageRootPath;
+        hostId = storage.hostId;
+        target = { kind: source, threadId, path: file };
+      } else {
+        const thread = await bb.sdk.threads.get({
+          threadId,
+          include: "environment",
+        });
+
+        if (!("environment" in thread)) {
+          throw new Error(
+            "Thread environment was not returned — inline-vis needs a live environment.",
+          );
+        }
+
+        const environment = thread.environment;
+        const workspacePath =
+          typeof environment?.path === "string" ? environment.path : null;
+        if (!environment || !workspacePath) {
+          throw new Error(
+            "This thread has no workspace path — inline-vis needs a live environment.",
+          );
+        }
+        const workspaceHostId =
+          typeof environment?.hostId === "string" ? environment.hostId : null;
+        if (!workspaceHostId) {
+          throw new Error(
+            "This thread's environment has no hostId — cannot read workspace files.",
+          );
+        }
+        rootPath = workspacePath;
+        hostId = workspaceHostId;
+        target = { kind: source, environmentId: environment.id, path: file };
       }
 
-      const environment = thread.environment;
-      const rootPath =
-        typeof environment?.path === "string" ? environment.path : null;
-      if (!rootPath) {
-        throw new Error(
-          "This thread has no workspace path — inline-vis needs a live environment.",
-        );
-      }
-      const hostId =
-        typeof environment?.hostId === "string" ? environment.hostId : null;
-      if (!hostId) {
-        throw new Error(
-          "This thread's environment has no hostId — cannot read workspace files.",
-        );
-      }
-
-      const absolutePath = resolveContainedHtmlPath(rootPath, file);
+      const absolutePath = resolveContainedPreviewPath(rootPath, file);
 
       let result;
       try {
@@ -180,24 +202,40 @@ export default async function plugin(bb: BbPluginApi) {
         });
       } catch (error) {
         if (httpStatus(error) === 404) {
-          throw new Error(`HTML file not found: ${file}`);
+          return { kind: "not-found" as const, file };
         }
         throw error;
       }
 
       if (result.contentEncoding !== "utf8") {
         throw new Error(
-          `HTML file is not valid UTF-8 text (encoding=${result.contentEncoding}).`,
+          `Preview file is not valid UTF-8 text (encoding=${result.contentEncoding}).`,
         );
       }
       const sizeBytes = result.sizeBytes;
-      if (sizeBytes > MAX_HTML_BYTES) {
+      if (sizeBytes > MAX_PREVIEW_BYTES) {
         throw new Error(
-          `HTML file is too large (${sizeBytes} bytes; max ${MAX_HTML_BYTES}).`,
+          `Preview file is too large (${sizeBytes} bytes; max ${MAX_PREVIEW_BYTES}).`,
         );
       }
 
-      return { file };
+      const kind = previewKind(file);
+      if (kind === "markdown") {
+        return {
+          kind,
+          file,
+          source,
+          target,
+          rootPath,
+          content: result.content,
+        };
+      }
+      const encodedFile = file.split("/").map(encodeURIComponent).join("/");
+      const url =
+        target.kind === "thread-storage"
+          ? `/api/v1/threads/${encodeURIComponent(threadId)}/thread-storage/files/${encodedFile}`
+          : `/api/v1/environments/${encodeURIComponent(target.environmentId)}/files/${encodedFile}`;
+      return { kind, file, source, target, url };
     },
   });
 }

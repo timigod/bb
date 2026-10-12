@@ -1,23 +1,32 @@
-export interface ResolveAbsoluteFilePathArgs {
+import {
+  getHostPathDirname,
+  isAbsoluteHostPath,
+  isHostPathWithin,
+  isWindowsHostPath,
+  joinHostPath,
+  normalizeHostPath,
+} from "@bb/domain";
+
+interface ResolveAbsoluteFilePathArgs {
   path: string;
   rootPath: string | null | undefined;
 }
 
-export interface BuildAbsoluteFilePathArgs {
+interface BuildAbsoluteFilePathArgs {
   path: string;
   rootPath: string;
 }
 
-export interface GetAbsoluteDirnameArgs {
+interface GetAbsoluteDirnameArgs {
   path: string;
 }
 
-export interface IsAbsoluteFilePathWithinRootArgs {
+interface IsAbsoluteFilePathWithinRootArgs {
   candidatePath: string;
   rootPath: string;
 }
 
-export interface NormalizeAbsoluteFilePathArgs {
+interface NormalizeAbsoluteFilePathArgs {
   path: string;
 }
 
@@ -33,55 +42,20 @@ function trimLeadingSlash(path: string): string {
 }
 
 function isAbsoluteFilePath(path: string): boolean {
-  return path.startsWith("/");
+  return isAbsoluteHostPath(path);
 }
 
 export function normalizeAbsoluteFilePath({
   path,
 }: NormalizeAbsoluteFilePathArgs): string | null {
-  if (!isAbsoluteFilePath(path)) {
-    return null;
-  }
-
-  const normalizedSegments: string[] = [];
-  for (const segment of path.split("/")) {
-    if (segment.length === 0 || segment === ".") {
-      continue;
-    }
-    if (segment === "..") {
-      if (normalizedSegments.length > 0) {
-        normalizedSegments.pop();
-      }
-      continue;
-    }
-    normalizedSegments.push(segment);
-  }
-
-  return normalizedSegments.length === 0
-    ? "/"
-    : `/${normalizedSegments.join("/")}`;
+  return normalizeHostPath(path);
 }
 
 export function isAbsoluteFilePathWithinRoot({
   candidatePath,
   rootPath,
 }: IsAbsoluteFilePathWithinRootArgs): boolean {
-  const normalizedCandidatePath = normalizeAbsoluteFilePath({
-    path: candidatePath,
-  });
-  const normalizedRootPath = normalizeAbsoluteFilePath({ path: rootPath });
-  if (normalizedCandidatePath === null || normalizedRootPath === null) {
-    return false;
-  }
-
-  if (normalizedRootPath === "/") {
-    return normalizedCandidatePath.startsWith("/");
-  }
-
-  return (
-    normalizedCandidatePath === normalizedRootPath ||
-    normalizedCandidatePath.startsWith(`${normalizedRootPath}/`)
-  );
+  return isHostPathWithin({ rootPath, candidatePath });
 }
 
 export function buildAbsoluteFilePath({
@@ -90,6 +64,10 @@ export function buildAbsoluteFilePath({
 }: BuildAbsoluteFilePathArgs): string {
   if (isAbsoluteFilePath(path)) {
     return path;
+  }
+
+  if (isWindowsHostPath(rootPath)) {
+    return joinHostPath({ rootPath, relativePath: path }) ?? path;
   }
 
   const normalizedRootPath = trimTrailingSlash(rootPath);
@@ -113,11 +91,10 @@ export function resolveAbsoluteFilePath({
   return buildAbsoluteFilePath({ path, rootPath });
 }
 
-/**
- * Parent directory of an absolute path, used as the base for resolving relative
- * links inside a previewed file. Returns the filesystem root for top-level paths.
- */
 export function getAbsoluteDirname({ path }: GetAbsoluteDirnameArgs): string {
+  if (isWindowsHostPath(path)) {
+    return getHostPathDirname(path) ?? path;
+  }
   const trimmed = trimTrailingSlash(path);
   const lastSlashIndex = trimmed.lastIndexOf("/");
   return lastSlashIndex <= 0 ? "/" : trimmed.slice(0, lastSlashIndex);

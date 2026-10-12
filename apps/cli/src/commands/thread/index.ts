@@ -1,5 +1,8 @@
+import { registerContextCommand } from "./context.js";
+import { registerSessionStateCommands } from "./session-state.js";
 import { Command } from "commander";
 import { registerActionsCommands } from "./actions.js";
+import { registerCountCommand } from "./count.js";
 import { registerInteractionCommands } from "./interactions.js";
 import { registerListCommand } from "./list.js";
 import { registerOpenCommand } from "./open.js";
@@ -19,6 +22,9 @@ export function registerThreadCommands(
   registerSpawnCommand(thread, getUrl);
   registerForkCommand(thread, getUrl);
   registerListCommand(thread, getUrl);
+  registerCountCommand(thread, getUrl);
+  registerContextCommand(thread, getUrl);
+  registerSessionStateCommands(thread, getUrl);
   registerShowCommand(thread, getUrl);
   registerOpenCommand(thread, getUrl);
   registerPaneCommand(thread, getUrl);

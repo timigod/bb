@@ -1,18 +1,28 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   claimAutomationScheduledRun,
+  closeAutomationRun,
   listDueAutomations,
   parseAutomationExecution,
   parseAutomationTrigger,
-  restoreAutomationAfterFailedRun,
   type AutomationRow,
   type AutomationRunRow,
   type Db,
 } from "./data.js";
 import { publishAutomationChange } from "./realtime.js";
 import { computeNextScheduledTime } from "./schedule-helpers.js";
-import { executeAgentRun, executeScriptRun } from "./run.js";
+import {
+  errorMessage,
+  executeAgentRun,
+  executeScriptRun,
+  type AgentRunApi,
+  type ScriptRunApi,
+} from "./run.js";
+import {
+  createScriptWorkingDirectoryResolver,
+  type ScriptWorkingDirectoryResolver,
+} from "./working-directory.js";
 
 const DUE_AUTOMATION_BATCH_SIZE = 100;
 export const SWEEP_INTERVAL_MS = 10_000;
@@ -20,38 +30,23 @@ export const SWEEP_INTERVAL_MS = 10_000;
 const hostListSchema = z.array(
   z.object({ status: z.enum(["connected", "disconnected"]) }).passthrough(),
 );
-type SweepApi = Pick<BbPluginApi, "realtime" | "log"> & {
-  sdk: {
-    hosts: { list(): Promise<unknown> };
-    threads: {
-      get(args: Parameters<BbPluginApi["sdk"]["threads"]["get"]>[0]): Promise<unknown>;
-      send(args: Parameters<BbPluginApi["sdk"]["threads"]["send"]>[0]): Promise<unknown>;
-      spawn(
-        args: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0],
-      ): Promise<unknown>;
-    };
+type SweepApi = AgentRunApi &
+  ScriptRunApi & {
+    sdk: { hosts: { list(): Promise<unknown> } };
   };
-};
 
-function buildScheduleRollback(
+function buildScheduleFailureHandler(
   db: Db,
   args: {
-    automation: AutomationRow;
     run: AutomationRunRow;
-    advancedNextRunAt: number | null;
-    now: number;
   },
 ): (error: unknown) => void {
   return (error) => {
-    restoreAutomationAfterFailedRun(db, {
-      automationId: args.automation.id,
+    closeAutomationRun(db, {
       runId: args.run.id,
-      triggerType: args.automation.triggerType,
-      advancedNextRunAt: args.advancedNextRunAt,
-      restoredNextRunAt: args.automation.nextRunAt ?? args.now,
-      expectedRunCount: args.automation.runCount + 1,
-      error: error instanceof Error ? error.message : String(error),
-      now: args.now,
+      status: "failed",
+      error: errorMessage(error),
+      now: Date.now(),
     });
   };
 }
@@ -65,6 +60,7 @@ async function processDueAutomation(
     now: number;
     agentHostsAvailable: boolean;
     serverUrl: string;
+    resolveWorkingDirectory: ScriptWorkingDirectoryResolver;
   },
 ): Promise<void> {
   if (args.automation.nextRunAt === null) return;
@@ -84,9 +80,7 @@ async function processDueAutomation(
           });
   } catch (error) {
     bb.log.error(
-      `Skipping due automation ${args.automation.id} with invalid stored configuration: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `Skipping due automation ${args.automation.id} with invalid stored configuration: ${errorMessage(error)}`,
     );
     return;
   }
@@ -106,11 +100,8 @@ async function processDueAutomation(
     "automations-changed",
     "automation-runs-changed",
   ]);
-  const onFailure = buildScheduleRollback(db, {
-    automation: args.automation,
+  const onFailure = buildScheduleFailureHandler(db, {
     run: claim.run,
-    advancedNextRunAt: newNextRunAt,
-    now: args.now,
   });
   if (execution.mode === "agent") {
     await executeAgentRun(bb, db, {
@@ -127,11 +118,10 @@ async function processDueAutomation(
       execution,
       onFailure,
       serverUrl: args.serverUrl,
+      resolveWorkingDirectory: args.resolveWorkingDirectory,
     }).catch((error: unknown) => {
       bb.log.error(
-        `Detached script automation ${args.automation.id} failed unexpectedly: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Detached script automation ${args.automation.id} failed unexpectedly: ${errorMessage(error)}`,
       );
     });
   }
@@ -148,9 +138,7 @@ async function hasConnectedHost(
       .some((host) => host.status === "connected");
   } catch (error) {
     bb.log.warn(
-      `Failed to list hosts for automation sweep: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `Failed to list hosts for automation sweep: ${errorMessage(error)}`,
     );
     return false;
   }
@@ -162,12 +150,19 @@ export async function sweepDueAutomations(
   args: {
     pluginDataDir: string;
     serverUrl: string;
+    serverHostId: string | null;
     now?: number;
   },
 ): Promise<void> {
   const now = args.now ?? Date.now();
   const due = listDueAutomations(db, { now, limit: DUE_AUTOMATION_BATCH_SIZE });
+  if (due.length === 0) return;
   const agentHostsAvailable = await hasConnectedHost(bb);
+  const resolveWorkingDirectory = createScriptWorkingDirectoryResolver({
+    sdk: bb.sdk,
+    pluginDataDir: args.pluginDataDir,
+    serverHostId: args.serverHostId,
+  });
   for (const automation of due) {
     try {
       await processDueAutomation(bb, db, {
@@ -176,12 +171,11 @@ export async function sweepDueAutomations(
         now,
         agentHostsAvailable,
         serverUrl: args.serverUrl,
+        resolveWorkingDirectory,
       });
     } catch (error) {
       bb.log.error(
-        `Failed to process due automation ${automation.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Failed to process due automation ${automation.id}: ${errorMessage(error)}`,
       );
     }
   }
@@ -193,14 +187,12 @@ export function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolve();
       return;
     }
-    const timeout = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
+    const settle = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", settle);
+      resolve();
+    };
+    const timeout = setTimeout(settle, ms);
+    signal.addEventListener("abort", settle, { once: true });
   });
 }

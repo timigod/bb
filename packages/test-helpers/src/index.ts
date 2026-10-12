@@ -5,15 +5,21 @@ export {
   listPreferredTestModels,
   resolvePreferredTestModel,
 } from "./provider-models.js";
-export type { ResolvePreferredTestModelArgs } from "./provider-models.js";
-export {
-  listSetupMarkers,
-  shellSingleQuote,
-  waitForSetupMarkerCount,
-} from "./setup-markers.js";
-export type { WaitForSetupMarkerCountArgs } from "./setup-markers.js";
+export { shellSingleQuote, waitForSetupMarkerCount } from "./setup-markers.js";
 export {
   makeWorkspaceMergeBase,
   makeWorkspaceStatus,
   makeWorkspaceWorkingTree,
 } from "./workspace-status.js";
+export {
+  listOpenFilePids,
+  readPositivePidFile,
+  resolveProjectEnvCandidates,
+} from "./process-fixtures.js";
+export {
+  corpusAvailable,
+  listCorpusThreads,
+  loadCorpusThread,
+  resolveProviderCorpusDir,
+} from "./provider-corpus.js";
+export type { CorpusThread } from "./provider-corpus.js";

@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createConnectServerSync,
   fetchConnectAccountServers,
-  selectTargetableConnectServers,
   type ConnectAccountServer,
 } from "../src/connect-server-sync.js";
 
@@ -46,11 +45,15 @@ describe("fetchConnectAccountServers", () => {
       serverUrl: "http://127.0.0.1:38886/",
       fetchImpl,
     });
-    expect(result?.selfHandle).toBe("me");
-    expect(result?.servers).toHaveLength(2);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(`unexpected skip: ${result.reason}`);
+    }
+    expect(result.result.selfHandle).toBe("me");
+    expect(result.result.servers).toHaveLength(2);
   });
 
-  it("returns null on network failure, non-JSON, or ok:false", async () => {
+  it("names the reason on network failure, plugin disabled, or not paired", async () => {
     await expect(
       fetchConnectAccountServers({
         serverUrl: "http://127.0.0.1:1",
@@ -58,7 +61,22 @@ describe("fetchConnectAccountServers", () => {
           throw new Error("ECONNREFUSED");
         },
       }),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+    await expect(
+      fetchConnectAccountServers({
+        serverUrl: "http://127.0.0.1:38886",
+        fetchImpl: async () => ({
+          ok: false,
+          status: 503,
+          json: async () => ({
+            ok: false,
+            error: 'plugin "connect" is not running (status: disabled)',
+          }),
+          text: async () => "",
+        }),
+      }),
+    ).resolves.toEqual({ ok: false, reason: "plugin-disabled" });
 
     await expect(
       fetchConnectAccountServers({
@@ -66,37 +84,42 @@ describe("fetchConnectAccountServers", () => {
         fetchImpl: async () => ({
           ok: false,
           status: 500,
-          json: async () => ({ ok: false, error: "not_paired" }),
+          json: async () => ({
+            ok: false,
+            error: { code: "handler_error", message: "not_paired" },
+          }),
           text: async () => "",
         }),
       }),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({ ok: false, reason: "not-paired" });
 
     await expect(
       fetchConnectAccountServers({
         serverUrl: "http://127.0.0.1:38886",
         fetchImpl: async () => ({
           ok: false,
-          status: 422,
-          json: async () => ({ ok: false, error: "plugin disabled" }),
+          status: 500,
+          json: async () => ({
+            ok: false,
+            error: { code: "handler_error", message: "network" },
+          }),
           text: async () => "",
         }),
       }),
-    ).resolves.toBeNull();
-  });
-});
-
-describe("selectTargetableConnectServers", () => {
-  it("drops the self handle and keeps everything else, live or not", () => {
-    const servers = selectTargetableConnectServers({
-      selfHandle: "me",
-      servers: [
-        { handle: "me", name: "primary", live: true, url: "https://me.x" },
-        { handle: "laptop", name: "Laptop", live: true, url: "https://l.x" },
-        { handle: "phone", name: "Phone", live: false, url: "https://p.x" },
-      ],
-    });
-    expect(servers.map((server) => server.handle)).toEqual(["laptop", "phone"]);
+    ).resolves.toEqual({ ok: false, reason: "unavailable" });
+    await expect(
+      fetchConnectAccountServers({
+        serverUrl: "http://127.0.0.1:38886",
+        fetchImpl: async () => ({
+          ok: false,
+          status: 502,
+          json: async () => {
+            throw new SyntaxError("not json");
+          },
+          text: async () => "",
+        }),
+      }),
+    ).resolves.toEqual({ ok: false, reason: "unavailable" });
   });
 });
 
@@ -130,12 +153,11 @@ describe("createConnectServerSync", () => {
       onServers(servers) {
         received = servers;
       },
+      onSkipped: () => undefined,
       onUnauthorized: () => undefined,
       fetchImpl,
       now: () => now,
-      minIntervalMs: 60_000,
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -149,7 +171,6 @@ describe("createConnectServerSync", () => {
       },
     ]);
 
-    // Within 60s: list should not re-fetch.
     now += 10_000;
     sync.onListRequested();
     await Promise.resolve();
@@ -157,9 +178,6 @@ describe("createConnectServerSync", () => {
 
     now += 60_000;
     const listSync = new Promise<void>((resolve) => {
-      // onListRequested fires syncNow without returning the promise; wait via
-      // a subsequent syncNow that coalesces onto the same in-flight work, or
-      // completes immediately if the list-triggered run already finished.
       sync.onListRequested();
       void sync.syncNow().then(resolve);
     });
@@ -167,24 +185,35 @@ describe("createConnectServerSync", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it("does not call onServers on failure and logs the failure only once until a success", async () => {
+  it("reports each skipped sync with its reason and logs once per failure streak", async () => {
     const logs: string[] = [];
+    const skipped: string[] = [];
     let onServersCalls = 0;
-    let fail = true;
-    const fetchImpl = vi.fn(async () => {
-      if (fail) {
-        throw new Error("down");
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
+    let mode: "down" | "disabled" | "up" = "down";
+    const fetchImpl = vi.fn(
+      async (): Promise<Pick<Response, "ok" | "status" | "json" | "text">> => {
+        if (mode === "down") {
+          throw new Error("down");
+        }
+        if (mode === "disabled") {
+          return {
+            ok: false,
+            status: 503,
+            json: async () => ({ ok: false, error: "plugin not running" }),
+            text: async () => "",
+          };
+        }
+        return {
           ok: true,
-          result: { selfHandle: "me", servers: [] },
-        }),
-        text: async () => "",
-      };
-    });
+          status: 200,
+          json: async () => ({
+            ok: true,
+            result: { selfHandle: "me", servers: [] },
+          }),
+          text: async () => "",
+        };
+      },
+    );
 
     const sync = createConnectServerSync({
       getCredential: () => null,
@@ -192,26 +221,37 @@ describe("createConnectServerSync", () => {
       onServers() {
         onServersCalls += 1;
       },
+      onSkipped(reason) {
+        skipped.push(reason);
+      },
       onUnauthorized: () => undefined,
       fetchImpl,
       log: (message) => {
         logs.push(message);
       },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
     await sync.syncNow();
-    expect(logs).toHaveLength(1);
+    expect(skipped).toEqual(["unavailable", "unavailable"]);
+    expect(logs).toEqual(["connect server sync skipped (unavailable)"]);
     expect(onServersCalls).toBe(0);
 
-    fail = false;
+    mode = "disabled";
+    await sync.syncNow();
+    expect(skipped).toEqual(["unavailable", "unavailable", "plugin-disabled"]);
+    expect(logs).toEqual([
+      "connect server sync skipped (unavailable)",
+      "connect server sync skipped (plugin-disabled)",
+    ]);
+
+    mode = "up";
     await sync.syncNow();
     expect(onServersCalls).toBe(1);
-    fail = true;
+    mode = "disabled";
     await sync.syncNow();
-    expect(logs).toHaveLength(2);
+    expect(logs).toHaveLength(3);
   });
 });
 
@@ -231,6 +271,7 @@ describe("createConnectServerSync without a local server", () => {
             servers: [
               { handle: "me", name: "This Mac", live: true },
               { handle: "other", name: "Other", live: true },
+              { handle: "phone", name: "Phone", live: false },
             ],
           }),
         ),
@@ -243,9 +284,9 @@ describe("createConnectServerSync without a local server", () => {
       onServers(servers) {
         received = servers;
       },
+      onSkipped: () => undefined,
       onUnauthorized: () => undefined,
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
@@ -255,7 +296,6 @@ describe("createConnectServerSync without a local server", () => {
         headers: { "x-bb-connect-machine": "bbcm_desktop" },
       }),
     );
-    // selfHandle drops out: "This Mac" is its own menu entry.
     expect(received).toEqual([
       {
         handle: "other",
@@ -263,40 +303,77 @@ describe("createConnectServerSync without a local server", () => {
         live: true,
         url: "https://other.getbb.app",
       },
+      {
+        handle: "phone",
+        name: "Phone",
+        live: false,
+        url: "https://phone.getbb.app",
+      },
     ]);
   });
 
   it("reports a refused credential so the caller drops it", async () => {
     let unauthorized = 0;
+    const skipped: string[] = [];
     const sync = createConnectServerSync({
       getCredential: () => credential,
       getLocalServerUrl: () => null,
       gateFetchImpl: async () => new Response("no", { status: 403 }),
       onServers: () => undefined,
+      onSkipped(reason) {
+        skipped.push(reason);
+      },
       onUnauthorized() {
         unauthorized += 1;
       },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
     expect(unauthorized).toBe(1);
+    expect(skipped).toEqual(["unauthorized"]);
   });
 
-  it("stays quiet when the app has no credential", async () => {
+  it("reports a gate outage as unavailable", async () => {
+    const skipped: string[] = [];
+    const sync = createConnectServerSync({
+      getCredential: () => credential,
+      getLocalServerUrl: () => null,
+      gateFetchImpl: async () => new Response("oops", { status: 502 }),
+      onServers: () => undefined,
+      onSkipped(reason) {
+        skipped.push(reason);
+      },
+      onUnauthorized: () => undefined,
+      setIntervalFn: () => 0,
+    });
+
+    await sync.syncNow();
+    expect(skipped).toEqual(["unavailable"]);
+  });
+
+  it("reports no-credential without calling the gate when the app has none", async () => {
     const gateFetchImpl = vi.fn(async () => new Response("{}"));
+    const skipped: string[] = [];
+    const logs: string[] = [];
     const sync = createConnectServerSync({
       getCredential: () => null,
       getLocalServerUrl: () => null,
       gateFetchImpl,
       onServers: () => undefined,
+      onSkipped(reason) {
+        skipped.push(reason);
+      },
       onUnauthorized: () => undefined,
+      log: (message) => {
+        logs.push(message);
+      },
       setIntervalFn: () => 0,
-      clearIntervalFn: () => undefined,
     });
 
     await sync.syncNow();
     expect(gateFetchImpl).not.toHaveBeenCalled();
+    expect(skipped).toEqual(["no-credential"]);
+    expect(logs).toEqual(["connect server sync skipped (no-credential)"]);
   });
 });

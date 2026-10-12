@@ -24,19 +24,11 @@ const localViewTestCases: LocalViewTestCase[] = [
   {
     label: "error",
     viewModel: {
+      actions: [],
       details: "The local service failed to start.",
       kind: "error",
       logText: "Failed to bind port",
       title: "Could not open bb",
-    },
-  },
-  {
-    label: "info",
-    viewModel: {
-      kind: "info",
-      message:
-        "A bb server is already running on this Mac. Connect via Window ▸ Server.",
-      title: "Local server available",
     },
   },
 ];
@@ -70,6 +62,7 @@ describe("local desktop views", () => {
   it("renders startup error logs without terminal control sequences", () => {
     const html = decodeLocalViewHtml({
       viewModel: {
+        actions: [],
         details: "The local service failed to start.",
         kind: "error",
         logText:
@@ -84,5 +77,34 @@ describe("local desktop views", () => {
     expect(html).toContain("Error: listen EADDRINUSE");
     expect(html).not.toContain("\x1b[");
     expect(html).not.toContain("\r");
+  });
+
+  it("renders one button per startup action and none without actions", () => {
+    const actionHtml = decodeLocalViewHtml({
+      viewModel: {
+        actions: [
+          { id: "retry", label: "Try again" },
+          { id: "choose-server", label: "Choose server…" },
+        ],
+        details: "bb Connect did not accept this app.",
+        kind: "error",
+        logText: "",
+        title: "Could not open Studio desktop",
+      },
+    });
+    const fatalHtml = decodeLocalViewHtml({
+      viewModel: {
+        actions: [],
+        details: "The desktop process could not continue.",
+        kind: "error",
+        logText: "",
+        title: "Could not open bb",
+      },
+    });
+
+    expect(actionHtml).toContain(
+      '<div class="actions"><button type="button" data-startup-action="retry">Try again</button><button type="button" data-startup-action="choose-server">Choose server…</button></div>',
+    );
+    expect(fatalHtml).not.toContain("<button");
   });
 });

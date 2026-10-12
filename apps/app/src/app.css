@@ -27,7 +27,40 @@
    * variable is the single switch both they and the shell root read.
    */
   :root {
+    --bb-app-chrome-row-height: 3rem;
+    --bb-window-title-bar-height: 2.5rem;
+    --bb-chrome-control-gap: 0.25rem;
+    --bb-panel-chrome-padding: 1rem;
     --bb-shell-height: 100dvh;
+    --bb-window-frame-top: 0px;
+    --bb-window-frame-lip: 0px;
+    --secondary-panel-width-mobile: min(76vw, 320px);
+    --bb-sidebar-rail-padding: 8px;
+    --bb-sidebar-control-size: 28px;
+    --bb-sidebar-control-icon-size: 16px;
+  }
+
+  @media (width < 48rem) and (pointer: coarse) {
+    :root {
+      --bb-sidebar-rail-padding: 12px;
+      --bb-sidebar-control-size: 36px;
+      --bb-sidebar-control-icon-size: 20px;
+    }
+  }
+
+  [data-sidebar-header-slot]
+    :where(
+      button,
+      a,
+      input,
+      select,
+      textarea,
+      [role="button"],
+      [role="link"],
+      [tabindex]
+    ) {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
   }
 
   html.bb-app-shell-root {
@@ -53,6 +86,19 @@
      * two-finger back/forward gesture.
      */
     overscroll-behavior-y: none;
+  }
+
+  /*
+   * App chrome (sidebar, page headers, composer toolbars) opts out of text
+   * selection with `select-none` so drags and Select All only pick up
+   * content. `user-select: auto` resolves from the parent, so WebKit would
+   * carry that opt-out into editable controls inside those regions (the
+   * inline thread-title rename, for example) and refuse to select their text.
+   * Restore native selection on the controls themselves.
+   */
+  .select-none
+    :where(input, textarea, [contenteditable]:not([contenteditable="false"])) {
+    user-select: text;
   }
 
   .chat-prompt-box {
@@ -98,10 +144,28 @@
   }
 
   /* Keep the drag cursor stable while crossing rows whose normal pointer
-   * cursor would otherwise override the cursor inherited from the body. */
-  body[data-sidebar-dragging="true"],
-  body[data-sidebar-dragging="true"] * {
-    cursor: grabbing !important;
+   * cursor would otherwise override the cursor inherited from the body.
+   * Only the sidebar panel's rows carry their own cursor rules, so the
+   * descendant override is scoped to that panel rather than the whole
+   * document, and the rules exist only for fine pointers: a touch drag has
+   * no cursor, and a document-wide `*` rule would restyle every mounted
+   * timeline node when the body attribute flips at drag start and end. */
+  @media (pointer: fine) {
+    body[data-sidebar-dragging="true"],
+    body[data-sidebar-dragging="true"] [data-sidebar="panel"] * {
+      cursor: grabbing !important;
+    }
+  }
+
+  /* A sidebar drag projects the dragged row into the hovered list, which can
+   * grow or shrink content above the scrolled viewport. Scroll anchoring would
+   * then move scrollTop to keep the visible rows still, but dnd-kit offsets
+   * its measured droppable rects by that scroll delta even though nothing
+   * moved on screen, so `over` resolves against the wrong rows and the
+   * projection flips back and forth (#1830). Keep scrollTop stable while a
+   * sidebar drag is active so the measured geometry matches the pointer. */
+  body[data-sidebar-dragging="true"] [data-sidebar="content"] {
+    overflow-anchor: none;
   }
 }
 
@@ -130,10 +194,9 @@
     box-shadow: var(--pill-shadow);
   }
 
-  /* Leading mention identity: a plain near-black outline glyph or section
-   * marker (near-white in dark), with no fill. */
-  .prompt-mention-pill svg,
-  .prompt-mention-pill [data-section-mention-marker] {
+  /* Leading mention identity: a plain near-black outline glyph (near-white in
+   * dark), with no fill. */
+  .prompt-mention-pill svg {
     color: var(--pill-icon);
   }
 
@@ -163,7 +226,7 @@
   [data-promptbox-compact-content] .ProseMirror[contenteditable] > *,
   [data-promptbox-compact-content]
     .ProseMirror[contenteditable]
-    :where(blockquote, h1, h2, h3, h4, h5, h6, li, ol, p, ul) {
+    :where(blockquote, p) {
     display: inline;
     margin: 0;
     padding: 0;
@@ -182,14 +245,9 @@
     + *::before,
   [data-promptbox-compact-content]
     .ProseMirror[contenteditable]
-    :where(blockquote, li)
+    :where(blockquote)
     > *
-    + *::before,
-  [data-promptbox-compact-content]
-    .ProseMirror[contenteditable]
-    :where(ol, ul)
-    > li
-    + li::before {
+    + *::before {
     content: " ";
   }
 
@@ -335,6 +393,10 @@
     [data-promptbox] [data-promptbox-icon-only-control] {
       flex-shrink: 0;
     }
+
+    [data-promptbox] [data-promptbox-shrinkable-control] {
+      flex-shrink: 1 !important;
+    }
   }
 
   @container promptbox-shell (max-width: 34rem) {
@@ -352,6 +414,10 @@
       flex-shrink: 0;
     }
 
+    [data-promptbox-shell] [data-promptbox-shrinkable-control] {
+      flex-shrink: 1 !important;
+    }
+
     [data-promptbox-shell] [data-promptbox-project-control] {
       flex-shrink: 0;
       max-inline-size: 10rem;
@@ -364,6 +430,35 @@
       display: none !important;
     }
   }
+
+  @media (width < 48rem) and (pointer: coarse) {
+    [data-new-thread-footer] button {
+      min-block-size: 2.75rem;
+    }
+  }
+
+  @media (width < 48rem) {
+    [data-new-thread-footer]
+      [data-promptbox-shrinkable-control]:has(~ :not(:empty)) {
+      flex-shrink: 0 !important;
+    }
+
+    [data-new-thread-footer]
+      [data-promptbox-shrinkable-control]:has(~ :not(:empty))
+      [data-promptbox-compact-label] {
+      display: none !important;
+    }
+
+    [data-new-thread-footer]
+      [data-promptbox-icon-only-control]
+      [data-promptbox-full-label] {
+      display: block !important;
+    }
+
+    [data-new-thread-footer] [data-promptbox-icon-only-control] {
+      flex-shrink: 1;
+    }
+  }
 }
 
 /*
@@ -374,6 +469,26 @@
  * The mobile path still owns its React state so software-keyboard expansion
  * remains synchronized with visualViewport changes.
  */
+[data-plugin-shelf] {
+  container: plugin-shelf / inline-size;
+}
+
+[data-plugin-shelf-grid] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@container plugin-shelf (min-width: 32.5rem) {
+  [data-plugin-shelf-grid] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container plugin-shelf (min-width: 49rem) {
+  [data-plugin-shelf-grid] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @container promptbox-shell (max-width: 30rem) {
   [data-follow-up-composer] {
     --follow-up-composer-container-compact: true;
@@ -401,13 +516,17 @@
   }
 
   [data-follow-up-composer] [data-promptbox-submit-action] {
-    width: 2rem;
-    height: 2rem;
+    width: auto;
+    aspect-ratio: 1;
     margin-left: 0;
-    padding: 0;
   }
 
-  [data-follow-up-composer] [data-follow-up-composer-footer] {
+  [data-follow-up-composer] [data-promptbox-submit-label] {
+    display: none;
+  }
+
+  [data-follow-up-composer]:not([data-follow-up-composer-footer-visible])
+    [data-follow-up-composer-footer] {
     min-height: 0;
     max-height: 0;
     margin-top: 0;
@@ -416,16 +535,12 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    ) {
+    [data-promptbox]:not([data-promptbox-voice-active]) {
     overflow: hidden;
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-action-row] {
     position: absolute;
     inset-block: 0;
@@ -435,25 +550,19 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-main] {
     height: 3rem;
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-expanded-only] {
     display: none !important;
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-scroll] {
     height: 3rem !important;
     min-height: 3rem !important;
@@ -465,9 +574,7 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content] {
     display: flex;
     align-items: center;
@@ -475,9 +582,7 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable] {
     width: 100%;
@@ -489,19 +594,15 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
     > *,
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
-    :where(blockquote, h1, h2, h3, h4, h5, h6, li, ol, p, ul) {
+    :where(blockquote, p) {
     display: inline;
     margin: 0;
     padding: 0;
@@ -515,38 +616,23 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
     > *
     + *::before,
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
-    :where(blockquote, li)
+    :where(blockquote)
     > *
-    + *::before,
-  [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
-    [data-promptbox-editor-content]
-    .ProseMirror[contenteditable]
-    :where(ol, ul)
-    > li
-    + li::before {
+    + *::before {
     content: " ";
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
     br {
@@ -555,9 +641,7 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror[contenteditable]
     br::after {
@@ -565,9 +649,7 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .prompt-mention-pill
     > span:last-child {
@@ -575,9 +657,7 @@
   }
 
   [data-follow-up-composer]:not([data-follow-up-composer-expanded])
-    [data-promptbox]:not([data-promptbox-zen]):not(
-      [data-promptbox-voice-active]
-    )
+    [data-promptbox]:not([data-promptbox-voice-active])
     [data-promptbox-editor-content]
     .ProseMirror
     p.is-editor-empty:first-child::before {
@@ -647,6 +727,46 @@
     background-color: color-mix(in oklab, var(--foreground) 40%, transparent);
   }
 
+  @media (hover: none) and (pointer: coarse) {
+    .thread-scrollbar,
+    [data-sidebar="content"] {
+      scrollbar-width: none;
+    }
+
+    .thread-scrollbar::-webkit-scrollbar,
+    [data-sidebar="content"]::-webkit-scrollbar {
+      display: none;
+    }
+  }
+
+  [data-vaul-drawer-direction] [data-sidebar="content"] {
+    scrollbar-color: transparent transparent;
+  }
+
+  [data-vaul-drawer-direction]
+    [data-sidebar="content"]::-webkit-scrollbar-thumb,
+  [data-vaul-drawer-direction]
+    [data-sidebar="content"]::-webkit-scrollbar-thumb:hover {
+    background-color: transparent;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    [data-vaul-drawer-direction] [data-sidebar="content"]:hover {
+      scrollbar-color: color-mix(in oklab, var(--foreground) 20%, transparent)
+        transparent;
+    }
+
+    [data-vaul-drawer-direction]
+      [data-sidebar="content"]:hover::-webkit-scrollbar-thumb {
+      background-color: color-mix(in oklab, var(--foreground) 20%, transparent);
+    }
+
+    [data-vaul-drawer-direction]
+      [data-sidebar="content"]:hover::-webkit-scrollbar-thumb:hover {
+      background-color: color-mix(in oklab, var(--foreground) 40%, transparent);
+    }
+  }
+
   /*
    * Opt out of the global thin scrollbar into always-visible classic
    * scrollbars for two-axis data surfaces (e.g. the CSV table preview).
@@ -681,26 +801,6 @@
   .persistent-scrollbar::-webkit-scrollbar-thumb:hover {
     background-color: color-mix(in oklab, var(--foreground) 40%, transparent);
   }
-
-  /*
-   * Soft right-edge fade for single-line text that is clipped horizontally
-   * (e.g. a queued-message preview). Fades the text out instead of a hard
-   * `…` ellipsis. Self-gating: short text doesn't reach the fade zone, so the
-   * fade only shows when content is actually truncated. Pair with
-   * `overflow-hidden whitespace-nowrap` (no scroll).
-   */
-  .fade-clip-right {
-    -webkit-mask-image: linear-gradient(
-      to right,
-      #000 calc(100% - 1.5rem),
-      transparent
-    );
-    mask-image: linear-gradient(
-      to right,
-      #000 calc(100% - 1.5rem),
-      transparent
-    );
-  }
 }
 
 /* Sweep the purple gradient across the `ultracode` glyphs. */
@@ -726,20 +826,20 @@
   }
 }
 
-/* Briefly highlight a conversation message that a sidebar search result
- * deep-links to, then fade back to transparent. */
 @keyframes bb-search-flash {
-  from {
-    background-color: color-mix(in oklch, var(--ring) 22%, transparent);
+  0%,
+  25% {
+    background-color: var(--state-hover);
   }
-  to {
+  100% {
     background-color: transparent;
   }
 }
 
 .bb-search-flash {
   border-radius: var(--radius-lg, 0.5rem);
-  animation: bb-search-flash 1.6s ease-out;
+  background-color: var(--state-hover);
+  animation: bb-search-flash 1.6s ease-out forwards;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -748,7 +848,51 @@
   }
 }
 
-/* Browse hero (Extensions → Browse): the archetype chips orbiting the mini bb
+@keyframes bb-count-flash {
+  0%,
+  35% {
+    background-color: var(--foreground);
+    color: var(--background);
+  }
+}
+
+@keyframes bb-count-roll-in {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+
+@keyframes bb-count-roll-out {
+  to {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+}
+
+.bb-count-flash {
+  animation: bb-count-flash 1.2s ease-out;
+}
+
+.bb-count-roll-in {
+  animation: bb-count-roll-in 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.bb-count-roll-out {
+  animation: bb-count-roll-out 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bb-count-roll-in {
+    animation: none;
+  }
+
+  .bb-count-roll-out {
+    display: none;
+  }
+}
+
+/* Browse hero (Plugins → Browse plugins): the archetype chips orbiting the mini bb
  * window drift slowly so the hero reads as alive without competing with the
  * composer sitting in the middle of it. Duration and delay are per-chip custom
  * properties so each chip drifts out of phase with its neighbours from one

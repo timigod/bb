@@ -6,9 +6,11 @@ import type {
 } from "@bb/host-daemon-contract";
 import type { ProviderCliInstallLogDialogState } from "@/components/dialogs/ProviderCliInstallLogDialog";
 import type { ProviderCliActionableIssue } from "@/components/provider-cli/provider-cli-install";
+import { BbRequestTimeoutError } from "@bb/sdk/browser";
 import { appToast } from "@/components/ui/app-toast";
 import { invalidateHostProviderCliStatus } from "@/hooks/cache-owners/provider-cli-status-cache-owner";
 import { invalidateSystemExecutionOptions } from "@/hooks/cache-owners/system-cache-effects";
+import { asHttpError, getHttpErrorMessage } from "@/lib/http-error";
 import { sdk } from "@/lib/sdk";
 
 type ProviderCliInstallCompletedEvent = Extract<
@@ -24,24 +26,31 @@ export const PROVIDER_CLI_FAILURE_MAX_ENTRIES = 32;
 const PROVIDER_CLI_FAILURE_LOG_TRUNCATION_MARKER =
   "\n\n… provider update output truncated …\n\n";
 
-export interface ProviderCliInstallJob {
+interface ProviderCliInstallJob {
   hostId: string;
   issue: ProviderCliActionableIssue;
 }
 
+export type ProviderCliInstallFailureKind = "command" | "interrupted";
+
+export const PROVIDER_CLI_FAILURE_SUMMARIES: Record<
+  ProviderCliInstallFailureKind,
+  string
+> = {
+  command: "Update failed",
+  interrupted: "Connection lost during update",
+};
+
 export interface ProviderCliInstallFailure {
   issueFingerprint: string;
+  kind: ProviderCliInstallFailureKind;
   logDialogState: ProviderCliInstallLogDialogState;
 }
 
-export interface ProviderCliInstallSnapshot {
-  /** The job currently executing on a host, or null when nothing is running. */
+interface ProviderCliInstallSnapshot {
   runningJobKey: string | null;
-  /** Jobs waiting behind the running one. */
   queuedJobKeys: ReadonlySet<string>;
-  /** The failure log a user opened from a toast, or null when closed. */
   logDialogState: ProviderCliInstallLogDialogState | null;
-  /** The latest failed attempt for each provider row. */
   failuresByJobKey: ReadonlyMap<string, ProviderCliInstallFailure>;
 }
 
@@ -72,9 +81,6 @@ const INITIAL_SNAPSHOT: ProviderCliInstallSnapshot = {
   failuresByJobKey: EMPTY_FAILURES_BY_JOB_KEY,
 };
 
-// Module-level, not component state: a provider CLI install keeps running (and
-// its queue keeps draining) after the user navigates away from Settings →
-// Updates. Components subscribe to mirror progress; they never own it.
 let snapshot: ProviderCliInstallSnapshot = INITIAL_SNAPSHOT;
 let queuedJobs: ProviderCliInstallJob[] = [];
 let queryClient: QueryClient | null = null;
@@ -87,7 +93,6 @@ function setSnapshot(patch: Partial<ProviderCliInstallSnapshot>): void {
   }
 }
 
-/** Stable identity for a (machine, provider) install slot. */
 export function providerCliJobKey(
   hostId: string,
   provider: ProviderCliKey,
@@ -106,12 +111,6 @@ export function getProviderCliInstallSnapshot(): ProviderCliInstallSnapshot {
   return snapshot;
 }
 
-/**
- * The store outlives every component, so it cannot read the query client from
- * React context when an install finishes. Mounted consumers hand it over; the
- * app's client is process-stable, so the last registration stays correct even
- * after they all unmount.
- */
 export function registerProviderCliInstallQueryClient(
   client: QueryClient,
 ): void {
@@ -146,6 +145,31 @@ function exitDescription(event: ProviderCliInstallCompletedEvent): string {
     return `Command exited with code ${event.exitCode}`;
   }
   return `Command exited after signal ${event.signal ?? "unknown"}`;
+}
+
+const CONNECTION_LOST_HTTP_STATUSES: ReadonlySet<number> = new Set([
+  502, 503, 504,
+]);
+
+function describeInstallRequestFailure(error: unknown): {
+  kind: ProviderCliInstallFailureKind;
+  message: string;
+} {
+  const httpError = asHttpError(error);
+  const connectionLost =
+    httpError === null
+      ? error instanceof TypeError || error instanceof BbRequestTimeoutError
+      : CONNECTION_LOST_HTTP_STATUSES.has(httpError.status);
+  if (connectionLost) {
+    return {
+      kind: "interrupted",
+      message: PROVIDER_CLI_FAILURE_SUMMARIES.interrupted,
+    };
+  }
+  const message =
+    (httpError === null ? null : getHttpErrorMessage(httpError)) ??
+    (error instanceof Error ? error.message : String(error));
+  return { kind: "command", message };
 }
 
 function getProviderCliTitle(args: {
@@ -185,7 +209,6 @@ function setProviderCliInstallFailure(args: {
   jobKey: string;
 }): void {
   const failuresByJobKey = new Map(snapshot.failuresByJobKey);
-  // Refresh an existing key's insertion order so eviction stays least-recent.
   failuresByJobKey.delete(args.jobKey);
   failuresByJobKey.set(args.jobKey, args.failure);
   while (failuresByJobKey.size > PROVIDER_CLI_FAILURE_MAX_ENTRIES) {
@@ -201,6 +224,7 @@ function setProviderCliInstallFailure(args: {
 function showProviderCliInstallFailureToast(args: {
   jobKey: string;
   issue: ProviderCliActionableIssue;
+  kind: ProviderCliInstallFailureKind;
   log: string;
   message: string;
   toastId: string;
@@ -215,6 +239,7 @@ function showProviderCliInstallFailureToast(args: {
     jobKey: args.jobKey,
     failure: {
       issueFingerprint: args.issue.fingerprint,
+      kind: args.kind,
       logDialogState,
     },
   });
@@ -284,6 +309,7 @@ function runInstall(job: ProviderCliInstallJob): void {
       showProviderCliInstallFailureToast({
         jobKey,
         issue,
+        kind: "command",
         log: installLogChunks.join(""),
         message: failureMessage,
         toastId: failureToastId,
@@ -295,8 +321,8 @@ function runInstall(job: ProviderCliInstallJob): void {
       showProviderCliInstallFailureToast({
         jobKey,
         issue,
+        ...describeInstallRequestFailure(error),
         log: installLogChunks.join(""),
-        message,
         toastId: failureToastId,
       });
     })
@@ -345,7 +371,6 @@ export function startProviderCliInstall(job: ProviderCliInstallJob): void {
   runInstall(job);
 }
 
-/** Drop all cross-test state from this module-level store. */
 export function resetProviderCliInstallStoreForTests(): void {
   snapshot = INITIAL_SNAPSHOT;
   queuedJobs = [];

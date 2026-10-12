@@ -3,9 +3,10 @@ import os from "node:os";
 import path, { delimiter } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createUserShellPathResolver,
   prepareRuntimeShellEnv,
+  resolvePowerShellExecutionPolicyDefault,
   resolveLocalBbExecutablePath,
-  resolveUserShellPath,
   type SpawnUserShellEnv,
   type SpawnUserShellEnvArgs,
   type UserShellEnvSpawnResult,
@@ -23,10 +24,12 @@ interface FakeCliPackageOptions {
   executablePath?: string;
   executable?: boolean;
   writeEntry?: boolean;
+  writeRuntime?: boolean;
 }
 
 interface FakeCliPackage {
   cliEntryPath: string;
+  cliRuntimePath: string;
 }
 
 interface FakeShellEnvSpawn {
@@ -76,6 +79,7 @@ async function createFakeCliPackage(
   const cliPackageRoot = await makeTempDir("bb-cli-package-");
   const executablePath = options.executablePath ?? "./dist/bin/bb";
   const cliEntryPath = path.resolve(cliPackageRoot, executablePath);
+  const cliRuntimePath = path.resolve(cliPackageRoot, "dist/index.js");
 
   if (options.writeEntry ?? true) {
     await fs.mkdir(path.dirname(cliEntryPath), { recursive: true });
@@ -87,8 +91,14 @@ async function createFakeCliPackage(
     await fs.chmod(cliEntryPath, options.executable ? 0o755 : 0o644);
   }
 
+  if (options.writeRuntime) {
+    await fs.mkdir(path.dirname(cliRuntimePath), { recursive: true });
+    await fs.writeFile(cliRuntimePath, "process.stdout.write('bb')\n", "utf8");
+  }
+
   return {
     cliEntryPath,
+    cliRuntimePath,
   };
 }
 
@@ -146,15 +156,32 @@ afterEach(async () => {
 
 describe("resolveLocalBbExecutablePath", () => {
   it("returns the built CLI executable path", async () => {
-    const { cliEntryPath } = await createFakeCliPackage({
+    const { cliEntryPath, cliRuntimePath } = await createFakeCliPackage({
+      executable: true,
+      writeRuntime: true,
+    });
+
+    await expect(
+      resolveLocalBbExecutablePath({
+        cliExecutablePath: cliEntryPath,
+        cliRuntimePath,
+      }),
+    ).resolves.toBe(cliEntryPath);
+  });
+
+  it("fails before startup when the source CLI runtime is unbuilt", async () => {
+    const { cliEntryPath, cliRuntimePath } = await createFakeCliPackage({
       executable: true,
     });
 
     await expect(
       resolveLocalBbExecutablePath({
         cliExecutablePath: cliEntryPath,
+        cliRuntimePath,
       }),
-    ).resolves.toBe(cliEntryPath);
+    ).rejects.toThrow(
+      `Missing built bb CLI runtime at ${cliRuntimePath}. Build @bb/cli before starting the host daemon.`,
+    );
   });
 
   it("fails clearly when the built CLI entry is missing", async () => {
@@ -171,19 +198,22 @@ describe("resolveLocalBbExecutablePath", () => {
     );
   });
 
-  it("fails clearly when the built CLI entry is not executable", async () => {
-    const { cliEntryPath } = await createFakeCliPackage({
-      executable: false,
-    });
+  it.skipIf(process.platform === "win32")(
+    "fails clearly when the built CLI entry is not executable",
+    async () => {
+      const { cliEntryPath } = await createFakeCliPackage({
+        executable: false,
+      });
 
-    await expect(
-      resolveLocalBbExecutablePath({
-        cliExecutablePath: cliEntryPath,
-      }),
-    ).rejects.toThrow(
-      `Resolved bb CLI entry is not executable: ${cliEntryPath}. Build @bb/cli before starting the host daemon.`,
-    );
-  });
+      await expect(
+        resolveLocalBbExecutablePath({
+          cliExecutablePath: cliEntryPath,
+        }),
+      ).rejects.toThrow(
+        `Resolved bb CLI entry is not executable: ${cliEntryPath}. Build @bb/cli before starting the host daemon.`,
+      );
+    },
+  );
 
   it("skips the execute-bit check on win32", async () => {
     const { cliEntryPath } = await createFakeCliPackage({
@@ -200,7 +230,7 @@ describe("resolveLocalBbExecutablePath", () => {
   });
 });
 
-describe("resolveUserShellPath", () => {
+describe("createUserShellPathResolver", () => {
   it("settles when the shell env probe times out even if the shell ignores SIGTERM", async () => {
     const shellDir = await makeTempDir("bb-shell-timeout-");
     const shellPath = path.join(shellDir, "ignore-term-shell");
@@ -219,11 +249,11 @@ describe("resolveUserShellPath", () => {
     const startedAt = Date.now();
 
     await expect(
-      resolveUserShellPath({
+      createUserShellPathResolver({
         env: { SHELL: shellPath, PATH: "/usr/bin" },
         platform: "linux",
         timeoutMs: 25,
-      }),
+      })(),
     ).resolves.toBeNull();
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
@@ -239,12 +269,12 @@ describe("resolveUserShellPath", () => {
     });
 
     await expect(
-      resolveUserShellPath({
+      createUserShellPathResolver({
         env: { SHELL: "/usr/bin/bash", PATH: "/usr/bin" },
         platform: "linux",
         spawnUserShellEnv: fakeSpawn.spawn,
         timeoutMs: 1234,
-      }),
+      })(),
     ).resolves.toBe(shellPath);
 
     expect(fakeSpawn.calls).toEqual([
@@ -275,16 +305,45 @@ describe("resolveUserShellPath", () => {
     });
 
     await expect(
-      resolveUserShellPath({
+      createUserShellPathResolver({
         env: { SHELL: "/bin/zsh", PATH: "/usr/bin" },
         platform: "linux",
         spawnUserShellEnv: fakeSpawn.spawn,
-      }),
+      })(),
     ).resolves.toBe(shellPath);
 
     expect(fakeSpawn.calls.map((call) => call.args[0])).toEqual([
       "-ilc",
       "-lc",
+    ]);
+  });
+
+  it("retains the previous PATH when a refreshed interactive probe fails", async () => {
+    const interactivePath = "/home/me/.local/bin:/usr/bin";
+    const fakeSpawn = createFakeShellEnvSpawn({
+      results: [
+        createShellEnvSpawnResult({
+          stdout: createMarkedShellEnvOutput(interactivePath),
+        }),
+        createShellEnvSpawnResult({
+          status: 1,
+          stderr: "interactive shell failed",
+        }),
+      ],
+    });
+
+    const resolvePath = createUserShellPathResolver({
+      env: { SHELL: "/bin/zsh", PATH: "/usr/bin" },
+      platform: "linux",
+      spawnUserShellEnv: fakeSpawn.spawn,
+    });
+
+    await expect(resolvePath()).resolves.toBe(interactivePath);
+    await expect(resolvePath()).resolves.toBe(interactivePath);
+
+    expect(fakeSpawn.calls.map((call) => call.args[0])).toEqual([
+      "-ilc",
+      "-ilc",
     ]);
   });
 
@@ -298,11 +357,11 @@ describe("resolveUserShellPath", () => {
     });
 
     await expect(
-      resolveUserShellPath({
+      createUserShellPathResolver({
         env: { PATH: "/usr/bin" },
         platform: "linux",
         spawnUserShellEnv: fakeSpawn.spawn,
-      }),
+      })(),
     ).resolves.toBe("/usr/bin:/bin");
 
     expect(fakeSpawn.calls[0]?.command).toBe("/bin/sh");
@@ -319,35 +378,89 @@ describe("resolveUserShellPath", () => {
     });
 
     await expect(
-      resolveUserShellPath({
+      createUserShellPathResolver({
         env: { PATH: "/usr/bin" },
         platform: "darwin",
         spawnUserShellEnv: fakeSpawn.spawn,
-      }),
+      })(),
     ).resolves.toBe("/opt/homebrew/bin:/usr/bin");
 
     expect(fakeSpawn.calls[0]?.command).toBe("/bin/zsh");
     expect(fakeSpawn.calls[0]?.args[0]).toBe("-ilc");
   });
 
-  it("skips shell probing on Windows", async () => {
+  it("reads the Windows PATH and the variables it references from the registry", async () => {
     const fakeSpawn = createFakeShellEnvSpawn({
       results: [
         createShellEnvSpawnResult({
-          stdout: createMarkedShellEnvOutput("C:\\Windows"),
+          stdout:
+            "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\r\n    JAVA_HOME    REG_SZ    C:\\Program Files\\Java\\jdk-21\r\n    Path    REG_EXPAND_SZ    %SystemRoot%\\system32;C:\\Program Files\\nodejs\\;%JAVA_HOME%\\bin\r\n\r\n",
+        }),
+        createShellEnvSpawnResult({
+          stdout:
+            "\r\nHKEY_CURRENT_USER\\Environment\r\n    TOOLS    REG_EXPAND_SZ    %USERPROFILE%\\tools\r\n    Path    REG_SZ    %USERPROFILE%\\AppData\\Roaming\\npm;c:\\program files\\NODEJS;%TOOLS%\\bin\r\n\r\n",
         }),
       ],
     });
 
     await expect(
-      resolveUserShellPath({
-        env: { SHELL: "/bin/bash", PATH: "C:\\Windows" },
+      createUserShellPathResolver({
+        env: {
+          Path: "C:\\Windows\\system32;C:\\launcher\\bin",
+          SystemRoot: "C:\\Windows",
+          USERPROFILE: "C:\\Users\\me",
+        },
         platform: "win32",
         spawnUserShellEnv: fakeSpawn.spawn,
-      }),
-    ).resolves.toBeNull();
+      })(),
+    ).resolves.toBe(
+      "C:\\Windows\\system32;C:\\Program Files\\nodejs\\;C:\\Program Files\\Java\\jdk-21\\bin;C:\\Users\\me\\AppData\\Roaming\\npm;C:\\Users\\me\\tools\\bin;C:\\launcher\\bin",
+    );
 
-    expect(fakeSpawn.calls).toEqual([]);
+    expect(fakeSpawn.calls.map((call) => [call.command, call.args])).toEqual([
+      [
+        "C:\\Windows\\System32\\reg.exe",
+        [
+          "query",
+          "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+        ],
+      ],
+      ["C:\\Windows\\System32\\reg.exe", ["query", "HKCU\\Environment"]],
+    ]);
+  });
+
+  it("keeps the Windows machine PATH when the user environment cannot be read", async () => {
+    const fakeSpawn = createFakeShellEnvSpawn({
+      results: [
+        createShellEnvSpawnResult({
+          stdout: "    Path    REG_SZ    C:\\Windows\r\n",
+        }),
+        createShellEnvSpawnResult({ status: 1, stdout: "" }),
+      ],
+    });
+
+    await expect(
+      createUserShellPathResolver({
+        env: { SystemRoot: "C:\\Windows" },
+        platform: "win32",
+        spawnUserShellEnv: fakeSpawn.spawn,
+      })(),
+    ).resolves.toBe("C:\\Windows");
+  });
+
+  it("falls back to the inherited PATH when the Windows registry cannot be read", async () => {
+    const fakeSpawn = createFakeShellEnvSpawn({
+      results: [createShellEnvSpawnResult({ status: 1, stdout: "" })],
+    });
+
+    await expect(
+      createUserShellPathResolver({
+        env: { PATH: "C:\\Windows" },
+        platform: "win32",
+        spawnUserShellEnv: fakeSpawn.spawn,
+      })(),
+    ).resolves.toBeNull();
+    expect(fakeSpawn.calls).toHaveLength(1);
   });
 });
 
@@ -379,6 +492,27 @@ describe("prepareRuntimeShellEnv", () => {
       BB_SERVER_URL: "http://127.0.0.1:3334",
       BB_HOST_DAEMON_PORT: "3002",
     });
+  });
+
+  it("sets the PowerShell execution policy it is given and none otherwise", () => {
+    const options = {
+      bbExecutableDirectory: "C:\\bb",
+      inheritedPath: "C:\\Windows",
+      serverUrl: "http://127.0.0.1:43123",
+    };
+
+    expect(
+      prepareRuntimeShellEnv({
+        ...options,
+        powershellExecutionPolicy: "RemoteSigned",
+      }),
+    ).toMatchObject({ PSExecutionPolicyPreference: "RemoteSigned" });
+    expect(
+      prepareRuntimeShellEnv({ ...options, powershellExecutionPolicy: null }),
+    ).not.toHaveProperty("PSExecutionPolicyPreference");
+    expect(prepareRuntimeShellEnv(options)).not.toHaveProperty(
+      "PSExecutionPolicyPreference",
+    );
   });
 
   it("uses an explicit bbExecutablePath for BB_CLI", () => {
@@ -424,5 +558,127 @@ describe("prepareRuntimeShellEnv", () => {
       BB_CLI: path.resolve("/tmp/bb-bin", "bb"),
       BB_SERVER_URL: "http://127.0.0.1:3334",
     });
+  });
+});
+
+describe("resolvePowerShellExecutionPolicyDefault", () => {
+  const notConfigured = createShellEnvSpawnResult({ status: 1, stdout: "" });
+  const windowsEnv = {
+    PATH: "C:\\Windows\\system32;C:\\Program Files\\PowerShell\\7\\",
+    SystemRoot: "C:\\Windows",
+    USERPROFILE: "C:\\Users\\me",
+  };
+
+  it("offers RemoteSigned when neither the user nor the machine chose a policy", async () => {
+    const fakeSpawn = createFakeShellEnvSpawn({
+      results: [notConfigured, notConfigured],
+    });
+    const readPaths: string[] = [];
+
+    await expect(
+      resolvePowerShellExecutionPolicyDefault({
+        env: windowsEnv,
+        platform: "win32",
+        readTextFile: async (filePath) => {
+          readPaths.push(filePath);
+          return null;
+        },
+        spawnUserShellEnv: fakeSpawn.spawn,
+      }),
+    ).resolves.toBe("RemoteSigned");
+
+    expect(fakeSpawn.calls.map((call) => call.args)).toEqual([
+      [
+        "query",
+        "HKCU\\Software\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.PowerShell",
+        "/v",
+        "ExecutionPolicy",
+      ],
+      [
+        "query",
+        "HKLM\\SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.PowerShell",
+        "/v",
+        "ExecutionPolicy",
+      ],
+    ]);
+    expect(readPaths).toEqual([
+      "C:\\Users\\me\\Documents\\PowerShell\\powershell.config.json",
+      "C:\\Program Files\\PowerShell\\7\\powershell.config.json",
+    ]);
+  });
+
+  it("leaves a policy the user or machine set in the registry alone", async () => {
+    for (const results of [
+      [
+        createShellEnvSpawnResult({
+          stdout: "    ExecutionPolicy    REG_SZ    AllSigned\r\n",
+        }),
+      ],
+      [
+        notConfigured,
+        createShellEnvSpawnResult({
+          stdout: "    ExecutionPolicy    REG_SZ    Restricted\r\n",
+        }),
+      ],
+    ]) {
+      await expect(
+        resolvePowerShellExecutionPolicyDefault({
+          env: windowsEnv,
+          platform: "win32",
+          readTextFile: async () => null,
+          spawnUserShellEnv: createFakeShellEnvSpawn({ results }).spawn,
+        }),
+      ).resolves.toBeNull();
+    }
+  });
+
+  it("leaves a policy set in a PowerShell 7 configuration file alone", async () => {
+    await expect(
+      resolvePowerShellExecutionPolicyDefault({
+        env: windowsEnv,
+        platform: "win32",
+        readTextFile: async (filePath) =>
+          filePath.includes("Documents")
+            ? '{"Microsoft.PowerShell:ExecutionPolicy":"AllSigned"}'
+            : null,
+        spawnUserShellEnv: createFakeShellEnvSpawn({
+          results: [notConfigured, notConfigured],
+        }).spawn,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("offers nothing when the variable is already set, the registry cannot be read, or the host is not Windows", async () => {
+    const neverSpawn = createFakeShellEnvSpawn({ results: [] });
+    await expect(
+      resolvePowerShellExecutionPolicyDefault({
+        env: { ...windowsEnv, PSEXECUTIONPOLICYPREFERENCE: "AllSigned" },
+        platform: "win32",
+        spawnUserShellEnv: neverSpawn.spawn,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      resolvePowerShellExecutionPolicyDefault({
+        env: windowsEnv,
+        platform: "linux",
+        spawnUserShellEnv: neverSpawn.spawn,
+      }),
+    ).resolves.toBeNull();
+    expect(neverSpawn.calls).toEqual([]);
+    await expect(
+      resolvePowerShellExecutionPolicyDefault({
+        env: windowsEnv,
+        platform: "win32",
+        readTextFile: async () => null,
+        spawnUserShellEnv: createFakeShellEnvSpawn({
+          results: [
+            createShellEnvSpawnResult({
+              error: new Error("spawn reg.exe ENOENT"),
+              status: null,
+            }),
+          ],
+        }).spawn,
+      }),
+    ).resolves.toBeNull();
   });
 });

@@ -11,7 +11,7 @@ import {
   parseLifecycleError,
   type LifecycleErrorDescription,
 } from "@/lib/lifecycle-errors";
-import { getMutationErrorMessage } from "@/lib/mutation-errors";
+import { showMutationErrorToast } from "@/lib/mutation-errors";
 import { useUpdateEnvironment } from "../../../hooks/mutations/environment-mutations";
 
 interface UseEnvironmentMergeBaseParams {
@@ -75,7 +75,7 @@ export function shouldSyncSelectedMergeBaseBranch({
   );
 }
 
-export function resolveImplicitMergeBaseBranch({
+function resolveImplicitMergeBaseBranch({
   environment,
   workspaceStatus,
 }: ResolveImplicitMergeBaseBranchParams): string | undefined {
@@ -176,13 +176,14 @@ export function useEnvironmentMergeBase({
   const showBranchComparisonUi = Boolean(
     effectiveMergeBaseBranch || workspaceStatus?.branch.defaultBranch,
   );
-  const mergeBaseBranch = effectiveMergeBaseBranch;
   const isOnDefaultBranch =
     workspaceStatus?.branch.currentBranch != null &&
     workspaceStatus.branch.currentBranch ===
       workspaceStatus.branch.defaultBranch;
   const showMergeBase =
-    showBranchComparisonUi && Boolean(mergeBaseBranch) && !isOnDefaultBranch;
+    showBranchComparisonUi &&
+    Boolean(effectiveMergeBaseBranch) &&
+    !isOnDefaultBranch;
 
   const handleMergeBaseBranchChange: MergeBaseBranchChangeHandler = useCallback(
     (branch) => {
@@ -230,13 +231,11 @@ export function useEnvironmentMergeBase({
               return;
             }
 
-            appToast.error(
-              getMutationErrorMessage({
-                error,
-                fallbackMessage: "Failed to update merge base branch",
-                lifecycleOperation: "update_merge_base",
-              }),
-            );
+            showMutationErrorToast({
+              error,
+              fallbackMessage: "Failed to update merge base branch",
+              lifecycleOperation: "update_merge_base",
+            });
           },
         },
       );
@@ -255,6 +254,5 @@ export function useEnvironmentMergeBase({
     handleMergeBaseBranchChange,
     showBranchComparisonUi,
     showMergeBase,
-    mergeBaseBranch,
   };
 }

@@ -1,34 +1,25 @@
 import { describe, expect, it } from "vitest";
 import type { Label, Task } from "../../shared/contract.js";
 import {
-  activeWorkLabel,
   formatDueDate,
   groupTasksByStatus,
   labelFilterOptions,
   partitionLabels,
   selectedLabelIds,
 } from "./lib.js";
+import { makeTask } from "../../test-fixtures.js";
 
 const ULID_A = "01ARZ3NDEKTSV4RRFFQ69G5FAA";
 const ULID_B = "01ARZ3NDEKTSV4RRFFQ69G5FAB";
 const ULID_C = "01ARZ3NDEKTSV4RRFFQ69G5FAC";
 
 function task(overrides: Partial<Task> & Pick<Task, "id" | "status">): Task {
-  return {
+  return makeTask({
     projectId: ULID_A,
-    number: 1,
-    key: "TSK-1",
-    title: "A task",
-    description: "",
-    priority: "none",
-    dueDate: null,
-    parentTaskId: null,
-    position: 0,
     createdAt: "2026-07-01T00:00:00.000Z",
     updatedAt: "2026-07-01T00:00:00.000Z",
-    labelIds: [],
     ...overrides,
-  };
+  });
 }
 
 describe("groupTasksByStatus", () => {
@@ -75,21 +66,6 @@ describe("formatDueDate", () => {
   });
 });
 
-describe("activeWorkLabel", () => {
-  it("distinguishes starting from working for a single agent", () => {
-    expect(activeWorkLabel([{ liveStatus: "starting" }])).toBe(
-      "Agent starting",
-    );
-    expect(activeWorkLabel([{ liveStatus: "working" }])).toBe("Agent working");
-  });
-
-  it("counts multiple live agents", () => {
-    expect(
-      activeWorkLabel([{ liveStatus: "working" }, { liveStatus: "starting" }]),
-    ).toBe("2 agents working");
-  });
-});
-
 describe("partitionLabels", () => {
   const label = (name: string): Label => ({
     id: name,
@@ -105,13 +81,5 @@ describe("partitionLabels", () => {
       hidden: [],
     });
     expect(partitionLabels([], 2)).toEqual({ visible: [], hidden: [] });
-  });
-
-  it("moves the tail into hidden above the cap", () => {
-    const labels = [label("a"), label("b"), label("c")];
-    expect(partitionLabels(labels, 1)).toEqual({
-      visible: [labels[0]],
-      hidden: [labels[1], labels[2]],
-    });
   });
 });

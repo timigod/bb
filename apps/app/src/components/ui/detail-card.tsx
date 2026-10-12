@@ -1,13 +1,10 @@
-import { type CSSProperties, type ReactNode } from "react";
+import { type CSSProperties, type ReactNode, type UIEventHandler } from "react";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
 
-/**
- * A detail-row label with a leading icon, styled like the timeline's tool-call
- * leading icons (`size-3.5 text-muted-foreground`). Shared so detail surfaces
- * (the thread info panel, the git-action dialog) render the same row labels
- * consistently.
- */
+export const DETAIL_ROW_ICON_CLASS =
+  "size-3 shrink-0 text-subtle-foreground max-md:pointer-coarse:size-4";
+
 export function DetailRowIconLabel({
   icon,
   children,
@@ -17,17 +14,12 @@ export function DetailRowIconLabel({
 }) {
   return (
     <span className="flex items-center gap-1.5">
-      <Icon name={icon} className="size-3.5 shrink-0 text-muted-foreground" />
+      <Icon name={icon} className={DETAIL_ROW_ICON_CLASS} />
       <span className="min-w-0 truncate">{children}</span>
     </span>
   );
 }
 
-/**
- * The label/value column grid shared by every detail row. Exported so loading
- * skeletons can align their placeholder bars to real rows without re-typing
- * (and silently drifting from) the column template.
- */
 export const DETAIL_GRID_CLASS =
   "grid grid-cols-[var(--detail-label-width,96px)_minmax(0,1fr)] gap-x-3";
 const DETAIL_LABEL_CLASS = "m-0 text-xs leading-5 text-muted-foreground";
@@ -44,21 +36,13 @@ function labelWidthStyle(
   return { "--detail-label-width": labelWidth } as CSSProperties;
 }
 
-export type DetailCardAppearance = "card" | "flat";
+type DetailCardAppearance = "card" | "flat";
 
-export interface DetailCardProps {
+interface DetailCardProps {
   children: ReactNode;
   className?: string;
-  /**
-   * Width of the label column. Applied as a CSS custom property so descendant
-   * rows inherit it without prop drilling. Defaults to 96px.
-   */
+  onScroll?: UIEventHandler<HTMLDListElement>;
   labelWidth?: string;
-  /**
-   * `card` (default) wraps the rows in a bordered, padded panel.
-   * `flat` drops the chrome so the rows sit inline with surrounding content
-   * — useful inside modals or other containers that already provide framing.
-   */
   appearance?: DetailCardAppearance;
 }
 
@@ -69,11 +53,13 @@ const DETAIL_CARD_CARD_CLASS =
 export function DetailCard({
   children,
   className,
+  onScroll,
   labelWidth,
   appearance = "card",
 }: DetailCardProps) {
   return (
     <dl
+      onScroll={onScroll}
       className={cn(
         DETAIL_CARD_BASE_CLASS,
         appearance === "card" && DETAIL_CARD_CARD_CLASS,
@@ -86,17 +72,13 @@ export function DetailCard({
   );
 }
 
-export interface DetailRowProps {
+interface DetailRowProps {
   label: ReactNode;
   children: ReactNode;
   className?: string;
   labelClassName?: string;
   valueClassName?: string;
   align?: "start" | "center";
-  /**
-   * `horizontal` (default): label sits left of the value in the shared label column.
-   * `vertical`: label sits above the value. Use for wide/tall content like lists.
-   */
   orientation?: DetailRowOrientation;
 }
 

@@ -4,25 +4,8 @@ import type {
   TaskStatus,
   TaskThread,
 } from "../../shared/contract.js";
-import type { IconName } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
-
-export const STATUS_LABELS: Record<TaskStatus, string> = {
-  backlog: "Backlog",
-  todo: "Todo",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  done: "Done",
-  canceled: "Canceled",
-};
-
-export const PRIORITY_LABELS: Record<TaskPriority, string> = {
-  urgent: "Urgent",
-  high: "High",
-  medium: "Medium",
-  low: "Low",
-  none: "No priority",
-};
+import type { IconName } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 
 const STATUS_COLORS: Record<TaskStatus, string> = {
   backlog: "var(--muted-foreground)",
@@ -33,7 +16,6 @@ const STATUS_COLORS: Record<TaskStatus, string> = {
   canceled: "var(--muted-foreground)",
 };
 
-/** Linear-style status ring: dashed, open, part-filled pie, or solid glyph. */
 export function StatusIcon({
   status,
   className,
@@ -113,7 +95,6 @@ export function StatusIcon({
   );
 }
 
-/** Linear-style priority bars; urgent is a filled warning square. */
 export function PriorityIcon({
   priority,
   className,
@@ -136,7 +117,13 @@ export function PriorityIcon({
     );
   }
   const lit =
-    priority === "high" ? 3 : priority === "medium" ? 2 : priority === "low" ? 1 : 0;
+    priority === "high"
+      ? 3
+      : priority === "medium"
+        ? 2
+        : priority === "low"
+          ? 1
+          : 0;
   const heights = [5, 8, 11];
   return (
     <svg
@@ -194,7 +181,6 @@ export const THREAD_STATUS_META: Record<
   },
 };
 
-/** Mirrors the app's PR pill styling (see apps/app pull-request-display). */
 export const PR_STATE_META: Record<
   TaskPullRequest["state"],
   { label: string; icon: IconName; textClassName: string }
@@ -239,13 +225,6 @@ export function formatRelativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Formats a YYYY-MM-DD due date like "Jul 22" (with year when not this year). */
 export function formatDueDate(dueDate: string): string {
   const parsed = new Date(`${dueDate}T00:00:00`);
   if (Number.isNaN(parsed.valueOf())) return dueDate;

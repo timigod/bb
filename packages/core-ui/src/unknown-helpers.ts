@@ -6,20 +6,13 @@ export function toRecord(value: unknown): Record<string, unknown> | null {
   return isRecord(value) ? value : null;
 }
 
-/**
- * Recursively extract a human-readable error message from an unknown value.
- * Checks `message` first, then falls back to the provided `legacyKeys`.
- */
 export function extractErrorMessage(
   value: unknown,
-  opts?: { maxLength?: number; legacyKeys?: readonly string[] },
+  opts?: { legacyKeys?: readonly string[] },
 ): string | null {
   if (typeof value === "string") {
     const normalized = value.replace(/\s+/g, " ").trim();
     if (normalized.length === 0) return null;
-    if (opts?.maxLength && normalized.length > opts.maxLength) {
-      return `${normalized.slice(0, opts.maxLength - 1)}...`;
-    }
     return normalized;
   }
   if (Array.isArray(value)) {

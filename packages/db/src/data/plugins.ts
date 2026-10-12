@@ -1,11 +1,11 @@
 import { and, eq, isNull } from "drizzle-orm";
-import type { DbConnection } from "../connection.js";
+import type { DbConnection, DbQueryConnection } from "../connection.js";
 import { installedPlugins, pluginArtifacts } from "../schema.js";
 
 export type PluginProvenance =
   | { kind: "builtin" }
   | { kind: "direct" }
-  | { kind: "catalog"; entryId: string };
+  | { kind: "catalog"; marketplace: string; entryId: string };
 
 export type PluginSourceIntent =
   | { kind: "path"; canonicalPath: string }
@@ -21,8 +21,16 @@ export type PluginSourceIntent =
       kind: "git";
       url: string;
       subdirectory: string | null;
-      requestedRef: string;
-      refKind: "branch" | "tag" | "commit";
+      selector: PluginGitSelector;
+    };
+
+export type PluginGitSelector =
+  | { kind: "ref"; ref: string; refKind: "branch" | "tag" | "commit" }
+  | {
+      kind: "range";
+      range: string;
+      tagPrefix: string;
+      resolvedTag: string;
     };
 
 export type PluginExactResolution =
@@ -47,6 +55,7 @@ export interface InstalledPluginRow {
   source: string;
   provenance: "builtin" | "direct" | "catalog";
   catalogEntryId: string | null;
+  catalogMarketplaceName: string | null;
   sourceKind: "path" | "builtin" | "npm" | "git";
   sourcePath: string | null;
   sourceBuiltinName: string | null;
@@ -58,6 +67,9 @@ export interface InstalledPluginRow {
   sourceGitSubdirectory: string | null;
   sourceGitRequestedRef: string | null;
   sourceGitRefKind: "branch" | "tag" | "commit" | null;
+  sourceGitRange: string | null;
+  sourceGitTagPrefix: string | null;
+  sourceGitResolvedTag: string | null;
   npmResolvedVersion: string | null;
   npmIntegrity: string | null;
   gitResolvedCommit: string | null;
@@ -73,6 +85,7 @@ export interface InstalledPluginRow {
   rootDir: string;
   version: string;
   enabled: boolean;
+  enabledFollowsDefault: boolean;
   removedAt: number | null;
   installedAt: number;
   updatedAt: number;
@@ -89,6 +102,7 @@ export interface UpsertInstalledPluginInput {
   rootDir: string;
   version: string;
   enabled: boolean;
+  enabledFollowsDefault: boolean;
 }
 
 export interface LegacyInstalledPluginRegistration {
@@ -99,10 +113,50 @@ export interface LegacyInstalledPluginRegistration {
   enabled: boolean;
 }
 
+type NormalizeLegacyPluginSourceIntent =
+  | Exclude<PluginSourceIntent, { kind: "git" }>
+  | {
+      kind: "git";
+      url: string;
+      subdirectory: string | null;
+      selector: {
+        kind: "ref";
+        ref: string;
+        refKind: "branch" | "tag" | "commit" | null;
+      };
+    };
+
 export type NormalizeLegacyInstalledPluginInput = Omit<
   UpsertInstalledPluginInput,
-  "exactResolution"
-> & { exactResolution: LegacyPluginExactResolution };
+  "exactResolution" | "sourceIntent" | "enabledFollowsDefault"
+> & {
+  sourceIntent: NormalizeLegacyPluginSourceIntent;
+  exactResolution: LegacyPluginExactResolution;
+};
+
+function gitSelectorColumns(
+  selector:
+    | PluginGitSelector
+    | Extract<NormalizeLegacyPluginSourceIntent, { kind: "git" }>["selector"]
+    | null,
+) {
+  return {
+    sourceGitRequestedRef:
+      selector?.kind === "ref" ? selector.ref : (null as string | null),
+    sourceGitRefKind:
+      selector?.kind === "ref"
+        ? selector.refKind
+        : (null as "branch" | "tag" | "commit" | null),
+    sourceGitRange:
+      selector?.kind === "range" ? selector.range : (null as string | null),
+    sourceGitTagPrefix:
+      selector?.kind === "range" ? selector.tagPrefix : (null as string | null),
+    sourceGitResolvedTag:
+      selector?.kind === "range"
+        ? selector.resolvedTag
+        : (null as string | null),
+  } as const;
+}
 
 function normalizedColumns(
   plugin: UpsertInstalledPluginInput | NormalizeLegacyInstalledPluginInput,
@@ -116,6 +170,10 @@ function normalizedColumns(
     provenance: plugin.provenance.kind,
     catalogEntryId:
       plugin.provenance.kind === "catalog" ? plugin.provenance.entryId : null,
+    catalogMarketplaceName:
+      plugin.provenance.kind === "catalog"
+        ? plugin.provenance.marketplace
+        : null,
     sourceKind: plugin.sourceIntent.kind,
     sourcePath:
       plugin.sourceIntent.kind === "path"
@@ -143,12 +201,9 @@ function normalizedColumns(
       plugin.sourceIntent.kind === "git"
         ? plugin.sourceIntent.subdirectory
         : null,
-    sourceGitRequestedRef:
-      plugin.sourceIntent.kind === "git"
-        ? plugin.sourceIntent.requestedRef
-        : null,
-    sourceGitRefKind:
-      plugin.sourceIntent.kind === "git" ? plugin.sourceIntent.refKind : null,
+    ...gitSelectorColumns(
+      plugin.sourceIntent.kind === "git" ? plugin.sourceIntent.selector : null,
+    ),
     npmResolvedVersion:
       plugin.exactResolution.kind === "npm"
         ? plugin.exactResolution.version
@@ -268,6 +323,7 @@ export function upsertInstalledPlugin(
       rootDir: plugin.rootDir,
       version: plugin.version,
       enabled: plugin.enabled,
+      enabledFollowsDefault: plugin.enabledFollowsDefault,
       ...normalized,
       removedAt: null,
       installedAt: now,
@@ -280,6 +336,7 @@ export function upsertInstalledPlugin(
         rootDir: plugin.rootDir,
         version: plugin.version,
         enabled: plugin.enabled,
+        enabledFollowsDefault: plugin.enabledFollowsDefault,
         ...normalized,
         removedAt: null,
         updatedAt: now,
@@ -291,6 +348,40 @@ export function upsertInstalledPlugin(
   return row;
 }
 
+export function listInstalledPluginsFromMarketplace(
+  db: DbQueryConnection,
+  marketplaceName: string,
+): { id: string }[] {
+  return db
+    .select({ id: installedPlugins.id })
+    .from(installedPlugins)
+    .where(
+      and(
+        eq(installedPlugins.provenance, "catalog"),
+        eq(installedPlugins.catalogMarketplaceName, marketplaceName),
+        isNull(installedPlugins.removedAt),
+      ),
+    )
+    .all();
+}
+
+export function setInstalledPluginDirectProvenance(
+  db: DbQueryConnection,
+  id: string,
+): boolean {
+  const result = db
+    .update(installedPlugins)
+    .set({
+      provenance: "direct",
+      catalogEntryId: null,
+      catalogMarketplaceName: null,
+      updatedAt: Date.now(),
+    })
+    .where(and(eq(installedPlugins.id, id), isNull(installedPlugins.removedAt)))
+    .run();
+  return result.changes > 0;
+}
+
 export function setInstalledPluginEnabled(
   db: DbConnection,
   id: string,
@@ -298,7 +389,7 @@ export function setInstalledPluginEnabled(
 ): boolean {
   const result = db
     .update(installedPlugins)
-    .set({ enabled, updatedAt: Date.now() })
+    .set({ enabled, enabledFollowsDefault: false, updatedAt: Date.now() })
     .where(eq(installedPlugins.id, id))
     .run();
   return result.changes > 0;
@@ -366,19 +457,6 @@ export function setInstalledPluginSourceClassification(
         isNull(installedPlugins.removedAt),
       ),
     )
-    .run();
-  return result.changes > 0;
-}
-
-export function setInstalledPluginActiveArtifact(
-  db: DbConnection,
-  id: string,
-  activeArtifactId: string | null,
-): boolean {
-  const result = db
-    .update(installedPlugins)
-    .set({ activeArtifactId, updatedAt: Date.now() })
-    .where(eq(installedPlugins.id, id))
     .run();
   return result.changes > 0;
 }

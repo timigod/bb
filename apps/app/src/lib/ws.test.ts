@@ -6,6 +6,10 @@ const fakeSocketState = vi.hoisted(() => {
   type CloseHandler = () => void;
   type MessageHandler = (event: MessageEvent) => void;
   type OpenHandler = () => void;
+  interface ReconnectOptions {
+    minReconnectionDelay?: number;
+    reconnectionDelayGrowFactor?: number;
+  }
 
   class FakeReconnectingWebSocket {
     onclose: CloseHandler | null = null;
@@ -13,8 +17,14 @@ const fakeSocketState = vi.hoisted(() => {
     onopen: OpenHandler | null = null;
     readyState = 1;
     readonly sentMessages: string[] = [];
+    readonly options: ReconnectOptions | undefined;
 
-    constructor() {
+    constructor(
+      _url: string,
+      _protocols?: unknown,
+      options?: ReconnectOptions,
+    ) {
+      this.options = options;
       instances.push(this);
     }
 
@@ -46,10 +56,18 @@ vi.mock("partysocket/ws", () => ({
 }));
 
 vi.mock("./dev-websocket-url", () => ({
-  buildDevWebSocketUrl: () => "ws://bb.test/ws",
+  buildBrowserWebSocketUrl: () => "ws://bb.test/ws",
 }));
 
-import { WebSocketManager } from "./ws";
+import {
+  REALTIME_PING_INTERVAL_MS,
+  REALTIME_PONG_TIMEOUT_MS,
+  REALTIME_RESUME_HIDDEN_THRESHOLD_MS,
+  REALTIME_RESUME_PONG_TIMEOUT_MS,
+  WebSocketManager,
+  type WebSocketConnectedEvent,
+  type WebSocketManagerBrowserEvents,
+} from "./ws";
 
 const THREAD_TARGET = {
   kind: "thread-detail",
@@ -74,7 +92,10 @@ function installOpenWebSocketConstructor(): void {
   Object.defineProperty(globalThis, "WebSocket", {
     configurable: true,
     value: {
+      CONNECTING: 0,
       OPEN: 1,
+      CLOSING: 2,
+      CLOSED: 3,
     },
   });
 }
@@ -221,7 +242,6 @@ describe("WebSocketManager thread-open signals", () => {
     expect(threadOpen).toHaveBeenCalledWith(signal);
     expect(changed).not.toHaveBeenCalled();
     expect(manager.consumePendingOpenFile("thr_1")).toEqual(signal.file);
-    // Consumed exactly once: a later visit does not re-open.
     expect(manager.consumePendingOpenFile("thr_1")).toBeNull();
   });
 
@@ -260,5 +280,342 @@ describe("WebSocketManager thread-open signals", () => {
 
     expect(paneAction).toHaveBeenCalledWith(signal);
     expect(threadOpen).not.toHaveBeenCalled();
+  });
+});
+
+interface FakeBrowserEvents extends WebSocketManagerBrowserEvents {
+  setVisible: (visible: boolean) => void;
+  goOnline: () => void;
+}
+
+function createFakeBrowserEvents(initiallyVisible = true): FakeBrowserEvents {
+  let visible = initiallyVisible;
+  const visibilityListeners = new Set<() => void>();
+  const onlineListeners = new Set<() => void>();
+  return {
+    isDocumentVisible: () => visible,
+    subscribeToVisibility: (listener) => {
+      visibilityListeners.add(listener);
+      return () => {
+        visibilityListeners.delete(listener);
+      };
+    },
+    subscribeToOnline: (listener) => {
+      onlineListeners.add(listener);
+      return () => {
+        onlineListeners.delete(listener);
+      };
+    },
+    setVisible: (nextVisible) => {
+      visible = nextVisible;
+      for (const listener of visibilityListeners) {
+        listener();
+      }
+    },
+    goOnline: () => {
+      for (const listener of onlineListeners) {
+        listener();
+      }
+    },
+  };
+}
+
+function getSocketAt(index: number): FakeSocket & {
+  onmessage: ((event: MessageEvent) => void) | null;
+  readyState: number;
+} {
+  const socket = fakeSocketState.instances[index];
+  if (!socket) {
+    throw new Error(`Expected websocket instance #${index}`);
+  }
+  return socket;
+}
+
+function receive(
+  socket: { onmessage: ((event: MessageEvent) => void) | null },
+  payload: unknown,
+): void {
+  socket.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+}
+
+function pingCount(socket: FakeSocket): number {
+  return readClientMessages(socket).filter((message) => message.type === "ping")
+    .length;
+}
+
+describe("WebSocketManager liveness", () => {
+  const originalWebSocket = globalThis.WebSocket;
+
+  beforeEach(() => {
+    fakeSocketState.instances.length = 0;
+    installOpenWebSocketConstructor();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: originalWebSocket,
+    });
+  });
+
+  function createLiveManager(browserEvents = createFakeBrowserEvents()) {
+    const manager = new WebSocketManager(browserEvents);
+    const connectedEvents: WebSocketConnectedEvent[] = [];
+    manager.onConnected((event) => connectedEvents.push(event));
+    manager.connect();
+    const socket = getSocketAt(0);
+    socket.open();
+    return { browserEvents, connectedEvents, manager, socket };
+  }
+
+  it("pings an idle visible socket on the interval and reconnects when no frame answers", () => {
+    const { connectedEvents, socket } = createLiveManager();
+    const openedAt = Date.now();
+
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS);
+    expect(pingCount(socket)).toBe(1);
+    receive(socket, { type: "pong" });
+    vi.advanceTimersByTime(REALTIME_PONG_TIMEOUT_MS);
+    expect(fakeSocketState.instances).toHaveLength(1);
+
+    vi.advanceTimersByTime(
+      REALTIME_PING_INTERVAL_MS - REALTIME_PONG_TIMEOUT_MS,
+    );
+    expect(pingCount(socket)).toBe(2);
+    const lastActivityAt = openedAt + REALTIME_PING_INTERVAL_MS;
+    vi.advanceTimersByTime(REALTIME_PONG_TIMEOUT_MS);
+
+    expect(fakeSocketState.instances).toHaveLength(2);
+    expect(socket.readyState).toBe(3);
+    const replacement = getSocketAt(1);
+    replacement.open();
+    expect(connectedEvents).toEqual([
+      { reconnected: false },
+      { reconnected: true, disconnectedAt: lastActivityAt },
+    ]);
+  });
+
+  it("treats any inbound frame as liveness and skips pings while frames flow", () => {
+    const { socket } = createLiveManager();
+
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS - 1000);
+    receive(socket, {
+      type: "changed",
+      entity: "thread",
+      id: "thr_1",
+      changes: ["events-appended"],
+    });
+    vi.advanceTimersByTime(1000);
+    expect(pingCount(socket)).toBe(0);
+
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS);
+    expect(pingCount(socket)).toBe(1);
+    receive(socket, { type: "pong" });
+    vi.advanceTimersByTime(REALTIME_PONG_TIMEOUT_MS);
+    expect(fakeSocketState.instances).toHaveLength(1);
+  });
+
+  it("does not ping while hidden and probes once on becoming visible", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS * 4);
+    expect(pingCount(socket)).toBe(0);
+
+    browserEvents.setVisible(true);
+    expect(pingCount(socket)).toBe(1);
+    receive(socket, { type: "pong" });
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS);
+    expect(pingCount(socket)).toBe(2);
+  });
+
+  it("probes on becoming visible even when buffered frames land on resume", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS * 4);
+    receive(socket, {
+      type: "changed",
+      entity: "thread",
+      id: "thr_1",
+      changes: ["events-appended"],
+    });
+    browserEvents.setVisible(true);
+
+    expect(pingCount(socket)).toBe(1);
+    vi.advanceTimersByTime(REALTIME_RESUME_PONG_TIMEOUT_MS);
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("replaces the socket when a stale frame arrives instead of a pong", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS * 4);
+    browserEvents.setVisible(true);
+    expect(pingCount(socket)).toBe(1);
+
+    receive(socket, {
+      type: "changed",
+      entity: "thread",
+      id: "thr_1",
+      changes: ["events-appended"],
+    });
+    vi.advanceTimersByTime(REALTIME_RESUME_PONG_TIMEOUT_MS);
+
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("reconnects a silent socket 1.5 s after a resume probe, not after 5 s", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS * 4);
+    browserEvents.setVisible(true);
+    expect(pingCount(socket)).toBe(1);
+
+    vi.advanceTimersByTime(REALTIME_RESUME_PONG_TIMEOUT_MS - 100);
+    expect(fakeSocketState.instances).toHaveLength(1);
+    vi.advanceTimersByTime(100);
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("shortens a pending interval pong timer when a resume probe fires", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS);
+    expect(pingCount(socket)).toBe(1);
+    browserEvents.goOnline();
+    expect(pingCount(socket)).toBe(2);
+
+    vi.advanceTimersByTime(REALTIME_RESUME_PONG_TIMEOUT_MS);
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("keeps a pending resume pong timer when the interval ping fires", () => {
+    const { browserEvents, socket } = createLiveManager();
+
+    vi.advanceTimersByTime(REALTIME_PING_INTERVAL_MS - 100);
+    browserEvents.goOnline();
+    vi.advanceTimersByTime(100);
+    expect(pingCount(socket)).toBe(2);
+
+    vi.advanceTimersByTime(REALTIME_RESUME_PONG_TIMEOUT_MS - 100);
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("fires onResumed once after a long hide, never after a short hide, and on online", () => {
+    const { browserEvents, manager } = createLiveManager();
+    const onResumed = vi.fn();
+    manager.onResumed(onResumed);
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_RESUME_HIDDEN_THRESHOLD_MS - 3_000);
+    browserEvents.setVisible(true);
+    expect(onResumed).not.toHaveBeenCalled();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(REALTIME_RESUME_HIDDEN_THRESHOLD_MS + 1_000);
+    browserEvents.setVisible(true);
+    browserEvents.setVisible(true);
+    expect(onResumed).toHaveBeenCalledTimes(1);
+
+    browserEvents.goOnline();
+    expect(onResumed).toHaveBeenCalledTimes(2);
+  });
+
+  it("fires onResumed when a tab that started hidden becomes visible after the threshold", () => {
+    const { browserEvents, manager } = createLiveManager(
+      createFakeBrowserEvents(false),
+    );
+    const onResumed = vi.fn();
+    manager.onResumed(onResumed);
+
+    vi.advanceTimersByTime(REALTIME_RESUME_HIDDEN_THRESHOLD_MS + 1_000);
+    browserEvents.setVisible(true);
+
+    expect(onResumed).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire onResumed for online events while hidden", () => {
+    const { browserEvents, manager } = createLiveManager();
+    const onResumed = vi.fn();
+    manager.onResumed(onResumed);
+
+    browserEvents.setVisible(false);
+    browserEvents.goOnline();
+
+    expect(onResumed).not.toHaveBeenCalled();
+  });
+
+  it("schedules the first automatic reconnect within 500 ms of a close", () => {
+    createLiveManager();
+    const options = fakeSocketState.instances[0]?.options;
+    const minDelay = options?.minReconnectionDelay ?? Infinity;
+
+    expect(minDelay).toBeGreaterThanOrEqual(250);
+    expect(minDelay).toBeLessThan(500);
+    expect(options?.reconnectionDelayGrowFactor).toBe(2);
+  });
+
+  it("reconnects immediately on visible or online when the socket is closed", () => {
+    const { browserEvents, connectedEvents, socket } = createLiveManager();
+
+    browserEvents.setVisible(false);
+    socket.close();
+    const closedAt = Date.now();
+    vi.advanceTimersByTime(500);
+    expect(fakeSocketState.instances).toHaveLength(1);
+
+    browserEvents.setVisible(true);
+    expect(fakeSocketState.instances).toHaveLength(2);
+    getSocketAt(1).open();
+    expect(connectedEvents.at(-1)).toEqual({
+      reconnected: true,
+      disconnectedAt: closedAt,
+    });
+
+    getSocketAt(1).close();
+    browserEvents.goOnline();
+    expect(fakeSocketState.instances).toHaveLength(3);
+  });
+
+  it("reconnects immediately when the socket closes while a probe is outstanding", () => {
+    const { browserEvents, connectedEvents, socket } = createLiveManager();
+    const openedAt = Date.now();
+
+    browserEvents.setVisible(false);
+    vi.advanceTimersByTime(60_000);
+    browserEvents.setVisible(true);
+    expect(pingCount(socket)).toBe(1);
+    vi.advanceTimersByTime(1000);
+    socket.close();
+
+    expect(fakeSocketState.instances).toHaveLength(2);
+    getSocketAt(1).open();
+    expect(connectedEvents.at(-1)).toEqual({
+      reconnected: true,
+      disconnectedAt: openedAt,
+    });
+    vi.advanceTimersByTime(REALTIME_PONG_TIMEOUT_MS);
+    expect(fakeSocketState.instances).toHaveLength(2);
+  });
+
+  it("re-sends subscriptions on the replacement socket after a failed probe", () => {
+    const { manager } = createLiveManager();
+    manager.subscribe(THREAD_TARGET);
+
+    vi.advanceTimersByTime(
+      REALTIME_PING_INTERVAL_MS + REALTIME_PONG_TIMEOUT_MS,
+    );
+    const replacement = getSocketAt(1);
+    replacement.open();
+
+    expect(readClientMessages(replacement)).toEqual([
+      { type: "subscribe", target: THREAD_TARGET },
+    ]);
+    expect(manager.getConnectionState()).toBe("connected");
   });
 });

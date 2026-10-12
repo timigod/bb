@@ -10,18 +10,8 @@ import {
 export const DATABASE_COMPACTION_MIN_RECLAIMABLE_BYTES = 128 * 1024 * 1024;
 export const DATABASE_COMPACTION_MIN_RECLAIMABLE_RATIO = 0.15;
 
-/** Below this many freelist pages, incremental reclamation isn't worth a pass. */
 export const DATABASE_INCREMENTAL_VACUUM_MIN_FREELIST_PAGES = 1_024;
-/**
- * Upper bound on pages reclaimed per incremental pass. Incremental vacuum moves
- * pages individually, so capping the batch keeps each pass short enough to run
- * without stalling a busy server (unlike a full VACUUM).
- */
 export const DATABASE_INCREMENTAL_VACUUM_MAX_PAGES = 20_000;
-/**
- * Maintenance should give way quickly to foreground database work. The sweep
- * catches SQLITE_BUSY and tries again on a later hourly pass.
- */
 export const DATABASE_MAINTENANCE_BUSY_TIMEOUT_MS = 100;
 
 const ACTIVE_THREAD_STATUSES = ["active", "starting"] as const;
@@ -60,7 +50,6 @@ interface SqliteTableNameRow {
 }
 
 export interface DatabaseMaintenanceActivity {
-  activeCommandCount: number;
   activeEnvironmentProvisioningCount: number;
   activePendingInteractionCount: number;
   activeProjectDeletionCount: number;
@@ -100,6 +89,11 @@ export interface DatabaseIncrementalVacuumDecisionArgs {
 export interface CompactDatabaseResult {
   after: DatabaseCompactionStats;
   before: DatabaseCompactionStats;
+}
+
+export interface IncrementalVacuumResult {
+  after: DatabaseFreelistStats;
+  before: DatabaseFreelistStats;
 }
 
 export interface RunIncrementalVacuumArgs {
@@ -209,7 +203,6 @@ function runWithMaintenanceBusyTimeout<TValue>(
 export function getDatabaseMaintenanceActivity(
   db: DbConnection,
 ): DatabaseMaintenanceActivity {
-  const activeCommandCount = 0;
   const activeThreadCount = countValue(
     db
       .select({ value: count() })
@@ -256,7 +249,6 @@ export function getDatabaseMaintenanceActivity(
   );
 
   return {
-    activeCommandCount,
     activeEnvironmentProvisioningCount,
     activePendingInteractionCount,
     activeProjectDeletionCount,
@@ -269,7 +261,6 @@ export function isDatabaseMaintenanceIdle(
   activity: DatabaseMaintenanceActivity,
 ): boolean {
   return (
-    activity.activeCommandCount === 0 &&
     activity.activeEnvironmentProvisioningCount === 0 &&
     activity.activePendingInteractionCount === 0 &&
     activity.activeProjectDeletionCount === 0 &&
@@ -404,9 +395,6 @@ export function compactDatabase(db: DbConnection): CompactDatabaseResult {
     work: () => {
       const before = getDatabaseCompactionStats(db);
 
-      // Convert to incremental auto-vacuum (no-op if already incremental). For
-      // legacy auto_vacuum=NONE databases, SQLite applies this mode change only
-      // when the full VACUUM below completes successfully.
       db.$client.exec("PRAGMA auto_vacuum = INCREMENTAL");
       db.$client.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       db.$client.exec("VACUUM");
@@ -420,27 +408,21 @@ export function compactDatabase(db: DbConnection): CompactDatabaseResult {
   });
 }
 
-/**
- * Reclaims up to `maxPages` freelist pages on an incremental-auto-vacuum
- * database. Unlike {@link compactDatabase} this does not rewrite the whole
- * file, but it still performs maintenance writes and passive WAL checkpoints.
- * Lock contention is bounded by DATABASE_MAINTENANCE_BUSY_TIMEOUT_MS.
- */
 export function runIncrementalVacuum(
   db: DbConnection,
   args: RunIncrementalVacuumArgs,
-): CompactDatabaseResult {
+): IncrementalVacuumResult {
   return runWithMaintenanceBusyTimeout({
     db,
     work: () => {
-      const before = getDatabaseCompactionStats(db);
+      const before = getDatabaseFreelistStats(db);
 
       db.$client.exec("PRAGMA wal_checkpoint(PASSIVE)");
       db.$client.exec(`PRAGMA incremental_vacuum(${args.maxPages})`);
       db.$client.exec("PRAGMA wal_checkpoint(PASSIVE)");
 
       return {
-        after: getDatabaseCompactionStats(db),
+        after: getDatabaseFreelistStats(db),
         before,
       };
     },

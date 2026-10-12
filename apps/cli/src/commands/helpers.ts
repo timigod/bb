@@ -1,19 +1,14 @@
 import { createInterface } from "node:readline/promises";
 import {
-  PERSONAL_PROJECT_ID,
   reasoningLevelSchema,
   reasoningLevelValues,
   type ReasoningLevel,
 } from "@bb/domain";
-import type {
-  CommitActionResponse,
-  SquashMergeActionResponse,
-} from "@bb/server-contract";
+import { noteJsonPayloadWritten } from "../cli-error-output.js";
 import type { ResolvedId } from "../context-env.js";
 
 export {
   type ResolvedId,
-  type ThreadSelfTargetOptions,
   requireThreadId,
   requireThreadIdOrSelf,
 } from "../context-env.js";
@@ -24,44 +19,21 @@ export interface JsonOutputOptions {
   json?: boolean;
 }
 
-/**
- * Print data as formatted JSON and return true, or return false if --json was not requested.
- * Use this as the single JSON output path for all CLI commands.
- */
 export function outputJson(opts: JsonOutputOptions, data: unknown): boolean {
   if (!opts.json) return false;
   console.log(JSON.stringify(data, null, 2));
+  noteJsonPayloadWritten();
   return true;
 }
 
-/**
- * Print a context label to stderr when a fallback env ID was used (human output only).
- */
-export function printContextLabel(
-  resolved: ResolvedId,
-  kind: "Thread" | "Project",
-  envVar: string,
-  opts: JsonOutputOptions,
-): void {
-  if (opts.json) return;
-  if (resolved.source === "env") {
-    const displayId =
-      kind === "Project" && resolved.id === PERSONAL_PROJECT_ID
-        ? "-"
-        : resolved.id;
-    console.error(`${kind} ${displayId} (from ${envVar})`);
-  }
+export function collectOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
 }
 
-export function printEnvironmentGitOperationResult(
-  result: CommitActionResponse | SquashMergeActionResponse,
-): void {
-  const flags = [
-    ...(result.action === "commit"
-      ? ["committed"]
-      : [result.merged ? "merged" : "noop"]),
-  ];
-  console.log(`${result.message} [${flags.join(", ")}]`);
+export function printThreadContextLabel(resolved: ResolvedId): void {
+  if (resolved.source === "env") {
+    console.error(`Thread ${resolved.id} (from BB_THREAD_ID)`);
+  }
 }
 
 export async function confirmDestructiveAction(
@@ -89,9 +61,6 @@ export async function confirmDestructiveAction(
 
 export function getErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
-  // Node's fetch says "fetch failed" and keeps the actionable socket errors
-  // under `cause`. Multi-address connections use an AggregateError, so walk
-  // both links while guarding against malformed cyclic error graphs.
   const seen = new Set<Error>();
   const messages: string[] = [];
   const pending: Error[] = [err];
@@ -132,7 +101,7 @@ export function parseReasoningLevel(
     return parsed.data;
   }
   throw new Error(
-    `Invalid reasoning level '${value}'. Expected ${joinValues(REASONING_LEVELS)}.`,
+    `Invalid reasoning level '${value}'. Expected a level id the model lists, such as ${joinValues(REASONING_LEVELS)}.`,
   );
 }
 

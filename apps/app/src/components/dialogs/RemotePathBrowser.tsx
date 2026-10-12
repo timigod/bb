@@ -1,6 +1,14 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { normalizeProjectPathInput } from "@bb/domain";
+import type { HostDirectoryListing } from "@bb/server-contract";
 import { Button } from "@bb/shared-ui/button";
 import { EmptyState } from "@bb/shared-ui/empty-state";
 import { Icon } from "@bb/shared-ui/icon";
@@ -17,11 +25,6 @@ interface Crumb {
   path: string;
 }
 
-/**
- * Splits an absolute directory into navigable ancestor crumbs. The host's
- * separator is inferred from the path string (the client can't know a remote
- * host's platform), so this handles both POSIX and Windows roots.
- */
 export function toBreadcrumb(directory: string): Crumb[] {
   const isWindows = /^[A-Za-z]:/.test(directory);
   if (!isWindows) {
@@ -45,10 +48,6 @@ export function toBreadcrumb(directory: string): Crumb[] {
   return crumbs;
 }
 
-/**
- * Appends a child name to a host directory using that host's separator, which
- * is inferred from the path string the same way {@link toBreadcrumb} does.
- */
 export function joinHostPath(directory: string, name: string): string {
   if (/^[A-Za-z]:/.test(directory)) {
     return `${directory.replace(/[\\/]+$/, "")}\\${name}`;
@@ -56,7 +55,6 @@ export function joinHostPath(directory: string, name: string): string {
   return `${directory.replace(/\/+$/, "")}/${name}`;
 }
 
-/** Rejects names that would silently create somewhere other than here. */
 export function getFolderNameValidationMessage(name: string): string | null {
   if (!name) return "Enter a folder name.";
   if (name === "." || name === "..") return "Enter a folder name.";
@@ -64,16 +62,15 @@ export function getFolderNameValidationMessage(name: string): string | null {
   return null;
 }
 
+const DIRECTORY_ENTRY_ROW_HEIGHT_PX = 28;
+const DIRECTORY_ENTRY_OVERSCAN_ROWS = 10;
+
+const NO_ENTRIES: HostDirectoryListing["entries"] = [];
+
 interface RemotePathBrowserProps {
   hostId: string;
-  /** Directory to open at; null starts at the host's home directory. */
   initialPath?: string | null;
-  /** Whether this picker may create and select a new child directory. */
   allowCreateFolder: boolean;
-  /**
-   * Reports the resolved directory currently shown (the folder that would be
-   * picked). Null while the first listing loads or a manual path fails to read.
-   */
   onDirectoryChange: (directory: string | null) => void;
   disabled?: boolean;
 }
@@ -103,6 +100,36 @@ export function RemotePathBrowser({
   const directory = data?.directory ?? null;
   const crumbs = directory ? toBreadcrumb(directory) : [];
 
+  const entries = data?.entries ?? NO_ENTRIES;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const getScrollElement = useCallback(() => scrollRef.current, []);
+  const estimateEntrySize = useCallback(
+    () => DIRECTORY_ENTRY_ROW_HEIGHT_PX,
+    [],
+  );
+  const getEntryKey = useCallback(
+    (index: number) => entries[index]?.path ?? index,
+    [entries],
+  );
+  const entryVirtualizer = useVirtualizer({
+    count: entries.length,
+    getScrollElement,
+    estimateSize: estimateEntrySize,
+    getItemKey: getEntryKey,
+    overscan: DIRECTORY_ENTRY_OVERSCAN_ROWS,
+  });
+
+  const cancelCreatingFolder = () => {
+    setIsCreatingFolder(false);
+    setNewFolderError(null);
+  };
+
+  const navigateTo = (path: string) => {
+    cancelCreatingFolder();
+    entryVirtualizer.scrollToOffset(0);
+    setCurrentPath(path);
+  };
+
   const startCreatingFolder = () => {
     if (
       !allowCreateFolder ||
@@ -119,18 +146,6 @@ export function RemotePathBrowser({
     setIsCreatingFolder(true);
   };
 
-  const cancelCreatingFolder = () => {
-    setIsCreatingFolder(false);
-    setNewFolderError(null);
-  };
-
-  // A pending name belongs to the folder it was started in, so leaving that
-  // folder (including after a successful create) abandons it.
-  const navigateTo = (path: string) => {
-    cancelCreatingFolder();
-    setCurrentPath(path);
-  };
-
   const createFolder = useMutation({
     mutationFn: async ({ parent, name }: { parent: string; name: string }) => {
       const path = joinHostPath(parent, name);
@@ -139,8 +154,6 @@ export function RemotePathBrowser({
     },
     onSuccess: async (path, { parent }) => {
       setNewFolderName("");
-      // The new folder becomes the picked directory; refresh the parent so it
-      // is listed too when the user navigates back up.
       navigateTo(path);
       await invalidateHostDirectoryListing({
         queryClient,
@@ -178,7 +191,6 @@ export function RemotePathBrowser({
     createFolder.mutate({ parent: directory, name });
   };
 
-  // Keep the dialog's pick target in sync with the resolved directory.
   useEffect(() => {
     onDirectoryChange(directory);
   }, [directory, onDirectoryChange]);
@@ -234,17 +246,25 @@ export function RemotePathBrowser({
         className="px-2 py-3"
       />
     );
-  } else if (data.entries.length === 0) {
+  } else if (entries.length === 0) {
     body = <EmptyState message="This folder is empty." className="px-2 py-3" />;
   } else {
     body = (
-      <ul className="flex flex-col">
-        {data.entries.map((entry) => {
+      <ul
+        className="relative"
+        style={{ height: entryVirtualizer.getTotalSize() }}
+      >
+        {entryVirtualizer.getVirtualItems().map((virtualItem) => {
+          const entry = entries[virtualItem.index];
+          if (!entry) return null;
           if (entry.kind === "file") {
             return (
               <li
                 key={entry.path}
-                className="flex items-center gap-2 px-2 py-1 text-sm text-muted-foreground"
+                data-index={virtualItem.index}
+                ref={entryVirtualizer.measureElement}
+                className="absolute left-0 flex w-full items-center gap-2 px-2 py-1 text-sm text-muted-foreground"
+                style={{ top: virtualItem.start }}
               >
                 <Icon name="File" className="size-4 shrink-0" />
                 <span className="min-w-0 truncate" title={entry.name}>
@@ -254,7 +274,13 @@ export function RemotePathBrowser({
             );
           }
           return (
-            <li key={entry.path}>
+            <li
+              key={entry.path}
+              data-index={virtualItem.index}
+              ref={entryVirtualizer.measureElement}
+              className="absolute left-0 w-full"
+              style={{ top: virtualItem.start }}
+            >
               <button
                 type="button"
                 disabled={interactionDisabled}
@@ -383,6 +409,7 @@ export function RemotePathBrowser({
       </div>
 
       <div
+        ref={scrollRef}
         className={cn(
           "h-56 min-h-0 overflow-y-auto px-1.5 py-1",
           isPlaceholderData && "opacity-60",
@@ -394,8 +421,6 @@ export function RemotePathBrowser({
             aria-label="Create new folder"
             className="mb-1 flex flex-col gap-1"
           >
-            {/* Mirrors an entry row's px-2 + size-4 icon + gap-2 so the name
-                being typed lines up with the folder names below it. */}
             <div className="flex items-center gap-2 px-2">
               <Icon
                 name="Folder"

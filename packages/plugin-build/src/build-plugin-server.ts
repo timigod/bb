@@ -2,82 +2,60 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  rename,
+  realpath,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, extname, join, relative, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { init as initModuleLexer, parse as parseModule } from "es-module-lexer";
+import { renameIntoPlace } from "./rename-into-place.js";
 import { createPluginArtifactMeta } from "./plugin-artifact-meta.js";
-import { validatePluginBuildManifest } from "./plugin-manifest.js";
-import { type PluginBuildToolchain } from "./toolchain.js";
+import { zodLocaleStubPlugin } from "./zod-locale-stub.mjs";
+import { zodResolutionPlugin } from "./zod-resolution.js";
+import {
+  isRecord,
+  readPluginPackageJsonFile,
+  resolveManifestEntryFile,
+  validatePluginBuildManifest,
+} from "./plugin-manifest.js";
+import {
+  describeUnresolvedSdkImport,
+  PLUGIN_SDK_PACKAGE_NAME,
+} from "./plugin-sdk-install.js";
+import {
+  NODE_ESM_REQUIRE_BANNER,
+  type PluginBuildToolchain,
+} from "./toolchain.js";
 
-/**
- * `bb plugin build` — compile a plugin's `bb.server` entry into a
- * self-contained backend bundle (prebuilt distribution, design §6):
- *
- * - `dist/server.js` (+ `.map`) — single node-platform ESM file with the
- *   plugin's npm deps inlined, so git:/npm: consumers never need npm or
- *   node_modules. `@bb/plugin-sdk` stays external — plugin authors only ever
- *   have its `.d.ts` types, so the specifier must survive to load time, where
- *   the server's loader aliases it to the SDK runtime bundle shipped next to
- *   the server (workspace resolution covers source checkouts). better-sqlite3
- *   is also external (plugins get sqlite from the host via `bb.storage`;
- *   native deps are unsupported in plugins regardless).
- * - `dist/server.meta.json` — SDK compatibility plus authoritative plugin,
- *   artifact-format, and build-version metadata.
- */
+const LEGACY_PLUGIN_SDK_SPECIFIER = "@bb/plugin-sdk";
 
-// Same shim scripts/build-utils.mjs applies to our own node bundles: plugin
-// deps may be CJS and reference require/__dirname/__filename, which do not
-// exist in ESM output.
-const NODE_ESM_REQUIRE_BANNER = [
-  'import { createRequire as __createRequire } from "node:module";',
-  'import { dirname as __pathDirname } from "node:path";',
-  'import { fileURLToPath as __fileURLToPath } from "node:url";',
-  "const require = __createRequire(import.meta.url);",
-  "var __filename = __fileURLToPath(import.meta.url);",
-  "var __dirname = __pathDirname(__filename);",
-].join("\n");
-
-/**
- * Specifiers the backend bundle leaves unresolved. Everything else a plugin's
- * server source imports is inlined from its node_modules, so it has to be a
- * real `dependency` — `packages/templates` scaffolds against this list.
- */
 export const PLUGIN_SERVER_EXTERNALS: readonly string[] = [
-  "@bb/plugin-sdk",
+  PLUGIN_SDK_PACKAGE_NAME,
+  LEGACY_PLUGIN_SDK_SPECIFIER,
   "better-sqlite3",
 ];
 
+const PLUGIN_SDK_ROOT_FILTER = /^@get-bb\/plugin-sdk$|^@bb\/plugin-sdk$/;
+const PLUGIN_SDK_SUBPATH_FILTER = /^@get-bb\/plugin-sdk\//;
+const PLUGIN_SDK_SUBPATH_RESOLVE_MARK = "bb-server-sdk-subpath";
+const PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK = "bb-server-runtime-fallback";
+const PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK = "bb-server-source-boundary";
+const PLUGIN_BUNDLED_DEPENDENCY_MARK = "bb-server-bundled-dependency";
+const BARE_PACKAGE_FILTER = /^[^./]|^@[^/]+\/[^/]+/;
+const FILE_IMPORT_FILTER = /^(?:\.{1,2}\/|\/)/;
+
 interface PluginServerConfig {
-  /** Absolute path of the `bb.server` entry file. */
   serverEntry: string;
   packageName: string;
   pluginVersion: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Read `<rootDir>/package.json` and resolve its `bb.server` entry, or throw. */
 async function readPluginServerConfig(
   rootDir: string,
 ): Promise<PluginServerConfig> {
   const packageJsonPath = join(rootDir, "package.json");
-  let raw: string;
-  try {
-    raw = await readFile(packageJsonPath, "utf8");
-  } catch {
-    throw new Error(`no readable package.json at ${packageJsonPath}`);
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`package.json is not valid JSON at ${packageJsonPath}`);
-  }
+  const json = await readPluginPackageJsonFile(packageJsonPath);
   if (!isRecord(json) || !isRecord(json.bb) || json.bb.server === undefined) {
     throw new Error(
       `no server entry: ${packageJsonPath} has no "bb": { "server": "./server.ts" } field`,
@@ -88,21 +66,11 @@ async function readPluginServerConfig(
     rootDir,
     packageJsonPath,
   );
-  const server = manifest.bb.server;
-  if (isAbsolute(server)) {
-    throw new Error(`manifest bb.server must be relative, got "${server}"`);
-  }
-  const serverEntry = resolve(rootDir, server);
-  if (serverEntry !== rootDir && !serverEntry.startsWith(rootDir + "/")) {
-    throw new Error(
-      `manifest bb.server escapes the plugin directory: "${server}"`,
-    );
-  }
-  try {
-    await stat(serverEntry);
-  } catch {
-    throw new Error(`manifest bb.server points at a missing file: ${server}`);
-  }
+  const serverEntry = await resolveManifestEntryFile(
+    rootDir,
+    manifest.bb.server,
+    "bb.server",
+  );
   return {
     serverEntry,
     packageName: manifest.name,
@@ -110,54 +78,270 @@ async function readPluginServerConfig(
   };
 }
 
-export interface PluginServerBuildResult {
+interface PluginServerBuildResult {
   jsPath: string;
   mapPath: string;
   metaPath: string;
 }
 
-/**
- * Build `<rootDir>`'s backend bundle into `<rootDir>/dist/`. Throws with a
- * human-readable message on any problem (missing bb.server, compile errors).
- */
+export interface PluginServerBuildOptions {
+  hostProvidedZod?: boolean;
+  outDir?: string;
+  format?: "esm" | "cjs";
+  validatedConfig?: PluginServerConfig;
+  runtimeImports?: Record<string, { path: string; external?: boolean }>;
+  fallbackResolve?: (specifier: string) => string | undefined;
+  preserveSourceModuleLocation?: boolean;
+  externalizeSourceOutsideRoot?: boolean;
+  externalizeBareImports?: boolean;
+}
+
+async function transformSourceModuleLocation(
+  esbuild: typeof import("esbuild"),
+  path: string,
+): Promise<string> {
+  const sourceUrl = pathToFileURL(path).href;
+  const transformed = await esbuild.transform(await readFile(path, "utf8"), {
+    loader: loaderForSourcePath(path),
+    target: "node22",
+    sourcefile: path,
+    define: {
+      "import.meta.url": JSON.stringify(sourceUrl),
+      "import.meta.dirname": JSON.stringify(dirname(path)),
+      "import.meta.filename": JSON.stringify(path),
+      __dirname: JSON.stringify(dirname(path)),
+      __filename: JSON.stringify(path),
+    },
+  });
+  await initModuleLexer;
+  const [imports] = parseModule(transformed.code);
+  let code = transformed.code;
+  for (const entry of [...imports].reverse()) {
+    if (entry.d < 0 || entry.n !== undefined) continue;
+    const expression = code.slice(entry.s, entry.e);
+    const resolved = `((specifier) => typeof specifier === "string" && (specifier.startsWith("./") || specifier.startsWith("../")) ? new URL(specifier, ${JSON.stringify(sourceUrl)}).href : specifier)(${expression})`;
+    code = `${code.slice(0, entry.s)}${resolved}${code.slice(entry.e)}`;
+  }
+  return code;
+}
+
+function loaderForSourcePath(path: string): "js" | "jsx" | "ts" | "tsx" {
+  const extension = extname(path);
+  if (extension === ".ts" || extension === ".mts" || extension === ".cts") {
+    return "ts";
+  }
+  if (extension === ".tsx") return "tsx";
+  if (extension === ".jsx") return "jsx";
+  return "js";
+}
+
 export async function buildPluginServer(
   rootDir: string,
   bbVersion: string,
   toolchain: PluginBuildToolchain,
+  options: PluginServerBuildOptions = {},
 ): Promise<PluginServerBuildResult> {
   const { serverEntry, packageName, pluginVersion } =
-    await readPluginServerConfig(rootDir);
-  const distDir = join(rootDir, "dist");
+    options.validatedConfig ?? (await readPluginServerConfig(rootDir));
+  const format = options.format ?? "esm";
+  const sourceRoot = await realpath(rootDir);
+  const distDir = options.outDir ?? join(rootDir, "dist");
   await mkdir(distDir, { recursive: true });
-  const jsPath = join(distDir, "server.js");
-  const mapPath = join(distDir, "server.js.map");
+  const fileName = format === "esm" ? "server.js" : "server.cjs";
+  const jsPath = join(distDir, fileName);
+  const mapPath = join(distDir, `${fileName}.map`);
   const metaPath = join(distDir, "server.meta.json");
 
-  // Build every artifact into a staging directory and only rename into place
-  // once all steps succeeded — a failed rebuild must not clobber the previous
-  // dist/server.js the loader may still prefer.
   const stageDir = await mkdtemp(join(distDir, ".stage-"));
   try {
-    const stagedJsPath = join(stageDir, "server.js");
+    const stagedJsPath = join(stageDir, fileName);
     const stagedMetaPath = join(stageDir, "server.meta.json");
 
-    // Dynamic specifier: restate the module type (see build-plugin-app.ts).
     const esbuild = (await import(
       toolchain.esbuild
     )) as typeof import("esbuild");
+    const runtimeImports = options.runtimeImports ?? {};
     await esbuild.build({
       entryPoints: [serverEntry],
       outfile: stagedJsPath,
       bundle: true,
-      format: "esm",
+      format,
       platform: "node",
       target: "node22",
       sourcemap: true,
-      banner: { js: NODE_ESM_REQUIRE_BANNER },
-      // The server's loader aliases the SDK to its shipped runtime bundle at
-      // load time; better-sqlite3 comes from the host (bb.storage). Node
-      // builtins are auto-external via platform: "node".
-      external: [...PLUGIN_SERVER_EXTERNALS],
+      sourcesContent: false,
+      ...(format === "esm" ? { banner: { js: NODE_ESM_REQUIRE_BANNER } } : {}),
+      external: PLUGIN_SERVER_EXTERNALS.filter(
+        (specifier) =>
+          !PLUGIN_SDK_ROOT_FILTER.test(specifier) &&
+          runtimeImports[specifier] === undefined,
+      ).concat(
+        Object.values(runtimeImports)
+          .filter((entry) => entry.external === true)
+          .map((entry) => entry.path),
+      ),
+      minify: true,
+      keepNames: true,
+      plugins: [
+        zodResolutionPlugin("server", {
+          hostProvidedBareZod: options.hostProvidedZod,
+          fallbackResolve: options.fallbackResolve,
+        }),
+        zodLocaleStubPlugin(),
+        ...(options.preserveSourceModuleLocation === true
+          ? [
+              {
+                name: "bb-plugin-source-url",
+                setup(build: import("esbuild").PluginBuild) {
+                  build.onLoad(
+                    { filter: /\.(?:[cm]?[jt]s|[jt]sx)$/ },
+                    async (args: import("esbuild").OnLoadArgs) => ({
+                      contents: await transformSourceModuleLocation(
+                        esbuild,
+                        args.path,
+                      ),
+                      loader: "js",
+                      pluginData: args.pluginData,
+                    }),
+                  );
+                },
+              },
+            ]
+          : []),
+        {
+          name: "bb-plugin-sdk-resolution",
+          setup(build) {
+            for (const [specifier, entry] of Object.entries(runtimeImports)) {
+              const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              build.onResolve({ filter: new RegExp(`^${escaped}$`) }, () => ({
+                path: entry.path,
+                external: entry.external === true,
+                pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+              }));
+            }
+            build.onResolve({ filter: PLUGIN_SDK_ROOT_FILTER }, (args) => ({
+              path: args.path,
+              external: true,
+            }));
+            build.onResolve(
+              { filter: PLUGIN_SDK_SUBPATH_FILTER },
+              async (args) => {
+                if (args.pluginData === PLUGIN_SDK_SUBPATH_RESOLVE_MARK) {
+                  return undefined;
+                }
+                const installed = await build.resolve(args.path, {
+                  resolveDir: args.resolveDir,
+                  kind: args.kind,
+                  importer: args.importer,
+                  pluginData: PLUGIN_SDK_SUBPATH_RESOLVE_MARK,
+                });
+                if (installed.errors.length === 0 && installed.path !== "") {
+                  return {
+                    path: installed.path,
+                    pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                  };
+                }
+                return {
+                  errors: [
+                    {
+                      text: await describeUnresolvedSdkImport({
+                        specifier: args.path,
+                        resolveDir: args.resolveDir,
+                        need: `a server entry's "${args.path}" import is bundled from the plugin's own SDK install (bb serves only the bare "${PLUGIN_SDK_PACKAGE_NAME}" at load time), so the plugin needs`,
+                        esbuildErrors: installed.errors,
+                      }),
+                    },
+                  ],
+                };
+              },
+            );
+            build.onResolve({ filter: BARE_PACKAGE_FILTER }, async (args) => {
+              if (
+                args.kind === "entry-point" ||
+                args.pluginData === PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK ||
+                PLUGIN_SDK_SUBPATH_FILTER.test(args.path) ||
+                /^zod($|\/)/.test(args.path) ||
+                options.fallbackResolve === undefined
+              ) {
+                return undefined;
+              }
+              const installed = await build.resolve(args.path, {
+                resolveDir: args.resolveDir,
+                kind: args.kind,
+                importer: args.importer,
+                pluginData: PLUGIN_RUNTIME_FALLBACK_RESOLVE_MARK,
+              });
+              if (installed.errors.length === 0 && installed.path !== "") {
+                return {
+                  path: installed.path,
+                  external:
+                    options.externalizeBareImports === true ||
+                    installed.external ||
+                    installed.path.startsWith("node:"),
+                  pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                };
+              }
+              const fallback = options.fallbackResolve(args.path);
+              return fallback === undefined || fallback.startsWith("node:")
+                ? undefined
+                : {
+                    path: fallback,
+                    external: options.externalizeBareImports === true,
+                    pluginData: PLUGIN_BUNDLED_DEPENDENCY_MARK,
+                  };
+            });
+            if (options.externalizeSourceOutsideRoot === true) {
+              build.onResolve({ filter: FILE_IMPORT_FILTER }, async (args) => {
+                if (
+                  args.importer === "" ||
+                  args.kind === "entry-point" ||
+                  args.pluginData === PLUGIN_BUNDLED_DEPENDENCY_MARK ||
+                  args.pluginData === PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK
+                ) {
+                  return undefined;
+                }
+                const importerFromRoot = relative(sourceRoot, args.importer);
+                if (
+                  importerFromRoot === ".." ||
+                  importerFromRoot.startsWith(`..${sep}`) ||
+                  importerFromRoot.split(sep).includes("node_modules")
+                ) {
+                  return undefined;
+                }
+                const resolved = await build.resolve(args.path, {
+                  resolveDir: args.resolveDir,
+                  kind: args.kind,
+                  importer: args.importer,
+                  pluginData: PLUGIN_SOURCE_BOUNDARY_RESOLVE_MARK,
+                });
+                if (resolved.errors.length > 0 || resolved.path === "") {
+                  return undefined;
+                }
+                const fromRoot = relative(sourceRoot, resolved.path);
+                if (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`)) {
+                  return { path: resolved.path };
+                }
+                if (args.kind === "dynamic-import") {
+                  return {
+                    path:
+                      process.platform === "win32"
+                        ? pathToFileURL(resolved.path).href
+                        : resolved.path,
+                    external: true,
+                  };
+                }
+                return {
+                  errors: [
+                    {
+                      text: `server source import escapes the plugin directory: ${args.path}`,
+                    },
+                  ],
+                };
+              });
+            }
+          },
+        },
+      ],
       logLevel: "error",
     });
     await writeFile(
@@ -169,10 +353,19 @@ export async function buildPluginServer(
       ) + "\n",
     );
 
-    // Same filesystem as dist/, so each rename is atomic.
-    await rename(stagedJsPath, jsPath);
-    await rename(join(stageDir, "server.js.map"), mapPath);
-    await rename(stagedMetaPath, metaPath);
+    if (format === "esm") {
+      await writeFile(join(stageDir, "package.json"), '{"type":"module"}\n');
+    }
+
+    await renameIntoPlace(stagedJsPath, jsPath);
+    await renameIntoPlace(join(stageDir, `${fileName}.map`), mapPath);
+    await renameIntoPlace(stagedMetaPath, metaPath);
+    if (format === "esm") {
+      await renameIntoPlace(
+        join(stageDir, "package.json"),
+        join(distDir, "package.json"),
+      );
+    }
   } finally {
     await rm(stageDir, { recursive: true, force: true });
   }

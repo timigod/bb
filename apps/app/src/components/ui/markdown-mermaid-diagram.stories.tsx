@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { MarkdownPreview } from "./markdown-preview.js";
 import { MarkdownMermaidDiagram } from "./markdown-mermaid-diagram.js";
 import { StoryCard, StoryRow } from "../../../.ladle/story-card";
 
@@ -18,9 +20,39 @@ const SEQUENCE = `sequenceDiagram
   U->>S: Request
   S-->>U: Response`;
 
-// Renders inside a rounded-md recessed container with a copy/source/expand
-// toolbar. The expand (Maximize) control opens the full-screen viewer dialog
-// whose surface uses the reduced shadow-sm.
+const STREAMING_STEPS = [
+  "flowchart TD\n  A[Start]",
+  "flowchart TD\n  A[Start] --> B[",
+  "flowchart TD\n  A[Start] --> B[Finish]",
+  "flowchart TD\n  A[Start] --> B[Finish]\n  B --> C[",
+  "flowchart TD\n  A[Start] --> B[Finish]\n  B --> C[Done]",
+  "flowchart TD\n  A[Start] --> B[Finish]\n  B --> C[Done]\n```\n\nDone.",
+];
+
+export function Streaming() {
+  const [step, setStep] = useState(0);
+  return (
+    <StoryCard>
+      <StoryRow label="streaming" hint="Advance through incomplete node labels">
+        <div className="w-full max-w-[640px]">
+          <button
+            type="button"
+            onClick={() =>
+              setStep((current) => (current + 1) % STREAMING_STEPS.length)
+            }
+          >
+            Next chunk ({step + 1}/{STREAMING_STEPS.length})
+          </button>
+          <MarkdownPreview
+            content={`\`\`\`mermaid\n${STREAMING_STEPS[step]}`}
+            incrementalBlocks
+          />
+        </div>
+      </StoryRow>
+    </StoryCard>
+  );
+}
+
 export function Overview() {
   return (
     <StoryCard>

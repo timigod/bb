@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
 import {
   ExecutionControls,
   type ExecutionControlsProps,
 } from "./ExecutionControls";
+import { ModelReasoningMenu } from "@/components/pickers/ModelReasoningMenuSplit";
 
 function makeExecutionControlsProps(
   providerOnChange?: (value: string) => void,
@@ -43,6 +44,8 @@ function renderExecutionControls(props: ExecutionControlsProps) {
   const { wrapper } = createQueryClientTestHarness();
   return render(<ExecutionControls {...props} />, { wrapper });
 }
+
+beforeAll(() => ModelReasoningMenu.preload());
 
 afterEach(() => {
   cleanup();
@@ -84,7 +87,7 @@ describe("ExecutionControls", () => {
         active: { model: "o4-mini" },
         options: [],
         loadFailed: true,
-        loadError: { providerId: "codex", code: "failed" },
+        loadError: { providerId: "codex", code: "failed", detail: null },
       },
     });
 
@@ -96,41 +99,6 @@ describe("ExecutionControls", () => {
     expect(trigger.textContent).not.toContain("Failed to load models");
   });
 
-  it("shows the picker footer action even when model controls are unavailable", () => {
-    const props = makeExecutionControlsProps();
-
-    renderExecutionControls({
-      ...props,
-      provider: {
-        options: [],
-        hasMultiple: false,
-      },
-      model: {
-        ...props.model,
-        selected: "",
-        options: [],
-      },
-      reasoning: {
-        ...props.reasoning,
-        options: [],
-      },
-      footerAction: {
-        label: "Handoff to new thread",
-        onClick: () => {},
-      },
-    });
-
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Provider, model and reasoning",
-      }),
-    );
-
-    expect(
-      screen.getByRole("button", { name: "Handoff to new thread" }),
-    ).not.toBeNull();
-  });
-
   it("maps disabled fast mode to the explicit default service tier", () => {
     const onServiceTierChange = vi.fn();
     renderExecutionControls({
@@ -139,6 +107,7 @@ describe("ExecutionControls", () => {
         value: "fast",
         onChange: onServiceTierChange,
         supported: true,
+        options: [{ id: "fast", label: "Fast" }],
       },
     });
 

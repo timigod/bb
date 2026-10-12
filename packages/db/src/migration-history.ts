@@ -26,6 +26,21 @@ export const compatibleMigrationHashes = [
     when: 1781660000001,
     hash: "025358fe89253aec7f5bd970dc3eb88d0e834f0d58fb9d75329a5d39899340f4",
   },
+  {
+    tag: "0103_wandering_mongoose",
+    when: 1787181956957,
+    hash: "79d39e7b68d1db8ba02614fe4cc227cc0c154d77c7183f2e37ed2d8475412993",
+  },
+  {
+    tag: "0111_known_morph",
+    when: 1788219579088,
+    hash: "eda4daf7f011d8718c21d3fbd71030f30438863cd1e6ceddd32a5052fb3a14cd",
+  },
+  {
+    tag: "0132_thread_drafts",
+    when: 1790322211064,
+    hash: "34086c32a5765e290293be611f00de29327ad1903e663f11b93d88eacfb95f7f",
+  },
 ] as const satisfies readonly CompatibleMigrationHash[];
 
 export const publishedMigrationWhensByTag: ReadonlyMap<string, number> =

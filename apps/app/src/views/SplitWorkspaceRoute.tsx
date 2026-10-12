@@ -1,28 +1,38 @@
+import { queueSplitDownload } from "@/lib/split-prefetch";
+import { pluginDetailKeyFromRoute } from "@/components/plugin/plugin-detail-key";
 import { useMemo } from "react";
+import { disableGlobalCursorStyles } from "react-resizable-panels";
 import { matchPath, Navigate, useLocation } from "react-router-dom";
+import { useAtomValue } from "jotai";
+import { splitLayoutAtom } from "@/lib/split-layout/atoms";
+import { holdsPluginDetailPane } from "@/lib/split-layout/openPaneContentInSplit";
+import "@bb/shared-ui/icon-extended";
 import {
   APP_ROOT_ROUTE_PATH,
   LEGACY_PROJECT_COMPOSE_ROUTE_PATH,
+  PLUGIN_DETAIL_ROUTE_PATH,
   PLUGIN_PANEL_ROUTE_PATH,
 } from "@/lib/route-paths";
 import type { PaneContent } from "@/lib/split-layout";
 import { useRouteState } from "@/hooks/useRouteState";
-import { LegacyProjectComposeRedirect } from "./RootComposeView";
+import { LegacyProjectComposeRedirect } from "./LegacyProjectComposeRedirect";
 import { SplitThreadArea } from "./thread-detail/SplitThreadArea";
+import { LazyPluginsView } from "./ToolsViewSplits";
+
+disableGlobalCursorStyles();
 
 const ROOT_COMPOSE_CONTENT = { kind: "new-thread" } as const;
 
-/**
- * Stable route owner for every page that can live in the split workspace.
- *
- * All supported URLs intentionally match the same outer `*` route in App.tsx.
- * Focus-driven URL changes therefore update `routeContent` without replacing
- * this component or remounting the split tree and its plugin/compose panes.
- */
+queueSplitDownload("markdown-html");
+
 export default function SplitWorkspaceRoute() {
   const location = useLocation();
   const { projectId, threadId, isThreadView } = useRouteState();
   const pluginMatch = matchPath(PLUGIN_PANEL_ROUTE_PATH, location.pathname);
+  const pluginDetailMatch = matchPath(
+    PLUGIN_DETAIL_ROUTE_PATH,
+    location.pathname,
+  );
   const legacyProjectMatch = matchPath(
     LEGACY_PROJECT_COMPOSE_ROUTE_PATH,
     location.pathname,
@@ -30,6 +40,7 @@ export default function SplitWorkspaceRoute() {
   const pluginId = pluginMatch?.params.pluginId;
   const panelPath = pluginMatch?.params.panelPath;
   const pluginSubPath = pluginMatch?.params["*"] ?? "";
+  const detailPluginId = pluginDetailMatch?.params.pluginId;
 
   const routeContent = useMemo<PaneContent | null>(() => {
     if (location.pathname === APP_ROOT_ROUTE_PATH) {
@@ -37,6 +48,9 @@ export default function SplitWorkspaceRoute() {
     }
     if (isThreadView && projectId && threadId) {
       return { kind: "thread", projectId, threadId };
+    }
+    if (detailPluginId) {
+      return { kind: "plugin-detail", pluginId: detailPluginId };
     }
     if (pluginId && panelPath) {
       return {
@@ -48,6 +62,7 @@ export default function SplitWorkspaceRoute() {
     }
     return null;
   }, [
+    detailPluginId,
     isThreadView,
     location.pathname,
     panelPath,
@@ -57,12 +72,27 @@ export default function SplitWorkspaceRoute() {
     threadId,
   ]);
 
+  const layout = useAtomValue(splitLayoutAtom);
+
   const legacyProjectId = legacyProjectMatch?.params.projectId;
   if (legacyProjectId) {
     return <LegacyProjectComposeRedirect projectId={legacyProjectId} />;
   }
   if (routeContent === null) {
     return <Navigate to={APP_ROOT_ROUTE_PATH} replace />;
+  }
+  if (
+    routeContent.kind === "plugin-detail" &&
+    !holdsPluginDetailPane(layout, routeContent.pluginId)
+  ) {
+    return (
+      <LazyPluginsView
+        detailKey={pluginDetailKeyFromRoute(
+          routeContent.pluginId,
+          location.search,
+        )}
+      />
+    );
   }
   return <SplitThreadArea routeContent={routeContent} />;
 }

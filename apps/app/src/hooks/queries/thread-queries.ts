@@ -1,11 +1,16 @@
+import { prependOlderTimelineRows } from "@bb/client-core";
 import {
+  infiniteQueryOptions,
   useInfiniteQuery,
   useQuery,
   useQueryClient,
+  type InfiniteData,
+  type NotifyOnChangeProps,
   type QueryClient,
 } from "@tanstack/react-query";
-import { useCallback, useMemo } from "react";
-import { useDebounceValue } from "usehooks-ts";
+import { useCallback, useEffect, useMemo } from "react";
+import { COMPACT_VIEWPORT_QUERY } from "@bb/shared-ui/hooks/use-compact-viewport";
+import { getMediaQuerySnapshot } from "@bb/shared-ui/hooks/use-media-query";
 import type { PendingInteraction, ThreadListEntry } from "@bb/domain";
 import type {
   PromptHistoryResponse,
@@ -17,13 +22,16 @@ import type {
   ThreadWithIncludesResponse,
   ThreadConversationOutlineResponse,
   ThreadStorageFileListResponse,
+  ThreadStorageLocationResponse,
   ThreadStoragePathListResponse,
   ThreadTimelineResponse,
+  TimelineRow,
   TimelineTurnSummaryDetailsResponse,
 } from "@bb/server-contract";
+import { useDebouncedValue } from "../useDebouncedValue";
 import { applyTimelineDelta } from "@bb/server-contract";
-import type { ThreadListFilters } from "@/lib/api-types";
-import type { FilePreview } from "@/lib/file-preview";
+import type { ThreadListFilters } from "@bb/client-core";
+import type { FilePreview } from "@bb/client-core";
 import type { PathListOptions } from "@/lib/path-list-options";
 import type { ThreadStorageFileListOptions } from "@/lib/thread-storage-files";
 import * as api from "@/lib/api";
@@ -35,7 +43,9 @@ import {
 import {
   getCachedSidebarNavigationThreads,
   getCachedThreadListPlaceholder,
+  findSidebarNavigationThreadPlaceholder,
 } from "../cache-owners/query-cache";
+import { useSidebarNavigationThreadSelection } from "./sidebar-navigation-query";
 import {
   getCachedThreadLists,
   iterateThreadListCacheEntries,
@@ -48,10 +58,12 @@ import {
 import {
   PROMPT_HISTORY_STALE_TIME_MS,
   requireEnabledQueryArg,
+  requireThreadId,
   shouldRetryTransientReadQuery,
   TRANSIENT_READ_RETRY_DELAY_MS,
 } from "./query-helpers";
 import {
+  HEAVY_PAYLOAD_QUERY_POLICY,
   REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
   REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
   RESUME_REFETCH_QUERY_POLICY,
@@ -67,6 +79,7 @@ import {
   threadQueryKey,
   threadSearchQueryKey,
   threadStorageFilesQueryKey,
+  threadStorageLocationQueryKey,
   threadStoragePathsQueryKey,
   threadStorageFilePreviewQueryKey,
   threadHostFilePreviewQueryKey,
@@ -74,10 +87,16 @@ import {
   threadTimelineQueryKey,
   threadTimelineTurnSummaryDetailsQueryKey,
   threadsQueryKey,
+  type ThreadConversationOutlineRole,
   type ThreadTimelineTurnSummaryDetailsQueryIdentity,
 } from "./query-keys";
 import { ARCHIVED_THREADS_PAGE_SIZE } from "./archived-threads-page-size";
 import { ingestThreadDetailBootstrap } from "../cache-owners/thread-detail-cache-owner";
+import { clearThreadTimelineUnseenEvents } from "../cache-owners/thread-timeline-unseen-events";
+import {
+  THREAD_OPEN_CACHE_GC_MS,
+  touchThreadOpenCache,
+} from "../cache-owners/thread-open-cache-owner";
 
 interface QueryOptions {
   enabled?: boolean;
@@ -85,13 +104,13 @@ interface QueryOptions {
   staleTime?: number;
 }
 
-const THREAD_LIST_STALE_TIME_MS = 10_000;
+export const THREAD_LIST_STALE_TIME_MS = 10_000;
 const THREAD_SEARCH_STALE_TIME_MS = 10_000;
 const THREAD_DETAIL_STALE_TIME_MS = 5_000;
-export const THREAD_MENTION_CANDIDATE_LIMIT = 200;
-export const THREAD_SEARCH_DEBOUNCE_MS = 150;
+const THREAD_MENTION_CANDIDATE_LIMIT = 200;
+const THREAD_SEARCH_DEBOUNCE_MS = 150;
 export const THREAD_SEARCH_LIMIT_PER_GROUP = 20;
-export const THREAD_SEARCH_MIN_NON_WHITESPACE_CHARS = 2;
+const THREAD_SEARCH_MIN_NON_WHITESPACE_CHARS = 2;
 
 interface ThreadDetailBootstrapQueryOptions extends QueryOptions {
   timelinePrefetch?: boolean;
@@ -110,7 +129,11 @@ export function didThreadDetailBootstrapRefreshAfterMount(query: {
   );
 }
 
-type ThreadTimelineQueryOptions = QueryOptions;
+interface ThreadTimelineQueryOptions extends QueryOptions {
+  notifyOnChangeProps?: NotifyOnChangeProps;
+}
+
+type ThreadConversationOutlineQueryOptions = QueryOptions;
 
 type ThreadTimelineTurnSummaryDetailsQueryOptions = QueryOptions;
 
@@ -120,7 +143,7 @@ type ThreadPromptHistoryQueryOptions = QueryOptions;
 
 type ThreadPendingInteractionsQueryOptions = QueryOptions;
 
-export interface UseThreadsFilters extends Omit<
+interface UseThreadsFilters extends Omit<
   ThreadListFilters,
   "archived" | "projectId"
 > {
@@ -133,13 +156,13 @@ export interface ProjectThreadSubsetFilters {
   parentThreadId?: string;
 }
 
-export interface UseProjectThreadSubsetArgs {
+interface UseProjectThreadSubsetArgs {
   enabled?: boolean;
   filters: ProjectThreadSubsetFilters;
   projectId: string | undefined;
 }
 
-export interface UseProjectThreadSubsetResult {
+interface UseProjectThreadSubsetResult {
   data: ThreadListResponse | undefined;
   isError: boolean;
   isFetching: boolean;
@@ -147,14 +170,14 @@ export interface UseProjectThreadSubsetResult {
   retry: () => void;
 }
 
-export interface UseThreadMentionCandidatesResult {
+interface UseThreadMentionCandidatesResult {
   data: ThreadListResponse | undefined;
   isError: boolean;
   isFetching: boolean;
   isLoading: boolean;
 }
 
-export interface UseThreadSearchArgs {
+interface UseThreadSearchArgs {
   active: boolean;
   limitPerGroup?: number;
   query: string;
@@ -175,7 +198,7 @@ interface BuildThreadSubsetListFiltersArgs {
   projectId: string | undefined;
 }
 
-export interface UseThreadMentionCandidatesArgs {
+interface UseThreadMentionCandidatesArgs {
   enabled?: boolean;
 }
 
@@ -190,10 +213,6 @@ const THREAD_MENTION_CANDIDATE_FILTERS = {
   archived: false,
   limit: THREAD_MENTION_CANDIDATE_LIMIT,
 } satisfies UseThreadsFilters;
-
-function requireThreadId(id: string, hookName: string): string {
-  return requireEnabledQueryArg({ value: id, hookName, argName: "thread id" });
-}
 
 function buildThreadSubsetListFilters({
   filters,
@@ -232,8 +251,6 @@ function threadMatchesProjectThreadSubset(
   ) {
     return false;
   }
-  // Hidden threads never enter subset caches: every subset consumer is a
-  // navigation surface, matching the server's default list exclusion.
   if (thread.visibility === "hidden") {
     return false;
   }
@@ -262,6 +279,27 @@ function addThreadMentionCandidate(
   if (!candidatesById.has(thread.id)) {
     candidatesById.set(thread.id, thread);
   }
+}
+
+function buildThreadMentionCandidates(
+  threads: readonly ThreadListItem[],
+  { limit }: { limit: number },
+): ThreadListResponse {
+  const candidatesById = new Map<string, ThreadListItem>();
+  for (const thread of threads) {
+    addThreadMentionCandidate(candidatesById, thread);
+  }
+  return Array.from(candidatesById.values()).slice(0, limit);
+}
+
+const EMPTY_THREAD_LIST: ThreadListResponse = [];
+
+function selectThreadMentionCandidates(
+  threads: ThreadListEntry[],
+): ThreadListResponse {
+  return buildThreadMentionCandidates(threads, {
+    limit: THREAD_MENTION_CANDIDATE_LIMIT,
+  });
 }
 
 function getThreadMentionCandidatePlaceholder({
@@ -296,7 +334,6 @@ export function hasThreadSearchableQuery(value: string): boolean {
 
 export interface UseArchivedThreadsFilters {
   projectId?: string;
-  /** Restrict to root or child threads. */
   kind?: ArchivedThreadsKindFilter;
 }
 
@@ -363,6 +400,106 @@ export function useThreads(filters: UseThreadsFilters, options?: QueryOptions) {
   });
 }
 
+interface MachineThreadPreview {
+  threads: ThreadListResponse;
+  total: number;
+}
+
+export function useMachineThreadPreview({
+  hostId,
+  limit,
+}: {
+  hostId: string | null;
+  limit: number;
+}) {
+  const enabled = hostId !== null;
+  useThreadListRealtimeSubscription({ enabled });
+  return useQuery<MachineThreadPreview>({
+    queryKey:
+      hostId === null
+        ? disabledThreadListQueryKey({ archived: false, limit })
+        : threadListQueryKey({ archived: false, hostId, limit }),
+    queryFn: async ({ signal }) => {
+      const id = requireEnabledQueryArg({
+        value: hostId,
+        hookName: "useMachineThreadPreview",
+        argName: "host id",
+      });
+      const [threads, count] = await Promise.all([
+        sdk.threads.list({ archived: false, hostId: id, limit, signal }),
+        sdk.threads.count({ hostId: id, signal }),
+      ]);
+      return { threads, total: count.total };
+    },
+    enabled,
+    staleTime: THREAD_LIST_STALE_TIME_MS,
+  });
+}
+
+interface UseChildThreadsArgs {
+  enabled: boolean;
+  parentThreadId: string | undefined;
+}
+
+interface UseChildThreadsResult {
+  data: ThreadListResponse | undefined;
+  isError: boolean;
+  isFetching: boolean;
+  isLoading: boolean;
+}
+
+export function useChildThreads({
+  enabled: enabledOption,
+  parentThreadId,
+}: UseChildThreadsArgs): UseChildThreadsResult {
+  const enabled = enabledOption && Boolean(parentThreadId);
+  useThreadListRealtimeSubscription({ enabled });
+  const selectChildren = useCallback(
+    (threads: ThreadListEntry[]) =>
+      parentThreadId === undefined
+        ? EMPTY_THREAD_LIST
+        : filterProjectThreadSubset(threads, { parentThreadId }),
+    [parentThreadId],
+  );
+  const { data: sidebarChildren, isBootstrapPending } =
+    useSidebarNavigationThreadSelection(selectChildren);
+  const shouldFetch =
+    enabled && sidebarChildren === undefined && !isBootstrapPending;
+  const fallbackQuery = useQuery<ThreadListResponse>({
+    queryKey:
+      shouldFetch && parentThreadId
+        ? threadListQueryKey({ archived: false, parentThreadId })
+        : disabledThreadListQueryKey({ archived: false }),
+    queryFn: ({ signal }) =>
+      sdk.threads.list({
+        archived: false,
+        parentThreadId: requireThreadId(
+          parentThreadId ?? "",
+          "useChildThreads",
+        ),
+        signal,
+      }),
+    enabled: shouldFetch,
+    staleTime: THREAD_LIST_STALE_TIME_MS,
+  });
+  const derivedChildren = enabled ? sidebarChildren : undefined;
+  if (derivedChildren !== undefined) {
+    return {
+      data: derivedChildren,
+      isError: false,
+      isFetching: false,
+      isLoading: false,
+    };
+  }
+  const waitingForBootstrap = enabled && isBootstrapPending;
+  return {
+    data: fallbackQuery.data,
+    isError: fallbackQuery.isError,
+    isFetching: fallbackQuery.isFetching || waitingForBootstrap,
+    isLoading: fallbackQuery.isLoading || waitingForBootstrap,
+  };
+}
+
 export function useProjectThreadSubset({
   enabled: enabledOption,
   filters,
@@ -372,7 +509,6 @@ export function useProjectThreadSubset({
   const enabled = (enabledOption ?? true) && Boolean(projectId);
   useThreadListRealtimeSubscription({ enabled });
   const { hasParent, parentThreadId } = filters;
-  const canDeriveFromActiveProjectThreads = true;
   const activeProjectThreadListQueryKey =
     enabled && projectId
       ? threadListQueryKey({ archived: false, projectId })
@@ -380,7 +516,6 @@ export function useProjectThreadSubset({
           projectId ? { archived: false, projectId } : { archived: false },
         );
   const activeProjectThreadListIsCached =
-    canDeriveFromActiveProjectThreads &&
     enabled &&
     projectId !== undefined &&
     queryClient.getQueryData<ThreadListResponse>(
@@ -448,14 +583,18 @@ export function useThreadMentionCandidates({
   const queryClient = useQueryClient();
   const enabled = enabledOption ?? true;
   useThreadListRealtimeSubscription({ enabled });
-  const queryKey = enabled
+  const { data: sidebarCandidates, isBootstrapPending } =
+    useSidebarNavigationThreadSelection(selectThreadMentionCandidates);
+  const shouldFetch =
+    enabled && sidebarCandidates === undefined && !isBootstrapPending;
+  const queryKey = shouldFetch
     ? threadListQueryKey(THREAD_MENTION_CANDIDATE_FILTERS)
     : disabledThreadListQueryKey(THREAD_MENTION_CANDIDATE_FILTERS);
   const threadsQuery = useQuery<ThreadListResponse>({
     queryKey,
     queryFn: ({ signal }) =>
       sdk.threads.list({ ...THREAD_MENTION_CANDIDATE_FILTERS, signal }),
-    enabled,
+    enabled: shouldFetch,
     placeholderData: (previousData) =>
       previousData ??
       getThreadMentionCandidatePlaceholder({
@@ -464,12 +603,22 @@ export function useThreadMentionCandidates({
       }),
     staleTime: THREAD_LIST_STALE_TIME_MS,
   });
+  const derivedCandidates = enabled ? sidebarCandidates : undefined;
 
+  if (derivedCandidates !== undefined) {
+    return {
+      data: derivedCandidates,
+      isError: false,
+      isFetching: false,
+      isLoading: false,
+    };
+  }
+  const waitingForBootstrap = enabled && isBootstrapPending;
   return {
     data: threadsQuery.data,
     isError: threadsQuery.isError,
-    isFetching: threadsQuery.isFetching,
-    isLoading: threadsQuery.isLoading,
+    isFetching: threadsQuery.isFetching || waitingForBootstrap,
+    isLoading: threadsQuery.isLoading || waitingForBootstrap,
   };
 }
 
@@ -478,10 +627,7 @@ export function useThreadSearch({
   limitPerGroup = THREAD_SEARCH_LIMIT_PER_GROUP,
   query,
 }: UseThreadSearchArgs): UseThreadSearchResult {
-  const [debouncedRawQuery] = useDebounceValue(
-    query,
-    THREAD_SEARCH_DEBOUNCE_MS,
-  );
+  const debouncedRawQuery = useDebouncedValue(query, THREAD_SEARCH_DEBOUNCE_MS);
   const trimmedQuery = query.trim();
   const debouncedQuery = debouncedRawQuery.trim();
   const liveQueryIsSearchable = hasThreadSearchableQuery(trimmedQuery);
@@ -490,7 +636,10 @@ export function useThreadSearch({
     active && liveQueryIsSearchable && trimmedQuery !== debouncedQuery;
   const enabled = active && liveQueryIsSearchable && hasSearchableQuery;
   const threadSearchQuery = useQuery<ThreadSearchResponse>({
-    queryKey: threadSearchQueryKey({ limitPerGroup, query: debouncedQuery }),
+    queryKey: threadSearchQueryKey({
+      limitPerGroup,
+      query: debouncedQuery,
+    }),
     queryFn: ({ signal }) =>
       sdk.threads.search({
         limitPerGroup: String(limitPerGroup),
@@ -532,15 +681,12 @@ export function useThread(id: string, options?: QueryOptions) {
     placeholderData: (previousData, previousQuery) =>
       resolveThreadPlaceholder(previousData, previousQuery?.queryKey, id) ??
       liftThreadListPlaceholder(
-        getCachedThreadListPlaceholder(queryClient, id),
+        getCachedThreadListPlaceholder(queryClient, id) ??
+          findSidebarNavigationThreadPlaceholder(queryClient, id),
       ),
   });
 }
 
-// A thread primed from the sidebar list cache has no spawn-policy flag (the
-// list response omits it). Conservatively hide the spawn affordance on the
-// placeholder; the real single-thread response, which carries the server-
-// computed value, resolves moments later.
 function liftThreadListPlaceholder(
   thread: ThreadListEntry | undefined,
 ): ThreadResponse | undefined {
@@ -550,7 +696,9 @@ function liftThreadListPlaceholder(
   return {
     ...thread,
     activeBackgroundAgentCount: thread.activity.activeBackgroundAgentCount,
+    canRestoreEnvironment: false,
     canSpawnChild: false,
+    queuedMessageCount: 0,
   };
 }
 
@@ -568,10 +716,6 @@ export function useThreadDetailBootstrap(
       const threadId = requireThreadId(id, "useThreadDetailBootstrap");
       const timelinePrefetch = options?.timelinePrefetch ?? false;
 
-      // The thread shell and timeline are independent reads. Starting the
-      // timeline only after the bootstrap completes adds a full network
-      // round-trip to every cold thread open, which is especially visible
-      // through bb connect's edge + tunnel path.
       if (timelinePrefetch) {
         void queryClient.prefetchQuery({
           queryKey: threadTimelineQueryKey(threadId),
@@ -597,6 +741,7 @@ export function useThreadDetailBootstrap(
     },
     enabled,
     staleTime: Infinity,
+    gcTime: THREAD_OPEN_CACHE_GC_MS,
     retry: shouldRetryTransientReadQuery,
     retryDelay: TRANSIENT_READ_RETRY_DELAY_MS,
   });
@@ -658,9 +803,13 @@ export function useThreadPendingInteractions(
         signal,
       }),
     enabled,
-    refetchOnMount: options?.refetchOnMount ?? true,
+    refetchOnMount:
+      options?.refetchOnMount ??
+      ((query) => (query.getObserversCount() === 1 ? "always" : true)),
     ...REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
-    staleTime: options?.staleTime,
+    ...(options?.staleTime === undefined
+      ? {}
+      : { staleTime: options.staleTime }),
   });
 }
 
@@ -684,8 +833,22 @@ export function useThreadStorageFiles(
       });
     },
     enabled,
-    // Subscriptions can be absent while no UI is listening, so remount must
-    // establish a fresh baseline instead of trusting cached data.
+    ...REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
+  });
+}
+
+export function useThreadStorageLocation(id: string, options?: QueryOptions) {
+  const enabled = (options?.enabled ?? true) && Boolean(id);
+  useThreadDetailRealtimeSubscription(id, { enabled });
+
+  return useQuery<ThreadStorageLocationResponse>({
+    queryKey: threadStorageLocationQueryKey(id),
+    queryFn: ({ signal }) =>
+      sdk.threads.storageLocation({
+        threadId: requireThreadId(id, "useThreadStorageLocation"),
+        signal,
+      }),
+    enabled,
     ...REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
   });
 }
@@ -735,6 +898,7 @@ export function useThreadStorageFilePreview(
       ),
     enabled,
     ...REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
   });
 }
 
@@ -761,16 +925,10 @@ export function useThreadHostFilePreview(
       ),
     enabled,
     ...RESUME_REFETCH_QUERY_POLICY,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
   });
 }
 
-/**
- * Resolve a timeline response into the full window to cache. A `delta` response
- * is applied to the window we already hold (preserving unchanged row identity);
- * a full response is returned as-is. Falls back to a full fetch if the delta's
- * base is stale (should not happen, since the server only sends a delta when it
- * can reconstruct our exact window).
- */
 async function mergeThreadTimelineDelta(
   previous: ThreadTimelineResponse | undefined,
   response: ThreadTimelineResponse,
@@ -794,26 +952,41 @@ interface FetchThreadTimelineArgs {
   threadId: string;
 }
 
+export const COMPACT_THREAD_TIMELINE_SEGMENT_LIMIT = 8;
+
+function resolveThreadTimelineSegmentLimit(): number | undefined {
+  return getMediaQuerySnapshot(COMPACT_VIEWPORT_QUERY)
+    ? COMPACT_THREAD_TIMELINE_SEGMENT_LIMIT
+    : undefined;
+}
+
 async function fetchThreadTimeline({
   queryClient,
   signal,
   threadId,
 }: FetchThreadTimelineArgs): Promise<ThreadTimelineResponse> {
-  // Ask for a delta against the window we already hold. The server only
-  // honors it when it can still reconstruct exactly what we have; otherwise
-  // it returns the full window.
   const queryKey = threadTimelineQueryKey(threadId);
   const previous = queryClient.getQueryData<ThreadTimelineResponse>(queryKey);
+  const segmentLimit = resolveThreadTimelineSegmentLimit();
+  const pageArgs = {
+    deferContent: "true" as const,
+    ...(segmentLimit === undefined
+      ? {}
+      : { segmentLimit: String(segmentLimit) }),
+  };
   const response = await sdk.threads.timeline({
     threadId,
     signal,
+    ...pageArgs,
     ...(previous?.maxSeq !== undefined
       ? { afterSequence: String(previous.maxSeq) }
       : {}),
   });
-  return mergeThreadTimelineDelta(previous, response, () =>
-    sdk.threads.timeline({ threadId, signal }),
+  const timeline = await mergeThreadTimelineDelta(previous, response, () =>
+    sdk.threads.timeline({ threadId, signal, ...pageArgs }),
   );
+  clearThreadTimelineUnseenEvents(queryClient, threadId, timeline.maxSeq);
+  return timeline;
 }
 
 export function useThreadTimeline(
@@ -823,6 +996,11 @@ export function useThreadTimeline(
   const queryClient = useQueryClient();
   const enabled = (options?.enabled ?? true) && Boolean(id);
   useThreadDetailRealtimeSubscription(id, { enabled });
+  useEffect(() => {
+    if (enabled) {
+      touchThreadOpenCache(queryClient, id);
+    }
+  }, [enabled, id, queryClient]);
 
   return useQuery<ThreadTimelineResponse>({
     queryKey: threadTimelineQueryKey(id),
@@ -835,6 +1013,10 @@ export function useThreadTimeline(
       });
     },
     enabled,
+    gcTime: THREAD_OPEN_CACHE_GC_MS,
+    ...(options?.notifyOnChangeProps === undefined
+      ? {}
+      : { notifyOnChangeProps: options.notifyOnChangeProps }),
     refetchOnMount: options?.refetchOnMount ?? true,
     ...(options?.staleTime === undefined
       ? {}
@@ -850,26 +1032,19 @@ export function useThreadTimeline(
   });
 }
 
-/**
- * Full conversation outline (every user/agent message) for a thread's
- * table-of-contents minimap. Unlike {@link useThreadTimeline}, this is not
- * paginated — it always reflects the whole thread — so the minimap can show
- * messages that have not yet been scrolled/paged into the loaded window. It is
- * invalidated by the same realtime `events-appended` signal as the timeline
- * window, so it stays in sync as new messages arrive.
- */
 export function useThreadConversationOutline(
   id: string,
-  options?: ThreadTimelineQueryOptions,
+  role: ThreadConversationOutlineRole,
+  options?: ThreadConversationOutlineQueryOptions,
 ) {
   const enabled = (options?.enabled ?? true) && Boolean(id);
   useThreadDetailRealtimeSubscription(id, { enabled });
 
   return useQuery<ThreadConversationOutlineResponse>({
-    queryKey: threadConversationOutlineQueryKey(id),
+    queryKey: threadConversationOutlineQueryKey(id, role),
     queryFn: async ({ signal }) => {
       const threadId = requireThreadId(id, "useThreadConversationOutline");
-      return sdk.threads.conversationOutline({ threadId, signal });
+      return sdk.threads.conversationOutline({ threadId, role, signal });
     },
     enabled,
     refetchOnMount: options?.refetchOnMount ?? true,
@@ -879,13 +1054,32 @@ export function useThreadConversationOutline(
   });
 }
 
-export function useThreadTimelineTurnSummaryDetails(
+function mergeTimelineTurnSummaryDetailsPages(
+  data: InfiniteData<TimelineTurnSummaryDetailsResponse, string | undefined>,
+): TimelineRow[] {
+  const [latest, ...olderPages] = data.pages;
+  let rows = latest?.rows ?? [];
+  for (const older of olderPages) {
+    rows = prependOlderTimelineRows({
+      olderRows: older.rows,
+      loadedRows: rows,
+    });
+  }
+  return rows;
+}
+
+function threadTimelineTurnSummaryDetailsQueryOptions(
   identity: ThreadTimelineTurnSummaryDetailsQueryIdentity,
-  options?: ThreadTimelineTurnSummaryDetailsQueryOptions,
 ) {
-  return useQuery<TimelineTurnSummaryDetailsResponse>({
+  return infiniteQueryOptions<
+    TimelineTurnSummaryDetailsResponse,
+    Error,
+    TimelineRow[],
+    ReturnType<typeof threadTimelineTurnSummaryDetailsQueryKey>,
+    string | undefined
+  >({
     queryKey: threadTimelineTurnSummaryDetailsQueryKey(identity),
-    queryFn: ({ signal }) =>
+    queryFn: ({ pageParam, signal }) =>
       sdk.threads.timelineTurnSummaryDetails({
         threadId: requireThreadId(
           identity.threadId,
@@ -894,32 +1088,60 @@ export function useThreadTimelineTurnSummaryDetails(
         sourceSeqEnd: String(identity.sourceSeqEnd),
         sourceSeqStart: String(identity.sourceSeqStart),
         turnId: identity.turnId,
+        deferContent: "true",
+        ...(identity.itemId === null ? {} : { itemId: identity.itemId }),
+        ...(pageParam === undefined ? {} : { beforeCursor: pageParam }),
         signal,
       }),
-    enabled:
-      (options?.enabled ?? true) &&
-      Boolean(identity.threadId) &&
-      Boolean(identity.turnId),
+    initialPageParam: undefined,
+    getNextPageParam: (lastPage) => lastPage.olderCursor ?? undefined,
+    select: mergeTimelineTurnSummaryDetailsPages,
     meta: {
       errorMessage: "Failed to load turn summary details.",
       showErrorToast: false,
     },
+    staleTime: Infinity,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
+  });
+}
+
+export function prefetchThreadTimelineTurnSummaryDetails(
+  queryClient: QueryClient,
+  identity: ThreadTimelineTurnSummaryDetailsQueryIdentity,
+): void {
+  if (!identity.threadId || !identity.turnId) {
+    return;
+  }
+  void queryClient.prefetchInfiniteQuery(
+    threadTimelineTurnSummaryDetailsQueryOptions(identity),
+  );
+}
+
+export function useThreadTimelineTurnSummaryDetails(
+  identity: ThreadTimelineTurnSummaryDetailsQueryIdentity,
+  options?: ThreadTimelineTurnSummaryDetailsQueryOptions,
+) {
+  return useInfiniteQuery({
+    ...threadTimelineTurnSummaryDetailsQueryOptions(identity),
+    enabled:
+      (options?.enabled ?? true) &&
+      Boolean(identity.threadId) &&
+      Boolean(identity.turnId),
     refetchOnMount: options?.refetchOnMount ?? true,
     staleTime: options?.staleTime ?? Infinity,
   });
 }
 
-export function getLatestPendingInteraction(
-  interactions: readonly PendingInteraction[] | undefined,
-): PendingInteraction | null {
-  if (!interactions || interactions.length === 0) {
-    return null;
-  }
+const EMPTY_PENDING_INTERACTIONS: readonly PendingInteraction[] = [];
 
-  const [firstInteraction, ...restInteractions] = interactions;
-  return restInteractions.reduce<PendingInteraction>(
-    (latest, interaction) =>
-      interaction.createdAt > latest.createdAt ? interaction : latest,
-    firstInteraction,
+export function orderPendingInteractions(
+  interactions: readonly PendingInteraction[] | undefined,
+): readonly PendingInteraction[] {
+  if (!interactions || interactions.length === 0) {
+    return EMPTY_PENDING_INTERACTIONS;
+  }
+  return [...interactions].sort(
+    (left, right) =>
+      left.createdAt - right.createdAt || left.id.localeCompare(right.id),
   );
 }

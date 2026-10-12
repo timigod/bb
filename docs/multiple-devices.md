@@ -9,12 +9,20 @@ There are two separate ways to use more than one device with bb:
 
 You can use either story independently or combine them.
 
+In both stories one computer runs the bb server. It stores your threads, the
+database, and settings, and every browser and execution machine connects to it.
+Pick a computer that stays on, such as a desktop, home server, or VM: while the
+server machine is asleep or off, nothing can reach bb and running threads may
+stop. Settings → Machines badges it `server` once several machines are
+connected, `bb machine list` shows `server` in its Role column, and the server
+machine cannot be removed.
+
 ## Open bb from another browser
 
-The simplest managed route is **bb connect**. Pair the server from Settings →
-Connect (or `bb connect --code ... --server
-...`), then open its getbb.app URL. The server owns the tunnel and reconnects
-after restart.
+The simplest managed route is **bb connect**. Sign the server in to your bb
+account from Settings → bb connect (or `bb account login`, or
+`bb connect --code ...` with a dashboard code), then open its getbb.app URL.
+The server owns the tunnel and reconnects after restart.
 
 For a private tailnet route, keep bb on its loopback default and publish it
 through Tailscale Serve:
@@ -45,15 +53,108 @@ container runtime must still publish that port to the host (for example,
 `docker run -p 3000:3000 ...`). Host firewall and upstream network rules also
 remain separate from bb's bind setting.
 
-If a browser on another computer should open work-host files in its local
-editor, run bb's local helper there, verify `ssh <work-host>` succeeds, and map
-the server/work-host to that SSH target:
+### Use editors installed on the browser device
+
+Local editor integration is optional. It connects the remote bb page to the
+loopback-only helper started by the bb desktop app or `npx bb-app` on the
+computer running the browser. The helper discovers installed editors and opens
+paths without exposing its API to the network.
+
+If that browser should open work-host files in its local editor, first make
+sure bb is running on the browser device. Verify `ssh <work-host>` succeeds
+there, then map the server/work-host to that SSH target:
 
 ```bash
-npx bb-app client ssh-target set <bb-server-origin> <ssh-target>
+npx bb-app client ssh-target set <bb-server-origin> <ssh-target> --host-id <work-host-id>
 ```
 
+Copy the work-host ID from `bb machine list`. `--host-id` may be omitted when
+the server has exactly one machine. A browser running on an enrolled execution
+machine needs no SSH mapping for that same machine: connected daemons report
+their helper ports to the server, and the browser discovers the matching local
+helper after you enable integration.
+
+Then open Settings → Files in that browser and enable **Local editor
+integration**. The browser may ask once for permission to connect to software
+on the computer. bb does not request that permission during normal remote page
+loads; it is only needed for discovering and launching local editors.
+
+If Settings reports that it cannot connect to the helper:
+
+1. Confirm the bb desktop app or `npx bb-app` is running on the browser device.
+2. Confirm the browser allows local network access for the bb page.
+3. A helper enrolled with this exact server trusts its origin automatically.
+   For a separate local bb helper serving a custom HTTPS or Tailscale browser,
+   configure that exact origin with
+   `npx bb-app config set BB_APP_URL <origin>` and restart bb.
+4. Return to Settings → Files and choose **Retry**.
+
 Phones and tablets need no helper; editor-launch actions are simply unavailable.
+
+## Use the bb mobile app
+
+The bb mobile app is a client for a bb server; it runs nothing itself. Over
+bb connect it pairs the same way the desktop app does: the phone enrolls as a
+connect machine with its own credential, which the getbb.app dashboard lists
+and can revoke.
+
+1. Sign the bb server in to your bb account first (Settings → bb account, `bb account login`, or `bb connect --code …`).
+2. Mint a pairing code for the phone: Settings → Mobile → **Add mobile device** (QR code plus the code as text, with a countdown), or run
+   `bb connect machine-code` (`--json` prints
+   `{code, serverUrl, apex, expiresAt}`).
+3. In the mobile app, add a server over bb connect and scan the QR code or type
+   the code. Codes last 10 minutes and work once.
+
+The phone keeps its credential in the device keychain and mints sessions from
+it; it never holds the server's pairing secret. A session lasts seven days and
+renews while the phone is in use. To cut a phone off, revoke it in the
+getbb.app dashboard machine list; its session stops working within about 20
+seconds. Every phone takes one of
+the account's machine slots, so a machine-limit error means an unused device
+should be revoked first. On a trusted network the app can also use a direct
+server URL (Tailscale Serve or `--server-bind-host 0.0.0.0`) with the same
+caveats as a browser. Platforms (iOS first) and what the phone cannot do are
+listed in [platform-support.md](platform-support.md).
+
+### Push notifications on a self-hosted server
+
+The built-in Push notifications plugin sends messages through Expo. A
+self-hosted server must reach `https://exp.host`. The server needs no Apple or
+Google key.
+
+An Expo push token lets its holder send a notification to one app installation.
+The token cannot read notifications. It cannot access the phone or authenticate
+to the bb server. Treat the token as private because a leak can cause unwanted
+notifications.
+
+The server sends a thread title and a short plain-text preview. Use these commands to
+manage device registrations and inspect the sender:
+
+```bash
+bb push-notifications list
+bb push-notifications add --token <expo-push-token> --platform ios --label <device-name>
+bb push-notifications remove <id>
+bb push-notifications status
+bb push-notifications thread <thread> [--level inherit|all|input-only|muted]
+```
+
+`thread` prints a thread's resolved notification level and where it comes from;
+with `--level` it sets the thread's own level. A thread uses its own level,
+else the `childLevel` setting if it has a parent (default `input-only`), else
+`defaultLevel` (default `all`). A thread's level also limits its child
+threads: every ancestor's own level caps the result.
+
+Turn delivery off with `bb plugin disable push-notifications`. The plugin keeps
+registrations in its private storage. Enable the plugin to resume delivery.
+
+The `expoPushUrl` plugin setting changes the Expo endpoint. Use it only for a
+controlled test service or a compatible relay:
+
+```bash
+bb plugin config push-notifications set expoPushUrl <url>
+```
+
+The Expo request supports `HTTPS_PROXY` and `NO_PROXY`.
 
 ## Point the desktop app at another bb
 
@@ -74,40 +175,70 @@ them when it starts, when it becomes active, and every five minutes.
 
 ## Add an execution machine
 
-Open Settings → Machines and choose Add machine. Run the generated one-line
+Open Settings → Machines and choose Add a machine. Run the generated one-line
 installer on the computer that should
-execute work. It installs and enrolls a host daemon; when bb connect is paired,
+execute work. Choose Windows in the dialog for a PowerShell command; a Windows
+machine needs Node.js 22.19 or newer and Git for Windows, and its daemon starts
+when you sign in to Windows. It installs and enrolls a host daemon; when bb connect is paired,
 the installer also configures the machine credential used to reach the server
 through the account gate. Without bb connect, open the server through a
 Tailscale Serve URL before generating the installer; the loopback listener is
-not directly reachable from another machine.
+not directly reachable from another machine. When bb connect is not paired and
+the server URL is a loopback or unspecified address, the dialog does not show an
+installer. It asks you to set up machine access first by choosing the address
+machines should use. Once access is ready, the dialog also names the server
+machine the new machine will depend on.
 
-The installer always installs the exact `bb-app` package exposed by that
-server at `/install/bb-app.tgz`; a `bb-app` already on PATH is reused, and the
-npm registry consulted, only when the server provides no package. Version
-strings cannot distinguish unpublished builds, so this keeps remote machines
-aligned with development and pre-release servers whose build may not exist on
-npm. The package route is public like `/install.sh`: `bb-app` is public
-software, and exposing an unpublished build slightly early through a paired
-tunnel is an accepted tradeoff. npm installs the package into the machine's bb
-data directory, not its system-wide global prefix, so enrollment needs neither
-`sudo` nor a PATH change.
+The installer always installs the exact host-only `bb-app` package exposed by
+that server at `/install/bb-app.tgz`. The package contains the host daemon,
+provider/plugin workers, native host dependencies, and bundled `bb` CLI, but no
+web app or server. A `bb-app` already on PATH is reused, and the npm registry
+consulted, only when the server provides no package. Version strings cannot
+distinguish unpublished builds, so the route also publishes a SHA-256 digest.
+The installer verifies that digest and uses a conditional request on later runs
+to skip an identical installed artifact. The package route is public like
+`/install.sh`: `bb-app` is public software, and exposing an unpublished build
+slightly early through a paired tunnel is an accepted tradeoff. npm installs
+the package into the machine's bb data directory, not its system-wide global
+prefix, so enrollment needs neither `sudo` nor a PATH change.
+
+The Connect gate consumes platform authentication cookies without forwarding
+them to tunnels, including public installer requests and port shares. Tenant
+responses may set host-only cookies outside the `better-auth.*` and
+`bb-connect.*` namespaces (including their `__Secure-` variants); cookies
+with a `Domain` attribute are dropped. Only the gate can renew platform
+cookies. Public installer responses are served as sandboxed plain text, or
+as an attachment for `/install/bb-app.tgz`, with content sniffing disabled.
 
 Each joined server gets its own daemon instance, data directory
 (`~/.bb-machines/<server-host>`, override with `BB_DATA_DIR` when running the
 installer), local API port, and launchd/systemd service. The installer persists
-the selected port in that data directory and atomically reserves it under
-`~/.bb-machines/host-daemon-ports/`, including when `BB_DATA_DIR` points
-elsewhere. Subsequent runs reuse the reservation; pass `--host-daemon-port
-<port>` to the installer to override the selection. One machine can therefore
+the selected port in that data directory. Subsequent runs reuse it; pass
+`--host-daemon-port <port>` to the installer to override the selection. One machine can therefore
 serve several bb servers at once, and joining never touches a full local bb
 install's `~/.bb`. Each instance keeps its own `bb-app` under that data
 directory and self-updates against its own server, so servers running different
 bb versions on one machine remain isolated.
 
+On Linux, the installer uses the current user's systemd manager (or a system
+unit when run as root on a non-container systemd host). If the user bus is not
+reachable from the installer's environment, it retries using the current
+user's runtime path reported by `loginctl`. If the bus remains unavailable on
+a systemd host, installation fails before enrolling or creating a unit; rerun
+it from a systemd user session. In containers and on machines without systemd
+as init, the installer runs a detached daemon instead. Set
+`BB_INSTALL_SKIP_SERVICE=1` only when a detached daemon is acceptable: no
+service starts it after a reboot. The temporary daemon used
+for a first join is not supervised. When the installer starts a previously
+joined daemon without a service, its launcher restarts it after crashes and
+self-updates while the launcher remains running.
+
 The installed launchd/systemd service enables `--auto-update`. If session open
 reports a newer server protocol, the daemon downloads the server artifact,
-updates its private install, then exits so the service manager restarts it.
+verifies its SHA-256 digest, updates its private install, then exits so the
+service manager restarts it. If the identical artifact is already installed,
+the server returns `304` and the daemon restarts without downloading or running
+npm again.
 Failed attempts fall back to normal reconnect behavior with a persisted
 exponential retry backoff from 5 seconds to 5 minutes. Settings → Machines and
 `bb machine retry-update <id-or-name>` can bypass the current backoff. A daemon

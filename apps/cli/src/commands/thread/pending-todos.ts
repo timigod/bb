@@ -5,19 +5,11 @@ import type {
 } from "@bb/domain";
 import type { BbSdk } from "@bb/sdk";
 
-export interface FetchThreadPendingTodosArgs {
+interface FetchThreadPendingTodosArgs {
   sdk: Pick<BbSdk, "threads">;
   threadId: string;
 }
 
-/**
- * Best-effort fetch — returns null if the timeline endpoint is unreachable or
- * fails. Pending TODOs are a context surface, not a primary signal, so a
- * failure here should not break the wrapping command.
- *
- * Uses `summaryOnly=true` so the server skips row generation/serialization;
- * the CLI only consumes `pendingTodos`, not the full timeline.
- */
 export async function fetchThreadPendingTodos(
   args: FetchThreadPendingTodosArgs,
 ): Promise<ThreadTimelinePendingTodos | null> {
@@ -45,7 +37,6 @@ const STATUS_RANK: Record<ThreadTimelinePendingTodoItemStatus, number> = {
 };
 
 interface TodoCounts {
-  active: number;
   completed: number;
   total: number;
 }
@@ -53,21 +44,13 @@ interface TodoCounts {
 function countTodos(
   items: readonly ThreadTimelinePendingTodoItem[],
 ): TodoCounts {
-  let active = 0;
   let completed = 0;
   for (const item of items) {
     if (item.status === "completed") completed += 1;
-    else active += 1;
   }
-  return { active, completed, total: items.length };
+  return { completed, total: items.length };
 }
 
-/**
- * Prints the pending-TODOs section to stdout. The projection only emits a
- * snapshot during an active turn; once items exist we keep the section
- * visible (showing `M/M done` if every item is completed) until the turn
- * ends — matches the banner UI behavior.
- */
 export function printPendingTodos(
   pendingTodos: ThreadTimelinePendingTodos | null,
 ): void {

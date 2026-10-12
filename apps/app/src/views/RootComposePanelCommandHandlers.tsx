@@ -1,16 +1,18 @@
 import { useEffect } from "react";
 import { useAppCommandHandler } from "@/components/commands/AppCommandProvider";
+import { useWindowRightPanel } from "@/components/layout/WindowRightPanelToggle";
 import { getBbDesktopInfo } from "@/lib/bb-desktop";
 
 interface RootComposePanelCommandHandlersProps {
   isFocused: boolean;
+  isOpen: boolean;
   onClose: () => boolean;
   onToggle: () => void;
 }
 
-/** Focus-scoped command bridge for a New Thread pane's secondary panel. */
 export function RootComposePanelCommandHandlers({
   isFocused,
+  isOpen,
   onClose,
   onToggle,
 }: RootComposePanelCommandHandlersProps) {
@@ -19,6 +21,7 @@ export function RootComposePanelCommandHandlers({
     onToggle();
     return true;
   });
+  useWindowRightPanel({ isOpen, enabled: isFocused });
   useAppCommandHandler("panel.close", () => {
     if (!isFocused) return false;
     return onClose();

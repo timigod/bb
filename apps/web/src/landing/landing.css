@@ -1,7 +1,11 @@
-/* bb landing — editorial light, themed to match the bb app.
+/* bb landing — editorial, themed to match the bb app in both schemes.
    Tokens mirror apps/app/src/components/ui/theme.css: a neutral zero-chroma
    ink-over-canvas ramp, inverted-neutral primary button, and the app's own
    chromatic tokens (file-accent, success, diff-added/removed, warning-text).
+   Dark mode swaps the two anchors (--bg/--ink) plus the chromatic tokens in
+   the `.dark` block below — every surface, border, and state fill derives
+   from the anchors, so the ramp re-derives coherently. The `.dark` class is
+   set pre-paint by THEME_INIT in __root.tsx from the system color scheme.
    All color-mix() interpolation is done `in oklab` (rectangular), never
    `in oklch` (polar) — mixing a chromatic accent toward white in oklch
    interpolates the hue through pink; oklab keeps the hue put. */
@@ -23,10 +27,23 @@
 }
 
 :root {
+  color-scheme: light;
   --bg: oklch(1 0 0);
   --ink: oklch(0.3211 0 0);
   --dim: oklch(0.44 0 0);
   --subtle: oklch(0.5 0 0);
+  --label-muted: color-mix(in oklch, var(--subtle) 90%, var(--bg));
+  --text-label-small: 12px;
+  /* Display type sits a step darker than the body ink (and a step lighter in
+     dark) so headings lead without a weight change; --ink-strong is the same
+     idea for emphasized body copy inside the app mocks. */
+  --heading: oklch(0.21 0 0);
+  --heading-sub: oklch(0.24 0 0);
+  --ink-strong: oklch(0.28 0 0);
+  /* Base color for drop shadows and scrims. Tracks the ink in light mode; the
+     dark block pins it to black — a light-ink shadow on a dark canvas would
+     read as a glow, not depth. */
+  --shade: var(--ink);
   --border: color-mix(in oklab, var(--ink) 14%, var(--bg));
   --border-soft: color-mix(in oklab, var(--ink) 8%, var(--bg));
   --surface: color-mix(in oklab, var(--ink) 3.5%, var(--bg));
@@ -38,11 +55,7 @@
   --add: oklch(0.4 0.13 163); /* --diff-added */
   --del: oklch(0.4 0.17 28); /* --diff-removed */
   --spark: oklch(0.55 0.14 50); /* --warning-text */
-  /* Product Hunt orange (#FF6154 ≈ oklch(0.68 0.19 27)), pulled down in
-     lightness and chroma. At full saturation it is the only neon on an
-     otherwise achromatic page and reads as a foreign badge; this keeps the
-     hue recognisable while sitting inside the ink ramp. */
-  --ph: oklch(0.58 0.15 32);
+  --attention: oklch(0.74 0.15 80);
   --radius: 0.5rem;
   --font-sans:
     "Inter Variable", "Inter Fallback", Inter, -apple-system,
@@ -50,10 +63,53 @@
   --font-mono: "Fira Code", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
+/* Dark theme: the two anchors flip (canvas and ink values match the app's
+   dark theme) and every derived mix re-resolves. Mix percentages step up like
+   the app's dark ramp — the same 8–14% that reads on white is near-invisible
+   on the dark canvas. Chromatic tokens are the app's dark values.
+   The achromatic text steps stay explicit rather than mixes of the anchors,
+   matching :root above: --heading, --heading-sub and --ink-strong are lighter
+   than --ink, so no ink-to-canvas mix can express them. */
+.dark {
+  color-scheme: dark;
+  --bg: oklch(0.195 0 0);
+  --ink: oklch(0.81 0 0);
+  --dim: oklch(0.75 0 0);
+  --subtle: oklch(0.68 0 0);
+  --label-muted: color-mix(in oklch, var(--subtle) 90%, var(--bg));
+  --heading: oklch(0.93 0 0);
+  --heading-sub: oklch(0.88 0 0);
+  --ink-strong: oklch(0.85 0 0);
+  --shade: oklch(0 0 0);
+  --border: color-mix(in oklab, var(--ink) 19.4%, var(--bg));
+  --border-soft: color-mix(in oklab, var(--ink) 11%, var(--bg));
+  --surface: color-mix(in oklab, var(--ink) 4.3%, var(--bg));
+  --surface-recessed: color-mix(in oklab, var(--ink) 8%, var(--bg));
+  --state-hover: color-mix(in oklab, var(--ink) 9%, var(--bg));
+  --accent: oklch(0.72 0.09 250); /* --timeline-accent (dark) */
+  --ok: oklch(0.74 0.15 155); /* --success (dark) */
+  --add: oklch(0.77 0.17 163); /* --diff-added (dark) */
+  --del: oklch(0.72 0.19 22); /* --diff-removed (dark) */
+  --spark: oklch(0.75 0.16 50); /* --warning-text (dark) */
+  --attention: oklch(0.8 0.15 80);
+}
+
+@layer landing-reset {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  code,
+  .mono {
+    font-family: var(--font-mono);
+  }
 }
 
 /* The hero's faint full-bleed wash (::before/::after) extends past the wrap on
@@ -77,16 +133,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-a {
-  color: inherit;
-  text-decoration: none;
-}
-
-code,
-.mono {
-  font-family: var(--font-mono);
-}
-
 .wrap {
   max-width: 980px;
   margin: 0 auto;
@@ -100,6 +146,8 @@ code,
   align-items: center;
   justify-content: space-between;
   padding: 22px 0;
+  position: relative;
+  z-index: 10;
   animation: hdr-down 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
@@ -115,8 +163,26 @@ code,
   }
 }
 
-.logo img {
+/* The bb mark ships as two files: the light one is the app-icon tile (white,
+   baked into the PNG) which would glare on the dark canvas, the dark one is
+   the brand's white glyph on transparent, matching the dark favicons. Naming
+   them from two declarations means the browser only fetches the one the
+   winning rule needs — a pair of <img> toggled with display:none downloads
+   both, on every page, for one visible mark. */
+.bb-mark {
   display: block;
+  flex-shrink: 0;
+  background-image: url("../assets/bb-icon.png");
+  background-size: 100% 100%;
+}
+
+.dark .bb-mark {
+  background-image: url("../assets/bb-icon-dark.png");
+}
+
+.logo-mark {
+  width: 36px;
+  height: 36px;
 }
 
 .nav-links {
@@ -134,9 +200,158 @@ code,
   color: var(--ink);
 }
 
-.nav-links .nav-current {
+.nav-links .nav-current,
+.nav-links a.nav-current {
   color: var(--ink);
-  font-weight: 500;
+}
+
+.nav-menu {
+  position: relative;
+}
+
+.nav-menu summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+  color: var(--dim);
+  cursor: pointer;
+  list-style: none;
+}
+
+.nav-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.nav-menu summary:hover,
+.nav-menu[open] summary,
+.nav-links .nav-menu summary.nav-current {
+  color: var(--ink);
+}
+
+.nav-menu summary svg {
+  width: 14px;
+  height: 14px;
+}
+
+.nav-menu[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.nav-menu summary:focus-visible,
+.nav-menu-panel a:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.nav-menu-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: -10px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: 0 8px 24px color-mix(in oklab, var(--shade) 12%, transparent);
+}
+
+.nav-links .nav-menu-panel a {
+  padding: 8px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.nav-links .nav-menu-panel a:hover,
+.nav-links .nav-menu-panel a[aria-current="page"] {
+  background: var(--surface);
+  color: var(--heading);
+}
+
+.nav-sub {
+  position: relative;
+}
+
+.nav-links .nav-sub-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  font: inherit;
+  color: var(--dim);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.nav-sub-trigger svg {
+  width: 14px;
+  height: 14px;
+}
+
+.nav-links .nav-sub-trigger:hover,
+.nav-links .nav-sub.open > .nav-sub-trigger {
+  background: var(--surface);
+  color: var(--heading);
+}
+
+.nav-sub-trigger:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.nav-sub-panel {
+  position: absolute;
+  top: -6px;
+  left: calc(100% + 12px);
+  display: none;
+  flex-direction: column;
+  min-width: 200px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: 0 8px 24px color-mix(in oklab, var(--shade) 12%, transparent);
+}
+
+.nav-sub.open > .nav-sub-panel {
+  display: flex;
+}
+
+.nav-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.nav-icon-button:hover {
+  background: var(--state-hover);
+  color: var(--ink);
+}
+
+.nav-icon-button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.nav-icon-button svg {
+  width: 17px;
+  height: 17px;
 }
 
 /* ── Buttons ────────────────────────────────────────────────────── */
@@ -170,7 +385,7 @@ code,
 
 .btn-primary:hover {
   background: color-mix(in oklab, var(--ink) 90%, var(--bg));
-  box-shadow: 0 4px 14px color-mix(in oklab, var(--ink) 18%, transparent);
+  box-shadow: 0 4px 14px color-mix(in oklab, var(--shade) 18%, transparent);
 }
 
 .btn-ghost {
@@ -210,7 +425,7 @@ code,
 
 .install-actions {
   display: flex;
-  gap: 12px;
+  gap: 12px 36px;
   flex-wrap: wrap;
   justify-content: center;
 }
@@ -227,6 +442,17 @@ code,
   line-height: 1.5;
 }
 
+.nav-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.nav-download .btn-ic {
+  width: 14px;
+  height: 14px;
+}
+
 .btn-ic {
   width: 16px;
   height: 16px;
@@ -240,6 +466,22 @@ code,
   position: relative;
   background: var(--bg);
   font-family: var(--font-mono);
+}
+
+.cmd-compact {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.cmd-compact .cmd-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cmd-dollar {
@@ -281,7 +523,7 @@ code,
   pointer-events: none;
   opacity: 0;
   transform: translateX(-50%) translateY(4px);
-  box-shadow: 0 8px 22px -8px color-mix(in oklab, var(--ink) 50%, transparent);
+  box-shadow: 0 8px 22px -8px color-mix(in oklab, var(--shade) 50%, transparent);
   transition:
     opacity 0.18s ease,
     transform 0.18s ease;
@@ -316,6 +558,41 @@ code,
   font-size: 12.5px;
   color: var(--subtle);
   text-align: center;
+}
+
+.install-note-link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.install-note-link:hover {
+  color: var(--ink);
+}
+
+.install-choice .install-send,
+.install-choice .install-note-touch {
+  display: none;
+}
+
+.install-send {
+  position: relative;
+  font-family: var(--font-sans);
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .install-choice .install-download,
+  .install-choice .install-note-desktop {
+    display: none;
+  }
+
+  .install-choice .install-send {
+    display: inline-flex;
+  }
+
+  .install-choice .install-note-touch {
+    display: inline;
+  }
 }
 
 /* ── Hero ───────────────────────────────────────────────────────── */
@@ -358,37 +635,6 @@ code,
     rgb(0 0 0 / 70%),
     transparent 75%
   );
-}
-
-/* Hand-drawn accent underline that draws in under the key word. */
-.uline {
-  position: relative;
-  white-space: nowrap;
-}
-
-.uline svg {
-  position: absolute;
-  left: 0;
-  bottom: 0.02em;
-  width: 100%;
-  height: 0.14em;
-  overflow: visible;
-}
-
-.uline path {
-  fill: none;
-  stroke: color-mix(in oklab, var(--accent) 75%, transparent);
-  stroke-width: 6;
-  stroke-linecap: round;
-  stroke-dasharray: 210;
-  stroke-dashoffset: 210;
-  animation: draw-underline 0.7s ease-out 0.55s forwards;
-}
-
-@keyframes draw-underline {
-  to {
-    stroke-dashoffset: 0;
-  }
 }
 
 /* Staggered entrance for hero content — rises in just after the nav, matching
@@ -483,17 +729,6 @@ code,
   margin-right: -4px;
 }
 
-/* Launch-day variant of the announcement pill: the release-notes pill exactly,
-   with the chip warmed to Product Hunt's orange. The chip is the only thing
-   that changes, so the two read as the same component in the same slot. */
-.ph-callout-label {
-  background: var(--ph);
-}
-
-.ph-callout:hover {
-  border-color: color-mix(in oklab, var(--ph) 45%, var(--bg));
-}
-
 /* Scroll reveal: sections start hidden only once JS marks them pending,
    so prerendered/no-JS pages stay fully visible. */
 [data-reveal] {
@@ -514,7 +749,7 @@ code,
   letter-spacing: -0.035em;
   max-width: 780px;
   margin: 0 auto;
-  color: oklch(0.21 0 0);
+  color: var(--heading);
   text-wrap: balance;
 }
 
@@ -524,12 +759,6 @@ code,
   max-width: 600px;
   font-size: 17.5px;
   text-wrap: balance;
-}
-
-.fine {
-  margin-top: 14px;
-  color: var(--subtle);
-  font-size: 13px;
 }
 
 .providers {
@@ -670,7 +899,8 @@ code,
   display: flex;
   align-items: center;
   width: max-content;
-  animation: company-proof-scroll 42s linear infinite;
+  animation: company-proof-scroll calc(var(--company-proof-logos, 11) * 8s)
+    linear infinite;
   will-change: transform;
 }
 
@@ -681,6 +911,39 @@ code,
 .company-proof.is-offscreen .company-proof-track {
   animation-play-state: paused;
   will-change: auto;
+}
+
+.company-proof-track.is-reverse {
+  animation-direction: reverse;
+}
+
+.company-proof-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .company-proof-rows:hover .company-proof-track {
+    animation-play-state: paused;
+  }
+
+  .company-proof-heading {
+    position: relative;
+  }
+
+  .company-proof-toggle {
+    position: absolute;
+    top: 50%;
+    left: calc(100% + 6px);
+    transform: translateY(-50%);
+  }
+
+  .company-proof:not(.is-paused) .company-proof-toggle:not(:focus-visible) {
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 
 .company-proof-logos {
@@ -717,6 +980,20 @@ code,
   opacity: 0.52;
 }
 
+/* Dark: invert after the grayscale so near-black marks flip light instead of
+   sinking into the canvas; grayscale-first keeps the invert luminance-only.
+   Marks that carry their own tile background are excluded — inverting one of
+   those flips the tile rather than the glyph, so Blackstone's black square
+   would come out white and Notion's white square black. They keep their own
+   contrast, which already reads on either canvas. */
+.dark .company-proof-company img {
+  opacity: 0.6;
+}
+
+.dark .company-proof-company img:not(.company-proof-tile) {
+  filter: grayscale(1) invert(1);
+}
+
 /* One cycle travels exactly one logo-list copy. The track holds
    --company-proof-copies identical copies, so -100% / copies keeps the loop
    seamless at every viewport width. */
@@ -733,8 +1010,8 @@ code,
   background: var(--bg);
   overflow: hidden;
   box-shadow:
-    0 1px 0 color-mix(in oklab, var(--ink) 4%, transparent),
-    0 30px 70px -32px color-mix(in oklab, var(--ink) 34%, transparent);
+    0 1px 0 color-mix(in oklab, var(--shade) 4%, transparent),
+    0 30px 70px -32px color-mix(in oklab, var(--shade) 34%, transparent);
 }
 
 /* ── Self-constructing mock ───────────────────────────────────────────
@@ -1108,13 +1385,6 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   color: var(--ink);
 }
 
-.trow-glyph {
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
-  color: var(--subtle);
-}
-
 .trow-title {
   flex: 1;
   min-width: 0;
@@ -1253,7 +1523,7 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
 .msg-say {
   font-size: 13.5px;
   line-height: 1.55;
-  color: oklch(0.28 0 0);
+  color: var(--ink-strong);
   max-width: 58ch;
 }
 
@@ -1778,7 +2048,7 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   letter-spacing: -0.03em;
   text-wrap: balance;
   overflow-wrap: break-word;
-  color: oklch(0.21 0 0);
+  color: var(--heading);
 }
 
 .band-copy p {
@@ -1798,10 +2068,6 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   padding: 1px 5px;
   color: var(--ink);
   white-space: nowrap;
-}
-
-.band-cta {
-  margin-top: 26px;
 }
 
 .band-copy .providers {
@@ -1825,7 +2091,8 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   border-radius: 18px;
   overflow: hidden;
   background: var(--bg);
-  box-shadow: 0 18px 50px -26px color-mix(in oklab, var(--ink) 32%, transparent);
+  box-shadow: 0 18px 50px -26px
+    color-mix(in oklab, var(--shade) 32%, transparent);
 }
 
 /* contact bar */
@@ -1883,8 +2150,11 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   object-fit: cover;
 }
 
-/* wallpaper + messages */
+/* wallpaper + messages. --tg-card is Telegram's own surface colour, not a bb
+   token: the mock imitates a foreign app, so its values are deliberately
+   literal in both schemes, like the wallpaper and the outgoing green bubble. */
 .tg-feed {
+  --tg-card: #fff;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1944,8 +2214,8 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
 }
 
 .tg-in .tg-bubble {
-  background: #fff;
-  color: oklch(0.28 0 0);
+  background: var(--tg-card);
+  color: var(--ink-strong);
   border-bottom-left-radius: 5px;
 }
 
@@ -1979,7 +2249,7 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
 /* the bb thread card the bot spawns */
 .tg-thread {
   width: 100%;
-  background: #fff;
+  background: var(--tg-card);
   border: 1px solid var(--border-soft);
   border-radius: 12px;
   border-bottom-left-radius: 5px;
@@ -2135,6 +2405,21 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   }
 }
 
+/* Telegram mock, dark: the wallpaper and incoming bubbles follow Telegram's
+   own dark appearance (dark green-tinted wallpaper, graphite bubbles) so the
+   foreign app stays recognizable instead of glaring white on the dark page.
+   The outgoing green bubble is Telegram's in both schemes and stays put. */
+.dark .tg-feed {
+  --tg-card: oklch(0.28 0 0);
+  background-color: oklch(0.24 0.02 150);
+  background-image:
+    radial-gradient(
+      color-mix(in oklab, oklch(0.75 0.06 150) 10%, transparent) 1px,
+      transparent 1.5px
+    ),
+    linear-gradient(165deg, oklch(0.26 0.025 155), oklch(0.2 0.03 140));
+}
+
 /* ── Band 3 visual: mobile bb app mock ──────────────────────────── */
 
 .mockup-wrap-customize {
@@ -2265,7 +2550,7 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   50% {
     transform: translateY(-1px) scale(1.04);
     box-shadow: 0 8px 18px -12px
-      color-mix(in oklab, var(--ink) 60%, transparent);
+      color-mix(in oklab, var(--shade) 60%, transparent);
   }
 }
 
@@ -2392,6 +2677,37 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
 }
 
 /* ── Spawn sidebar (Band 5): a worker thread per provider, nested ──── */
+
+@keyframes rc-step {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@keyframes rc-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes rc-in {
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes rc-blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes rc-leave {
+  to {
+    opacity: 0;
+  }
+}
 
 .spawnbar {
   width: 100%;
@@ -2601,13 +2917,18 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   font-weight: 700;
   letter-spacing: -0.025em;
   margin-bottom: 12px;
-  color: oklch(0.21 0 0);
+  color: var(--heading);
 }
 
 .closer {
   border-top: 1px solid var(--border-soft);
   padding: 88px 0;
   text-align: center;
+}
+
+.closer h2,
+.closer p {
+  text-wrap: balance;
 }
 
 .closer p {
@@ -2711,20 +3032,89 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
 }
 
 .footer {
-  padding: 32px 0 52px;
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 16px;
+  display: grid;
+  grid-template-columns: 0.65fr 0.95fr 1.2fr 1.2fr 0.7fr;
+  gap: 32px;
+  padding: 56px 0 64px;
+  border-top: 1px solid var(--border-soft);
   color: var(--subtle);
   font-size: 14px;
+}
+
+.footer a {
+  color: var(--subtle);
 }
 
 .footer a:hover {
   color: var(--ink);
 }
 
+.footer a[aria-current="page"] {
+  color: var(--heading-sub);
+  font-weight: 500;
+}
+
+.footer-mark {
+  display: block;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
+.footer-brand p {
+  max-width: 170px;
+  margin-top: 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.footer-x {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.footer-brand .footer-legal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.footer-brand .footer-legal a {
+  white-space: nowrap;
+}
+
+.footer-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--heading-sub);
+}
+
+.footer-column ul {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 12px;
+  list-style: none;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────── */
+
+@media (max-width: 860px) {
+  .footer {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 32px 24px;
+  }
+
+  .footer-brand {
+    grid-column: 1 / -1;
+  }
+
+  .footer-brand p {
+    max-width: none;
+  }
+}
 
 @media (max-width: 820px) {
   .band-grid {
@@ -2745,6 +3135,17 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
      chip row under the copy is redundant on narrow screens. */
   .band-copy .providers {
     display: none;
+  }
+}
+
+@media (max-width: 860px) {
+  .nav-links {
+    gap: 16px;
+  }
+
+  .nav-links a,
+  .nav-menu summary {
+    white-space: nowrap;
   }
 }
 
@@ -2849,9 +3250,18 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
     justify-content: flex-start;
   }
 
-  /* Stack the two CTAs full-width so neither wraps awkwardly. */
+  /* The full download CTA is repeated immediately below in the hero. Hide the
+     nav copy on mobile so the three utility links retain comfortable spacing. */
+  .nav-links .btn {
+    display: none;
+  }
+}
+
+@media (max-width: 600px) {
   .install-actions {
     width: 100%;
+    max-width: 420px;
+    margin-inline: auto;
     flex-direction: column;
     align-items: stretch;
   }
@@ -2860,19 +3270,11 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
     width: 100%;
     justify-content: center;
   }
+}
 
-  /* The full download CTA is repeated immediately below in the hero. Hide the
-     nav copy on mobile so the three utility links retain comfortable spacing. */
-  .nav-links .btn {
+@media (max-width: 500px) {
+  .nav-links .nav-wide {
     display: none;
-  }
-
-  .nav-links {
-    gap: 16px;
-  }
-
-  .nav-links a:not(.btn) {
-    white-space: nowrap;
   }
 }
 
@@ -2883,14 +3285,58 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
     font-size: 13px;
   }
 
-  .updates-label {
+  .nav-menu {
+    position: static;
+  }
+
+  .nav-menu-panel {
+    right: 0;
+    left: auto;
+    max-width: 100%;
+  }
+
+  .nav-links .nav-menu-panel a {
+    white-space: normal;
+  }
+}
+
+@media (max-width: 760px) {
+  .nav-menu-panel:has(> .nav-sub.open) > :not(.nav-sub.open) {
     display: none;
   }
 
-  /* The launch pill keeps its chip. "Today" is the urgency, and without it the
-     line loses the one thing that makes it worth interrupting the hero for. */
-  .ph-callout-label {
-    display: inline;
+  .nav-sub-panel {
+    position: static;
+    min-width: 0;
+    padding: 4px 0 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .nav-links .nav-sub.open > .nav-sub-trigger {
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    gap: 6px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-soft);
+    border-radius: 8px 8px 0 0;
+    background: none;
+    font-weight: 600;
+    color: var(--heading);
+  }
+
+  .nav-sub.open > .nav-sub-trigger svg {
+    transform: rotate(180deg);
+  }
+}
+
+@media (max-width: 359px) {
+  .nav-links {
+    gap: 10px;
+  }
+
+  .nav-links .nav-icon-button {
+    display: none;
   }
 }
 
@@ -2927,11 +3373,6 @@ html.js .mock[data-construct]:not(.constructing):not(.constructed) {
   .nav,
   .hero > * {
     animation: none;
-  }
-
-  .uline path {
-    animation: none;
-    stroke-dashoffset: 0;
   }
 
   .trun {

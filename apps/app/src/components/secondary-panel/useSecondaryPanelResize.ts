@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useResizeObserver } from "usehooks-ts";
-import { applyResizeCursor, clearResizeCursor } from "@/lib/resizeCursor";
 import {
   secondaryPanelWidthPercentAtom,
   threadSecondaryPanelResizingAtom,
 } from "./threadSecondaryPanelAtoms";
+import { usePanelResizeSnap } from "./usePanelResizeSnap";
 
-export type SecondaryPanelDraggingHandler = (isDragging: boolean) => void;
 export type SecondaryPanelWidthChangeHandler = (
   width: number | undefined,
 ) => void;
@@ -18,25 +17,44 @@ type SecondaryPanelResizeHandler = (size: number) => void;
 interface UseSecondaryPanelResizeArgs {
   isSecondaryPanelOpen: boolean;
   onPanelWidthChange: SecondaryPanelWidthChangeHandler;
+  panelId: string;
+  renderAsDrawer: boolean;
 }
 
 export function useSecondaryPanelResize({
   isSecondaryPanelOpen,
   onPanelWidthChange,
+  panelId,
+  renderAsDrawer,
 }: UseSecondaryPanelResizeArgs) {
-  const [isSecondaryPanelDragging, setIsSecondaryPanelDragging] =
-    useState(false);
   const persistedWidthPercent = useAtomValue(secondaryPanelWidthPercentAtom);
   const setPersistedWidthPercent = useSetAtom(secondaryPanelWidthPercentAtom);
   const setIsResizing = useSetAtom(threadSecondaryPanelResizingAtom);
   const secondaryPanelRef = useRef<HTMLElement>(null!);
   const secondaryResizablePanelRef = useRef<ImperativePanelHandle | null>(null);
-  const isSecondaryPanelDraggingRef = useRef(false);
   const lastSecondaryPanelSizeRef = useRef(persistedWidthPercent);
+  const handleSecondaryPanelPointerResize = useCallback(
+    (leadingFraction: number) => {
+      secondaryResizablePanelRef.current?.resize((1 - leadingFraction) * 100);
+    },
+    [],
+  );
+  const handleSecondaryPanelDragging = useCallback(
+    (isDragging: boolean) => {
+      setIsResizing(isDragging);
+      if (!isDragging && lastSecondaryPanelSizeRef.current > 0) {
+        setPersistedWidthPercent(lastSecondaryPanelSizeRef.current);
+      }
+    },
+    [setIsResizing, setPersistedWidthPercent],
+  );
+  const resizeHitTargetRef = usePanelResizeSnap({
+    onResize: handleSecondaryPanelPointerResize,
+    onDragging: handleSecondaryPanelDragging,
+  });
 
   const prevOpenRef = useRef(isSecondaryPanelOpen);
   useEffect(() => {
-    // Skip initial mount — Panel's defaultSize handles it.
     if (prevOpenRef.current === isSecondaryPanelOpen) {
       return;
     }
@@ -66,76 +84,6 @@ export function useSecondaryPanelResize({
     },
   });
 
-  const finishSecondaryPanelDragging = useCallback(() => {
-    isSecondaryPanelDraggingRef.current = false;
-    setIsSecondaryPanelDragging(false);
-    setIsResizing(false);
-    clearResizeCursor();
-
-    // Drag finished — persist the user's chosen width.
-    if (lastSecondaryPanelSizeRef.current > 0) {
-      setPersistedWidthPercent(lastSecondaryPanelSizeRef.current);
-    }
-  }, [setIsResizing, setPersistedWidthPercent]);
-
-  const handleSecondaryPanelDragging =
-    useCallback<SecondaryPanelDraggingHandler>(
-      (isDragging) => {
-        if (isDragging) {
-          isSecondaryPanelDraggingRef.current = true;
-          setIsSecondaryPanelDragging(true);
-          setIsResizing(true);
-          applyResizeCursor("horizontal");
-          return;
-        }
-
-        finishSecondaryPanelDragging();
-      },
-      [finishSecondaryPanelDragging, setIsResizing],
-    );
-
-  useEffect(
-    () => () => {
-      if (!isSecondaryPanelDraggingRef.current) {
-        return;
-      }
-      isSecondaryPanelDraggingRef.current = false;
-      setIsResizing(false);
-      clearResizeCursor();
-    },
-    [setIsResizing],
-  );
-
-  useEffect(() => {
-    if (!isSecondaryPanelDragging) {
-      return;
-    }
-
-    window.addEventListener("pointerup", finishSecondaryPanelDragging, true);
-    window.addEventListener("mouseup", finishSecondaryPanelDragging, true);
-    window.addEventListener(
-      "pointercancel",
-      finishSecondaryPanelDragging,
-      true,
-    );
-    window.addEventListener("blur", finishSecondaryPanelDragging);
-
-    return () => {
-      window.removeEventListener(
-        "pointerup",
-        finishSecondaryPanelDragging,
-        true,
-      );
-      window.removeEventListener("mouseup", finishSecondaryPanelDragging, true);
-      window.removeEventListener(
-        "pointercancel",
-        finishSecondaryPanelDragging,
-        true,
-      );
-      window.removeEventListener("blur", finishSecondaryPanelDragging);
-    };
-  }, [finishSecondaryPanelDragging, isSecondaryPanelDragging]);
-
   const handleSecondaryPanelResize = useCallback<SecondaryPanelResizeHandler>(
     (size) => {
       if (size <= 0) {
@@ -143,11 +91,6 @@ export function useSecondaryPanelResize({
       }
 
       lastSecondaryPanelSizeRef.current = size;
-      // Mirror the live panel size onto the content's fixed width (container-query
-      // units against the horizontal group) for swipe mode: the content holds the
-      // open width while the panel's width transition clips it, and tracks the
-      // size live during a drag-resize. Guarding size > 0 leaves the width at the
-      // last open value through a collapse, so the content swipes out cleanly.
       secondaryPanelRef.current?.style.setProperty(
         "--secondary-swipe-width",
         `${size}cqw`,
@@ -156,9 +99,16 @@ export function useSecondaryPanelResize({
     [],
   );
 
+  useLayoutEffect(() => {
+    const panel =
+      secondaryPanelRef.current?.closest<HTMLElement>("[data-panel]");
+    const size = Number.parseFloat(panel?.style.flexGrow ?? "");
+    if (Number.isFinite(size)) handleSecondaryPanelResize(size);
+  }, [handleSecondaryPanelResize, isSecondaryPanelOpen, panelId, renderAsDrawer]);
+
   return {
-    handleSecondaryPanelDragging,
     handleSecondaryPanelResize,
+    resizeHitTargetRef,
     persistedWidthPercent,
     secondaryPanelRef,
     secondaryResizablePanelRef,

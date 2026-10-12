@@ -1,29 +1,39 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { PluginDiffRendererProps } from "@get-bb/plugin-sdk";
 import type { DiffFileEntry } from "@bb/server-contract";
 import type {
   DiffFileContentsResult,
   RequestDiffFileContents,
 } from "@/components/git-diff/GitDiffCardBody";
 import type { DiffPatchState } from "@/hooks/queries/use-environment-diff-patches";
+import {
+  resetPluginSlotStoreForTest,
+  setPluginSlotRegistrations,
+} from "@/lib/plugin-slots";
 import { DiffFileCard } from "./DiffFileCard";
+import { makeDiffFileEntry } from "@/test/fixtures/diff-files";
+import { makePluginRegistrationSet } from "@/test/fixtures/plugins";
+
+vi.mock("usehooks-ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("usehooks-ts")>()),
+  useIntersectionObserver: () => ({
+    ref: () => {},
+    isIntersecting: true,
+    entry: undefined,
+  }),
+}));
 
 const IMAGE_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/Qo3AAAAAElFTkSuQmCC";
 
 function buildEntry(overrides: Partial<DiffFileEntry> = {}): DiffFileEntry {
-  return {
-    path: "src/file.ts",
-    previousPath: null,
-    changeKind: "modified",
+  return makeDiffFileEntry({
     additions: 1,
     deletions: 1,
-    binary: false,
-    origin: "tracked",
-    loadMode: "auto",
     ...overrides,
-  };
+  });
 }
 
 function renderCard({
@@ -40,7 +50,11 @@ function renderCard({
   render(
     <DiffFileCard
       entry={entry}
-      diffViewOptions={{}}
+      presentation={{
+        view: "unified",
+        overflow: "scroll",
+        showLineNumbers: true,
+      }}
       isCollapsed={false}
       onToggleCollapsed={() => {}}
       patchState={patchState}
@@ -51,8 +65,19 @@ function renderCard({
   );
 }
 
+const TEXT_PATCH = [
+  "diff --git a/src/file.ts b/src/file.ts",
+  "--- a/src/file.ts",
+  "+++ b/src/file.ts",
+  "@@ -1,2 +1,2 @@",
+  "-const b = 2;",
+  "+const b = 3;",
+  "",
+].join("\n");
+
 afterEach(() => {
   cleanup();
+  resetPluginSlotStoreForTest();
 });
 
 describe("DiffFileCard", () => {
@@ -119,6 +144,86 @@ describe("DiffFileCard", () => {
     });
     expect(screen.getByText("Load diff")).toBeTruthy();
     expect(onRequestFileContents).not.toHaveBeenCalled();
+  });
+
+  it("renders its text body through the shared host diff boundary", async () => {
+    const seen: { patch: string; path: string; view: string }[] = [];
+    setPluginSlotRegistrations(
+      "demo",
+      makePluginRegistrationSet({
+        diffRenderers: [
+          {
+            id: "diffs",
+            title: "Demo diffs",
+            component: ({ patch, path, view }) => {
+              seen.push({ patch, path, view });
+              return <div data-testid="plugin-diff-body">plugin diff</div>;
+            },
+          },
+        ],
+      }),
+    );
+
+    renderCard({
+      entry: buildEntry(),
+      patchState: { status: "loaded", patch: TEXT_PATCH },
+    });
+
+    expect(await screen.findByTestId("plugin-diff-body")).toBeTruthy();
+    expect(seen.at(-1)?.patch).toBe(TEXT_PATCH);
+    expect(seen.at(-1)?.path).toBe("src/file.ts");
+    expect(seen.at(-1)?.view).toBe("unified");
+  });
+
+  it("forwards lazily resolved text sides to a replacement renderer", async () => {
+    const seen: PluginDiffRendererProps["experimental_fullFileContents"][] = [];
+    setPluginSlotRegistrations(
+      "demo",
+      makePluginRegistrationSet({
+        diffRenderers: [
+          {
+            id: "diffs",
+            title: "Demo diffs",
+            component: ({ experimental_fullFileContents }) => {
+              seen.push(experimental_fullFileContents);
+              return <div data-testid="plugin-diff-body">plugin diff</div>;
+            },
+          },
+        ],
+      }),
+    );
+    const onRequestFileContents = vi.fn<RequestDiffFileContents>(
+      async (path, side) => ({
+        kind: "text",
+        file: {
+          name: path,
+          contents:
+            side === "old"
+              ? "const b = 2;\nconst tail = true;\n"
+              : "const b = 3;\nconst tail = true;\n",
+        },
+      }),
+    );
+
+    renderCard({
+      entry: buildEntry(),
+      patchState: { status: "loaded", patch: TEXT_PATCH },
+      onRequestFileContents,
+    });
+
+    expect(screen.queryByRole("button", { name: "Expand context" })).toBeNull();
+    await waitFor(() => {
+      expect(seen.at(-1)).toEqual({
+        old: {
+          path: "src/file.ts",
+          content: "const b = 2;\nconst tail = true;\n",
+        },
+        new: {
+          path: "src/file.ts",
+          content: "const b = 3;\nconst tail = true;\n",
+        },
+      });
+    });
   });
 
   it("falls back to the load gate when an image-looking path is not previewable", async () => {

@@ -28,9 +28,10 @@ function createProcessOps(
   return {
     isRunning: vi.fn(() => true),
     kill: vi.fn(),
-    readCommand: vi.fn(async () => "node /opt/bb/bb-app.js start"),
-    // Matches STARTED_AT, so the identity check passes by default.
-    readElapsedSeconds: vi.fn(async () => 30 * 60),
+    readIdentity: vi.fn(async () => ({
+      command: "node /opt/bb/bb-app.js start",
+      startedAt: Date.now() - 30 * 60_000,
+    })),
     waitForExit: vi.fn(async () => true),
     ...overrides,
   };
@@ -131,12 +132,12 @@ describe("stopForeignRuntime", () => {
 
   it("recognises a launcher that was started with a relative path", async () => {
     const dataDir = await createDataDir();
-    // Node resolves argv[1] to an absolute path, but ps reports what was typed.
     await writeRuntimeFile({ dataDir });
     const processOps = createProcessOps({
-      readCommand: vi.fn(
-        async () => "node packages/bb-app/dist/bb-app.js start",
-      ),
+      readIdentity: vi.fn(async () => ({
+        command: "node packages/bb-app/dist/bb-app.js start",
+        startedAt: Date.now() - 30 * 60_000,
+      })),
     });
 
     await expect(
@@ -153,9 +154,11 @@ describe("stopForeignRuntime", () => {
   it("refuses a recycled pid whose start time does not match the record", async () => {
     const dataDir = await createDataDir();
     await writeRuntimeFile({ dataDir });
-    // Same command name, but this process started seconds ago, not 30 min ago.
     const processOps = createProcessOps({
-      readElapsedSeconds: vi.fn(async () => 5),
+      readIdentity: vi.fn(async () => ({
+        command: "node /opt/bb/bb-app.js start",
+        startedAt: Date.now() - 5_000,
+      })),
     });
 
     await expect(
@@ -228,9 +231,10 @@ describe("stopForeignRuntime", () => {
     const dataDir = await createDataDir();
     await writeRuntimeFile({ dataDir });
     const processOps = createProcessOps({
-      readCommand: vi.fn(
-        async () => "/Applications/Mail.app/Contents/MacOS/Mail",
-      ),
+      readIdentity: vi.fn(async () => ({
+        command: "/Applications/Mail.app/Contents/MacOS/Mail",
+        startedAt: Date.now() - 30 * 60_000,
+      })),
     });
 
     await expect(

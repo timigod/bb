@@ -1,31 +1,23 @@
-import { claudeTaskToolNameValues } from "@bb/domain";
 import type { ThreadEvent } from "@bb/domain";
 
-const SUPPRESSED_TIMELINE_TOOL_NAMES = new Set([
-  ...claudeTaskToolNameValues,
-  "TodoRead",
-  "TodoWrite",
-  "ToolSearch",
-  // AskUserQuestion is fully represented by its dedicated user-question
-  // lifecycle row. Keeping the generic tool-call row too produces a confusing
-  // duplicate ("Running tool: AskUserQuestion …" plus "Waiting for approval"
-  // alongside the question's own "Waiting for answer" row).
-  "AskUserQuestion",
-]);
-
 export function shouldSuppressLowValueToolCall(decoded: ThreadEvent): boolean {
-  if (
-    (decoded.type !== "item/started" && decoded.type !== "item/completed") ||
-    decoded.item.type !== "toolCall"
-  ) {
+  if (decoded.type !== "item/started" && decoded.type !== "item/completed") {
     return false;
   }
-
-  if (!SUPPRESSED_TIMELINE_TOOL_NAMES.has(decoded.item.tool)) {
-    return false;
+  const item = decoded.item;
+  switch (item.type) {
+    case "toolCall":
+    case "fileRead":
+    case "search":
+    case "planSteps":
+    case "extension":
+    case "delegation":
+    case "fileChange":
+      if (item.presentation?.suppress !== true) {
+        return false;
+      }
+      return item.status === "pending" || item.status === "completed";
+    default:
+      return false;
   }
-
-  return (
-    decoded.item.status === "pending" || decoded.item.status === "completed"
-  );
 }

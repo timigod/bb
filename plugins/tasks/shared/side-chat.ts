@@ -1,12 +1,6 @@
-/**
- * Side chats are hidden forks owned by the builtin side-chat plugin. Steering
- * privacy and title suppression use that canonical shape.
- */
-
-/** pluginId of the builtin side-chat plugin (bb's builtin registry). */
 const SIDE_CHAT_PLUGIN_ID = "side-chat";
 
-export interface SideChatShapeThread {
+interface SideChatShapeThread {
   originKind: string | null;
   originPluginId: string | null;
   visibility: string;

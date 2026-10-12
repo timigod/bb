@@ -11,29 +11,25 @@ import type {
 import { COMMAND_TIMEOUT_MS } from "../../constants.js";
 import { ApiError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
-import { callHostOnlineRpc } from "../hosts/online-rpc.js";
+import {
+  callHostOnlineRpc,
+  callHostOnlineRpcForWork,
+} from "../hosts/online-rpc.js";
 import { resolveServerOwnedSkillCatalogEntries } from "./injected-skills.js";
 
-/**
- * The built-in skills published to a machine's global agent skill roots so
- * agents running outside bb can drive bb through its CLI.
- */
-export const GLOBAL_CLI_SKILL_NAMES: readonly string[] = ["bb-cli"];
+const GLOBAL_CLI_SKILL_NAMES: readonly string[] = ["bb-cli"];
 
-/**
- * Status reads are a page-load nicety, so they give up well before the install
- * timeout rather than holding the settings row on a wedged machine.
- */
 const STATUS_TIMEOUT_MS = 5_000;
 
-/** Every enrolled machine, for callers that did not name any. */
 export function listInstallableMachineIds(
   deps: GlobalSkillInstallDeps,
 ): string[] {
-  return listHosts(deps.db).map((host) => host.id);
+  return listHosts(deps.db)
+    .filter((host) => host.type !== "ephemeral")
+    .map((host) => host.id);
 }
 
-export type InstallGlobalCliSkillsResult = SystemInstallCliSkillsResponse;
+type InstallGlobalCliSkillsResult = SystemInstallCliSkillsResponse;
 
 type GlobalSkillInstallDeps = Pick<
   AppDeps,
@@ -43,19 +39,17 @@ type GlobalSkillInstallDeps = Pick<
   | "lifecycleDedupers"
   | "logger"
   | "machineAuth"
+  | "providerRegistry"
+  | "aiServices"
+  | "pluginHostArtifacts"
   | "skillTreeRegistry"
   | "telemetry"
 >;
 
-export interface InstallGlobalCliSkillsArgs {
+interface InstallGlobalCliSkillsArgs {
   hostIds: readonly string[];
 }
 
-/**
- * Resolve the built-in CLI skills as tree sources. Resolution also registers
- * each tree hash with the skill tree registry, which is what lets a daemon
- * pull the tree bytes back over the internal skill-tree route.
- */
 function resolveGlobalCliSkills(
   deps: GlobalSkillInstallDeps,
 ): HostInstallGlobalSkill[] {
@@ -79,11 +73,6 @@ function resolveGlobalCliSkills(
   );
 }
 
-/**
- * Compare what a machine has installed against what this server would install.
- * Every expected copy must match for "installed"; nothing present at all is
- * "missing"; anything in between (stale bytes, one root only) is "outdated".
- */
 function resolveMachineSkillStatus(args: {
   entries: HostGlobalSkillsStatusResult["entries"];
   skills: readonly HostInstallGlobalSkill[];
@@ -104,11 +93,6 @@ function resolveMachineSkillStatus(args: {
     : "outdated";
 }
 
-/**
- * Read each requested machine's install status. A machine that is offline or
- * fails to answer reports "unknown" rather than failing the whole read — the
- * settings row still renders for the machines that did answer.
- */
 export async function readGlobalCliSkillStatus(
   deps: GlobalSkillInstallDeps,
   args: InstallGlobalCliSkillsArgs,
@@ -155,11 +139,6 @@ function installFailureMessage(error: unknown): string {
   return message.trim().length > 0 ? message : "The install failed";
 }
 
-/**
- * Copy the built-in bb CLI skills onto each requested machine. The server picks
- * the skills; each daemon owns the destinations. Machines install concurrently
- * and independently, so one offline machine never blocks the others.
- */
 export async function installGlobalCliSkills(
   deps: GlobalSkillInstallDeps,
   args: InstallGlobalCliSkillsArgs,
@@ -187,7 +166,7 @@ export async function installGlobalCliSkills(
   const results = await Promise.all(
     hosts.map(async (host) => {
       try {
-        const result = await callHostOnlineRpc(deps, {
+        const result = await callHostOnlineRpcForWork(deps, {
           hostId: host.id,
           timeoutMs: COMMAND_TIMEOUT_MS,
           command: { type: "host.install_global_skills", skills },

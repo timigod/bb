@@ -100,6 +100,12 @@ export const createTerminalRequestSchema = z
             command: z.string().trim().min(1).max(10_000),
           })
           .strict(),
+        z
+          .object({
+            mode: z.literal("argv"),
+            argv: z.array(z.string().max(10_000)).min(1).max(256),
+          })
+          .strict(),
       ])
       .optional(),
     target: terminalCreateTargetSchema,
@@ -168,17 +174,21 @@ export type TerminalOutputQuery = z.infer<typeof terminalOutputQuerySchema>;
 export const terminalWebSocketQuerySchema = z
   .object({
     sinceSeq: z.coerce.number().int().nonnegative().default(0),
+    outputAcks: z
+      .enum(["0", "1"])
+      .default("0")
+      .transform((value) => value === "1"),
   })
   .strict();
-export type TerminalWebSocketQuery = z.infer<
-  typeof terminalWebSocketQuerySchema
->;
 
 export const terminalOutputResponseSchema = z
   .object({
     chunks: z.array(terminalOutputChunkSchema),
     nextSeq: z.number().int().nonnegative(),
     truncated: z.boolean(),
+    status: terminalSessionStatusSchema,
+    exitCode: z.number().int().nullable(),
+    closeReason: terminalSessionCloseReasonSchema.nullable(),
   })
   .strict();
 export type TerminalOutputResponse = z.infer<
@@ -201,13 +211,19 @@ export const terminalClientMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("close"),
-      reason: z.literal("user"),
+      type: z.literal("ping"),
     })
     .strict(),
   z
     .object({
-      type: z.literal("ping"),
+      type: z.literal("ack"),
+      nextSeq: z.number().int().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("visibility"),
+      visible: z.boolean(),
     })
     .strict(),
 ]);

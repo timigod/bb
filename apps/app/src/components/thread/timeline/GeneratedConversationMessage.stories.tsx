@@ -3,7 +3,6 @@ import type {
   SystemMessageKind,
   SystemMessageSubject,
 } from "@bb/domain";
-import type { TimelineTitleLink } from "@bb/thread-view";
 import type { TimelineRow } from "@bb/server-contract";
 import type { ReactNode } from "react";
 import { ConversationMessageContent } from "@/components/thread/timeline/ConversationMessageContent";
@@ -15,19 +14,8 @@ export default {
   title: "thread/timeline/Generated Conversation Message",
 };
 
-// ThreadTimelinePane caps content at 760px; match it so the rows reflect
-// production width.
 function TimelineStage({ children }: { children: ReactNode }) {
   return <div className="w-full max-w-[760px]">{children}</div>;
-}
-
-function resolveThreadLink(link: TimelineTitleLink): string | null {
-  switch (link.kind) {
-    case "thread":
-      return `/projects/proj_demo/threads/${link.threadId}`;
-    default:
-      return null;
-  }
 }
 
 const acceptedMessage = {
@@ -42,14 +30,9 @@ interface SystemRowFixture {
   systemMessageKind: SystemMessageKind;
   systemMessageSubject: SystemMessageSubject | null;
   text: string;
-  // Optional body mentions; the expanded body renders `@thread:<id>` tokens as
-  // pills resolved from these. Most rows carry none.
   mentions?: readonly PromptTextMention[];
 }
 
-// The child-completed body is a realistic markdown report — heading, bold, a
-// list, inline code, and an `@thread:` mention — so the markdown rendering of
-// generated bodies is visible in the story.
 const CHILD_COMPLETED_BODY = [
   "# Rebuild threaded comments — final report",
   "",
@@ -77,8 +60,6 @@ const CHILD_COMPLETED_MENTIONS: readonly PromptTextMention[] = [
   },
 ];
 
-// One representative row per Family-B systemMessageKind. The title + icon are
-// derived from the kind/subject; the body text is the stripped message body.
 const SYSTEM_ROWS: readonly SystemRowFixture[] = [
   {
     label: "ownership-assigned (title-only)",
@@ -165,14 +146,13 @@ export function Overview() {
             <ConversationMessageContent
               role="user"
               initiator="system"
-              originKind={null}
               senderThreadId={null}
               senderThreadTitle={null}
               senderIsPluginSideChat={false}
-              resolveSegmentLinkHref={resolveThreadLink}
               systemMessageKind={row.systemMessageKind}
               systemMessageSubject={row.systemMessageSubject}
               text={row.text}
+              timestamp={0}
               attachments={null}
               mentions={row.mentions ?? []}
               projectId="proj_demo"
@@ -189,14 +169,13 @@ export function Overview() {
           <ConversationMessageContent
             role="user"
             initiator="agent"
-            originKind={null}
             senderThreadId="thr_worker2"
             senderThreadTitle="Worker 2"
             senderIsPluginSideChat={false}
-            resolveSegmentLinkHref={resolveThreadLink}
             systemMessageKind="unlabeled"
             systemMessageSubject={null}
             text="Can you take the migration step from here? I've finished the schema changes and pushed to the branch."
+            timestamp={0}
             attachments={null}
             mentions={[]}
             projectId="proj_demo"
@@ -212,14 +191,13 @@ export function Overview() {
           <ConversationMessageContent
             role="user"
             initiator="system"
-            originKind={null}
             senderThreadId={null}
             senderThreadTitle={null}
             senderIsPluginSideChat={false}
-            resolveSegmentLinkHref={resolveThreadLink}
             systemMessageKind="unlabeled"
             systemMessageSubject={null}
             text="A system message persisted before the taxonomy existed."
+            timestamp={0}
             attachments={null}
             mentions={[]}
             projectId="proj_demo"
@@ -242,14 +220,13 @@ export function ClippedAgentMessage() {
           <ConversationMessageContent
             role="user"
             initiator="agent"
-            originKind={null}
             senderThreadId="thr_host_hermes"
             senderThreadTitle="Host Hermes on Flue"
             senderIsPluginSideChat={false}
-            resolveSegmentLinkHref={resolveThreadLink}
             systemMessageKind="unlabeled"
             systemMessageSubject={null}
             text="TEST RESULT refines the diagnosis — RULE OUT eviction. A fire-and-forget direct POST with no wait parameter and no client-held stream should still render the complete report after expansion, including the exact follow-up checks the other agent already ran."
+            timestamp={0}
             attachments={null}
             mentions={[]}
             projectId="proj_demo"
@@ -261,11 +238,6 @@ export function ClippedAgentMessage() {
   );
 }
 
-// Markdown bodies, rendered EXPANDED so the formatting is visible without a
-// click. System-message bodies (sourceKind "system") render through
-// MarkdownPreview — headings, bold, lists, inline code, fenced code, and
-// @thread mention pills inside the markdown. Driven through the real timeline
-// path (ThreadTimelineRows) with `initialExpanded` seeding the open body.
 const MARKDOWN_ROWS: readonly {
   label: string;
   hint: string;

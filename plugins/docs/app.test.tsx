@@ -3,17 +3,52 @@ import {
   act,
   cleanup,
   fireEvent,
-  render,
   waitFor,
   within,
 } from "@testing-library/react";
+import { StrictMode } from "react";
+import { DOMParser as ProseMirrorDOMParser } from "@tiptap/pm/model";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import {
+  loadPluginApp,
+  renderSlot,
+  type RenderSlotOptions,
+} from "@get-bb/plugin-sdk/testing/app";
 
 const app = await loadPluginApp(() => import("./app"));
+const docsRegistration = app.navPanels[0]!;
+const navigationView = docsRegistration.fixedTabs?.[0]!;
+const navigationRegistration = {
+  ...docsRegistration,
+  component: navigationView.component,
+};
+const rangeGetBoundingClientRectDescriptor = Object.getOwnPropertyDescriptor(
+  Range.prototype,
+  "getBoundingClientRect",
+);
+const rangeGetClientRectsDescriptor = Object.getOwnPropertyDescriptor(
+  Range.prototype,
+  "getClientRects",
+);
 
-// jsdom has no matchMedia; @bb/shared-ui's responsive overlays query it.
 beforeEach(() => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  Object.defineProperties(Range.prototype, {
+    getBoundingClientRect: {
+      configurable: true,
+      value: () => new DOMRect(),
+    },
+    getClientRects: {
+      configurable: true,
+      value: () => ({ length: 0, item: () => null }),
+    },
+  });
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     value: vi.fn((query: string) => ({
@@ -32,6 +67,24 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  if (rangeGetBoundingClientRectDescriptor) {
+    Object.defineProperty(
+      Range.prototype,
+      "getBoundingClientRect",
+      rangeGetBoundingClientRectDescriptor,
+    );
+  } else {
+    Reflect.deleteProperty(Range.prototype, "getBoundingClientRect");
+  }
+  if (rangeGetClientRectsDescriptor) {
+    Object.defineProperty(
+      Range.prototype,
+      "getClientRects",
+      rangeGetClientRectsDescriptor,
+    );
+  } else {
+    Reflect.deleteProperty(Range.prototype, "getClientRects");
+  }
 });
 
 interface NoteSummary {
@@ -72,10 +125,81 @@ function listNotesResult(
   };
 }
 
+function listNotesResultForVault(
+  vaultId: "personal" | "work",
+  path: string,
+  title: string,
+) {
+  return {
+    ...listNotesResult([{ path, title, preview: "", modifiedAtMs: 1 }]),
+    vaults: [
+      {
+        id: "personal",
+        name: "Personal",
+        hostId: null,
+        rootPath: "/vaults/personal",
+      },
+      {
+        id: "work",
+        name: "Work",
+        hostId: null,
+        rootPath: "/vaults/work",
+      },
+    ],
+    vault: {
+      id: vaultId,
+      name: vaultId === "work" ? "Work" : "Personal",
+      hostId: null,
+      rootPath: `/vaults/${vaultId}`,
+    },
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
 const preview = {
   baseUrl: "/api/v1/file-previews/lease",
   expiresAtMs: Date.now() + 60_000,
 };
+
+function renderDocument(
+  path: string,
+  title: string,
+  options: RenderSlotOptions,
+) {
+  return renderSlot(
+    app.messageDirectives[0]!,
+    {
+      attributes: { vault: "personal", path, title },
+      source: `::docs{vault="personal" path="${path}" title="${title}"}`,
+      message: {
+        id: `msg_${path}`,
+        threadId: "thr_1",
+        turnId: "turn_1",
+        projectId: null,
+      },
+      openWorkspaceFile: null,
+    },
+    {
+      ...options,
+      rpc: {
+        readNote: () => ({
+          content: "Original paragraph.",
+          sha256: "original-sha",
+        }),
+        readProposal: () => null,
+        preparePreview: () => preview,
+        ...options.rpc,
+      },
+    },
+  );
+}
 
 function makeDataTransfer(path: string) {
   let storedPath = path;
@@ -96,8 +220,17 @@ describe("Docs nav panel", () => {
       id: "docs",
       title: "Docs",
       path: "docs",
-      headerContent: expect.any(Function),
+      fixedTabs: [
+        {
+          panelId: "docs",
+          id: "navigation",
+          title: "Navigation",
+          icon: "FileText",
+          layout: "flush",
+        },
+      ],
     });
+    expect(app.navPanels[0]?.headerContent).toBeUndefined();
     expect(app.messageDirectives).toHaveLength(1);
     expect(app.messageDirectives[0]?.id).toBe("docs");
     expect(app.threadPanelActions[0]).toMatchObject({
@@ -111,29 +244,19 @@ describe("Docs nav panel", () => {
     });
   });
 
-  it("keeps the sidebar toggle in the page header above sidebar actions", async () => {
-    const panel = app.navPanels[0]!;
+  it("renders navigation in the BB-owned right-panel view without custom chrome", async () => {
     const slot = renderSlot(
-      panel,
+      navigationRegistration,
       { subPath: "personal" },
       { rpc: { listNotes: () => listNotesResult([]) } },
     );
-    await slot.findByText("Select a note or HTML page.");
 
-    const HeaderContent = panel.headerContent!;
-    const header = render(<HeaderContent subPath="personal" />);
-    const headerSegment = header.getByTestId("notes-sidebar-header");
-    expect(headerSegment.classList.contains("w-8")).toBe(true);
-    // The sidebar is the plugin's own panel: it stays below the host header,
-    // so no plugin chrome may paint over the header's seam.
-    expect(header.queryByTestId("notes-sidebar-header-background")).toBeNull();
-    const toolbar = slot.getByRole("toolbar", {
+    const toolbar = await slot.findByRole("toolbar", {
       name: "Notes sidebar actions",
     });
-    expect(slot.getByRole("navigation", { name: "Notes" })).toBeTruthy();
-    expect(
-      slot.container.querySelector("aside")?.classList.contains("bg-muted/20"),
-    ).toBe(true);
+    slot.getByRole("navigation", { name: "Notes" });
+    expect(slot.container.querySelector("aside")).toBeNull();
+    expect(slot.queryByRole("separator")).toBeNull();
     expect(
       within(toolbar).getByRole("button", { name: "Search notes" }),
     ).toBeTruthy();
@@ -143,94 +266,59 @@ describe("Docs nav panel", () => {
     expect(
       within(toolbar).getByRole("button", { name: "New folder" }),
     ).toBeTruthy();
-    expect(
-      within(toolbar).queryByRole("button", {
-        name: "Collapse notes sidebar",
-      }),
-    ).toBeNull();
-    fireEvent.click(
-      header.getByRole("button", { name: "Collapse notes sidebar" }),
-    );
-    expect(slot.container.querySelector("aside")?.style.width).toBe("0px");
-    fireEvent.click(
-      header.getByRole("button", { name: "Expand notes sidebar" }),
-    );
-    expect(slot.container.querySelector("aside")?.style.width).toBe("288px");
-
-    header.unmount();
-    const fallbackToggle = await slot.findByRole("button", {
-      name: "Collapse notes sidebar",
-    });
-    fireEvent.click(slot.getByRole("button", { name: "Search notes" }));
-    await waitFor(() => {
-      expect(slot.getByRole("button", { name: "Close search" })).toBeTruthy();
-    });
-    expect(fallbackToggle.parentElement?.classList.contains("gap-1")).toBe(
-      true,
-    );
   });
 
-  it("keeps the header toggle inside its own box in a split pane", () => {
-    const HeaderContent = app.navPanels[0]!.headerContent!;
-    const header = render(
-      <div data-split-pane-id="pane-docs">
-        <HeaderContent subPath="personal" />
-      </div>,
+  it("keeps one shared request across page and navigation Strict Mode replay", async () => {
+    let requests = 0;
+    const StrictDocsSurfaces = (props: { subPath: string }) => (
+      <StrictMode>
+        <docsRegistration.component {...props} />
+        <navigationView.component {...props} />
+      </StrictMode>
     );
-
-    const headerSegment = header.getByTestId("notes-sidebar-header");
-    // The toggle must not reach into the host's own split-pane controls.
-    expect(headerSegment.classList.contains("-mr-4")).toBe(false);
-    expect(headerSegment.classList.contains("w-8")).toBe(true);
-    expect(header.queryByTestId("notes-sidebar-header-background")).toBeNull();
-  });
-
-  it("keeps the right sidebar pinned while a note loads", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "personal/slow.md" },
+      { ...navigationRegistration, component: StrictDocsSurfaces },
+      { subPath: "personal" },
       {
         rpc: {
-          listNotes: () =>
-            listNotesResult([
-              {
-                path: "slow.md",
-                title: "Slow note",
-                preview: "",
-                modifiedAtMs: 1,
-              },
-            ]),
-          readNote: () => new Promise(() => undefined),
-          preparePreview: () => preview,
+          listNotes: () => {
+            requests += 1;
+            return listNotesResult([]);
+          },
         },
       },
     );
 
-    await slot.findByText("Loading…");
-    const loading = slot.getByRole("status", { name: "Loading document" });
-    expect(loading.className).toContain("flex-1");
-    expect(loading.querySelectorAll(".animate-pulse")).toHaveLength(15);
-    expect(slot.container.querySelector("aside")?.className).toContain(
-      "order-2",
-    );
+    await slot.findByRole("navigation", { name: "Notes" });
+    await slot.findByText("Select a note or HTML page.");
+    expect(requests).toBe(1);
   });
 
-  it("keeps folder children together and lets the sidebar collapse and resize", async () => {
-    let nextFrameId = 1;
-    const frames = new Map<number, FrameRequestCallback>();
-    const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
-      const frameId = nextFrameId;
-      nextFrameId += 1;
-      frames.set(frameId, callback);
-      return frameId;
-    });
-    const cancelAnimationFrame = vi.fn((frameId: number) => {
-      frames.delete(frameId);
-    });
-    vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
-    vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+  it("shows an initial notebook error and lets the user retry", async () => {
+    let requests = 0;
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
+      { subPath: "personal" },
+      {
+        rpc: {
+          listNotes: () => {
+            requests += 1;
+            if (requests === 1) throw new Error("Host unavailable");
+            return listNotesResult([]);
+          },
+        },
+      },
+    );
+
+    await slot.findByText("Could not load vaults: Host unavailable");
+    fireEvent.click(slot.getByRole("button", { name: "Retry" }));
+    await slot.findByRole("navigation", { name: "Notes" });
+    expect(requests).toBe(2);
+  });
+
+  it("keeps folder children together in the native navigation view", async () => {
+    const slot = renderSlot(
+      navigationRegistration,
       { subPath: "personal" },
       {
         rpc: {
@@ -261,192 +349,18 @@ describe("Docs nav panel", () => {
     );
 
     await slot.findByText("Child note");
-    const aside = slot.container.querySelector("aside");
-    expect(aside?.className).toContain("order-2");
-    expect(aside?.className).toContain("border-l");
-    const rows = [...(aside?.querySelectorAll("button") ?? [])].map((node) =>
-      node.textContent?.trim(),
-    );
+    const rows = [
+      ...slot.getByRole("navigation").querySelectorAll("button"),
+    ].map((node) => node.textContent?.trim());
     expect(rows.indexOf("Child note")).toBe(rows.indexOf("projects") + 1);
     expect(rows.indexOf("Sibling note")).toBeGreaterThan(
       rows.indexOf("Child note"),
     );
-
-    fireEvent.click(slot.getByLabelText("Collapse notes sidebar"));
-    expect(slot.getByLabelText("Expand notes sidebar")).toBeTruthy();
-    expect(slot.container.querySelector("aside")?.style.width).toBe("40px");
-
-    fireEvent.click(slot.getByLabelText("Expand notes sidebar"));
-    const resizeHandle = slot.getByRole("separator", {
-      name: "Resize notes sidebar",
-    });
-    const setPointerCapture = vi.fn();
-    const releasePointerCapture = vi.fn();
-    resizeHandle.setPointerCapture = setPointerCapture;
-    resizeHandle.hasPointerCapture = () => true;
-    resizeHandle.releasePointerCapture = releasePointerCapture;
-    fireEvent.pointerDown(resizeHandle, { clientX: 288, pointerId: 7 });
-    expect(setPointerCapture).toHaveBeenCalledWith(7);
-    fireEvent.pointerMove(resizeHandle, { clientX: 176, pointerId: 7 });
-    fireEvent.pointerMove(resizeHandle, { clientX: 156, pointerId: 7 });
-    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
-    expect(slot.container.querySelector("aside")?.style.width).toBe("288px");
-    const firstFrame = frames.entries().next().value as
-      | [number, FrameRequestCallback]
-      | undefined;
-    expect(firstFrame).toBeTruthy();
-    act(() => firstFrame?.[1](0));
-    frames.delete(firstFrame?.[0] ?? -1);
-    expect(slot.container.querySelector("aside")?.style.width).toBe("420px");
-    fireEvent.pointerMove(resizeHandle, { clientX: 146, pointerId: 7 });
-    expect(requestAnimationFrame).toHaveBeenCalledTimes(2);
-    fireEvent.pointerUp(resizeHandle, { pointerId: 7 });
-    expect(cancelAnimationFrame).toHaveBeenCalledTimes(1);
-    expect(slot.container.querySelector("aside")?.style.width).toBe("430px");
-    expect(releasePointerCapture).toHaveBeenCalledWith(7);
-  });
-
-  it("isolates sidebar width and collapse state between panes on one vault", async () => {
-    vi.stubGlobal(
-      "requestAnimationFrame",
-      vi.fn(() => 17),
-    );
-    vi.stubGlobal("cancelAnimationFrame", vi.fn());
-    const panel = app.navPanels[0]!;
-    const PanelContent = panel.component;
-    const rpc = { listNotes: () => listNotesResult([]) };
-    const first = renderSlot(panel, { subPath: "personal" }, { rpc });
-    const second = renderSlot(panel, { subPath: "personal" }, { rpc });
-    first.rerender(
-      <div data-split-pane-id="pane-one">
-        <PanelContent subPath="personal" />
-      </div>,
-    );
-    second.rerender(
-      <div data-split-pane-id="pane-two">
-        <PanelContent subPath="personal" />
-      </div>,
-    );
-    await within(first.container).findByText("Select a note or HTML page.");
-    await within(second.container).findByText("Select a note or HTML page.");
-
-    const HeaderContent = panel.headerContent!;
-    const firstHeader = render(
-      <div data-split-pane-id="pane-one">
-        <HeaderContent subPath="personal" />
-      </div>,
-    );
-    const secondHeader = render(
-      <div data-split-pane-id="pane-two">
-        <HeaderContent subPath="personal" />
-      </div>,
-    );
-    const firstAside = first.container.querySelector("aside");
-    const secondAside = second.container.querySelector("aside");
-    expect(firstAside?.style.width).toBe("288px");
-    expect(secondAside?.style.width).toBe("288px");
-
-    const resizeHandle = within(first.container).getByRole("separator", {
-      name: "Resize notes sidebar",
-    });
-    resizeHandle.setPointerCapture = vi.fn();
-    resizeHandle.hasPointerCapture = () => true;
-    resizeHandle.releasePointerCapture = vi.fn();
-    fireEvent.pointerDown(resizeHandle, { clientX: 288, pointerId: 11 });
-    fireEvent.pointerMove(resizeHandle, { clientX: 176, pointerId: 11 });
-    fireEvent.pointerUp(resizeHandle, { pointerId: 11 });
-
-    expect(firstAside?.style.width).toBe("400px");
-    expect(secondAside?.style.width).toBe("288px");
-
-    fireEvent.click(
-      within(firstHeader.container).getByRole("button", {
-        name: "Collapse notes sidebar",
-      }),
-    );
-    expect(firstAside?.style.width).toBe("0px");
-    expect(secondAside?.style.width).toBe("288px");
-    expect(
-      within(secondHeader.container).getByRole("button", {
-        name: "Collapse notes sidebar",
-      }),
-    ).toBeTruthy();
-
-    firstHeader.unmount();
-    first.unmount();
-    const reopened = renderSlot(panel, { subPath: "personal" }, { rpc });
-    reopened.rerender(
-      <div data-split-pane-id="pane-one">
-        <PanelContent subPath="personal" />
-      </div>,
-    );
-    await within(reopened.container).findByText("Select a note or HTML page.");
-    const reopenedHeader = render(
-      <div data-split-pane-id="pane-one">
-        <HeaderContent subPath="personal" />
-      </div>,
-    );
-    expect(reopened.container.querySelector("aside")?.style.width).toBe(
-      "288px",
-    );
-    expect(
-      within(reopenedHeader.container).getByRole("button", {
-        name: "Collapse notes sidebar",
-      }),
-    ).toBeTruthy();
-  });
-
-  it("defaults the sidebar to collapsed in a narrow pane but allows expanding", async () => {
-    class FakeResizeObserver {
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-    }
-    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
-    const clientWidth = Object.getOwnPropertyDescriptor(
-      Element.prototype,
-      "clientWidth",
-    );
-    Object.defineProperty(Element.prototype, "clientWidth", {
-      configurable: true,
-      get: () => 400,
-    });
-    try {
-      const slot = renderSlot(
-        app.navPanels[0]!,
-        { subPath: "personal" },
-        {
-          rpc: {
-            listNotes: () =>
-              listNotesResult([
-                {
-                  path: "note.md",
-                  title: "Note",
-                  preview: "",
-                  modifiedAtMs: 1,
-                },
-              ]),
-          },
-        },
-      );
-
-      const expand = await slot.findByLabelText("Expand notes sidebar");
-      expect(slot.container.querySelector("aside")?.style.width).toBe("40px");
-
-      fireEvent.click(expand);
-      expect(slot.getByLabelText("Collapse notes sidebar")).toBeTruthy();
-      expect(slot.container.querySelector("aside")?.style.width).toBe("288px");
-    } finally {
-      if (clientWidth) {
-        Object.defineProperty(Element.prototype, "clientWidth", clientWidth);
-      }
-      vi.unstubAllGlobals();
-    }
   });
 
   it("passes note paths with spaces to host navigation without pre-encoding", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal" },
       {
         rpc: {
@@ -475,6 +389,376 @@ describe("Docs nav panel", () => {
     });
   });
 
+  it("syncs the editor workspace to vault changes from panel navigation and history", async () => {
+    const panel = docsRegistration;
+    const PanelContent = panel.component;
+    const slot = renderSlot(
+      panel,
+      { subPath: "personal/one.md" },
+      {
+        rpc: {
+          listNotes: (rawInput: unknown) => {
+            const input = rawInput as { vaultId?: string } | undefined;
+            const vaultId = input?.vaultId ?? "personal";
+            const name = vaultId === "work" ? "Work" : "Personal";
+            const path = vaultId === "work" ? "two.md" : "one.md";
+            return {
+              ...listNotesResult([
+                {
+                  path,
+                  title: name,
+                  preview: "",
+                  modifiedAtMs: 1,
+                },
+              ]),
+              vault: {
+                id: vaultId,
+                name,
+                hostId: null,
+                rootPath: `/vaults/${vaultId}`,
+              },
+            };
+          },
+          readNote: (rawInput: unknown) => {
+            const input = rawInput as { vaultId: string };
+            return {
+              content: `# ${input.vaultId === "work" ? "Work" : "Personal"}`,
+              sha256: input.vaultId,
+            };
+          },
+          preparePreview: () => preview,
+          renameToTitle: (rawInput: unknown) => {
+            const input = rawInput as { path: string };
+            return { path: input.path };
+          },
+        },
+      },
+    );
+    await slot.findByText("Personal");
+
+    slot.rerender(<PanelContent subPath="work/two.md" />);
+    await slot.findByText("Work");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "readNote",
+      input: { vaultId: "work", path: "two.md" },
+    });
+
+    slot.rerender(<PanelContent subPath="personal/one.md" />);
+    await slot.findByText("Personal");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "readNote",
+      input: { vaultId: "personal", path: "one.md" },
+    });
+  });
+
+  it("shares one notebook request across page and navigation mounts and vault events", async () => {
+    type PendingNotebook = {
+      vaultId: string;
+      resolve: (value: ReturnType<typeof listNotesResult>) => void;
+    };
+    const pending: PendingNotebook[] = [];
+    const notebook = (vaultId: string) => ({
+      ...listNotesResult([
+        {
+          path: `${vaultId}.md`,
+          title: vaultId === "work" ? "Work note" : "Personal note",
+          preview: "",
+          modifiedAtMs: 1,
+        },
+      ]),
+      vaults: [
+        {
+          id: "personal",
+          name: "Personal",
+          hostId: null,
+          rootPath: "/vaults/personal",
+        },
+        {
+          id: "work",
+          name: "Work",
+          hostId: null,
+          rootPath: "/vaults/work",
+        },
+      ],
+      vault: {
+        id: vaultId,
+        name: vaultId === "work" ? "Work" : "Personal",
+        hostId: null,
+        rootPath: `/vaults/${vaultId}`,
+      },
+    });
+    const rpc = {
+      listNotes: (rawInput: unknown) => {
+        const input = rawInput as { vaultId?: string } | undefined;
+        const vaultId = input?.vaultId ?? "personal";
+        return new Promise<ReturnType<typeof listNotesResult>>((resolve) => {
+          pending.push({ vaultId, resolve });
+        });
+      },
+      readNote: (rawInput: unknown) => {
+        const input = rawInput as { vaultId: string };
+        return {
+          content: `# ${input.vaultId === "work" ? "Work document" : "Personal document"}`,
+          sha256: input.vaultId,
+        };
+      },
+      preparePreview: () => preview,
+      createNote: () => ({ path: "created.md" }),
+      renameToTitle: (rawInput: unknown) => {
+        const input = rawInput as { path: string };
+        return { path: input.path };
+      },
+    };
+    const page = renderSlot(
+      docsRegistration,
+      { subPath: "personal/personal.md" },
+      { rpc },
+    );
+    const navigation = renderSlot(
+      navigationRegistration,
+      { subPath: "personal/personal.md" },
+      { rpc },
+    );
+    await waitFor(() => expect(pending).toHaveLength(1));
+    expect(pending.map((request) => request.vaultId)).toEqual(["personal"]);
+    for (const request of pending.splice(0))
+      request.resolve(notebook("personal"));
+    await page.findByText("Personal document");
+    await navigation.findByText("Personal note");
+
+    await page.emitRealtime("vault-changed", { vaultId: "personal" });
+    await navigation.emitRealtime("vault-changed", { vaultId: "personal" });
+    await waitFor(() => expect(pending).toHaveLength(1));
+    const latePersonalRequests = pending.splice(0);
+    expect(latePersonalRequests.map((request) => request.vaultId)).toEqual([
+      "personal",
+    ]);
+
+    page.rerender(<docsRegistration.component subPath="work/work.md" />);
+    navigation.rerender(<navigationView.component subPath="work/work.md" />);
+    expect(page.queryByText("Personal document")).toBeNull();
+    expect(navigation.queryByText("Personal note")).toBeNull();
+    await waitFor(() => expect(pending).toHaveLength(1));
+    const workRequests = pending.splice(0);
+    expect(workRequests.map((request) => request.vaultId)).toEqual(["work"]);
+    for (const request of workRequests) request.resolve(notebook("work"));
+    await page.findByText("Work document");
+    await navigation.findByText("Work note");
+
+    for (const request of latePersonalRequests) {
+      request.resolve(notebook("personal"));
+    }
+    await act(async () => undefined);
+    expect(page.queryByText("Personal document")).toBeNull();
+    expect(navigation.queryByText("Personal note")).toBeNull();
+    expect(page.getByText("Work document")).toBeTruthy();
+    expect(navigation.getByText("Work note")).toBeTruthy();
+
+    fireEvent.click(navigation.getByRole("button", { name: "New note" }));
+    await waitFor(() =>
+      expect(navigation.rpcCalls).toContainEqual({
+        method: "createNote",
+        input: { vaultId: "work", parent: "", name: "Untitled" },
+      }),
+    );
+  });
+
+  it("runs one follow-up refresh when a vault changes during an active request", async () => {
+    const requests: Array<{
+      resolve(value: ReturnType<typeof listNotesResult>): void;
+    }> = [];
+    const slot = renderSlot(
+      navigationRegistration,
+      { subPath: "personal" },
+      {
+        rpc: {
+          listNotes: () =>
+            new Promise<ReturnType<typeof listNotesResult>>((resolve) => {
+              requests.push({ resolve });
+            }),
+        },
+      },
+    );
+
+    await waitFor(() => expect(requests).toHaveLength(1));
+    await slot.emitRealtime("vault-changed", { vaultId: "personal" });
+    expect(requests).toHaveLength(1);
+
+    requests[0]!.resolve(
+      listNotesResult([
+        {
+          path: "stale.md",
+          title: "Stale note",
+          preview: "",
+          modifiedAtMs: 1,
+        },
+      ]),
+    );
+    await waitFor(() => expect(requests).toHaveLength(2));
+    requests[1]!.resolve(
+      listNotesResult([
+        {
+          path: "fresh.md",
+          title: "Fresh note",
+          preview: "",
+          modifiedAtMs: 2,
+        },
+      ]),
+    );
+
+    await slot.findByText("Fresh note");
+    expect(slot.queryByText("Stale note")).toBeNull();
+  });
+
+  it("ignores an obsolete vault refresh and rename after a deferred save", async () => {
+    const pendingSave = deferred<{
+      outcome: "written";
+      sha256: string;
+    }>();
+    const pendingWorkNotebook =
+      deferred<ReturnType<typeof listNotesResultForVault>>();
+    let workNotebookRequested = false;
+    const PanelContent = docsRegistration.component;
+    const slot = renderSlot(
+      docsRegistration,
+      { subPath: "personal/personal.md" },
+      {
+        rpc: {
+          listNotes: (rawInput: unknown) => {
+            const input = rawInput as { vaultId?: string } | undefined;
+            if (input?.vaultId === "work") {
+              workNotebookRequested = true;
+              return pendingWorkNotebook.promise;
+            }
+            return listNotesResultForVault(
+              "personal",
+              "personal.md",
+              "Personal note",
+            );
+          },
+          readNote: (rawInput: unknown) => {
+            const input = rawInput as { vaultId: string };
+            return {
+              content:
+                input.vaultId === "work"
+                  ? "# Work document\n\nWork body"
+                  : "# Personal document\n\nPersonal body",
+              sha256: input.vaultId,
+            };
+          },
+          preparePreview: () => preview,
+          saveNote: () => pendingSave.promise,
+          renameToTitle: (rawInput: unknown) => {
+            const input = rawInput as { vaultId: string; path: string };
+            return {
+              path:
+                input.vaultId === "personal"
+                  ? "personal-renamed.md"
+                  : input.path,
+            };
+          },
+        },
+      },
+    );
+    const body = await slot.findByText("Personal body");
+    body.textContent = "Edited personal body";
+    fireEvent.input(body);
+    await waitFor(
+      () =>
+        expect(slot.rpcCalls.some((call) => call.method === "saveNote")).toBe(
+          true,
+        ),
+      { timeout: 2_000 },
+    );
+
+    slot.rerender(<PanelContent subPath="work/work.md" />);
+    await waitFor(() => expect(workNotebookRequested).toBe(true));
+    await act(async () => {
+      pendingSave.resolve({ outcome: "written", sha256: "saved-personal" });
+    });
+    pendingWorkNotebook.resolve(
+      listNotesResultForVault("work", "work.md", "Work note"),
+    );
+
+    await slot.findByText("Work body");
+    expect(
+      slot.rpcCalls.filter(
+        (call) =>
+          call.method === "listNotes" &&
+          (call.input as { vaultId?: string }).vaultId === "personal",
+      ),
+    ).toHaveLength(1);
+    expect(slot.navigateCalls).not.toContainEqual({
+      method: "toPluginPanel",
+      path: "docs",
+      options: {
+        subPath: "personal/personal-renamed.md",
+        replace: true,
+      },
+    });
+  });
+
+  it("ignores obsolete refresh and navigation after deferred note creation", async () => {
+    const pendingCreate = deferred<{ path: string }>();
+    const pendingWorkNotebook =
+      deferred<ReturnType<typeof listNotesResultForVault>>();
+    let workNotebookRequested = false;
+    const slot = renderSlot(
+      navigationRegistration,
+      { subPath: "personal/personal.md" },
+      {
+        rpc: {
+          listNotes: (rawInput: unknown) => {
+            const input = rawInput as { vaultId?: string } | undefined;
+            if (input?.vaultId === "work") {
+              workNotebookRequested = true;
+              return pendingWorkNotebook.promise;
+            }
+            return listNotesResultForVault(
+              "personal",
+              "personal.md",
+              "Personal note",
+            );
+          },
+          createNote: () => pendingCreate.promise,
+        },
+      },
+    );
+    await slot.findByText("Personal note");
+    fireEvent.click(slot.getByRole("button", { name: "New note" }));
+    await waitFor(() =>
+      expect(slot.rpcCalls.some((call) => call.method === "createNote")).toBe(
+        true,
+      ),
+    );
+
+    slot.rerender(<navigationView.component subPath="work/work.md" />);
+    await waitFor(() => expect(workNotebookRequested).toBe(true));
+    await act(async () => {
+      pendingCreate.resolve({ path: "created-in-personal.md" });
+    });
+    pendingWorkNotebook.resolve(
+      listNotesResultForVault("work", "work.md", "Work note"),
+    );
+
+    await slot.findByText("Work note");
+    expect(
+      slot.rpcCalls.filter(
+        (call) =>
+          call.method === "listNotes" &&
+          (call.input as { vaultId?: string }).vaultId === "personal",
+      ),
+    ).toHaveLength(1);
+    expect(slot.navigateCalls).not.toContainEqual({
+      method: "toPluginPanel",
+      path: "docs",
+      options: {
+        subPath: "personal/created-in-personal.md",
+        replace: false,
+      },
+    });
+  });
+
   it("only shows host status when the selected vault is unavailable", async () => {
     const available = listNotesResult([]);
     const unavailable = {
@@ -489,7 +773,7 @@ describe("Docs nav panel", () => {
       ],
     };
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal" },
       { rpc: { listNotes: () => unavailable } },
     );
@@ -648,8 +932,6 @@ describe("Docs nav panel", () => {
     await waitFor(() => expect(saveNote).toHaveBeenCalled(), {
       timeout: 2_000,
     });
-    // The blank line separating frontmatter from the body survives the first
-    // save: without it every real-world document picks up a spurious diff line.
     expect(saveNote.mock.calls.at(-1)?.[0]).toMatchObject({
       content: expect.stringMatching(
         /^---\r\ntitle: Wiki page\r\ntype: knowledge\r\n---\r\n\r\n# Wiki page\n\nEdited body\./,
@@ -681,8 +963,6 @@ describe("Docs nav panel", () => {
       },
     );
 
-    // The opening `---` is a thematic break, not frontmatter, so the section it
-    // introduces must stay editable rather than being hidden as metadata.
     await waitFor(() => {
       const editor = slot.container.querySelector(".tiptap");
       expect(editor?.textContent).toContain("Some intro text.");
@@ -724,7 +1004,6 @@ describe("Docs nav panel", () => {
     );
 
     await slot.findByText("Article");
-    expect(slot.getByText("projects")).toBeTruthy();
     await waitFor(() => {
       const image = slot.container.querySelector("img");
       expect(image?.getAttribute("src")).toBe(
@@ -740,7 +1019,7 @@ describe("Docs nav panel", () => {
 
   it("creates a note inside the currently selected folder", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal/projects/existing.md" },
       {
         rpc: {
@@ -785,7 +1064,7 @@ describe("Docs nav panel", () => {
 
   it("deletes a file directly from its context menu", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal/projects/old.md" },
       {
         rpc: {
@@ -832,7 +1111,7 @@ describe("Docs nav panel", () => {
 
   it("reorders files by dragging within a folder", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal" },
       {
         rpc: {
@@ -878,7 +1157,7 @@ describe("Docs nav panel", () => {
 
   it("moves a file when it is dropped onto a folder", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal/old.md" },
       {
         rpc: {
@@ -934,7 +1213,7 @@ describe("Docs nav panel", () => {
 
   it("moves a nested file back to the top level", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal/projects/old.md" },
       {
         rpc: {
@@ -968,7 +1247,6 @@ describe("Docs nav panel", () => {
     const dataTransfer = makeDataTransfer("projects/old.md");
     fireEvent.dragStart(file, { dataTransfer });
     const topLevel = slot.getByRole("button", { name: "Move to top level" });
-    expect(topLevel.className).toContain("absolute");
     fireEvent.dragOver(topLevel, { dataTransfer });
     fireEvent.drop(topLevel, { dataTransfer });
 
@@ -989,37 +1267,20 @@ describe("Docs nav panel", () => {
     });
   });
 
-  it("opens Docs directive cards in the thread panel or full editor", () => {
+  it("opens HTML Docs directive cards in the thread panel or full editor", () => {
     const openThreadPanel = vi.fn(() => true);
-    const slot = renderSlot(
-      app.messageDirectives[0]!,
-      {
-        attributes: {
-          vault: "personal",
-          path: "plans/release.md",
-          title: "Release plan",
-        },
-        source:
-          '::docs{vault="personal" path="plans/release.md" title="Release plan"}',
-        message: {
-          id: "msg_1",
-          threadId: "thr_1",
-          turnId: "turn_1",
-          projectId: null,
-        },
-        openWorkspaceFile: null,
-      },
-      { openThreadPanel },
-    );
+    const slot = renderDocument("plans/release.html", "Release plan", {
+      openThreadPanel,
+    });
 
     fireEvent.click(slot.getByText("Release plan"));
-    expect(slot.queryByText("personal · plans/release.md")).toBeNull();
+    expect(slot.queryByText("personal · plans/release.html")).toBeNull();
     expect(openThreadPanel).toHaveBeenCalledWith({
       actionId: "document",
       title: "Release plan",
       params: {
         vaultId: "personal",
-        path: "plans/release.md",
+        path: "plans/release.html",
         title: "Release plan",
       },
     });
@@ -1028,8 +1289,327 @@ describe("Docs nav panel", () => {
     expect(slot.navigateCalls).toContainEqual({
       method: "toPluginPanel",
       path: "docs",
-      options: { subPath: "personal/plans/release.md" },
+      options: { subPath: "personal/plans/release.html" },
     });
+  });
+
+  it("shows cached document content immediately when returning to a thread", async () => {
+    const file = { content: "Keep this draft visible.", sha256: "saved-sha" };
+    const readNote = vi
+      .fn<() => Promise<typeof file>>()
+      .mockResolvedValue(file);
+    const render = () =>
+      renderDocument("cached-draft.md", "Cached draft", {
+        rpc: {
+          readNote,
+        },
+      });
+    const first = render();
+    await first.findByText(file.content);
+    await act(async () => {
+      first.unmount();
+    });
+    let finish!: (result: typeof file) => void;
+    readNote.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const returned = render();
+    try {
+      expect(
+        returned.getByRole("textbox", { name: "Document content" }).textContent,
+      ).toContain(file.content);
+    } finally {
+      await act(async () => {
+        finish({
+          ...file,
+          content: "Fresh content from disk.",
+          sha256: "new-sha",
+        });
+      });
+    }
+    await returned.findByText("Fresh content from disk.");
+  });
+
+  it("truncates tall inline documents and restores editing when they shrink", async () => {
+    let height = 600;
+    let resize = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: () => void) {
+          resize = callback;
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const bounds = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(() => new DOMRect(0, 0, 600, height));
+    const openThreadPanel = vi.fn(() => true);
+    try {
+      const slot = renderDocument("tall-inline.md", "Tall document", {
+        openThreadPanel,
+        rpc: {
+          readNote: () => ({ content: "A long document.", sha256: "tall-sha" }),
+        },
+      });
+      const button = await slot.findByRole("button", {
+        name: "Open Tall document in tab",
+      });
+      const editor = slot.getByRole("textbox", { name: "Document content" });
+      await waitFor(() => {
+        expect(editor.getAttribute("contenteditable")).toBe("false");
+      });
+      fireEvent.click(button);
+      expect(openThreadPanel).toHaveBeenCalledWith({
+        actionId: "document",
+        title: "Tall document",
+        params: {
+          vaultId: "personal",
+          path: "tall-inline.md",
+          title: "Tall document",
+        },
+      });
+      await act(async () => {
+        height = 200;
+        resize();
+      });
+      expect(
+        slot.queryByRole("button", { name: "Open Tall document in tab" }),
+      ).toBeNull();
+      await waitFor(() => {
+        expect(editor.getAttribute("contenteditable")).toBe("true");
+      });
+    } finally {
+      bounds.mockRestore();
+    }
+  });
+
+  it("edits Markdown inline and opens the same document in a tab", async () => {
+    const openThreadPanel = vi.fn(() => true);
+    const slot = renderDocument("inline-header.md", "Inline header", {
+      openThreadPanel,
+    });
+    const editor = await slot.findByRole("textbox", {
+      name: "Document content",
+    });
+    expect(editor.getAttribute("contenteditable")).toBe("true");
+    fireEvent.focus(editor);
+    expect(slot.queryByText("Editing")).toBeNull();
+    expect(slot.queryByText("Saved")).toBeNull();
+    expect(slot.container.querySelectorAll("header")).toHaveLength(1);
+    expect(slot.container.querySelector("footer")).toBeNull();
+    expect(slot.getByRole("button", { name: "Ask for changes" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Open in tab" }));
+    expect(openThreadPanel).toHaveBeenCalledWith({
+      actionId: "document",
+      title: "Inline header",
+      params: {
+        vaultId: "personal",
+        path: "inline-header.md",
+        title: "Inline header",
+      },
+    });
+  });
+
+  it("preserves the composer draft and attaches the document when asking for changes", async () => {
+    const slot = renderDocument("ask-inline.md", "Launch email", {
+      composer: { text: "Keep this instruction." },
+      rpc: {
+        readNote: () => ({ content: "Email body.", sha256: "original-sha" }),
+      },
+    });
+    await slot.findByRole("textbox", { name: "Document content" });
+    fireEvent.click(slot.getByRole("button", { name: "Ask for changes" }));
+    await waitFor(() =>
+      expect(slot.inspection.composer.draft.mentions).toMatchObject([
+        {
+          kind: "plugin",
+          provider: "note",
+          id: "personal:ask-inline.md",
+          label: "Launch email",
+        },
+      ]),
+    );
+    expect(slot.inspection.composer.text).toBe(
+      "Keep this instruction.\n\nUpdate @Launch email ",
+    );
+    expect(slot.inspection.composer.focusCount).toBeGreaterThan(0);
+  });
+
+  it.each(["reject", "redo"] as const)(
+    "keeps Ask and progress available through %s and restores proposal controls",
+    async (action) => {
+      const pending = {
+        vaultId: "personal",
+        path: `${action}-inline.md`,
+        version: action === "reject" ? 1 : 3,
+        baseContent: "Original paragraph.",
+        baseSha256: "original-sha",
+        content: "Revised paragraph.",
+        status: action === "reject" ? "pending" : "undone",
+        resolvedSha256: action === "reject" ? null : "original-sha",
+      };
+      let resolution = deferred<void>();
+      const resolveProposal = vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          await resolution.promise;
+          return {
+            ...pending,
+            version: pending.version + 1,
+            status: action === "reject" ? "rejected" : "pending",
+          };
+        })
+        .mockImplementationOnce(async () => {
+          await resolution.promise;
+          return {
+            ...pending,
+            version: pending.version + 2,
+            status: "pending",
+          };
+        });
+      const slot = renderDocument(pending.path, "Proposal", {
+        rpc: { readProposal: () => pending, resolveProposal },
+      });
+      const steps = action === "reject" ? ["Reject", "Undo"] : ["Redo"];
+      for (const [index, label] of steps.entries()) {
+        const button = await slot.findByRole("button", { name: label });
+        expect(button.textContent).toBe("");
+        expect(
+          slot.getByRole("button", { name: "Ask for changes" }),
+        ).toBeTruthy();
+        resolution = deferred<void>();
+        fireEvent.click(button);
+        expect((await slot.findByRole("status")).textContent).toBe(
+          "Updating document…",
+        );
+        expect(button.hasAttribute("disabled")).toBe(true);
+        expect(
+          slot.getByRole("textbox", { name: "Document content" }),
+        ).toBeTruthy();
+        await act(async () => resolution.resolve());
+        expect(slot.queryByRole("status")).toBeNull();
+        expect(resolveProposal).toHaveBeenLastCalledWith({
+          vaultId: "personal",
+          path: pending.path,
+          action: label.toLowerCase(),
+          expectedVersion: pending.version + index,
+        });
+        if (label === "Reject")
+          expect(slot.queryByRole("button", { name: "Accept" })).toBeNull();
+      }
+      expect(slot.getByRole("button", { name: "Accept" })).toBeTruthy();
+      expect(slot.getByRole("button", { name: "Reject" })).toBeTruthy();
+      expect(
+        slot.getByRole("button", { name: "Ask for changes" }),
+      ).toBeTruthy();
+    },
+  );
+
+  it("parses rich proposal baselines in an inert document and scopes refreshes", async () => {
+    const parse = vi.spyOn(ProseMirrorDOMParser.prototype, "parse");
+    const pending = {
+      vaultId: "personal",
+      path: "scoped-inline.md",
+      version: 1,
+      baseContent: "<p>Original <strong>formatted baseline</strong>.</p>",
+      baseSha256: "original-sha",
+      content: "Revised **formatted baseline**.",
+      status: "pending",
+      resolvedSha256: null,
+    };
+    const readNote = vi.fn(() => ({
+      content: pending.baseContent,
+      sha256: "original-sha",
+    }));
+    const slot = renderDocument(pending.path, "Scoped example", {
+      rpc: {
+        readNote,
+        readProposal: () => pending,
+      },
+    });
+    await slot.findByRole("textbox", { name: "Document content" });
+    const baselines = parse.mock.calls
+      .map(([root]) => root)
+      .filter((root) =>
+        root.textContent?.includes("Original formatted baseline"),
+      );
+    expect(baselines.length).toBeGreaterThan(0);
+    for (const root of baselines)
+      expect(root.ownerDocument?.defaultView).toBeNull();
+    expect(slot.container.querySelector("strong")?.textContent).toBe(
+      "formatted baseline",
+    );
+    parse.mockRestore();
+    readNote.mockClear();
+    await slot.emitRealtime("vault-changed", { vaultId: "other" });
+    await slot.emitRealtime("vault-changed", {
+      vaultId: "personal",
+      path: "other.md",
+    });
+    await slot.emitRealtime("proposal-changed", {
+      vaultId: "personal",
+      path: "other.md",
+      version: 2,
+    });
+    await slot.emitRealtime("vault-changed", {
+      vaultId: "personal",
+      path: pending.path,
+      proposalOnly: true,
+    });
+    expect(readNote).not.toHaveBeenCalled();
+    await slot.emitRealtime("proposal-changed", {
+      vaultId: "personal",
+      path: pending.path,
+      version: 2,
+    });
+    await waitFor(() => expect(readNote).toHaveBeenCalledTimes(1));
+    await slot.emitRealtime("vault-changed", {
+      vaultId: "personal",
+      path: pending.path,
+    });
+    await waitFor(() => expect(readNote).toHaveBeenCalledTimes(2));
+    await slot.emitRealtime("vault-changed", {});
+    await waitFor(() => expect(readNote).toHaveBeenCalledTimes(3));
+  });
+
+  it("opens a chosen document from the unconfigured Document panel", async () => {
+    const openThreadPanel = vi.fn(() => true);
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thr_1", params: null },
+      {
+        openThreadPanel,
+        rpc: {
+          listNotes: () =>
+            listNotesResult([
+              {
+                path: "Launch 50%.md",
+                title: "Launch 50%",
+                preview: "A draft",
+                modifiedAtMs: 1,
+              },
+            ]),
+        },
+      },
+    );
+    fireEvent.click(await slot.findByRole("button", { name: "Launch 50%" }));
+    expect(openThreadPanel).toHaveBeenCalledWith({
+      actionId: "document",
+      title: "Launch 50%",
+      params: {
+        vaultId: "personal",
+        path: "Launch 50%.md",
+        title: "Launch 50%",
+      },
+    });
+    expect(
+      slot.navigateCalls.some((call) => call.method === "toPluginPanel"),
+    ).toBe(false);
   });
 
   it("renders a linked Markdown document in the Docs thread panel", async () => {
@@ -1039,7 +1619,7 @@ describe("Docs nav panel", () => {
         threadId: "thr_1",
         params: {
           vaultId: "personal",
-          path: "plans/release.md",
+          path: "plans/panel-release.md",
           title: "Release plan",
         },
       },
@@ -1049,6 +1629,7 @@ describe("Docs nav panel", () => {
             content: "# Release plan\n\nShip it.",
             sha256: "sha",
           }),
+          readProposal: () => null,
           preparePreview: () => preview,
         },
       },
@@ -1056,80 +1637,168 @@ describe("Docs nav panel", () => {
 
     await slot.findByText("Ship it.");
     expect(slot.getAllByText("Release plan")).toHaveLength(2);
-    expect(slot.queryByText("plans/release.md")).toBeNull();
+    expect(slot.getByRole("button", { name: "Ask for changes" })).toBeTruthy();
+    expect(slot.queryByText("plans/panel-release.md")).toBeNull();
     expect(slot.getByRole("textbox").getAttribute("contenteditable")).toBe(
       "true",
     );
     expect(slot.queryByRole("button", { name: "Add to chat" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Mention in chat" })).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: "Open in Docs" }));
-    expect(slot.navigateCalls).toContainEqual({
-      method: "toPluginPanel",
-      path: "docs",
-      options: { subPath: "personal/plans/release.md" },
-    });
+    expect(slot.queryByRole("button", { name: "Open in Docs" })).toBeNull();
   });
 
-  it("opens arbitrary Markdown files without exposing composer actions", async () => {
+  it("preserves the file opener host through autosave, conflict overwrite, and reload", async () => {
+    let conflict = true;
     const slot = renderSlot(
       app.fileOpeners[0]!,
       {
-        path: "notes/plan.mdx",
+        path: "/Users/shared/notes/plan.mdx",
         source: {
-          kind: "workspace",
+          kind: "host",
           threadId: "thr_1",
-          environmentId: "env_1",
+          environmentId: null,
           projectId: "project_1",
+          experimental_hostId: "host_remote",
         },
+        Original: () => null,
       },
       {
         rpc: {
           openFile: () => ({
-            file: { content: "# Workspace plan", sha256: "sha" },
+            file: { content: "# Remote plan", sha256: "sha" },
             preview,
             previewPath: "notes/plan.mdx",
           }),
+          saveOpenedFile: () =>
+            conflict
+              ? { outcome: "conflict", currentSha256: "remote-sha" }
+              : { outcome: "written", sha256: "updated-sha" },
         },
       },
     );
 
-    await slot.findByText("Workspace plan");
+    const body = await slot.findByText("Remote plan");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "openFile",
+      input: {
+        source: {
+          kind: "host",
+          threadId: "thr_1",
+          environmentId: null,
+          projectId: "project_1",
+          experimental_hostId: "host_remote",
+        },
+        path: "/Users/shared/notes/plan.mdx",
+      },
+    });
+
+    body.textContent = "Updated remote plan";
+    fireEvent.input(body);
+    await waitFor(
+      () => {
+        expect(slot.rpcCalls).toContainEqual({
+          method: "saveOpenedFile",
+          input: {
+            source: {
+              kind: "host",
+              threadId: "thr_1",
+              environmentId: null,
+              projectId: "project_1",
+              experimental_hostId: "host_remote",
+            },
+            path: "/Users/shared/notes/plan.mdx",
+            content: "# Updated remote plan",
+            expectedSha256: "sha",
+          },
+        });
+      },
+      { timeout: 2_000 },
+    );
+    await slot.findByText("Changed on disk.");
+    conflict = false;
+    fireEvent.click(slot.getByRole("button", { name: "Overwrite" }));
+    await waitFor(() =>
+      expect(slot.queryByText("Changed on disk.")).toBeNull(),
+    );
+    const writes = slot.rpcCalls.filter(
+      (call) => call.method === "saveOpenedFile",
+    );
+    expect(writes).toHaveLength(2);
+    expect(writes[1]?.input).toEqual({
+      source: {
+        kind: "host",
+        threadId: "thr_1",
+        environmentId: null,
+        projectId: "project_1",
+        experimental_hostId: "host_remote",
+      },
+      path: "/Users/shared/notes/plan.mdx",
+      content: "# Updated remote plan",
+    });
+    conflict = true;
+    const updated = slot.getByText("Updated remote plan");
+    updated.textContent = "Discard this edit";
+    fireEvent.input(updated);
+    await slot.findByText("Changed on disk.");
+    fireEvent.click(slot.getByRole("button", { name: "Reload" }));
+    await slot.findByText("Remote plan");
+    expect(slot.queryByText("Discard this edit")).toBeNull();
     expect(slot.queryByRole("button", { name: "Add to chat" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Mention in chat" })).toBeNull();
   });
 
-  it("opens a full HTML page through the same preview lease", async () => {
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "personal/dashboards/metrics.html" },
-      {
+  it.each(["workspace", "panel"])(
+    "opens sandboxed HTML in the %s",
+    async (surface) => {
+      const path = "dashboards/metrics.html";
+      const options = {
         rpc: {
           listNotes: () =>
             listNotesResult(
               [],
               [
                 { kind: "directory", path: "dashboards" },
-                { kind: "file", path: "dashboards/metrics.html" },
+                { kind: "file", path },
               ],
             ),
           preparePreview: () => preview,
         },
-      },
-    );
-
-    await waitFor(() => {
-      const iframe = slot.container.querySelector("iframe");
-      expect(iframe?.getAttribute("src")).toBe(
-        "/api/v1/file-previews/lease/dashboards/metrics.html",
-      );
-      expect(iframe?.getAttribute("sandbox")).toBe("allow-scripts");
-    });
-    expect(slot.queryByRole("button", { name: "View source" })).toBeNull();
-  });
+      } satisfies RenderSlotOptions;
+      const slot =
+        surface === "panel"
+          ? renderSlot(
+              app.threadPanelActions[0]!,
+              {
+                threadId: "thr_1",
+                params: { vaultId: "personal", path, title: "Metrics" },
+              },
+              options,
+            )
+          : renderSlot(
+              docsRegistration,
+              { subPath: `personal/${path}` },
+              options,
+            );
+      await waitFor(() => {
+        const iframe = slot.container.querySelector("iframe");
+        expect(iframe?.getAttribute("src")).toBe(
+          `/api/v1/file-previews/lease/${path}`,
+        );
+        expect(iframe?.getAttribute("sandbox")).toBe("allow-scripts");
+        expect(iframe?.title).toBe(surface === "panel" ? "Metrics" : path);
+        expect(
+          iframe?.classList.contains(
+            surface === "panel" ? "min-h-[32rem]" : "min-h-0",
+          ),
+        ).toBe(true);
+      });
+      expect(slot.queryByRole("button", { name: "View source" })).toBeNull();
+    },
+  );
 
   it("filters the vault tree by note title", async () => {
     const slot = renderSlot(
-      app.navPanels[0]!,
+      navigationRegistration,
       { subPath: "personal" },
       {
         rpc: {
@@ -1153,10 +1822,9 @@ describe("Docs nav panel", () => {
     );
 
     await slot.findByText("Roadmap");
-    expect(slot.queryByText("Primary host")).toBeNull();
+    expect(slot.queryByText("Server machine")).toBeNull();
     const vault = slot.getByRole("combobox", { name: "Vault" });
-    expect(vault.closest("aside")).toBeTruthy();
-    expect(vault.className).toContain("border-transparent");
+    expect(vault.closest("aside")).toBeNull();
     expect(slot.queryByPlaceholderText("Search this vault")).toBeNull();
     fireEvent.click(slot.getByLabelText("Search notes"));
     fireEvent.change(slot.getByPlaceholderText("Search this vault"), {

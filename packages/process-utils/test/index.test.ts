@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
@@ -113,9 +113,7 @@ describe("process utils", () => {
       mkdtempSync(join(tmpdir(), "bb-process-utils-report-")),
       "logs",
     );
-    const connectionError = new Error(
-      "connect ECONNREFUSED 127.0.0.1:38886",
-    );
+    const connectionError = new Error("connect ECONNREFUSED 127.0.0.1:38886");
     Object.defineProperty(connectionError, "code", {
       value: "ECONNREFUSED",
     });
@@ -257,25 +255,28 @@ describe("process utils", () => {
   });
 
   it("resolves paths that stay within the configured root", () => {
+    const rootPath = join(tmpdir(), "root");
+    const candidatePath = join(rootPath, "child", "file.txt");
     expect(
       resolveContainedPath({
-        rootPath: "/tmp/root",
-        candidatePath: "/tmp/root/child/file.txt",
+        rootPath,
+        candidatePath,
       }),
-    ).toBe("/tmp/root/child/file.txt");
+    ).toBe(resolve(candidatePath));
   });
 
   it("rejects root and escaped paths", () => {
+    const rootPath = join(tmpdir(), "root");
     expect(
       resolveContainedPath({
-        rootPath: "/tmp/root",
-        candidatePath: "/tmp/root",
+        rootPath,
+        candidatePath: rootPath,
       }),
     ).toBeNull();
     expect(
       resolveContainedPath({
-        rootPath: "/tmp/root",
-        candidatePath: "/tmp/root/../escape",
+        rootPath,
+        candidatePath: join(rootPath, "..", "escape"),
       }),
     ).toBeNull();
   });
@@ -298,6 +299,28 @@ describe("process utils", () => {
       PATH: "/bin",
     });
     expect("SKIP_ME" in sanitizedEnv).toBe(false);
+  });
+
+  it("keeps provider credentials a nested bb server needs and drops the pool marker", () => {
+    const env: NodeJS.ProcessEnv = {
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:38886/pool/http",
+      ANTHROPIC_AUTH_TOKEN: "parent-hub-token",
+      CODEX_OPENAI_BASE_URL: "http://127.0.0.1:38886/pool/http/v1",
+      CODEX_POOL_AUTH_TOKEN: "parent-hub-token",
+      ENABLE_TOOL_SEARCH: "true",
+      BB_ACCOUNT_POOL_PARENT_URL: "http://127.0.0.1:38886/pool/http",
+      BB_ACCOUNT_POOL_PARENT_TOKEN: "parent-hub-token",
+      PATH: "/bin",
+    };
+
+    expect(sanitizeInheritedChildProcessEnv({ env })).toEqual({
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:38886/pool/http",
+      ANTHROPIC_AUTH_TOKEN: "parent-hub-token",
+      CODEX_OPENAI_BASE_URL: "http://127.0.0.1:38886/pool/http/v1",
+      CODEX_POOL_AUTH_TOKEN: "parent-hub-token",
+      ENABLE_TOOL_SEARCH: "true",
+      PATH: "/bin",
+    });
   });
 
   it("does not mutate the inherited env", () => {

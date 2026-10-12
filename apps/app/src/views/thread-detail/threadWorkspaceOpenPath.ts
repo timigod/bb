@@ -4,7 +4,7 @@ import type { WorkspaceChangedFilesSection } from "@/components/workspace/worksp
 import type {
   EnvironmentFilePreviewSource,
   WorkspaceFilePreviewStatusLabel,
-} from "@/lib/file-preview";
+} from "@bb/client-core";
 import { buildAbsoluteFilePath } from "@/lib/absolute-file-path";
 
 interface ResolveThreadWorkspaceOpenPathArgs {
@@ -19,7 +19,7 @@ interface ResolveEnvironmentOpenContextArgs {
   threadEnvironmentIsLocal: boolean;
 }
 
-export interface BuildOpenInEditorHandlerArgs {
+interface BuildOpenInEditorHandlerArgs {
   rootPath: string | null;
   canOpenPreferredTarget: boolean;
   openInPreferredTarget: (request: {
@@ -28,12 +28,6 @@ export interface BuildOpenInEditorHandlerArgs {
   }) => Promise<boolean>;
 }
 
-/**
- * Build the file-preview header's "open in editor" callback, gated on the
- * thread's environment being local and an editor being configured. Returns
- * `undefined` when either gate isn't satisfied so the icon hides instead of
- * surfacing a no-op button.
- */
 export function buildOpenInEditorHandler(
   args: BuildOpenInEditorHandlerArgs,
 ): ((relativePath: string) => void) | undefined {
@@ -49,11 +43,7 @@ export function buildOpenInEditorHandler(
   };
 }
 
-export interface ResolveThreadWorkspacePreviewRootPathArgs {
-  environment: Environment | null | undefined;
-}
-
-export type WorkspaceChangedFileOpenTarget =
+type WorkspaceChangedFileOpenTarget =
   | { kind: "diff" }
   | {
       kind: "preview";
@@ -61,7 +51,7 @@ export type WorkspaceChangedFileOpenTarget =
       statusLabel: WorkspaceFilePreviewStatusLabel | null;
     };
 
-export interface ResolveWorkspaceChangedFileOpenTargetArgs {
+interface ResolveWorkspaceChangedFileOpenTargetArgs {
   file: WorkspaceFileStatus;
   section: WorkspaceChangedFilesSection;
 }
@@ -95,17 +85,6 @@ export function resolveWorkspaceChangedFileOpenTarget(
   }
 
   return { kind: "diff" };
-}
-
-/**
- * Workspace previews are served by the thread host through the server, so path
- * containment should use the environment's host path even when the browser
- * cannot use that path for local editor integration.
- */
-export function resolveThreadWorkspacePreviewRootPath(
-  args: ResolveThreadWorkspacePreviewRootPathArgs,
-): string | null {
-  return args.environment?.path ?? null;
 }
 
 export function resolveEnvironmentOpenContext(

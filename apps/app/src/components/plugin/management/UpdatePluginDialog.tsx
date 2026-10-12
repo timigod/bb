@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { UPDATE_ACTION_ICON } from "@bb/domain/update-state";
 import { Button } from "@bb/shared-ui/button";
 import {
   Dialog,
@@ -10,13 +10,11 @@ import {
   DialogTitle,
 } from "@bb/shared-ui/dialog";
 import { Icon } from "@bb/shared-ui/icon";
-import { appToast } from "@/components/ui/app-toast.js";
+import { usePluginNotificationAction } from "@/components/plugin/PluginNotificationDescription";
+import { appToast } from "@/components/ui/app-toast";
 import { pluginAdminErrorMessage } from "@/lib/plugin-admin-error";
-import { invalidatePluginList } from "@/hooks/cache-owners/plugin-cache-owner";
-import {
-  applyPluginUpdate,
-  type PluginUpdateResult,
-} from "@/hooks/queries/plugin-catalog-queries";
+import { applyPluginUpdateJob } from "@/hooks/cache-owners/plugin-cache-owner";
+import { startPluginUpdate } from "@/hooks/queries/plugin-update-job-queries";
 import type { PluginListItem } from "@/hooks/queries/plugin-settings-queries";
 import {
   DetailsDisclosure,
@@ -27,19 +25,12 @@ import {
   SUCCESS_TEXT_STYLE,
 } from "./plugin-ui";
 
-export interface UpdatePluginDialogProps {
+interface UpdatePluginDialogProps {
   plugin: PluginListItem;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
-/**
- * Layer 3 update confirmation (sketch v2, dialogs C): verdict first, checks
- * collapsed, rollback promise always visible. The incompatible variant
- * arrives with details pre-expanded and Update disabled — the details are
- * the story. Persisted and in-session rolled-back outcomes render in place
- * with their recovery action instead of being reduced to tooltip history.
- */
 export function UpdatePluginDialog({
   plugin,
   open,
@@ -67,52 +58,26 @@ function UpdatePluginDialogContent({
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
+  const notificationAction = usePluginNotificationAction();
   const name = plugin.name ?? plugin.id;
   const state = plugin.updateState;
-  const [rolledBack, setRolledBack] = useState<PluginUpdateResult | null>(null);
-
   const update = useMutation({
-    mutationFn: () => applyPluginUpdate(fetch, plugin.id),
-    onSuccess: (result) => {
-      invalidatePluginList({ queryClient });
-      if (result.outcome === "rolled-back") {
-        setRolledBack(result);
-        return;
-      }
-      if (result.applied) {
-        appToast.success(`${name} updated`, {
-          description:
-            result.to !== null
-              ? `Now running ${displayPluginVersion(result.to.display)}.`
-              : undefined,
-        });
-      } else {
-        appToast.message(`${name} is already up to date`);
-      }
+    meta: { showErrorToast: false },
+    mutationFn: () => startPluginUpdate(plugin.id),
+    onSuccess: (job) => {
+      applyPluginUpdateJob({ queryClient, job });
       onOpenChange(false);
     },
     onError: (error) => {
-      appToast.error(`Updating ${name} failed`, {
-        description: pluginAdminErrorMessage(error),
+      appToast.error("Plugin update failed", {
+        description: `${plugin.name ?? plugin.id} — ${pluginAdminErrorMessage(error)}`,
+        action: notificationAction(plugin.id, "installed"),
       });
     },
   });
 
   const fromLine = `Currently ${displayPluginVersion(plugin.version)}`;
-  const persistedFailure = state.lastFailure;
-  const failure =
-    rolledBack !== null
-      ? {
-          version:
-            rolledBack.to?.display ??
-            state.availableVersion ??
-            "The new version",
-          at: null,
-          detail: rolledBack.detail ?? "",
-        }
-      : persistedFailure === null
-        ? null
-        : persistedFailure;
+  const failure = state.lastFailure;
 
   if (failure !== null) {
     const retryVersion = state.availableVersion;
@@ -154,12 +119,6 @@ function UpdatePluginDialogContent({
               ? `The restored version can keep running. Try again when a compatible update becomes available.`
               : `A compatible update to ${displayPluginVersion(retryVersion)} is still available. Retry when you’re ready.`}
           </p>
-          {rolledBack === null ? null : (
-            <p className="text-xs text-subtle-foreground">
-              The plugin is marked &ldquo;Update failed&rdquo; in the installed
-              list until an update succeeds.
-            </p>
-          )}
         </div>
         <DialogFooter>
           <Button
@@ -194,7 +153,6 @@ function UpdatePluginDialogContent({
       <>
         <DialogHeader>
           <DialogTitle>
-            {/* Hashes shorten here; the details grid keeps the full value. */}
             Update {name} to {displayPluginVersion(candidate)}?
           </DialogTitle>
           <DialogDescription>{fromLine}</DialogDescription>
@@ -237,7 +195,9 @@ function UpdatePluginDialogContent({
           >
             {update.isPending ? (
               <Icon name="Spinner" className="animate-spin" />
-            ) : null}
+            ) : (
+              <Icon name={UPDATE_ACTION_ICON} aria-hidden />
+            )}
             Update
           </Button>
         </DialogFooter>
@@ -267,7 +227,6 @@ function UpdatePluginDialogContent({
               bb
             </span>
           </div>
-          {/* Failure case: the details ARE the story, so they arrive open. */}
           <DetailsDisclosure summary="Details" defaultExpanded>
             <div className="space-y-1.5">
               {state.blockedReasons.length > 0 ? (
@@ -303,6 +262,7 @@ function UpdatePluginDialogContent({
             Close
           </Button>
           <Button type="button" disabled>
+            <Icon name={UPDATE_ACTION_ICON} aria-hidden />
             Update
           </Button>
         </DialogFooter>

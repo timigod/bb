@@ -1,4 +1,6 @@
-import type { Environment, Thread } from "@bb/domain";
+import { assertEnvironmentPathAvailable } from "../environments/path-admission.js";
+import type { EnvironmentRow } from "@bb/db";
+import type { Thread } from "@bb/domain";
 import type { DbConnection } from "@bb/db";
 import type { WorkSessionDeps } from "../../types.js";
 import { requireEnvironment } from "../lib/entity-lookup.js";
@@ -11,7 +13,7 @@ import {
 type ThreadCommandEnvironmentSource = Pick<Thread, "environmentId">;
 
 interface RequireThreadCommandEnvironmentArgs {
-  thread: ThreadCommandEnvironmentSource;
+  thread: ThreadCommandEnvironmentSource & Pick<Thread, "id">;
 }
 
 interface RequireThreadHostCommandEnvironmentArgs {
@@ -24,15 +26,25 @@ interface ThreadHostCommandEnvironment {
   id: string;
 }
 
+export function resolveThreadHostCommandEnvironment(
+  args: RequireThreadHostCommandEnvironmentArgs,
+): ThreadHostCommandEnvironment | null {
+  if (args.thread.environmentId === null) {
+    return null;
+  }
+  const environment = requireEnvironment(args.db, args.thread.environmentId);
+  return {
+    id: environment.id,
+    hostId: environment.hostId,
+  };
+}
+
 export function requireThreadHostCommandEnvironment(
   args: RequireThreadHostCommandEnvironmentArgs,
 ): ThreadHostCommandEnvironment {
-  if (args.thread.environmentId !== null) {
-    const environment = requireEnvironment(args.db, args.thread.environmentId);
-    return {
-      id: environment.id,
-      hostId: environment.hostId,
-    };
+  const environment = resolveThreadHostCommandEnvironment(args);
+  if (environment !== null) {
+    return environment;
   }
 
   throwThreadEnvironmentUnavailable(
@@ -43,17 +55,17 @@ export function requireThreadHostCommandEnvironment(
 export async function requireThreadCommandEnvironment(
   deps: WorkSessionDeps,
   args: RequireThreadCommandEnvironmentArgs,
-): Promise<Environment> {
+): Promise<EnvironmentRow> {
   if (args.thread.environmentId !== null) {
     const environment = requireEnvironment(deps.db, args.thread.environmentId);
-    // Decision B*: a gone environment (being torn down or already destroyed) is
-    // never reprovisioned, so reject the work request up front with the
-    // "environment is gone" surface the frontend banner keys off — before any
-    // execution-options resolution or turn dispatch.
     const goneDetails = goneThreadEnvironmentDetails(environment);
-    if (goneDetails) {
+    if (goneDetails && environment.environmentProviderId === null) {
       throwThreadEnvironmentUnavailable(goneDetails);
     }
+    assertEnvironmentPathAvailable(deps, {
+      ...environment,
+      threadId: args.thread.id,
+    });
     return environment;
   }
 

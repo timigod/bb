@@ -1,9 +1,12 @@
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Attachment, TasksStore } from "../db";
-
-export const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024;
+import {
+  attachmentDownloadUrl,
+  MAX_ATTACHMENT_SIZE_BYTES,
+} from "../shared/attachments";
+import { errorMessage } from "../shared/errors";
 
 const INLINE_RASTER_MIMES = new Set([
   "image/png",
@@ -33,7 +36,7 @@ export type AttachmentOwner =
   | { taskId: string; commentId?: never }
   | { taskId?: never; commentId: string };
 
-export type SaveAttachmentFromBytesOptions = AttachmentOwner & {
+type SaveAttachmentFromBytesOptions = AttachmentOwner & {
   fileName: string;
   mime?: string;
 };
@@ -65,7 +68,7 @@ export class AttachmentReferencedError extends Error {
   }
 }
 
-export class AttachmentCleanupError extends Error {
+class AttachmentCleanupError extends Error {
   constructor(
     readonly attachment: Attachment,
     readonly cleanupCause: unknown,
@@ -79,11 +82,11 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function removeAttachmentDescriptionReferences(
+function removeAttachmentDescriptionReferences(
   markdown: string,
   attachmentId: string,
 ): string {
-  const url = escapeRegExp(buildAttachmentUrl(attachmentId));
+  const url = escapeRegExp(attachmentDownloadUrl(attachmentId));
   return markdown.replace(new RegExp(`!\\[[^\\]]*\\]\\(${url}\\)`, "g"), "");
 }
 
@@ -137,10 +140,7 @@ export async function removeAttachmentBlobs(
   const failures = removals.flatMap((result, index) => {
     if (result.status === "fulfilled") return [];
     const attachment = attachments[index];
-    const message =
-      result.reason instanceof Error
-        ? result.reason.message
-        : String(result.reason);
+    const message = errorMessage(result.reason);
     bb.log.warn(
       `failed to remove attachment blob ${attachment?.id ?? "unknown"}: ${message}`,
     );
@@ -151,6 +151,30 @@ export async function removeAttachmentBlobs(
   }
 }
 
+function buildContentDisposition(
+  disposition: "inline" | "attachment",
+  fileName: string,
+): string {
+  const visibleName = fileName.replace(BIDI_CONTROL_PATTERN, "_");
+  const asciiFallback = visibleName
+    .replace(/[^\x20-\x7e]/g, "-")
+    .replace(/["\\]/g, "_");
+  return `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encodeExtValue(visibleName)}`;
+}
+
+function encodeExtValue(value: string): string {
+  let encoded = "";
+  for (const byte of Buffer.from(value, "utf8")) {
+    const char = String.fromCharCode(byte);
+    encoded += /[A-Za-z0-9!#$&+\-.^_`|~]/.test(char)
+      ? char
+      : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return encoded;
+}
+
+const BIDI_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
 function sanitizeFileName(fileName: string): string {
   const baseName = fileName
     .normalize("NFC")
@@ -160,6 +184,7 @@ function sanitizeFileName(fileName: string): string {
     ?.trim();
   let sanitized = (baseName ?? "")
     .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "_")
+    .replace(BIDI_CONTROL_PATTERN, "_")
     .replace(/^\.+/, "")
     .trim();
   while (Buffer.byteLength(sanitized, "utf8") > 180) {
@@ -179,7 +204,7 @@ function normalizeMime(mime: string): string {
   return normalized;
 }
 
-export function isInlineRasterMime(mime: string): boolean {
+function isInlineRasterMime(mime: string): boolean {
   return INLINE_RASTER_MIMES.has(
     mime.split(";", 1)[0]?.trim().toLowerCase() ?? "",
   );
@@ -351,10 +376,6 @@ async function persistAttachment(
   }
 }
 
-export function buildAttachmentUrl(attachmentId: string): string {
-  return `/api/v1/plugins/tasks/http${DOWNLOAD_PATH}?attachmentId=${encodeURIComponent(attachmentId)}`;
-}
-
 export async function saveAttachmentFromBytes(
   store: TasksStore,
   bytes: Uint8Array,
@@ -393,14 +414,6 @@ function errorResponse(context: PluginHttpContext, error: unknown): Response {
   throw error;
 }
 
-/**
- * Removes an attachment end to end using one shared policy for HTTP, RPC, and
- * CLI callers. Saved-description references are rejected unless the caller
- * explicitly opts into removing them, blob cleanup must succeed before the
- * row is removed, and realtime is published only after every mutation
- * succeeds. A cleanup failure therefore leaves the row and blob reachable for
- * a later retry instead of reporting a false success.
- */
 export async function deleteAttachmentById(
   bb: BbPluginApi,
   store: TasksStore,
@@ -420,7 +433,7 @@ export async function deleteAttachmentById(
       : undefined);
   const ownerTask = taskId ? store.getTask(taskId) : undefined;
   let nextDescription: string | undefined;
-  if (ownerTask?.description.includes(buildAttachmentUrl(attachment.id))) {
+  if (ownerTask?.description.includes(attachmentDownloadUrl(attachment.id))) {
     if (!options.removeDescriptionReferences) {
       throw new AttachmentReferencedError(attachment);
     }
@@ -469,11 +482,6 @@ export function publishAttachmentChanged(
   });
 }
 
-/**
- * Registers exact-match attachment routes. Upload accepts a raw request body
- * and therefore uses token auth; metadata may be supplied through query
- * parameters or x-task-id/x-comment-id/x-file-name/x-mime-type headers.
- */
 export function registerAttachments(
   bb: BbPluginApi,
   store: TasksStore,
@@ -503,7 +511,7 @@ export function registerAttachments(
         return context.json(
           {
             attachmentId: attachment.id,
-            url: buildAttachmentUrl(attachment.id),
+            url: attachmentDownloadUrl(attachment.id),
           },
           201,
         );
@@ -531,15 +539,14 @@ export function registerAttachments(
     const disposition = isInlineRasterMime(attachment.mime)
       ? "inline"
       : "attachment";
-    const encodedName = encodeURIComponent(attachment.fileName).replaceAll(
-      "'",
-      "%27",
-    );
     return new Response(new Uint8Array(await readFile(absolutePath)), {
       headers: {
         "Content-Type": attachment.mime,
         "Content-Length": String(attachment.sizeBytes),
-        "Content-Disposition": `${disposition}; filename="${attachment.fileName}"; filename*=UTF-8''${encodedName}`,
+        "Content-Disposition": buildContentDisposition(
+          disposition,
+          attachment.fileName,
+        ),
         "X-Content-Type-Options": "nosniff",
       },
     });
@@ -549,16 +556,11 @@ export function registerAttachments(
     const attachmentId = context.req.query("attachmentId")?.trim();
     try {
       const attachment = attachmentId
-        ? await deleteAttachmentById(
-            bb,
-            store,
-            attachmentId,
-            {
-              removeBlobs: options.removeBlobs,
-              removeDescriptionReferences:
-                context.req.query("removeDescriptionReferences") === "true",
-            },
-          )
+        ? await deleteAttachmentById(bb, store, attachmentId, {
+            removeBlobs: options.removeBlobs,
+            removeDescriptionReferences:
+              context.req.query("removeDescriptionReferences") === "true",
+          })
         : null;
       if (!attachment)
         return context.json({ error: "attachment not found" }, 404);

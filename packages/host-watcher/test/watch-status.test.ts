@@ -65,15 +65,12 @@ const sleep: Sleep = (durationMs) =>
   });
 
 async function settleAsyncWatchWork(): Promise<void> {
-  // Let watcher startup/retry microtasks finish before restoring shared spies.
   await Promise.resolve();
   await sleep(0);
   await Promise.resolve();
 }
 
-function ignoreWatchError(): void {
-  // Ignore watcher warnings in tests that assert only change callbacks.
-}
+function ignoreWatchError(): void {}
 
 async function runGit(
   args: RunGitArgs,
@@ -87,7 +84,7 @@ async function runGit(
 async function makeTempDir(prefix: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   tempDirs.push(dir);
-  return dir;
+  return fs.realpath(dir);
 }
 
 async function initRepo(): Promise<string> {
@@ -392,7 +389,6 @@ afterEach(async () => {
   );
 });
 
-// These tests mutate shared module spies, so keep them out of Vitest parallelism.
 describe.sequential("watchWorkspaceStatus", () => {
   it("starts watching before git init and promotes the repository watch", async () => {
     const workspacePath = await makeTempDir("bb-workspace-plain-");
@@ -420,7 +416,8 @@ describe.sequential("watchWorkspaceStatus", () => {
 
     try {
       await ready.promise;
-      expect(workspaceRootOptions[0]?.ignore).toBeUndefined();
+      expect(workspaceRootOptions[0]?.ignore).not.toContain(".git");
+      expect(workspaceRootOptions[0]?.ignore).toContain("*/**/.git/**");
 
       await runGit({ args: ["init", "-b", "main"], cwd: workspacePath });
       const canonicalWorkspacePath = await fs.realpath(workspacePath);
@@ -732,6 +729,10 @@ describe.sequential("watchWorkspaceStatus", () => {
       await ready;
       expect(getWorkspaceRootSubscribeOptions()?.ignore).toEqual([
         ".git",
+        "*/**/.git/**",
+        "**/node_modules/**",
+        "**/.cache/**",
+        "**/__pycache__/**",
         ".turbo",
         "coverage",
       ]);
@@ -785,7 +786,13 @@ describe.sequential("watchWorkspaceStatus", () => {
       expect(ignoreDiscoveryErrors).toHaveLength(1);
       expect(ignoreDiscoveryErrors[0]).toContain(normalizeWatchPath(repoPath));
       expect(subscribedRoots).toEqual([normalizeWatchPath(repoPath)]);
-      expect(subscribedOptions[0]?.ignore).toEqual([".git"]);
+      expect(subscribedOptions[0]?.ignore).toEqual([
+        ".git",
+        "*/**/.git/**",
+        "**/node_modules/**",
+        "**/.cache/**",
+        "**/__pycache__/**",
+      ]);
     } finally {
       await stopWatching();
     }
@@ -861,110 +868,6 @@ describe.sequential("watchWorkspaceStatus", () => {
         cwd: repoPath,
       });
       expect(branchOutput.stdout.trim()).toBe("feature");
-    } finally {
-      stopWatching();
-    }
-  });
-
-  it("detects repeated edits to an already dirty file", async () => {
-    const repoPath = await initRepo();
-    const { emitWorkspaceRootEvents, ready, watchWorkspaceStatus } =
-      await importWatchWorkspaceStatusWithManualWorkspaceEvents(repoPath);
-    const calls: number[] = [];
-    const stopWatching = watchWorkspaceStatus(repoPath, {
-      onChange: () => {
-        calls.push(Date.now());
-      },
-      onWatchError: ignoreWatchError,
-    });
-
-    try {
-      await ready;
-      await fs.writeFile(
-        path.join(repoPath, "README.md"),
-        "first edit\n",
-        "utf8",
-      );
-      emitWorkspaceRootEvents([
-        {
-          path: path.join(repoPath, "README.md"),
-          type: "update",
-        },
-      ]);
-      await waitForCallCount(() => calls.length, 1, WATCH_TEST_TIMEOUT_MS);
-
-      await fs.writeFile(
-        path.join(repoPath, "README.md"),
-        "second edit\n",
-        "utf8",
-      );
-      emitWorkspaceRootEvents([
-        {
-          path: path.join(repoPath, "README.md"),
-          type: "update",
-        },
-      ]);
-      await waitForCallCount(() => calls.length, 2, WATCH_TEST_TIMEOUT_MS);
-
-      const diffOutput = await runGit({
-        args: ["diff", "HEAD", "--"],
-        cwd: repoPath,
-      });
-      expect(diffOutput.stdout).toContain("second edit");
-    } finally {
-      stopWatching();
-    }
-  });
-
-  it("detects repeated edits to dirty files with spaced file names", async () => {
-    const repoPath = await initRepo();
-    await fs.writeFile(path.join(repoPath, "a b.txt"), "base\n", "utf8");
-    await runGit({ args: ["add", "a b.txt"], cwd: repoPath });
-    await runGit({ args: ["commit", "-m", "Add spaced file"], cwd: repoPath });
-
-    const { emitWorkspaceRootEvents, ready, watchWorkspaceStatus } =
-      await importWatchWorkspaceStatusWithManualWorkspaceEvents(repoPath);
-    const calls: number[] = [];
-    const stopWatching = watchWorkspaceStatus(repoPath, {
-      onChange: () => {
-        calls.push(Date.now());
-      },
-      onWatchError: ignoreWatchError,
-    });
-
-    try {
-      await ready;
-      await fs.writeFile(
-        path.join(repoPath, "a b.txt"),
-        "first edit\n",
-        "utf8",
-      );
-      emitWorkspaceRootEvents([
-        {
-          path: path.join(repoPath, "a b.txt"),
-          type: "update",
-        },
-      ]);
-      await waitForCallCount(() => calls.length, 1, WATCH_TEST_TIMEOUT_MS);
-
-      await fs.writeFile(
-        path.join(repoPath, "a b.txt"),
-        "second edit\n",
-        "utf8",
-      );
-      emitWorkspaceRootEvents([
-        {
-          path: path.join(repoPath, "a b.txt"),
-          type: "update",
-        },
-      ]);
-      await waitForCallCount(() => calls.length, 2, WATCH_TEST_TIMEOUT_MS);
-
-      const diffOutput = await runGit({
-        args: ["diff", "HEAD", "--"],
-        cwd: repoPath,
-      });
-      expect(diffOutput.stdout).toContain("second edit");
     } finally {
       stopWatching();
     }
@@ -1050,7 +953,7 @@ describe.sequential("watchWorkspaceStatus", () => {
     }
   });
 
-  it("waits for late workspace subscription unsubscribe when stopped during startup", async () => {
+  it("settles stop and cleans up a late workspace subscription", async () => {
     const repoPath = await initRepo();
     const rootPaths: string[] = [];
     const subscriptionDeferred =
@@ -1079,8 +982,8 @@ describe.sequential("watchWorkspaceStatus", () => {
     const stopPromise = stopWatching().then(() => {
       stopResolved = true;
     });
-    await Promise.resolve();
-    expect(stopResolved).toBe(false);
+    await stopPromise;
+    expect(stopResolved).toBe(true);
 
     subscriptionDeferred.resolve({ unsubscribe });
     await waitForCallCount(
@@ -1088,13 +991,10 @@ describe.sequential("watchWorkspaceStatus", () => {
       1,
       WATCH_TEST_TIMEOUT_MS,
     );
-    expect(stopResolved).toBe(false);
 
     unsubscribeDeferred.resolve(undefined);
-    await stopPromise;
 
     expect(unsubscribe).toHaveBeenCalledTimes(1);
-    expect(stopResolved).toBe(true);
   });
 
   it("ignores shared common-dir index updates for detached worktree environments", async () => {

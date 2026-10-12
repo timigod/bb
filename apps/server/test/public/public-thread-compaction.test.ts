@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  getLatestThreadSequence,
-  listQueuedThreadMessages,
-} from "@bb/db";
+import { getLatestThreadSequence, listQueuedThreadMessages } from "@bb/db";
 import {
   createStandaloneBuiltinCompactCommandInput,
   turnScope,
@@ -13,6 +10,7 @@ import { sendNextQueuedMessageIfPresent } from "../../src/services/threads/queue
 import {
   registerHostRpcResponder,
   type HostRpcHandlerResult,
+  EMPTY_WORKSPACE_AGENT_CONTEXT,
 } from "../helpers/host-rpc.js";
 import { readJson } from "../helpers/json.js";
 import {
@@ -59,17 +57,13 @@ function registerSuccessfulTurnResponder(
   return registerHostRpcResponder(harness, {
     ...args,
     handle: ({ command }): HostRpcHandlerResult => {
-      if (command.type === "host.list_files") {
-        return { ok: true, result: { files: [], truncated: false } };
+      if (command.type === "host.read_workspace_agent_context") {
+        return { ok: true, result: EMPTY_WORKSPACE_AGENT_CONTEXT };
       }
-      if (command.type === "host.read_file") {
-        return {
-          ok: false,
-          errorCode: "ENOENT",
-          errorMessage: `Path does not exist: ${command.path}`,
-        };
+      if (command.type === "turn.submit") {
+        return { ok: true, result: { trace: { spans: [] } } };
       }
-      return { ok: true, result: { appliedAs: "new-turn" } };
+      return { ok: true, result: {} };
     },
   });
 }
@@ -140,6 +134,44 @@ describe("public thread compaction", () => {
       });
     });
   });
+
+  it.each(["acp-omp", "acp-grok"])(
+    "routes %s compaction onto the bridge's /compact turn",
+    async (providerId) => {
+      await withTestHarness(async (harness) => {
+        const { host, session, thread } = seedCompactableThread(harness, {
+          providerId,
+          providerThreadId: "provider-thread-acp",
+        });
+        const responder = registerSuccessfulTurnResponder(harness, {
+          hostId: host.id,
+          sessionId: session.id,
+        });
+
+        const response = await harness.app.request(
+          `/api/v1/threads/${thread.id}/compact`,
+          { method: "POST" },
+        );
+        expect(
+          response.status,
+          JSON.stringify(await readJson(response.clone())),
+        ).toBe(200);
+        const turnSubmitRequests = responder.requests.filter(
+          ({ command }) => command.type === "turn.submit",
+        );
+        expect(turnSubmitRequests).toHaveLength(1);
+        expect(turnSubmitRequests[0]?.command).toMatchObject({
+          type: "turn.submit",
+          threadId: thread.id,
+          input: createStandaloneBuiltinCompactCommandInput(),
+          resumeContext: {
+            providerId,
+            providerThreadId: "provider-thread-acp",
+          },
+        });
+      });
+    },
+  );
 
   it("queues sends and defers send-now while manual compaction is active", async () => {
     await withTestHarness(async (harness) => {
@@ -242,12 +274,14 @@ describe("public thread compaction", () => {
         }),
       ).toBe(true);
       expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
-      await expect.poll(
-        () =>
-          responder.requests.filter(
-            ({ command }) => command.type === "turn.submit",
-          ).length,
-      ).toBe(2);
+      await expect
+        .poll(
+          () =>
+            responder.requests.filter(
+              ({ command }) => command.type === "turn.submit",
+            ).length,
+        )
+        .toBe(2);
     });
   });
 

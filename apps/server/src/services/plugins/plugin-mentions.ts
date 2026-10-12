@@ -7,7 +7,6 @@ type PluginMentionResource = Extract<
   { kind: "plugin" }
 >;
 
-/** Unique plugin mentions in `input`, in first-appearance order. */
 function collectPluginMentionResources(
   input: readonly PromptInput[],
 ): PluginMentionResource[] {
@@ -27,14 +26,6 @@ function collectPluginMentionResources(
   return resources;
 }
 
-/**
- * Resolve every plugin mention in a submitted message once (design §4.9
- * resolve-at-send) and return the agent-visible context inputs to append.
- * Duplicate mentions of the same (pluginId, itemId) resolve once. A resolve
- * failure throws a 422 ApiError so the composer surfaces it and the send is
- * blocked — silently dropping the context the user attached would be worse
- * than failing loudly.
- */
 export async function resolvePluginMentionContextInputs(
   input: readonly PromptInput[],
 ): Promise<PromptInput[]> {
@@ -59,6 +50,22 @@ export async function resolvePluginMentionContextInputs(
       mentions: [],
       visibility: "agent-only",
     });
+    for (const image of result.images) {
+      if (image.context?.trim()) {
+        contextInputs.push({
+          type: "text",
+          text: image.context,
+          mentions: [],
+          visibility: "agent-only",
+        });
+      }
+      contextInputs.push({
+        ...(image.type === "image"
+          ? { type: "image" as const, url: image.url }
+          : { type: "localImage" as const, path: image.path }),
+        visibility: "agent-only",
+      });
+    }
   }
   return contextInputs;
 }

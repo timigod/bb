@@ -1,25 +1,13 @@
-import type { PluginPanelActionEntry } from "@/components/plugin/PluginPanelActions";
+import { useNewTabActions, type UseNewTabActionsArgs } from "./NewTabActions";
 import {
-  NewTabActions,
   NewTabFileSearch,
   type NewTabFileSearchProps,
-  type OpenBrowserHandler,
-  type StartTerminalHandler,
 } from "./NewTabFileSearch";
 
-type NewTabPageFileSearchProps = Omit<NewTabFileSearchProps, "idleActions">;
+type NewTabPageFileSearchProps = Omit<NewTabFileSearchProps, "actions">;
 
-export interface NewTabPageProps extends NewTabPageFileSearchProps {
-  onOpenBrowser?: OpenBrowserHandler;
-  onStartTerminal?: StartTerminalHandler;
-  pluginActions?: readonly PluginPanelActionEntry[];
-}
+type NewTabPageProps = NewTabPageFileSearchProps & UseNewTabActionsArgs;
 
-/**
- * Browser-style "New Tab" landing page for the secondary panel. The tab body
- * keeps file search primary while secondary commands live in-page, avoiding
- * overlays that can be occluded by native browser/webview surfaces.
- */
 export function NewTabPage({
   autoFocus,
   currentThreadId,
@@ -34,22 +22,29 @@ export function NewTabPage({
   projectId,
   recentItemsThreadId,
   showFileSearch,
+  startTerminalDisabled,
+  startTerminalTrailing,
 }: NewTabPageProps) {
+  const actions = useNewTabActions({
+    onOpenBrowser,
+    onStartTerminal,
+    pluginActions,
+    startTerminalDisabled,
+    startTerminalTrailing,
+  });
+
   return (
-    <div className="flex min-h-full flex-col gap-3 bg-sidebar px-4 pb-3 pt-1">
+    <div
+      data-panel-new-tab-page=""
+      className="flex min-h-full flex-col gap-3 bg-sidebar px-4 pb-3 pt-1"
+    >
       <NewTabFileSearch
         projectId={projectId}
         environmentId={environmentId}
         hostId={hostId}
         currentThreadId={currentThreadId}
         autoFocus={autoFocus}
-        idleActions={
-          <NewTabActions
-            onOpenBrowser={onOpenBrowser}
-            onStartTerminal={onStartTerminal}
-            pluginActions={pluginActions}
-          />
-        }
+        actions={actions}
         initialQuery={initialQuery}
         onAutoFocusHandled={onAutoFocusHandled}
         onSelect={onSelect}

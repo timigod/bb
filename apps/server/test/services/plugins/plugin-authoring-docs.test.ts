@@ -1,55 +1,158 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import * as pluginSdkApp from "@bb/plugin-sdk/app";
+import ts from "typescript";
+import * as pluginSdkApp from "@get-bb/plugin-sdk/app";
 import {
   type BbPluginApi,
+  type ExperimentalAppOverlayProps,
   type PluginAppBuilder,
   type PluginAppSlots,
   type PluginContentScriptContext,
   type PluginContentScriptRegistration,
+  type PluginDiffRendererProps,
   type PluginFileOpenerProps,
   type PluginHomepageSectionProps,
   type PluginHttpAuthMode,
+  type PluginCommandContext,
+  type PluginCommandRegistration,
   type PluginMessageActionContext,
   type PluginMessageActionRegistration,
+  type ThreadChatMessageReference,
   type PluginMessageDirectiveProps,
   type PluginNavPanelProps,
   type PluginNavPanelRegistration,
   type PluginNewThreadPanelProps,
   type PluginPendingInteractionProps,
+  type PluginEnvironmentProviderInputsProps,
+  type PluginMachineProviderInputsProps,
+  type PluginProviderIconRegistration,
+  type PluginTimelineRendererProps,
   type PluginSettingDescriptor,
   type PluginSettingsSectionProps,
   type PluginSidebarFooterActionProps,
+  type PluginSourceCodeRendererProps,
   type PluginThreadHeaderActionProps,
+  type PluginThreadActionItemInput,
+  type ExperimentalPluginBrowserToolbarActionProps,
   type PluginThreadListProps,
   type PluginSidebarFooterActionRegistration,
   type PluginThreadEventPayloads,
   type PluginThreadPanelProps,
   type ThreadChatMessageAction,
   type ThreadChatProps,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 
 const FRONTEND_RUNTIME_EXPORT_NAMES = Object.keys(pluginSdkApp).sort();
+const REPO_ROOT = fileURLToPath(new URL("../../../../../", import.meta.url));
 
-/**
- * Durability test for the bb-plugin-authoring builtin skill: the skill must
- * document the ENTIRE plugin API. Growing BbPluginApi or the frontend SDK
- * surface without documenting the new member fails here.
- */
-
-const SKILL_PATH = fileURLToPath(
+const SKILL_ROOT = fileURLToPath(
   new URL(
-    "../../../src/services/skills/builtin-skills/bb-plugin-authoring/SKILL.md",
+    "../../../../../plugins/bb-guide/skills/bb-plugin-authoring/",
     import.meta.url,
   ),
 );
+const SKILL_PATH = join(SKILL_ROOT, "SKILL.md");
 
-/**
- * Every property of BbPluginApi, compile-time checked in both directions:
- * `satisfies` rejects entries that are not keys, and the Missing assertion
- * below rejects keys that are not entries.
- */
+function readSkillTree(directory = SKILL_ROOT): string {
+  return readdirSync(directory, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .flatMap((entry) => {
+      const entryPath = join(directory, entry.name);
+      if (entry.isDirectory()) return readSkillTree(entryPath);
+      return entry.name.endsWith(".md") ? readFileSync(entryPath, "utf8") : [];
+    })
+    .join("\n");
+}
+
+function readReference(name: string): string {
+  return readFileSync(join(SKILL_ROOT, "references", name), "utf8");
+}
+
+function exportedTypeNames(source: string): string[] {
+  return [
+    ...source.matchAll(
+      /(\/\*\*(?:(?!\*\/)[\s\S])*\*\/\s*)?^export (?:interface|type) ([A-Za-z0-9_]+)/gm,
+    ),
+  ]
+    .filter((match) => !(match[1] ?? "").includes("@internal"))
+    .map((match) => match[2])
+    .filter((name): name is string => name !== undefined);
+}
+
+function exportedNames(source: string): string[] {
+  return [
+    ...source.matchAll(
+      /^export (?:async )?(?:interface|type|function|const|class) ([A-Za-z0-9_]+)/gm,
+    ),
+  ]
+    .map((match) => match[1])
+    .filter((name): name is string => name !== undefined);
+}
+
+function declarationExportNames(source: string): string[] {
+  return [...source.matchAll(/^export(?: type)? \{([^}]*)\};/gm)].flatMap(
+    (match) =>
+      (match[1] ?? "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .map((name) => name.split(/\s+as\s+/).at(-1) ?? name),
+  );
+}
+
+const appModule = readFileSync(
+  join(REPO_ROOT, "packages/plugin-sdk/src/app.ts"),
+  "utf8",
+);
+const rpcTypeBlock = appModule.match(
+  /export type \{([\s\S]*?)\} from "\.\/rpc-contract\.js";/,
+)?.[1];
+if (!rpcTypeBlock) throw new Error("The app RPC type export block is missing");
+
+const FRONTEND_TYPE_EXPORT_NAMES = [
+  ...exportedTypeNames(
+    readFileSync(
+      join(REPO_ROOT, "packages/plugin-sdk/src/app-contract.ts"),
+      "utf8",
+    ),
+  ),
+  ...exportedTypeNames(
+    readFileSync(
+      join(REPO_ROOT, "packages/plugin-sdk/src/json-value.ts"),
+      "utf8",
+    ),
+  ),
+  ...rpcTypeBlock
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean),
+];
+
+const FRONTEND_TEST_EXPORT_NAMES = [
+  "packages/plugin-sdk/src/testing/app.tsx",
+  "packages/plugin-sdk/src/testing/host.ts",
+].flatMap((relativePath) =>
+  exportedNames(readFileSync(join(REPO_ROOT, relativePath), "utf8")),
+);
+
+const PUBLIC_PLUGIN_SDK_EXPORT_NAMES = [
+  "bb-plugin-sdk.d.ts",
+  "bb-plugin-sdk-provider-bridge.d.ts",
+  "bb-plugin-sdk-provider-bridge-testing.d.ts",
+  "bb-plugin-sdk-provider-bridge-acp.d.ts",
+  "bb-plugin-sdk-host.d.ts",
+  "bb-plugin-sdk-testing.d.ts",
+].flatMap((filename) =>
+  declarationExportNames(
+    readFileSync(
+      join(REPO_ROOT, "packages/plugin-sdk/bundled-types", filename),
+      "utf8",
+    ),
+  ),
+);
+
 const BB_PLUGIN_API_KEYS = [
   "pluginId",
   "log",
@@ -61,13 +164,20 @@ const BB_PLUGIN_API_KEYS = [
   "background",
   "cli",
   "agents",
+  "providers",
   "ui",
   "events",
   "status",
   "server",
   "hosts",
+  "experimental_aiServices",
+  "experimental_hooks",
+  "experimental_environments",
+  "experimental_machines",
+  "experimental_serverAccess",
   "sdk",
   "onDispose",
+  "onInstall",
 ] as const satisfies readonly (keyof BbPluginApi)[];
 
 type MissingApiKey = Exclude<
@@ -78,14 +188,9 @@ const _assertAllApiKeysListed: MissingApiKey extends never ? true : never =
   true;
 void _assertAllApiKeysListed;
 
-/**
- * Mirrors PluginSettingDescriptor["type"]
- * (packages/plugin-sdk/src/backend-contract.ts) — types only, so the union is
- * mirrored here and compile-time checked in both directions like
- * BB_PLUGIN_API_KEYS above.
- */
 const SETTING_DESCRIPTOR_TYPES = [
   "string",
+  "number",
   "boolean",
   "select",
   "project",
@@ -100,7 +205,6 @@ const _assertAllSettingTypesListed: MissingSettingType extends never
   : never = true;
 void _assertAllSettingTypesListed;
 
-/** Mirrors PluginHttpAuthMode (packages/plugin-sdk/src/backend-contract.ts). */
 const HTTP_AUTH_MODES = [
   "local",
   "token",
@@ -115,21 +219,36 @@ const _assertAllAuthModesListed: MissingAuthMode extends never ? true : never =
   true;
 void _assertAllAuthModesListed;
 
-/**
- * Mirrors PluginThreadEventPayloads
- * (packages/plugin-sdk/src/backend-contract.ts): every event name mapped to
- * every field of its payload. The `satisfies` requires every event key and
- * rejects non-payload fields; the Missing assertions reject omitted fields.
- */
 const THREAD_EVENT_PAYLOAD_FIELDS = {
+  "experimental_thread.events": ["thread", "sequence"],
+  "experimental_thread.parentChanged": ["thread", "previousParentThreadId"],
+  "experimental_terminal.input": ["terminal"],
+  "experimental_host.deleted": ["host"],
+  "experimental_environment.removed": ["removal"],
   "thread.created": ["thread"],
   "thread.active": ["thread"],
   "thread.idle": ["thread", "lastAssistantText"],
   "thread.failed": ["thread", "error"],
   "thread.archived": ["thread"],
+  "thread.unarchived": ["thread"],
   "thread.deleted": ["thread"],
+  "interaction.pending": ["thread", "interaction"],
+  "message.queued": ["entry"],
+  "message.dispatched": ["entry"],
+  "message.cancelled": ["entry"],
+  "turn.failed": [
+    "threadId",
+    "requestId",
+    "turnId",
+    "errorInfo",
+    "inputAccepted",
+    "rateLimits",
+    "attemptNumber",
+  ],
 } as const satisfies {
-  [E in keyof PluginThreadEventPayloads]: readonly (keyof PluginThreadEventPayloads[E])[];
+  [
+    E in keyof PluginThreadEventPayloads
+  ]: readonly (keyof PluginThreadEventPayloads[E])[];
 };
 
 type MissingThreadEventField = {
@@ -143,16 +262,10 @@ const _assertAllThreadEventFieldsListed: MissingThreadEventField extends never
   : never = true;
 void _assertAllThreadEventFieldsListed;
 
-/**
- * Mirrors the frontend slot registry (PluginAppSlots and the per-slot props
- * contracts in packages/plugin-sdk/src/app-contract.ts): every slot name
- * mapped to every field of its props. Checked in both directions like the
- * thread events above; MissingSlot rejects a PluginAppSlots method without an
- * entry here.
- */
 type SlotPropsByName = {
   homepageSection: PluginHomepageSectionProps;
   settingsSection: PluginSettingsSectionProps;
+  experimental_appOverlay: ExperimentalAppOverlayProps;
   navPanel: PluginNavPanelProps;
   threadPanelAction: PluginThreadPanelProps;
   experimental_newThreadPanelAction: PluginNewThreadPanelProps;
@@ -160,9 +273,18 @@ type SlotPropsByName = {
   sidebarFooterAction: PluginSidebarFooterActionProps;
   experimental_threadList: PluginThreadListProps;
   experimental_threadHeaderAction: PluginThreadHeaderActionProps;
+  experimental_threadAction: PluginThreadActionItemInput<unknown>;
+  experimental_browserToolbarAction: ExperimentalPluginBrowserToolbarActionProps;
   fileOpener: PluginFileOpenerProps;
+  experimental_sourceCodeRenderer: PluginSourceCodeRendererProps;
+  experimental_diffRenderer: PluginDiffRendererProps;
   messageDirective: PluginMessageDirectiveProps;
   messageAction: PluginMessageActionContext;
+  commandPaletteAction: PluginCommandContext;
+  experimental_providerIcon: PluginProviderIconRegistration;
+  experimental_timelineRenderer: PluginTimelineRendererProps;
+  experimental_environmentProviderInputs: PluginEnvironmentProviderInputsProps;
+  experimental_machineProviderInputs: PluginMachineProviderInputsProps;
 };
 
 type MissingSlot = Exclude<keyof PluginAppSlots, keyof SlotPropsByName>;
@@ -170,9 +292,12 @@ const _assertAllSlotsListed: MissingSlot extends never ? true : never = true;
 void _assertAllSlotsListed;
 
 const APP_BUILDER_FIELDS = [
+  "commands",
+  "experimental_icons",
   "slots",
   "composer",
   "contentScripts",
+  "experimental_sidebarFooter",
 ] as const satisfies readonly (keyof PluginAppBuilder)[];
 
 type MissingAppBuilderField = Exclude<
@@ -217,6 +342,7 @@ void _assertAllContentScriptRegistrationFieldsListed;
 const FRONTEND_SLOT_PROP_FIELDS = {
   homepageSection: ["projectId"],
   settingsSection: [],
+  experimental_appOverlay: [],
   navPanel: ["subPath"],
   threadPanelAction: ["threadId", "params"],
   experimental_newThreadPanelAction: ["projectId", "params"],
@@ -234,9 +360,55 @@ const FRONTEND_SLOT_PROP_FIELDS = {
     "projectId",
     "isCompactViewport",
   ],
-  fileOpener: ["path", "source"],
+  experimental_threadAction: ["thread", "data", "sdk", "navigate"],
+  experimental_browserToolbarAction: [
+    "threadId",
+    "tabId",
+    "url",
+    "experimental_page",
+    "isCompactViewport",
+  ],
+  fileOpener: ["path", "source", "experimental_lineRange", "Original"],
+  experimental_sourceCodeRenderer: [
+    "content",
+    "path",
+    "overflow",
+    "highlightedLines",
+    "Original",
+  ],
+  experimental_diffRenderer: [
+    "patch",
+    "path",
+    "view",
+    "overflow",
+    "showLineNumbers",
+    "experimental_fullFileContents",
+    "Original",
+  ],
   messageDirective: ["attributes", "source", "message", "openWorkspaceFile"],
-  messageAction: ["threadId", "message", "selectedText", "openPanel"],
+  messageAction: [
+    "threadId",
+    "message",
+    "selectedText",
+    "openPanel",
+    "composer",
+  ],
+  commandPaletteAction: ["threadId", "projectId", "openPanel"],
+  experimental_providerIcon: ["providerKind", "providerId", "icon"],
+  experimental_timelineRenderer: [
+    "row",
+    "payload",
+    "presentation",
+    "thread",
+    "Original",
+  ],
+  experimental_environmentProviderInputs: [
+    "projectId",
+    "target",
+    "value",
+    "onChange",
+  ],
+  experimental_machineProviderInputs: ["value", "onChange"],
 } as const satisfies {
   [S in keyof SlotPropsByName]: readonly (keyof SlotPropsByName[S])[];
 };
@@ -252,17 +424,13 @@ const _assertAllSlotPropFieldsListed: MissingSlotPropField extends never
   : never = true;
 void _assertAllSlotPropFieldsListed;
 
-/**
- * Mirrors PluginNavPanelRegistration (app-contract.ts), including the shared
- * title-bar `headerContent` action surface. Compile-time checked in both
- * directions like the slot props above.
- */
 const NAV_PANEL_REGISTRATION_FIELDS = [
   "id",
   "title",
   "icon",
   "path",
   "component",
+  "fixedTabs",
   "experimental_sidebarAccessory",
   "headerContent",
 ] as const satisfies readonly (keyof PluginNavPanelRegistration)[];
@@ -308,10 +476,41 @@ const _assertAllMessageActionRegistrationFieldsListed: MissingMessageActionRegis
   : never = true;
 void _assertAllMessageActionRegistrationFieldsListed;
 
-/**
- * Mirrors ThreadChatProps (app-contract.ts), compile-time checked in both
- * directions like the registration guards above.
- */
+const MESSAGE_REFERENCE_FIELDS = [
+  "id",
+  "threadId",
+  "role",
+  "text",
+  "sourceSeqEnd",
+  "experimental_messageSeq",
+] as const satisfies readonly (keyof ThreadChatMessageReference)[];
+
+type MissingMessageReferenceField = Exclude<
+  keyof ThreadChatMessageReference,
+  (typeof MESSAGE_REFERENCE_FIELDS)[number]
+>;
+const _assertAllMessageReferenceFieldsListed: MissingMessageReferenceField extends never
+  ? true
+  : never = true;
+void _assertAllMessageReferenceFieldsListed;
+
+const COMMAND_PALETTE_ACTION_REGISTRATION_FIELDS = [
+  "defaultShortcut",
+  "id",
+  "title",
+  "isAvailable",
+  "run",
+] as const satisfies readonly (keyof PluginCommandRegistration)[];
+
+type MissingCommandPaletteActionRegistrationField = Exclude<
+  keyof PluginCommandRegistration,
+  (typeof COMMAND_PALETTE_ACTION_REGISTRATION_FIELDS)[number]
+>;
+const _assertAllCommandPaletteActionRegistrationFieldsListed: MissingCommandPaletteActionRegistrationField extends never
+  ? true
+  : never = true;
+void _assertAllCommandPaletteActionRegistrationFieldsListed;
+
 const THREAD_CHAT_PROP_FIELDS = [
   "threadId",
   "variant",
@@ -332,7 +531,6 @@ const _assertAllThreadChatPropFieldsListed: MissingThreadChatPropField extends n
   : never = true;
 void _assertAllThreadChatPropFieldsListed;
 
-/** Mirrors ThreadChatMessageAction (app-contract.ts). */
 const THREAD_CHAT_MESSAGE_ACTION_FIELDS = [
   "id",
   "title",
@@ -351,10 +549,48 @@ const _assertAllThreadChatMessageActionFieldsListed: MissingThreadChatMessageAct
 void _assertAllThreadChatMessageActionFieldsListed;
 
 describe("bb-plugin-authoring skill", () => {
-  const skill = readFileSync(SKILL_PATH, "utf8");
+  const skillEntry = readFileSync(SKILL_PATH, "utf8");
+  const skill = readSkillTree();
+
+  it("typechecks the machine provider guide example against the public SDK", () => {
+    const source = readReference("backend-machines.md").match(
+      /```ts\n([\s\S]*?)```/u,
+    )?.[1];
+    expect(source).toBeDefined();
+    const filename = fileURLToPath(
+      new URL("./machine-guide-example.ts", import.meta.url),
+    );
+    const options: ts.CompilerOptions = {
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    };
+    const host = ts.createCompilerHost(options);
+    const readSource = host.getSourceFile.bind(host);
+    host.getSourceFile = (
+      file,
+      languageVersion,
+      onError,
+      shouldCreateNewSourceFile,
+    ) =>
+      resolve(file) === filename
+        ? ts.createSourceFile(file, source!, languageVersion)
+        : readSource(file, languageVersion, onError, shouldCreateNewSourceFile);
+    const program = ts.createProgram([filename], options, host);
+    expect(
+      ts
+        .getPreEmitDiagnostics(program)
+        .map((diagnostic) =>
+          ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+        ),
+    ).toEqual([]);
+  });
 
   it("has frontmatter naming the skill after its directory", () => {
-    expect(skill).toMatch(/^---\nname: bb-plugin-authoring\n/);
+    expect(skillEntry).toMatch(/^---\nname: bb-plugin-authoring\n/);
   });
 
   it("documents every BbPluginApi property", () => {
@@ -365,10 +601,56 @@ describe("bb-plugin-authoring skill", () => {
     }
   });
 
-  it("documents every @bb/plugin-sdk/app runtime export", () => {
+  it("documents every @get-bb/plugin-sdk/app runtime export", () => {
     for (const name of FRONTEND_RUNTIME_EXPORT_NAMES) {
       expect(skill, `${name} is not documented in the skill`).toContain(name);
     }
+  });
+
+  it("warns that environment provider inputs are persisted configuration, not credentials", () => {
+    const documented = readReference("backend-events.md").replace(/\s+/g, " ");
+    expect(documented).toContain(
+      "Parsed inputs are persisted on the environment and are readable by every plugin through the SDK, including after the environment is destroyed.",
+    );
+    expect(documented).toContain(
+      "They are configuration, not a credential store; keep credentials in secret settings.",
+    );
+  });
+
+  it("accounts for every @get-bb/plugin-sdk/app type export", () => {
+    for (const name of FRONTEND_TYPE_EXPORT_NAMES) {
+      expect(skill, `${name} is not documented in the skill`).toContain(name);
+    }
+  });
+
+  it("accounts for every frontend testing export", () => {
+    for (const name of FRONTEND_TEST_EXPORT_NAMES) {
+      expect(skill, `${name} is not documented in the skill`).toContain(name);
+    }
+  });
+
+  it("accounts for every public backend and provider entrypoint export", () => {
+    for (const name of PUBLIC_PLUGIN_SDK_EXPORT_NAMES) {
+      expect(skill, `${name} is not documented in the skill`).toContain(name);
+    }
+  });
+
+  it("keeps fake-host and distribution examples aligned with implementation", () => {
+    const testing = readReference("testing.md");
+    const quickstart = readReference("quickstart.md");
+    const distribution = readReference("distribution.md");
+
+    expect(testing).toContain(
+      "experimental_callHostRpc: async ({ method, input, hostId, signal })",
+    );
+    expect(testing).toContain('const body = JSON.stringify({ event: "test" })');
+    expect(testing).toMatch(
+      /experimental_emitHostSignal\(\s*"host-test",\s*"changed",\s*\{\s*reason: "test",?\s*\}/,
+    );
+    expect(testing).not.toContain("resolveAgentConfiguration(context)");
+    expect(quickstart).toContain("server.js.map");
+    expect(quickstart).toContain("--omit=dev --omit=optional");
+    expect(distribution).not.toMatch(/"engines"\s*:/);
   });
 
   it("documents the complete frontend content-script lifecycle contract", () => {
@@ -425,6 +707,39 @@ describe("bb-plugin-authoring skill", () => {
     }
   });
 
+  it("keeps environment app symbols and composer and event guidance current", () => {
+    const frontendIndex = readReference("frontend-api-index.md");
+    const backendIndex = readReference("backend-api-index.md");
+    const appSymbols = [
+      "experimental_BranchPicker",
+      "BranchPickerProps",
+      "experimental_useBranches",
+      "UseBranchesArgs",
+      "BranchesState",
+      "experimental_useCheckoutState",
+      "UseCheckoutStateArgs",
+      "CheckoutState",
+      "PluginEnvironmentProviderInputsChange",
+      "PluginEnvironmentProviderInputsProps",
+      "PluginEnvironmentProviderInputsRegistration",
+    ];
+    for (const symbol of appSymbols) {
+      expect(frontendIndex).toContain(`\`${symbol}\``);
+      expect(backendIndex).not.toContain(`\`${symbol}\``);
+    }
+
+    expect(readReference("frontend-components.md")).not.toContain(
+      'workspace: { type: "personal" }',
+    );
+    expect(readReference("backend-events.md")).toContain("Fourteen events.");
+    expect(readReference("backend-events.md")).toContain(
+      "The seven `thread.*` ones",
+    );
+    expect(readReference("testing.md")).toContain(
+      "Thread events are observe-only; there are exactly seven",
+    );
+  });
+
   it("documents every navPanel registration field", () => {
     for (const field of NAV_PANEL_REGISTRATION_FIELDS) {
       expect(
@@ -451,7 +766,21 @@ describe("bb-plugin-authoring skill", () => {
         `messageAction registration field "${field}" is not documented in the skill`,
       ).toContain(field);
     }
-    expect(skill).toContain("sourceSeqEnd");
+    for (const field of MESSAGE_REFERENCE_FIELDS) {
+      expect(
+        skill,
+        `message reference field "${field}" is not documented in the skill`,
+      ).toContain(field);
+    }
+  });
+
+  it("documents every commandPaletteAction registration field", () => {
+    for (const field of COMMAND_PALETTE_ACTION_REGISTRATION_FIELDS) {
+      expect(
+        skill,
+        `commandPaletteAction registration field "${field}" is not documented in the skill`,
+      ).toContain(field);
+    }
   });
 
   it("documents every ThreadChat prop", () => {

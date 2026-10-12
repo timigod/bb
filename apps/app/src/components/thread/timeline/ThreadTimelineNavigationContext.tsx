@@ -5,11 +5,12 @@ import type {
   ThreadTimelineLocalFileLinkHandler,
 } from "./types.js";
 
-export interface ThreadTimelineNavigation {
+interface ThreadTimelineNavigation {
   environmentId: string | null;
   onOpenLink: ThreadTimelineLinkHandler;
   onOpenLocalFileLink: ThreadTimelineLocalFileLinkHandler;
   resolveMentionLink: PromptMentionLinkResolver;
+  threadId?: string;
   workspaceRootPath: string | undefined;
 }
 
@@ -22,6 +23,7 @@ export function ThreadTimelineNavigationProvider({
   onOpenLink,
   onOpenLocalFileLink,
   resolveMentionLink,
+  threadId,
   workspaceRootPath,
 }: ThreadTimelineNavigation & { children: ReactNode }) {
   const navigation = useMemo<ThreadTimelineNavigation>(
@@ -30,6 +32,7 @@ export function ThreadTimelineNavigationProvider({
       onOpenLink,
       onOpenLocalFileLink,
       resolveMentionLink,
+      threadId,
       workspaceRootPath,
     }),
     [
@@ -37,6 +40,7 @@ export function ThreadTimelineNavigationProvider({
       onOpenLink,
       onOpenLocalFileLink,
       resolveMentionLink,
+      threadId,
       workspaceRootPath,
     ],
   );
@@ -48,12 +52,6 @@ export function ThreadTimelineNavigationProvider({
   );
 }
 
-/**
- * Navigation owned by the surrounding thread detail surface. Hosted plugin
- * panels consume it without adding file-viewer controls to the public plugin
- * SDK contract. Null means the plugin component is mounted outside a thread
- * detail surface and must leave host-local links inert.
- */
 export function useThreadTimelineNavigation(): ThreadTimelineNavigation | null {
   return useContext(ThreadTimelineNavigationContext);
 }

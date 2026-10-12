@@ -1,12 +1,24 @@
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import {
+  copyFileSync,
+  lstatSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const defaultRepoRoot = resolve(fileURLToPath(import.meta.url), "../..");
 
-export const nativeModules = [
-  { name: "better-sqlite3", resolveFrom: "packages/db/package.json" },
+const nativeModules = [
+  {
+    name: "better-sqlite3",
+    resolveFrom: "packages/db/package.json",
+    binaryPath: "build/Release/better_sqlite3.node",
+  },
 ];
 
 function formatThrownValue(err) {
@@ -51,22 +63,9 @@ export function verifyNativeModule(name, requireModule) {
 }
 
 function shouldRebuildNativeModule(errorMessage) {
-  return (
-    /NODE_MODULE_VERSION|Could not locate the bindings file|Module did not self-register/.test(
-      errorMessage,
-    )
+  return /NODE_MODULE_VERSION|Could not locate the bindings file|Module did not self-register/.test(
+    errorMessage,
   );
-}
-
-function getRepairableNativeModuleError(name, requireModule) {
-  try {
-    verifyNativeModule(name, requireModule);
-    return null;
-  } catch (err) {
-    const message = formatThrownValue(err);
-    if (!shouldRebuildNativeModule(message)) throw err;
-    return message;
-  }
 }
 
 function getRepairedNativeModuleError(name, pkgJsonPath) {
@@ -94,25 +93,78 @@ instance.close();`,
   }
 }
 
+function detachHardlinkedBinary(binaryPath) {
+  let binaryStat;
+  try {
+    binaryStat = lstatSync(binaryPath);
+  } catch (err) {
+    if (err && typeof err === "object" && err.code === "ENOENT") {
+      return false;
+    }
+    throw err;
+  }
+
+  if (!binaryStat.isFile() || binaryStat.nlink <= 1) {
+    return false;
+  }
+
+  // pnpm can hardlink this file across worktrees. An installer writes the new
+  // ABI into the existing inode, so every linked checkout changes with it.
+  // Replace this checkout's link with a private copy before the repair starts.
+  const tempDir = mkdtempSync(join(dirname(binaryPath), ".bb-native-detach-"));
+  const detachedPath = join(tempDir, basename(binaryPath));
+  let originalWasUnlinked = false;
+  try {
+    copyFileSync(binaryPath, detachedPath);
+    unlinkSync(binaryPath);
+    originalWasUnlinked = true;
+    renameSync(detachedPath, binaryPath);
+    originalWasUnlinked = false;
+  } catch (err) {
+    if (originalWasUnlinked) {
+      renameSync(detachedPath, binaryPath);
+    }
+    throw err;
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+  return true;
+}
+
 export function ensureNativeModules({
+  checkOnly = false,
   repoRoot = defaultRepoRoot,
   modules = nativeModules,
   createRequire: createRequireImpl = createRequire,
   execFileSync: execFileSyncImpl = execFileSync,
-  verifyRepairedNativeModule: verifyRepairedNativeModuleImpl =
-    getRepairedNativeModuleError,
+  verifyRepairedNativeModule:
+    verifyRepairedNativeModuleImpl = getRepairedNativeModuleError,
   log = console.log,
 } = {}) {
-  for (const { name, resolveFrom } of modules) {
+  for (const { name, resolveFrom, binaryPath } of modules) {
     const requireModule = createRequireImpl(resolve(repoRoot, resolveFrom));
+    const pkgJsonPath = requireModule.resolve(`${name}/package.json`);
+    const pkgDir = dirname(pkgJsonPath);
+    if (
+      !checkOnly &&
+      binaryPath !== undefined &&
+      detachHardlinkedBinary(resolve(pkgDir, binaryPath))
+    ) {
+      log(
+        `[ensure-native-modules] Detached hardlinked ${name} binary before verification`,
+      );
+    }
     try {
       verifyNativeModule(name, requireModule);
     } catch (err) {
       const message = formatThrownValue(err);
+      if (checkOnly) {
+        throw new Error(
+          `[ensure-native-modules] ${name} failed validation: ${message}. Run pnpm start --dryrun to repair it before launch.`,
+        );
+      }
       if (!shouldRebuildNativeModule(message)) throw err;
 
-      const pkgJsonPath = requireModule.resolve(`${name}/package.json`);
-      const pkgDir = dirname(pkgJsonPath);
       const pkgRequire = createRequireImpl(pkgJsonPath);
       log(
         `[ensure-native-modules] Installing prebuilt ${name} for Node ${process.versions.node} (ABI ${process.versions.modules})`,
@@ -194,5 +246,9 @@ const isMainModule =
   fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMainModule) {
-  ensureNativeModules();
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--check")) {
+    throw new Error("Expected no arguments or --check");
+  }
+  ensureNativeModules({ checkOnly: args[0] === "--check" });
 }

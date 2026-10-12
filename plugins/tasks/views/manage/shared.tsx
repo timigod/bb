@@ -1,13 +1,8 @@
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
+import { errorMessage } from "../../shared/errors.js";
 
-/**
- * Fixed swatch palette for projects and labels. Values are CSS named colors —
- * they are stored as user data and rendered via inline `backgroundColor`
- * (matching the seed data's "blue"/"orange"/"violet"), so they must be valid
- * CSS colors without being hex literals.
- */
-export const COLOR_PALETTE = [
+const COLOR_PALETTE = [
   { value: "slateblue", label: "Indigo" },
   { value: "steelblue", label: "Blue" },
   { value: "lightseagreen", label: "Teal" },
@@ -22,14 +17,6 @@ export const COLOR_PALETTE = [
 
 export const DEFAULT_COLOR = COLOR_PALETTE[0].value;
 
-/** Mirrors the contract's project prefix rule (shared/contract.ts). */
-export const PROJECT_PREFIX_PATTERN = /^[A-Z][A-Z0-9]{0,9}$/;
-
-/**
- * Suggest a project prefix from its name: initials for multi-word names,
- * the first three letters otherwise. Must satisfy PROJECT_PREFIX_PATTERN,
- * so leading digits are dropped.
- */
 export function derivePrefix(name: string): string {
   const words = name
     .toUpperCase()
@@ -43,9 +30,8 @@ export function derivePrefix(name: string): string {
   return raw.replace(/^[0-9]+/, "").slice(0, 10);
 }
 
-/** Friendly copy for raw RPC failures (the store surfaces SQLite messages). */
 export function describeCreateProjectError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   if (message.includes("UNIQUE") && message.includes("prefix")) {
     return "That prefix is already used by another project.";
   }
@@ -60,7 +46,11 @@ export function ColorSwatchPicker({
   onChange: (color: string) => void;
 }) {
   return (
-    <div role="radiogroup" aria-label="Color" className="flex flex-wrap gap-1.5">
+    <div
+      role="radiogroup"
+      aria-label="Color"
+      className="flex flex-wrap gap-1.5"
+    >
       {COLOR_PALETTE.map((swatch) => (
         <button
           key={swatch.value}
@@ -82,7 +72,6 @@ export function ColorSwatchPicker({
   );
 }
 
-/** Compact labeled checkbox (no checkbox component is vendored yet). */
 export function CheckboxField({
   checked,
   onCheckedChange,

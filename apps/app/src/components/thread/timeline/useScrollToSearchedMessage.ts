@@ -1,26 +1,55 @@
-import { useEffect, useRef } from "react";
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useLocation } from "react-router-dom";
+import { parseMessageLink } from "@bb/client-core";
+import { appToast } from "@/components/ui/app-toast";
 import { useBottomAnchoredScroll } from "@/components/ui/bottom-anchored-scroll-body.js";
+import { revealTimelineRow } from "./reveal-timeline-row.js";
 
-// Structural subset of a timeline view row — every row carries an event-sequence
-// range, which is how we map a searched message's sequence to its rendered row.
 interface SeqAnchoredRow {
   id: string;
+  messageSeq?: number;
   sourceSeqStart: number;
   sourceSeqEnd: number;
-  childRows?: readonly SeqAnchoredRow[];
+  childRows?: readonly SeqAnchoredRow[] | null;
   children?: readonly SeqAnchoredRow[] | null;
 }
 
 interface SearchMessageTarget {
+  match: "message" | "sequence";
   seq: number;
   threadId: string | null;
+}
+
+export interface SearchMessageLocationTarget extends SearchMessageTarget {
+  locationKey: string;
+}
+
+interface SearchMessageLocation {
+  target: SearchMessageLocationTarget | null;
+  readLocationKey: () => string;
+}
+
+interface SearchMessageLocationProviderProps {
+  threadId: string | undefined;
+  children: ReactNode;
 }
 
 interface SearchMessagePaginationOptions {
   hasOlderRows?: boolean;
   isLoadingOlderRows?: boolean;
   onLoadOlderRows?: () => Promise<void> | void;
+  reportsMissingTarget?: boolean;
 }
 
 interface SeqRange {
@@ -28,8 +57,8 @@ interface SeqRange {
   max: number;
 }
 
-const FLASH_CLASS_NAME = "bb-search-flash";
-const FLASH_DURATION_MS = 1700;
+const REVEAL_STABLE_FRAME_COUNT = 2;
+const REVEAL_MAX_FRAME_COUNT = 12;
 
 function escapeTimelineRowId(rowId: string): string {
   if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
@@ -43,7 +72,7 @@ function containsSeq(row: SeqAnchoredRow, seq: number): boolean {
 }
 
 function getNestedRows(row: SeqAnchoredRow): readonly SeqAnchoredRow[] | null {
-  if (row.childRows) {
+  if (row.childRows !== undefined) {
     return row.childRows;
   }
   if ("children" in row) {
@@ -52,7 +81,45 @@ function getNestedRows(row: SeqAnchoredRow): readonly SeqAnchoredRow[] | null {
   return [];
 }
 
+function findMessageSeqRowPath(
+  rows: readonly SeqAnchoredRow[],
+  seq: number,
+): SeqAnchoredRow[] | null {
+  for (const row of rows) {
+    if (row.messageSeq === seq) {
+      return [row];
+    }
+    const nestedRows = getNestedRows(row);
+    const nestedPath =
+      nestedRows === null ? null : findMessageSeqRowPath(nestedRows, seq);
+    if (nestedPath !== null) {
+      return [row, ...nestedPath];
+    }
+  }
+  return null;
+}
+
 function findDeepestSeqAnchoredRow(
+  rows: readonly SeqAnchoredRow[],
+  seq: number,
+): SeqAnchoredRow | null {
+  return (
+    findMessageSeqRowPath(rows, seq)?.at(-1) ??
+    findDeepestContainingRow(rows, seq)
+  );
+}
+
+function findSearchTargetRow(
+  rows: readonly SeqAnchoredRow[],
+  seq: number,
+  match: SearchMessageTarget["match"],
+): SeqAnchoredRow | null {
+  return match === "message"
+    ? (findMessageSeqRowPath(rows, seq)?.at(-1) ?? null)
+    : findDeepestSeqAnchoredRow(rows, seq);
+}
+
+function findDeepestContainingRow(
   rows: readonly SeqAnchoredRow[],
   seq: number,
 ): SeqAnchoredRow | null {
@@ -64,7 +131,7 @@ function findDeepestSeqAnchoredRow(
     if (nestedRows === null) {
       return null;
     }
-    return findDeepestSeqAnchoredRow(nestedRows, seq) ?? row;
+    return findDeepestContainingRow(nestedRows, seq) ?? row;
   }
   return null;
 }
@@ -111,10 +178,6 @@ function getRowsSeqWindowKey(rows: readonly SeqAnchoredRow[]): string {
     .join("|");
 }
 
-function rowsContainSeq(rows: readonly SeqAnchoredRow[], seq: number): boolean {
-  return rows.some((row) => containsSeq(row, seq));
-}
-
 function collectSearchedMessageAncestorRowIdsInRows({
   ancestorIds,
   rows,
@@ -129,7 +192,7 @@ function collectSearchedMessageAncestorRowIdsInRows({
       continue;
     }
     const nestedRows = getNestedRows(row);
-    if (nestedRows === null) {
+    if (nestedRows === null || nestedRows.length === 0) {
       ancestorIds.add(row.id);
       return true;
     }
@@ -150,14 +213,20 @@ function collectSearchedMessageAncestorRowIdsInRows({
 export function collectSearchedMessageAncestorRowIds(
   rows: readonly SeqAnchoredRow[],
   seq: number,
+  match: SearchMessageTarget["match"],
 ): ReadonlySet<string> {
+  const messagePath = findMessageSeqRowPath(rows, seq);
+  if (messagePath !== null) {
+    return new Set(messagePath.map((row) => row.id));
+  }
+  if (match === "message") {
+    return new Set();
+  }
   const ancestorIds = new Set<string>();
   collectSearchedMessageAncestorRowIdsInRows({ ancestorIds, rows, seq });
   return ancestorIds;
 }
 
-// Sidebar search hands the matched message's event sequence to the thread route
-// via `navigate(path, { state: { searchMessageSeq, searchThreadId } })`.
 export function readSearchMessageTarget(
   state: unknown,
 ): SearchMessageTarget | null {
@@ -173,6 +242,7 @@ export function readSearchMessageTarget(
     const threadIdValue = (state as { searchThreadId?: unknown })
       .searchThreadId;
     return {
+      match: "sequence",
       seq: value,
       threadId: typeof threadIdValue === "string" ? threadIdValue : null,
     };
@@ -180,14 +250,83 @@ export function readSearchMessageTarget(
   return null;
 }
 
-/**
- * When the thread was opened from a sidebar search result whose match was in a
- * message body, scroll that message into view and briefly highlight it.
- *
- * Keyed off `location.key` so it fires once per navigation (not on every render
- * or row update). The effect also depends on `rows`, so if the timeline hasn't
- * hydrated the target row yet it simply retries once the rows arrive.
- */
+const SearchMessageLocationContext =
+  createContext<SearchMessageLocation | null>(null);
+
+function searchTargetAppliesToThread(
+  target: SearchMessageTarget,
+  threadId: string | undefined,
+): boolean {
+  return (
+    threadId === undefined ||
+    target.threadId === null ||
+    target.threadId === threadId
+  );
+}
+
+export function SearchMessageLocationProvider({
+  threadId,
+  children,
+}: SearchMessageLocationProviderProps) {
+  const location = useLocation();
+  const locationKey = `${location.key}:${location.pathname}${location.search}${location.hash}`;
+  const locationKeyRef = useRef(locationKey);
+  useLayoutEffect(() => {
+    locationKeyRef.current = locationKey;
+  }, [locationKey]);
+  const readLocationKey = useCallback(() => locationKeyRef.current, []);
+  const searchTarget = readSearchMessageTarget(location.state);
+  const messageLinkTarget = parseMessageLink(
+    `${location.pathname}${location.search}${location.hash}`,
+  );
+  const target =
+    messageLinkTarget === null
+      ? searchTarget
+      : { ...messageLinkTarget, match: "message" as const };
+  const applies =
+    target !== null && searchTargetAppliesToThread(target, threadId);
+  const targetLocationKey = applies ? locationKey : null;
+  const targetMatch = applies ? target.match : null;
+  const targetSeq = applies ? target.seq : null;
+  const targetThreadId = applies ? target.threadId : null;
+  const value = useMemo<SearchMessageLocation>(
+    () => ({
+      target:
+        targetLocationKey === null || targetMatch === null || targetSeq === null
+          ? null
+          : {
+              locationKey: targetLocationKey,
+              match: targetMatch,
+              seq: targetSeq,
+              threadId: targetThreadId,
+            },
+      readLocationKey,
+    }),
+    [
+      readLocationKey,
+      targetLocationKey,
+      targetMatch,
+      targetSeq,
+      targetThreadId,
+    ],
+  );
+  return createElement(
+    SearchMessageLocationContext.Provider,
+    { value },
+    children,
+  );
+}
+
+export function useSearchMessageLocation(): SearchMessageLocation {
+  const value = useContext(SearchMessageLocationContext);
+  if (value === null) {
+    throw new Error(
+      "useSearchMessageLocation: no <SearchMessageLocationProvider> above the caller",
+    );
+  }
+  return value;
+}
+
 export function useScrollToSearchedMessage(
   rows: readonly SeqAnchoredRow[],
   threadId: string | undefined,
@@ -195,18 +334,47 @@ export function useScrollToSearchedMessage(
     hasOlderRows = false,
     isLoadingOlderRows = false,
     onLoadOlderRows,
+    reportsMissingTarget = false,
   }: SearchMessagePaginationOptions = {},
-): void {
-  const location = useLocation();
+): boolean {
+  const { target, readLocationKey } = useSearchMessageLocation();
   const bottomAnchor = useBottomAnchoredScroll();
   const handledKeyRef = useRef<string | null>(null);
   const olderLoadAttemptKeyRef = useRef<string | null>(null);
-  const target = readSearchMessageTarget(location.state);
+  const targetLocationKey = target?.locationKey ?? null;
+  const [initialLocationKey] = useState(targetLocationKey);
+  const [settledLocationKey, setSettledLocationKey] = useState<string | null>(
+    null,
+  );
+  const targetMatch = target?.match ?? null;
   const targetSeq = target?.seq ?? null;
   const targetThreadId = target?.threadId ?? null;
+  const targetLeafRow =
+    targetSeq === null || targetMatch === null
+      ? null
+      : findSearchTargetRow(rows, targetSeq, targetMatch);
+  const loadedRange = useMemo(() => getRowsSeqRange(rows), [rows]);
+  const targetIsOlderThanLoadedRows =
+    loadedRange !== null && targetSeq !== null && targetSeq < loadedRange.max;
+  const targetIsMissing =
+    targetLeafRow === null &&
+    loadedRange !== null &&
+    (targetMatch === "message" || targetIsOlderThanLoadedRows);
+  const canLoadOlderTarget = targetIsOlderThanLoadedRows && hasOlderRows;
+  const isInitialRevealPending =
+    reportsMissingTarget &&
+    initialLocationKey !== null &&
+    initialLocationKey === targetLocationKey &&
+    settledLocationKey !== initialLocationKey &&
+    !(targetIsMissing && !canLoadOlderTarget && !isLoadingOlderRows);
 
   useEffect(() => {
-    if (targetSeq === null || handledKeyRef.current === location.key) {
+    if (
+      targetLocationKey === null ||
+      targetMatch === null ||
+      targetSeq === null ||
+      handledKeyRef.current === targetLocationKey
+    ) {
       return;
     }
     if (threadId !== undefined && targetThreadId !== null) {
@@ -214,18 +382,13 @@ export function useScrollToSearchedMessage(
         return;
       }
     }
-    const targetLeafRow = findDeepestSeqAnchoredRow(rows, targetSeq);
     if (targetLeafRow === null) {
-      // Target row not rendered yet (still loading, or inside a collapsed
-      // group). Leave the key unhandled so a later rows change can retry.
-      const loadedRange = getRowsSeqRange(rows);
-      const targetIsOlderThanLoadedRows =
-        loadedRange !== null && targetSeq < loadedRange.max;
       const olderLoadAttemptKey =
         loadedRange === null
           ? null
           : [
-              location.key,
+              targetLocationKey,
+              targetMatch,
               targetThreadId ?? "",
               targetSeq,
               loadedRange.min,
@@ -233,67 +396,103 @@ export function useScrollToSearchedMessage(
               getRowsSeqWindowKey(rows),
             ].join("::");
       if (
-        targetIsOlderThanLoadedRows &&
-        !rowsContainSeq(rows, targetSeq) &&
-        hasOlderRows &&
+        canLoadOlderTarget &&
         !isLoadingOlderRows &&
         onLoadOlderRows !== undefined &&
         olderLoadAttemptKey !== null &&
         olderLoadAttemptKeyRef.current !== olderLoadAttemptKey
       ) {
         olderLoadAttemptKeyRef.current = olderLoadAttemptKey;
-        void Promise.resolve(onLoadOlderRows()).catch(() => undefined);
+        void Promise.resolve(onLoadOlderRows()).catch(() => {
+          if (readLocationKey() !== targetLocationKey) return;
+          handledKeyRef.current = targetLocationKey;
+          setSettledLocationKey(targetLocationKey);
+          if (reportsMissingTarget) {
+            appToast.message("Failed to load message", {
+              description: "Please try opening the link again.",
+            });
+          }
+        });
+        return;
+      }
+      if (
+        reportsMissingTarget &&
+        targetIsMissing &&
+        !canLoadOlderTarget &&
+        !isLoadingOlderRows
+      ) {
+        handledKeyRef.current = targetLocationKey;
+        appToast.message("Message not found", {
+          description:
+            "It may have been removed by an edit or hidden by a context clear.",
+        });
       }
       return;
     }
     const selector = `[data-timeline-row-id="${escapeTimelineRowId(targetLeafRow.id)}"]`;
-    if (document.querySelector(selector) === null) {
+    const renderedTarget = document.querySelector<HTMLElement>(selector);
+    if (
+      renderedTarget === null ||
+      renderedTarget.dataset.timelineWindowedRealized === "false"
+    ) {
       return;
     }
-    handledKeyRef.current = location.key;
-
-    let flashed = false;
+    let frame: number;
+    let frameCount = 0;
+    let stableFrameCount = 0;
+    let previousGeometry: string | null = null;
     const revealTarget = () => {
+      if (readLocationKey() !== targetLocationKey) {
+        return;
+      }
       const element = document.querySelector<HTMLElement>(selector);
       if (element === null) {
         return;
       }
-      if (bottomAnchor !== null) {
-        // scrollElementIntoView suppresses stick-to-bottom so this wins over the
-        // default open-at-bottom behavior.
-        bottomAnchor.scrollElementIntoView({
-          element,
-          options: { block: "center" },
-        });
-      } else {
-        element.scrollIntoView({ block: "center" });
+      revealTimelineRow(element, bottomAnchor, false);
+      const rect = element.getBoundingClientRect();
+      const scrollArea = bottomAnchor?.getScrollElement();
+      const geometry = [
+        Math.round(rect.top + (scrollArea?.scrollTop ?? 0)),
+        Math.round(rect.height),
+        scrollArea?.scrollHeight ?? 0,
+      ].join(":");
+      stableFrameCount =
+        geometry === previousGeometry ? stableFrameCount + 1 : 0;
+      previousGeometry = geometry;
+      frameCount += 1;
+      if (
+        stableFrameCount >= REVEAL_STABLE_FRAME_COUNT ||
+        frameCount >= REVEAL_MAX_FRAME_COUNT
+      ) {
+        handledKeyRef.current = targetLocationKey;
+        setSettledLocationKey(targetLocationKey);
+        revealTimelineRow(element, bottomAnchor);
+        return;
       }
-      if (!flashed) {
-        flashed = true;
-        element.classList.add(FLASH_CLASS_NAME);
-        window.setTimeout(() => {
-          element.classList.remove(FLASH_CLASS_NAME);
-        }, FLASH_DURATION_MS);
-      }
+      frame = requestAnimationFrame(revealTarget);
     };
 
-    // Reveal on the next frame, then once more after layout settles, so a late
-    // scroll-anchor restore can't leave the target off-screen.
-    const frame = requestAnimationFrame(revealTarget);
-    const settle = window.setTimeout(revealTarget, 320);
+    frame = requestAnimationFrame(revealTarget);
     return () => {
       cancelAnimationFrame(frame);
-      window.clearTimeout(settle);
     };
   }, [
     bottomAnchor,
-    hasOlderRows,
+    canLoadOlderTarget,
     isLoadingOlderRows,
-    location.key,
+    loadedRange,
     onLoadOlderRows,
+    readLocationKey,
+    reportsMissingTarget,
     rows,
+    targetLocationKey,
+    targetMatch,
     targetSeq,
     targetThreadId,
+    targetIsMissing,
+    targetLeafRow,
     threadId,
   ]);
+  return isInitialRevealPending;
 }

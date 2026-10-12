@@ -1,20 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  getPersonalWorkspaceRoot,
-  WorkspaceError,
-  type HostWorkspace,
-} from "@bb/host-workspace";
+import fs from "node:fs/promises";
+import { afterEach, describe, expect, it } from "vitest";
+import { WorkspaceError, type HostWorkspace } from "@bb/host-workspace";
 import { dispatchCommand } from "../../src/command-dispatch.js";
 import type { EventSinkInput } from "../../src/event-sink.js";
-import {
-  TerminalManager,
-  type ResolveTerminalShell,
-  type SpawnTerminalPtyArgs,
-  type TerminalPtyAdapter,
-  type TerminalPtyDisposable,
-  type TerminalPtyExit,
-  type TerminalPtyProcess,
-} from "../../src/terminals/terminal-manager.js";
 import {
   cleanupTempDirs,
   createFakeRuntime,
@@ -25,146 +13,29 @@ import {
 } from "./dispatch-helpers.js";
 import { RuntimeManager } from "../../src/runtime-manager.js";
 
-const DEFAULT_TERMINAL_START = { mode: "shell" } as const;
-
-interface Deferred<TValue> {
-  promise: Promise<TValue>;
-  resolve: (value: TValue | PromiseLike<TValue>) => void;
-  reject: (reason?: Error) => void;
-}
-
-interface ResizeCall {
-  cols: number;
-  rows: number;
-}
-
-interface SpawnedTerminal {
-  args: SpawnTerminalPtyArgs;
-  pty: FakeTerminalPty;
-}
-
-interface CreateTerminalManagerArgs {
-  manager: RuntimeManager;
-  resolveShell: ResolveTerminalShell;
-}
-
-interface TerminalManagerFixture {
-  adapter: FakeTerminalPtyAdapter;
-  manager: TerminalManager;
-}
-
-type TerminalDataListener = (data: string) => void;
-type TerminalExitListener = (event: TerminalPtyExit) => void;
-
 afterEach(cleanupTempDirs);
 
-function createDeferred<TValue>(): Deferred<TValue> {
-  let resolve!: Deferred<TValue>["resolve"];
-  let reject!: Deferred<TValue>["reject"];
-  const promise = new Promise<TValue>((innerResolve, innerReject) => {
-    resolve = innerResolve;
-    reject = innerReject;
-  });
-  return { promise, reject, resolve };
-}
-
-class FakeTerminalPty implements TerminalPtyProcess {
-  readonly killCalls: (string | null)[];
-  readonly resizeCalls: ResizeCall[];
-  readonly writeCalls: (Buffer | string)[];
-  private readonly dataListeners: TerminalDataListener[];
-  private readonly exitListeners: TerminalExitListener[];
-
-  constructor() {
-    this.killCalls = [];
-    this.resizeCalls = [];
-    this.writeCalls = [];
-    this.dataListeners = [];
-    this.exitListeners = [];
-  }
-
-  kill(signal?: string): void {
-    this.killCalls.push(signal ?? null);
-  }
-
-  onData(listener: TerminalDataListener): TerminalPtyDisposable {
-    this.dataListeners.push(listener);
-    return {
-      dispose: () => {
-        const index = this.dataListeners.indexOf(listener);
-        if (index >= 0) {
-          this.dataListeners.splice(index, 1);
-        }
-      },
-    };
-  }
-
-  onExit(listener: TerminalExitListener): TerminalPtyDisposable {
-    this.exitListeners.push(listener);
-    return {
-      dispose: () => {
-        const index = this.exitListeners.indexOf(listener);
-        if (index >= 0) {
-          this.exitListeners.splice(index, 1);
-        }
-      },
-    };
-  }
-
-  resize(cols: number, rows: number): void {
-    this.resizeCalls.push({ cols, rows });
-  }
-
-  write(data: Buffer | string): void {
-    this.writeCalls.push(data);
-  }
-}
-
-class FakeTerminalPtyAdapter implements TerminalPtyAdapter {
-  readonly spawned: SpawnedTerminal[];
-
-  constructor() {
-    this.spawned = [];
-  }
-
-  spawn(args: SpawnTerminalPtyArgs): TerminalPtyProcess {
-    const pty = new FakeTerminalPty();
-    this.spawned.push({ args, pty });
-    return pty;
-  }
-}
-
-function createTerminalManager(
-  args: CreateTerminalManagerArgs,
-): TerminalManagerFixture {
-  const adapter = new FakeTerminalPtyAdapter();
-  const manager = new TerminalManager({
-    logger: {
-      debug: vi.fn(),
-      error: vi.fn(),
-      info: vi.fn(),
-      warn: vi.fn(),
-    },
-    ptyAdapter: adapter,
-    resolveShell: args.resolveShell,
-    runtimeManager: args.manager,
-    sendMessage: () => true,
-  });
-  return { adapter, manager };
+function streamedEntries(emitted: EventSinkInput[]) {
+  return emitted.flatMap((input) =>
+    input.event.type === "system/thread-provisioning"
+      ? input.event.entries
+      : [],
+  );
 }
 
 describe("environment command dispatch", () => {
-  it("covers environment.provision in unmanaged mode", async () => {
+  it("covers environment.attach in unmanaged mode", async () => {
     const harness = createHarness({ workspacePath: "/tmp/unmanaged" });
     const sourcePath = await makeTempDir("bb-dispatch-unmanaged-");
 
     const result = await dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-unmanaged",
         initiator: null,
-        workspaceProvisionType: "unmanaged",
         path: sourcePath,
+        setupScriptTimeoutMs: null,
       },
       harness.dispatchOptions(),
     );
@@ -172,25 +43,11 @@ describe("environment command dispatch", () => {
     expect(result).toMatchObject({
       path: sourcePath,
       isGitRepo: true,
-      isWorktree: false,
       branchName: "main",
       defaultBranch: "main",
     });
-    expect(result.transcript).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          key: "workspace-path",
-          text: `Using workspace: ${sourcePath}`,
-        }),
-        expect.objectContaining({
-          key: "workspace-branch",
-          text: expect.stringContaining("Using branch: main"),
-        }),
-      ]),
-    );
     expect(harness.provisions).toEqual([
       {
-        workspaceProvisionType: "unmanaged",
         path: sourcePath,
         onProgress: expect.any(Function),
         signal: expect.any(AbortSignal),
@@ -198,100 +55,79 @@ describe("environment command dispatch", () => {
     ]);
   });
 
-  it("covers environment.provision in managed-worktree mode", async () => {
-    const harness = createHarness({
-      workspacePath: "/tmp/worktree",
-      isWorktree: true,
-    });
-    const sourcePath = await makeTempDir("bb-dispatch-worktree-");
+  it("runs setup before attaching a provider-owned workspace", async () => {
+    const harness = createHarness({ workspacePath: "/tmp/provider-owned" });
+    const sourcePath = await makeTempDir("bb-dispatch-provider-owned-");
+    const markerPath = `${sourcePath}/setup-marker`;
+    await fs.writeFile(
+      `${sourcePath}/.bb-env-setup.sh`,
+      `printf '%s' \"$SETUP_VALUE\" > '${markerPath}'\n`,
+    );
+    const emittedEvents: EventSinkInput[] = [];
 
-    const result = await dispatchCommand(
+    await dispatchCommand(
       {
-        type: "environment.provision",
-        environmentId: "env-worktree",
-        initiator: null,
-        workspaceProvisionType: "managed-worktree",
-        sourcePath,
-        targetPath: "/tmp/worktree",
-        branchName: "bb/test",
-        baseBranch: "main",
-        setupTimeoutMs: 900000,
+        type: "environment.attach",
+        contributedEnv: [
+          {
+            name: "SETUP_VALUE",
+            value: "ready",
+            source: { plugin: "fixture" },
+            reason: "test",
+          },
+        ],
+        environmentId: "env-provider-owned",
+        initiator: {
+          threadId: "thr-provider-owned",
+          provisioningId: "tpv-provider-owned",
+        },
+        path: sourcePath,
+        setupScriptTimeoutMs: 10_000,
       },
-      harness.dispatchOptions(),
+      makeDispatchOptions({
+        runtimeManager: harness.manager,
+        eventSink: {
+          emit: (event) => emittedEvents.push(event),
+          flush: async () => undefined,
+        },
+      }),
     );
 
-    expect(result).toMatchObject({
-      path: "/tmp/worktree",
-      isGitRepo: true,
-      isWorktree: true,
-      branchName: "main",
-      defaultBranch: "main",
-    });
-    expect(result.transcript).toEqual(
+    await expect(fs.readFile(markerPath, "utf8")).resolves.toBe("ready");
+    expect(streamedEntries(emittedEvents)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          key: "workspace-path",
-          text: "Using workspace: /tmp/worktree",
+          key: "setup-started",
+          text: "Running .bb-env-setup.sh",
         }),
-        expect.objectContaining({
-          key: "workspace-branch",
-          text: expect.stringContaining("Using branch: main"),
-        }),
+        expect.objectContaining({ key: "setup-completed" }),
+        expect.objectContaining({ key: "workspace-path" }),
       ]),
     );
-    expect(harness.provisions).toEqual([
-      {
-        workspaceProvisionType: "managed-worktree",
-        sourcePath,
-        targetPath: "/tmp/worktree",
-        branchName: "bb/test",
-        baseBranch: "main",
-        timeoutMs: 900000,
-        onProgress: expect.any(Function),
-        signal: expect.any(AbortSignal),
-      },
-    ]);
   });
 
-  it("covers environment.provision in personal mode", async () => {
-    const dataDir = await makeTempDir("bb-dispatch-personal-data-");
-    const environmentId = "env_personal";
-    const personalWorkspaceRoot = getPersonalWorkspaceRoot(dataDir);
-    const targetPath = `${personalWorkspaceRoot}/${environmentId}`;
-    const harness = createHarness({
-      workspacePath: targetPath,
-    });
-    harness.workspace.isGitRepo = false;
-    harness.workspace.getCurrentBranch = async () => null;
-
-    const result = await dispatchCommand(
-      {
-        type: "environment.provision",
-        environmentId,
-        initiator: null,
-        workspaceProvisionType: "personal",
-        targetPath,
-      },
-      harness.dispatchOptions({ dataDir }),
+  it("fails attachment when the setup script fails", async () => {
+    const harness = createHarness({ workspacePath: "/tmp/setup-failure" });
+    const sourcePath = await makeTempDir("bb-dispatch-setup-failure-");
+    await fs.writeFile(
+      `${sourcePath}/.bb-env-setup.sh`,
+      "printf 'script diagnostic\\n'\nexit 7\n",
     );
 
-    expect(result).toMatchObject({
-      path: targetPath,
-      isGitRepo: false,
-      isWorktree: false,
-      branchName: null,
-      defaultBranch: null,
-    });
-    expect(harness.provisions).toEqual([
-      {
-        workspaceProvisionType: "personal",
-        environmentId,
-        personalWorkspaceRoot,
-        targetPath,
-        onProgress: expect.any(Function),
-        signal: expect.any(AbortSignal),
-      },
-    ]);
+    await expect(
+      dispatchCommand(
+        {
+          type: "environment.attach",
+          contributedEnv: [],
+          environmentId: "env-setup-failure",
+          initiator: null,
+          path: sourcePath,
+          setupScriptTimeoutMs: 10_000,
+        },
+        harness.dispatchOptions(),
+      ),
+    ).rejects.toThrow("failed with exit code 7");
+    expect(harness.provisions).toEqual([]);
   });
 
   it("returns success when cancelling a provision with no in-flight work", async () => {
@@ -300,7 +136,7 @@ describe("environment command dispatch", () => {
     await expect(
       dispatchCommand(
         {
-          type: "environment.provision.cancel",
+          type: "environment.attach.cancel",
           environmentId: "env-missing",
         },
         harness.dispatchOptions(),
@@ -336,11 +172,12 @@ describe("environment command dispatch", () => {
     const dispatchOptions = makeDispatchOptions({ runtimeManager: manager });
     const provision = dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-cancel",
         initiator: null,
-        workspaceProvisionType: "unmanaged",
         path: "/tmp/cancelled",
+        setupScriptTimeoutMs: null,
       },
       dispatchOptions,
     );
@@ -349,7 +186,7 @@ describe("environment command dispatch", () => {
     await expect(
       dispatchCommand(
         {
-          type: "environment.provision.cancel",
+          type: "environment.attach.cancel",
           environmentId: "env-cancel",
         },
         dispatchOptions,
@@ -389,11 +226,12 @@ describe("environment command dispatch", () => {
     const dispatchOptions = makeDispatchOptions({ runtimeManager: manager });
     const provision = dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-cancel-no-settle",
         initiator: null,
-        workspaceProvisionType: "unmanaged",
         path: "/tmp/cancelled-no-settle",
+        setupScriptTimeoutMs: null,
       },
       dispatchOptions,
     ).finally(() => {
@@ -403,7 +241,7 @@ describe("environment command dispatch", () => {
 
     const cancel = dispatchCommand(
       {
-        type: "environment.provision.cancel",
+        type: "environment.attach.cancel",
         environmentId: "env-cancel-no-settle",
       },
       dispatchOptions,
@@ -416,62 +254,23 @@ describe("environment command dispatch", () => {
     void provision;
   });
 
-  it("rejects personal provision targets outside the data dir personal workspace root", async () => {
-    const dataDir = await makeTempDir("bb-dispatch-personal-data-");
-    const environmentId = "env_personal";
-    const harness = createHarness();
-
-    await expect(() =>
-      dispatchCommand(
-        {
-          type: "environment.provision",
-          environmentId,
-          initiator: null,
-          workspaceProvisionType: "personal",
-          targetPath: `${dataDir}/personal-workspaces-sibling/${environmentId}`,
-        },
-        harness.dispatchOptions({ dataDir }),
-      ),
-    ).rejects.toThrow("Personal workspace target path must match");
-    expect(harness.provisions).toEqual([]);
-  });
-
-  it("rejects personal provision targets that traverse out of the environment directory", async () => {
-    const dataDir = await makeTempDir("bb-dispatch-personal-data-");
-    const environmentId = "env_personal";
-    const harness = createHarness();
-
-    await expect(() =>
-      dispatchCommand(
-        {
-          type: "environment.provision",
-          environmentId,
-          initiator: null,
-          workspaceProvisionType: "personal",
-          targetPath: `${getPersonalWorkspaceRoot(dataDir)}/${environmentId}/../env_other`,
-        },
-        harness.dispatchOptions({ dataDir }),
-      ),
-    ).rejects.toThrow("Personal workspace target path must match");
-    expect(harness.provisions).toEqual([]);
-  });
-
   it("streams live events and flushes when initiator is provided", async () => {
     const harness = createHarness({ workspacePath: "/tmp/live-stream" });
     const sourcePath = await makeTempDir("bb-dispatch-stream-");
     const emittedEvents: EventSinkInput[] = [];
     let flushCount = 0;
 
-    const result = await dispatchCommand(
+    await dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-stream",
         initiator: {
           threadId: "thr-initiator",
           provisioningId: "tpv-initiator",
         },
-        workspaceProvisionType: "unmanaged",
         path: sourcePath,
+        setupScriptTimeoutMs: null,
       },
       makeDispatchOptions({
         runtimeManager: harness.manager,
@@ -495,11 +294,16 @@ describe("environment command dispatch", () => {
         ? firstEvent.event.environmentId
         : undefined,
     ).toBe("env-stream");
-    expect(result.transcript.length).toBeGreaterThan(0);
-    expect(result.transcript).toEqual(
+    expect(streamedEntries(emittedEvents)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ key: "workspace-path" }),
-        expect.objectContaining({ key: "workspace-branch" }),
+        expect.objectContaining({
+          key: "workspace-path",
+          text: `Using workspace: ${sourcePath}`,
+        }),
+        expect.objectContaining({
+          key: "workspace-branch",
+          text: expect.stringContaining("Using branch: main"),
+        }),
       ]),
     );
   });
@@ -537,16 +341,17 @@ describe("environment command dispatch", () => {
       createRuntime: () => runtime,
     });
 
-    const result = await dispatchCommand(
+    await dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-batched-progress",
         initiator: {
           threadId: "thr-batched-progress",
           provisioningId: "tpv-batched-progress",
         },
-        workspaceProvisionType: "unmanaged",
         path: "/tmp/batched-progress",
+        setupScriptTimeoutMs: null,
       },
       makeDispatchOptions({
         runtimeManager: manager,
@@ -575,7 +380,6 @@ describe("environment command dispatch", () => {
       "workspace-path",
       "workspace-branch",
     ]);
-    expect(result.transcript.map((entry) => entry.key)).toEqual(entryKeys);
   });
 
   it("flushes live events before surfacing provisioning failures", async () => {
@@ -585,15 +389,12 @@ describe("environment command dispatch", () => {
       provisionWorkspace: async (options) => {
         options.onProgress?.({
           type: "step",
-          key: "git-worktree",
-          text: "git worktree add -B bb/failure /tmp/failure",
+          key: "git-checkout-started",
+          text: "Switching to branch bb/failure",
           status: "started",
           startedAt: Date.now(),
         });
-        throw new WorkspaceError(
-          "git_command_failed",
-          "git worktree add failed",
-        );
+        throw new WorkspaceError("git_command_failed", "git checkout failed");
       },
       createRuntime: () => createFakeRuntime().runtime,
     });
@@ -601,18 +402,15 @@ describe("environment command dispatch", () => {
     await expect(() =>
       dispatchCommand(
         {
-          type: "environment.provision",
+          type: "environment.attach",
+          contributedEnv: [],
           environmentId: "env-failure",
           initiator: {
             threadId: "thr-failure",
             provisioningId: "tpv-failure",
           },
-          workspaceProvisionType: "managed-worktree",
-          sourcePath: "/tmp/source",
-          targetPath: "/tmp/failure",
-          branchName: "bb/failure",
-          baseBranch: "main",
-          setupTimeoutMs: 900000,
+          path: "/tmp/failure",
+          setupScriptTimeoutMs: null,
         },
         makeDispatchOptions({
           runtimeManager: manager,
@@ -626,7 +424,7 @@ describe("environment command dispatch", () => {
           },
         }),
       ),
-    ).rejects.toThrow("git worktree add failed");
+    ).rejects.toThrow("git checkout failed");
 
     expect(emittedEvents).toEqual([
       expect.objectContaining({
@@ -637,261 +435,108 @@ describe("environment command dispatch", () => {
     expect(flushCount).toBe(1);
   });
 
-  it("returns empty transcript when environment already exists", async () => {
+  it("streams the workspace steps when a re-provision of an existing environment does no work", async () => {
     const harness = createHarness({ workspacePath: "/tmp/idempotent" });
     const sourcePath = await makeTempDir("bb-dispatch-idempotent-");
+    const emittedEvents: EventSinkInput[] = [];
 
-    // First provision
     await dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-idempotent",
         initiator: null,
-        workspaceProvisionType: "unmanaged",
         path: sourcePath,
+        setupScriptTimeoutMs: null,
       },
       harness.dispatchOptions(),
     );
 
-    // Second provision — same environment
     const result = await dispatchCommand(
       {
-        type: "environment.provision",
+        type: "environment.attach",
+        contributedEnv: [],
         environmentId: "env-idempotent",
         initiator: {
           threadId: "thr-second",
           provisioningId: "tpv-second",
         },
-        workspaceProvisionType: "unmanaged",
         path: sourcePath,
-      },
-      harness.dispatchOptions(),
-    );
-
-    expect(result.transcript).toEqual([]);
-  });
-
-  it("covers environment.destroy", async () => {
-    const harness = createHarness();
-    const closeEnvironmentTerminals = vi.fn(async () => undefined);
-    await harness.manager.ensureEnvironment({
-      environmentId: "env-1",
-      workspacePath: "/tmp/env-1",
-    });
-
-    const result = await dispatchCommand(
-      {
-        type: "environment.destroy",
-        environmentId: "env-1",
-        workspaceContext: {
-          workspacePath: "/tmp/env-1",
-          workspaceProvisionType: "managed-worktree",
-        },
+        setupScriptTimeoutMs: null,
       },
       makeDispatchOptions({
         runtimeManager: harness.manager,
-        terminalManager: { closeEnvironmentTerminals },
+        eventSink: {
+          emit: (event) => {
+            emittedEvents.push(event);
+          },
+          flush: async () => undefined,
+        },
       }),
     );
 
-    expect(result).toEqual({});
-    expect(closeEnvironmentTerminals).toHaveBeenCalledWith({
-      environmentId: "env-1",
-      reason: "environment-destroyed",
-    });
-    expect(harness.runtimeState.shutdownCount).toBe(1);
-    expect(harness.workspaceState.destroyed).toBe(true);
-  });
-
-  it("waits for terminal closes before destroying an environment", async () => {
-    const harness = createHarness();
-    const terminalClose = createDeferred<void>();
-    const closeEnvironmentTerminals = vi.fn(() => terminalClose.promise);
-    await harness.manager.ensureEnvironment({
-      environmentId: "env-1",
-      workspacePath: "/tmp/env-1",
-    });
-
-    let destroyResolved = false;
-    const destroyPromise = dispatchCommand(
-      {
-        type: "environment.destroy",
-        environmentId: "env-1",
-        workspaceContext: {
-          workspacePath: "/tmp/env-1",
-          workspaceProvisionType: "managed-worktree",
-        },
-      },
-      makeDispatchOptions({
-        runtimeManager: harness.manager,
-        terminalManager: { closeEnvironmentTerminals },
+    expect(result.path).toBe(sourcePath);
+    expect(streamedEntries(emittedEvents)).toEqual([
+      expect.objectContaining({
+        key: "workspace-path",
+        text: `Using workspace: ${sourcePath}`,
       }),
-    ).then((result) => {
-      destroyResolved = true;
-      return result;
-    });
-
-    await vi.waitFor(() =>
-      expect(closeEnvironmentTerminals).toHaveBeenCalledWith({
-        environmentId: "env-1",
-        reason: "environment-destroyed",
+      expect.objectContaining({
+        key: "workspace-branch",
+        text: expect.stringContaining("Using branch: main"),
       }),
-    );
-    expect(destroyResolved).toBe(false);
-    expect(harness.runtimeState.shutdownCount).toBe(0);
-    expect(harness.workspaceState.destroyed).toBe(false);
-
-    terminalClose.resolve(undefined);
-    await expect(destroyPromise).resolves.toEqual({});
-    expect(destroyResolved).toBe(true);
-    expect(harness.runtimeState.shutdownCount).toBe(1);
-    expect(harness.workspaceState.destroyed).toBe(true);
-  });
-
-  it("waits for in-progress terminal opens to close before destroying an environment", async () => {
-    const harness = createHarness();
-    const shell = createDeferred<string>();
-    let resolveShellCalls = 0;
-    const terminalFixture = createTerminalManager({
-      manager: harness.manager,
-      resolveShell: () => {
-        resolveShellCalls += 1;
-        return shell.promise;
-      },
-    });
-    const dispatchOptions = makeDispatchOptions({
-      runtimeManager: harness.manager,
-      terminalManager: terminalFixture.manager,
-    });
-
-    const openPromise = terminalFixture.manager.handleMessage({
-      type: "terminal.open",
-      requestId: "open-1",
-      terminalId: "term-1",
-      threadId: "thr-1",
-      target: {
-        kind: "workspace",
-        environmentId: "env-1",
-        workspaceContext: {
-          workspacePath: "/tmp/env-1",
-          workspaceProvisionType: "managed-worktree",
-        },
-      },
-      cols: 100,
-      rows: 30,
-      start: DEFAULT_TERMINAL_START,
-    });
-    await vi.waitFor(() => expect(resolveShellCalls).toBe(1));
-
-    let destroyResolved = false;
-    const destroyPromise = dispatchCommand(
-      {
-        type: "environment.destroy",
-        environmentId: "env-1",
-        workspaceContext: {
-          workspacePath: "/tmp/env-1",
-          workspaceProvisionType: "managed-worktree",
-        },
-      },
-      dispatchOptions,
-    ).then((result) => {
-      destroyResolved = true;
-      return result;
-    });
-
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(destroyResolved).toBe(false);
-    expect(harness.runtimeState.shutdownCount).toBe(0);
-    expect(harness.workspaceState.destroyed).toBe(false);
-
-    shell.resolve("/bin/zsh");
-    await Promise.all([openPromise, destroyPromise]);
-
-    const pty = terminalFixture.adapter.spawned[0]?.pty;
-    if (!pty) {
-      throw new Error("Expected terminal PTY to spawn");
-    }
-    expect(pty.killCalls).toEqual([null]);
-    expect(harness.runtimeState.shutdownCount).toBe(1);
-    expect(harness.workspaceState.destroyed).toBe(true);
-    expect(destroyResolved).toBe(true);
-  });
-
-  it("destroys a managed environment after daemon restart (not in memory)", async () => {
-    const harness = createHarness();
-    // Environment is NOT in memory — simulates daemon restart.
-    // The destroy command must reconnect using workspaceContext before destroying.
-    const result = await dispatchCommand(
-      {
-        type: "environment.destroy",
-        environmentId: "env-restart",
-        workspaceContext: {
-          workspacePath: "/tmp/env-1",
-          workspaceProvisionType: "managed-worktree",
-        },
-      },
-      makeDispatchOptions({ runtimeManager: harness.manager }),
-    );
-
-    expect(result).toEqual({});
-    // The workspace was reconnected (lazy provision) then destroyed
-    expect(harness.workspaceState.destroyed).toBe(true);
-    expect(harness.provisions).toEqual([
-      {
-        workspaceProvisionType: "reconnect-managed-worktree",
-        path: "/tmp/env-1",
-        signal: expect.any(AbortSignal),
-      },
     ]);
   });
+});
 
-  it("treats a retry as success when the workspace was already removed", async () => {
-    // Simulate: first destroy succeeds and removes the workspace,
-    // then daemon crashes before reporting. On retry, the path is gone.
-    let callCount = 0;
-    const { workspace } = createFakeWorkspace("/tmp/env-retry");
-    const { runtime } = createFakeRuntime();
-    const manager = new RuntimeManager({
-      provisionWorkspace: async () => {
-        callCount++;
-        if (callCount > 1) {
-          throw new WorkspaceError(
-            "path_not_found",
-            "Managed workspace path does not exist: /tmp/env-retry",
-          );
-        }
-        return workspace;
-      },
-      createRuntime: () => runtime,
-    });
-
-    // First destroy: succeeds (workspace exists in memory after reconnect)
-    await dispatchCommand(
+it("cancels setup with contributions even when another attach is waiting", async () => {
+  const sourcePath = await makeTempDir("bb-setup-env-cancel-");
+  const harness = createHarness({ workspacePath: sourcePath });
+  await fs.writeFile(
+    `${sourcePath}/.bb-env-setup.sh`,
+    'printf "%s" "$SETUP_VALUE" > started\nsleep 120\nprintf unsafe > after-cancel\n',
+  );
+  const command = {
+    type: "environment.attach" as const,
+    contributedEnv: [
       {
-        type: "environment.destroy",
-        environmentId: "env-retry",
-        workspaceContext: {
-          workspacePath: "/tmp/env-retry",
-          workspaceProvisionType: "managed-worktree",
-        },
+        name: "SETUP_VALUE",
+        value: "configured",
+        source: { plugin: "fixture" },
+        reason: "test",
       },
-      makeDispatchOptions({ runtimeManager: manager }),
-    );
-
-    // Second destroy (retry): workspace path is gone, should succeed (idempotent)
-    const retryResult = await dispatchCommand(
-      {
-        type: "environment.destroy",
-        environmentId: "env-retry",
-        workspaceContext: {
-          workspacePath: "/tmp/env-retry",
-          workspaceProvisionType: "managed-worktree",
+    ],
+    environmentId: "env-setup-cancel",
+    initiator: null,
+    path: sourcePath,
+    setupScriptTimeoutMs: 5000,
+  };
+  const options = harness.dispatchOptions();
+  const first = dispatchCommand(command, options);
+  const second = dispatchCommand(command, options);
+  const settled = Promise.allSettled([first, second]);
+  try {
+    await expect
+      .poll(async () => fs.readFile(`${sourcePath}/started`, "utf8"))
+      .toBe("configured");
+    await expect(
+      dispatchCommand(
+        {
+          type: "environment.attach.cancel",
+          environmentId: command.environmentId,
         },
-      },
-      makeDispatchOptions({ runtimeManager: manager }),
-    );
-
-    expect(retryResult).toEqual({});
-  });
+        options,
+      ),
+    ).resolves.toEqual({ aborted: true });
+    const rejection = {
+      status: "rejected",
+      reason: expect.objectContaining({ code: "provision_cancelled" }),
+    };
+    expect(await settled).toEqual([rejection, rejection]);
+    await expect(fs.stat(`${sourcePath}/after-cancel`)).rejects.toThrow();
+    expect(harness.provisions).toHaveLength(0);
+  } finally {
+    await harness.manager.shutdownAll();
+    await settled;
+  }
 });

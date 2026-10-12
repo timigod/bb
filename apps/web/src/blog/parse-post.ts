@@ -1,11 +1,7 @@
-/** Parses a blog markdown file with YAML-like front matter into a typed post.
- *  The shape is the one the marketing blog actually writes: title/date/lede,
- *  then headings, paragraphs, lists, quotes, and images. Anything else stays
- *  literal text rather than becoming markup. */
-
 export type PostBlock =
   | { kind: "paragraph"; text: string }
   | { kind: "heading"; text: string }
+  | { kind: "subheading"; text: string }
   | { kind: "list"; items: string[] }
   | {
       kind: "image";
@@ -15,7 +11,9 @@ export type PostBlock =
       caption?: string;
     }
   | { kind: "quote"; lines: string[] }
-  | { kind: "tweet"; href: string; id: string };
+  | { kind: "video"; src: string; poster: string; caption: string }
+  | { kind: "tweet"; href: string; id: string }
+  | { kind: "component"; name: "plugin-guide"; slide?: string };
 
 export type Post = {
   slug: string;
@@ -50,7 +48,7 @@ function formatDate(iso: string): string {
   }).format(new Date(`${iso}T00:00:00Z`));
 }
 
-function parseFrontMatter(source: string): {
+export function parseFrontMatter(source: string): {
   fields: Record<string, string>;
   body: string;
 } {
@@ -80,8 +78,12 @@ const LINKED_IMAGE_RE = /^\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)$/;
 const CAPTION_RE = /^\*(.+)\*$/;
 const TWEET_RE =
   /^tweet:(https:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[A-Za-z0-9_]+\/status\/(\d+)(?:\?.*)?)$/;
+const VIDEO_RE = /^video:([^|]+)\|([^|]+)\|(.+)$/;
+const PLUGIN_GUIDE_RE = /^component:plugin-guide(?::([a-z0-9-]+))?$/;
 
-function parseImage(line: string): Extract<PostBlock, { kind: "image" }> | null {
+function parseImage(
+  line: string,
+): Extract<PostBlock, { kind: "image" }> | null {
   const linked = LINKED_IMAGE_RE.exec(line);
   if (linked) {
     const src = linked[2];
@@ -153,6 +155,12 @@ export function parsePost(slug: string, source: string): Post {
       continue;
     }
 
+    if (line.startsWith("### ")) {
+      flushAll();
+      blocks.push({ kind: "subheading", text: line.slice(4) });
+      continue;
+    }
+
     if (line.startsWith("## ")) {
       flushAll();
       blocks.push({ kind: "heading", text: line.slice(3) });
@@ -163,6 +171,29 @@ export function parsePost(slug: string, source: string): Post {
     if (tweet) {
       flushAll();
       blocks.push({ kind: "tweet", href: tweet[1], id: tweet[2] });
+      continue;
+    }
+
+    const pluginGuide = PLUGIN_GUIDE_RE.exec(line);
+    if (pluginGuide) {
+      flushAll();
+      blocks.push(
+        pluginGuide[1]
+          ? { kind: "component", name: "plugin-guide", slide: pluginGuide[1] }
+          : { kind: "component", name: "plugin-guide" },
+      );
+      continue;
+    }
+
+    const video = VIDEO_RE.exec(line);
+    if (video && isRenderableHref(video[1]) && isRenderableHref(video[2])) {
+      flushAll();
+      blocks.push({
+        kind: "video",
+        src: video[1],
+        poster: video[2],
+        caption: video[3],
+      });
       continue;
     }
 
@@ -227,9 +258,9 @@ export function parsePost(slug: string, source: string): Post {
     lede,
     sourceLabel: fields.sourceLabel,
     sourceHref: fields.sourceHref,
-    cover: coverFromField ?? (firstImage
-      ? { src: firstImage.src, alt: firstImage.alt }
-      : undefined),
+    cover:
+      coverFromField ??
+      (firstImage ? { src: firstImage.src, alt: firstImage.alt } : undefined),
     blocks,
   };
 }

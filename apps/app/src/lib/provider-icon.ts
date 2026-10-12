@@ -1,155 +1,69 @@
-import {
-  getBuiltInAgentProviderInfo,
-  isAcpProviderId,
-  isAgentProviderId,
-} from "@bb/agent-providers";
-import type { ComponentType } from "react";
-import { createElement, useState } from "react";
-import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
-import { CursorIcon } from "@/components/icons/CursorIcon";
-import { GrokIcon } from "@/components/icons/GrokIcon";
-import { HermesAgentIcon } from "@/components/icons/HermesAgentIcon";
-import { OpenAiIcon } from "@/components/icons/OpenAiIcon";
-import { OpencodeIcon } from "@/components/icons/OpencodeIcon";
-import { OmpIcon } from "@/components/icons/OmpIcon";
-import { PiIcon } from "@/components/icons/PiIcon";
-import { Icon } from "@bb/shared-ui/icon";
-
-const ACP_ID_PREFIX = "acp-";
+import type { PluginProviderIconRegistration } from "@get-bb/plugin-sdk/app";
+import type { CSSProperties, ComponentType } from "react";
+import { createElement } from "react";
+import { isPresentationTintColor, type ProviderInfo } from "@bb/domain";
+import { ProviderIcon } from "@/components/plugin/ProviderIcon";
 
 interface ProviderIconInfo {
   icon: ComponentType<{ className?: string }>;
   ariaLabel: string;
 }
 
-const GenericAcpIcon: ComponentType<{ className?: string }> = ({ className }) =>
-  createElement(Icon, { name: "Code", className, "aria-hidden": "true" });
-
-// Brand icons for well-known ACP agents, keyed by slug (the provider id with
-// the `acp-` prefix stripped). Unknown ACP agents fall back to the generic
-// glyph; the display name still comes from the server-provided ProviderInfo.
-const KNOWN_ACP_BRAND_ICONS: Record<
-  string,
-  ComponentType<{ className?: string }>
-> = {
-  grok: GrokIcon,
-  "hermes-agent": HermesAgentIcon,
-  opencode: OpencodeIcon,
-  omp: OmpIcon,
-};
-
-const configuredProviderLogoIcons = new Map<
-  string,
-  ComponentType<{ className?: string }>
->();
-
-function getConfiguredProviderLogoIcon(
-  providerId: string,
-  logoUrl: string,
-): ComponentType<{ className?: string }> {
-  const cacheKey = `${providerId}\0${logoUrl}`;
-  const cached = configuredProviderLogoIcons.get(cacheKey);
-  if (cached !== undefined) {
-    return cached;
-  }
-
-  const fallbackIcon = getProviderIconInfo(providerId)?.icon;
-  const ProviderLogoIcon: ComponentType<{ className?: string }> = ({
-    className,
-  }) => {
-    const [failed, setFailed] = useState(false);
-    if (failed) {
-      return fallbackIcon === undefined
-        ? null
-        : createElement(fallbackIcon, { className });
-    }
-    return createElement("img", {
-      "aria-hidden": "true",
-      alt: "",
-      className: `${className ?? ""} object-contain`.trim(),
-      onError: () => setFailed(true),
-      src: logoUrl,
-    });
-  };
-  configuredProviderLogoIcons.set(cacheKey, ProviderLogoIcon);
-  return ProviderLogoIcon;
+interface ProviderIconSource {
+  logoUrl: string | null;
+  icon?: { glyph: string };
+  family?: string;
+  displayName?: string;
 }
 
-/**
- * Maps closed_internal provider IDs to their brand icon components.
- * Returns undefined for unknown providers so callers can fall back gracefully.
- */
+const providerIcons = new Map<string, ComponentType<{ className?: string }>>();
+
 export function getProviderIconInfo(
+  providerKind: PluginProviderIconRegistration["providerKind"],
   providerId: string,
-  logoUrl: string | null = null,
-): ProviderIconInfo | undefined {
-  if (logoUrl !== null) {
-    return {
-      icon: getConfiguredProviderLogoIcon(providerId, logoUrl),
-      ariaLabel: "Provider logo",
-    };
+  source: ProviderIconSource | null = null,
+): ProviderIconInfo {
+  const cacheKey = JSON.stringify([
+    providerKind,
+    providerId,
+    source?.logoUrl,
+    source?.icon?.glyph,
+  ]);
+  let icon = providerIcons.get(cacheKey);
+  if (icon === undefined) {
+    const ResolvedProviderIcon: ComponentType<{ className?: string }> = ({
+      className,
+    }) =>
+      createElement(ProviderIcon, {
+        providerKind,
+        provider: {
+          id: providerId,
+          logoUrl: source?.logoUrl,
+          icon: source?.icon,
+        },
+        className,
+      });
+    icon = ResolvedProviderIcon;
+    providerIcons.set(cacheKey, icon);
   }
+  return {
+    icon,
+    ariaLabel:
+      source?.displayName ??
+      (source?.family === "acp" ? "ACP provider" : providerId),
+  };
+}
 
-  if (!isAgentProviderId(providerId) && isAcpProviderId(providerId)) {
-    const slug = providerId.slice(ACP_ID_PREFIX.length);
-    const brandIcon = KNOWN_ACP_BRAND_ICONS[slug];
-    return {
-      icon: brandIcon ?? GenericAcpIcon,
-      ariaLabel: brandIcon ? slug : "ACP provider",
-    };
-  }
-
-  const providerInfo = isAgentProviderId(providerId)
-    ? getBuiltInAgentProviderInfo(providerId)
-    : null;
-  if (!providerInfo) {
+export function getProviderIconTintStyle(
+  provider: Pick<ProviderInfo, "strings"> | undefined,
+): CSSProperties | undefined {
+  const tint = provider?.strings?.iconTint;
+  if (
+    tint === undefined ||
+    !isPresentationTintColor(tint.light) ||
+    !isPresentationTintColor(tint.dark)
+  ) {
     return undefined;
   }
-
-  switch (providerId) {
-    case "codex":
-      return {
-        icon: OpenAiIcon,
-        ariaLabel: providerInfo.displayName,
-      };
-    case "claude-code":
-      return {
-        icon: ClaudeIcon,
-        ariaLabel: providerInfo.displayName,
-      };
-    case "pi":
-      return {
-        icon: PiIcon,
-        ariaLabel: providerInfo.displayName,
-      };
-    case "acp-cursor":
-      return {
-        icon: CursorIcon,
-        ariaLabel: providerInfo.displayName,
-      };
-    default:
-      return undefined;
-  }
-}
-
-export function getProviderIconColorClass(providerId: string): string {
-  if (providerId === "codex") {
-    return "text-foreground";
-  }
-  if (providerId === "claude-code") {
-    return "text-[#D97757]";
-  }
-  if (providerId === "pi") {
-    return "text-[#6D5DFB]";
-  }
-  if (providerId === "acp-cursor") {
-    return "text-[#111827] dark:text-[#F5F5F5]";
-  }
-  if (providerId === "acp-opencode") {
-    return "text-[#2563EB]";
-  }
-  if (providerId === "acp-omp") {
-    return "text-[#9333EA]";
-  }
-  return "text-foreground";
+  return { color: `light-dark(${tint.light.trim()}, ${tint.dark.trim()})` };
 }

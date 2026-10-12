@@ -1,11 +1,11 @@
 import { useMemo } from "react";
 import type { WorkspacePathEntry } from "@bb/server-contract";
-import { useDebounceValue } from "usehooks-ts";
 import { useEnvironmentPathSuggestions } from "./queries/environment-queries";
 import { useProjectPathSuggestions } from "./queries/project-queries";
 import { useThreadStoragePaths } from "./queries/thread-queries";
 import { isProjectlessProjectId } from "@/lib/route-paths";
 import type { PathListOptions } from "@/lib/path-list-options";
+import { useDebouncedValue } from "./useDebouncedValue";
 
 export const PATH_SUGGESTION_DEBOUNCE_MS = 120;
 
@@ -13,7 +13,7 @@ const DEFAULT_PATH_SUGGESTION_LIMIT = 8;
 const SOURCE_OVERSAMPLE_MULTIPLIER = 2;
 
 export type PathSuggestionSource = "workspace" | "thread-storage";
-export type PathSuggestionEntryKind = "file" | "directory";
+type PathSuggestionEntryKind = "file" | "directory";
 
 type WorkspaceSource = "environment" | "project" | "none";
 
@@ -26,7 +26,7 @@ export interface PathSuggestion {
   positions: number[];
 }
 
-export interface UsePathSuggestionsArgs {
+interface UsePathSuggestionsArgs {
   projectId: string | undefined;
   query: string | null;
   limit?: number;
@@ -36,7 +36,7 @@ export interface UsePathSuggestionsArgs {
   includeDirectories: boolean;
 }
 
-export interface UsePathSuggestionsResult {
+interface UsePathSuggestionsResult {
   suggestions: PathSuggestion[];
   isLoading: boolean;
   isError: boolean;
@@ -146,7 +146,7 @@ export function usePathSuggestions(
 ): UsePathSuggestionsResult {
   const limit = args.limit ?? DEFAULT_PATH_SUGGESTION_LIMIT;
   const oversampleLimit = limit * SOURCE_OVERSAMPLE_MULTIPLIER;
-  const [debouncedNonNullQuery] = useDebounceValue(
+  const debouncedNonNullQuery = useDebouncedValue(
     args.query,
     PATH_SUGGESTION_DEBOUNCE_MS,
   );
@@ -156,10 +156,6 @@ export function usePathSuggestions(
   const debouncedTrimmedQuery = debouncedQuery?.trim() ?? "";
   const isDebouncing = hasQuery && trimmedQuery !== debouncedTrimmedQuery;
   const hasDebouncedQuery = debouncedTrimmedQuery.length > 0;
-  // The workspace source for an existing thread is its environment; the
-  // selected project source is only used by the new-thread compose box before
-  // an environment exists. Projectless (personal) threads have no project
-  // source, so without an environment there is no workspace to search.
   const workspaceSource: WorkspaceSource = args.environmentId
     ? "environment"
     : args.projectId && !isProjectlessProjectId(args.projectId)
@@ -205,9 +201,6 @@ export function usePathSuggestions(
     args.currentThreadId ?? "",
     threadStorageOptions,
     {
-      // Match the workspace query: only search once there is a (debounced)
-      // query. Without this an empty input still fires a storage request whose
-      // results we discard, and whose failure surfaces as a spurious error.
       enabled: isThreadStorageQueryEnabled,
     },
   );
@@ -218,7 +211,9 @@ export function usePathSuggestions(
     }
 
     return buildPathSuggestions({
-      workspacePaths: includeWorkspace ? (workspaceQuery.data?.paths ?? []) : [],
+      workspacePaths: includeWorkspace
+        ? (workspaceQuery.data?.paths ?? [])
+        : [],
       threadStoragePaths: includeThreadStorage
         ? (threadStorageQuery.data?.paths ?? [])
         : [],

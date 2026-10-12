@@ -1,4 +1,4 @@
-const DEFAULT_DEBOUNCE_MS = 300;
+const DEBOUNCE_MS = 300;
 const IGNORED_SEGMENTS = new Set(["dist", "node_modules", ".git"]);
 
 export function isIgnoredPluginDevPath(relativePath: string): boolean {
@@ -7,17 +7,21 @@ export function isIgnoredPluginDevPath(relativePath: string): boolean {
     .some((segment) => IGNORED_SEGMENTS.has(segment));
 }
 
-export interface PluginDevLoopDeps {
-  pluginId: string;
+export interface PluginDevLoopTargets {
   hasApp: boolean;
-  buildApp: () => Promise<void>;
-  reloadPlugin: () => Promise<void>;
-  log: (line: string) => void;
-  debounceMs?: number;
-  now?: () => number;
+  hasHost: boolean;
 }
 
-export interface PluginDevLoop {
+interface PluginDevLoopDeps {
+  pluginId: string;
+  targets: () => Promise<PluginDevLoopTargets>;
+  buildApp: () => Promise<void>;
+  buildHost: () => Promise<void>;
+  reloadPlugin: () => Promise<void>;
+  log: (line: string) => void;
+}
+
+interface PluginDevLoop {
   handleChange: (relativePath: string) => void;
   settled: () => Promise<void>;
   dispose: () => void;
@@ -28,8 +32,6 @@ function errorMessage(error: unknown): string {
 }
 
 export function createPluginDevLoop(deps: PluginDevLoopDeps): PluginDevLoop {
-  const debounceMs = deps.debounceMs ?? DEFAULT_DEBOUNCE_MS;
-  const now = deps.now ?? (() => Date.now());
   const pending = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
@@ -39,15 +41,36 @@ export function createPluginDevLoop(deps: PluginDevLoopDeps): PluginDevLoop {
     const parts = [
       `${files.length} file${files.length === 1 ? "" : "s"} changed`,
     ];
-    if (deps.hasApp) {
-      const startedAt = now();
+    let targets: PluginDevLoopTargets;
+    try {
+      targets = await deps.targets();
+    } catch (error) {
+      parts.push(`manifest read failed: ${errorMessage(error)}`);
+      deps.log(`${parts.join(" · ")} — fix and save to retry`);
+      return;
+    }
+    if (targets.hasApp) {
+      const startedAt = Date.now();
       try {
         await deps.buildApp();
         parts.push(
-          `rebuilt app in ${Math.max(0, Math.round(now() - startedAt))}ms`,
+          `rebuilt app in ${Math.max(0, Math.round(Date.now() - startedAt))}ms`,
         );
       } catch (error) {
         parts.push(`build failed: ${errorMessage(error)}`);
+        deps.log(`${parts.join(" · ")} — fix and save to retry`);
+        return;
+      }
+    }
+    if (targets.hasHost) {
+      const startedAt = Date.now();
+      try {
+        await deps.buildHost();
+        parts.push(
+          `rebuilt host in ${Math.max(0, Math.round(Date.now() - startedAt))}ms`,
+        );
+      } catch (error) {
+        parts.push(`host build failed: ${errorMessage(error)}`);
         deps.log(`${parts.join(" · ")} — fix and save to retry`);
         return;
       }
@@ -72,7 +95,7 @@ export function createPluginDevLoop(deps: PluginDevLoopDeps): PluginDevLoop {
       if (disposed || isIgnoredPluginDevPath(relativePath)) return;
       pending.add(relativePath);
       if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(flush, debounceMs);
+      timer = setTimeout(flush, DEBOUNCE_MS);
     },
     settled: () => queueTail,
     dispose() {

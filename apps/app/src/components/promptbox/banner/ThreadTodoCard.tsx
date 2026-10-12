@@ -3,17 +3,25 @@ import type {
   ThreadTimelinePendingTodoItemStatus,
   ThreadTimelinePendingTodos,
 } from "@bb/domain";
-import { PromptStackCard } from "@/components/promptbox/banner/PromptStackCard";
+import { AnimatedDisclosureBody } from "@/components/promptbox/banner/AnimatedBody";
+import {
+  PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
+  PROMPT_STACK_CARD_ROW_HEIGHT,
+  PromptStackCard,
+} from "@/components/promptbox/banner/PromptStackCard";
 import {
   activityIconClass,
   activityRowClass,
   activityTextClass,
   type ActivityRowState,
-} from "@/components/ui/activity-row-styles";
+} from "@bb/shared-ui/activity-row-styles";
 import { Icon } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
-
-const TODO_CARD_ROW_HEIGHT = 32;
+import {
+  PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+  PromptStackHoverChevron,
+  useDisclosureFocusHandoff,
+} from "@bb/shared-ui/prompt-stack-disclosure";
 
 const STATUS_SORT_RANK: Record<ThreadTimelinePendingTodoItemStatus, number> = {
   in_progress: 0,
@@ -30,7 +38,7 @@ const STATUS_ACTIVITY_STATE: Record<
   completed: "completed",
 };
 
-export interface ThreadTodoCardProps {
+interface ThreadTodoCardProps {
   pendingTodos: ThreadTimelinePendingTodos | null;
   isExpanded: boolean;
   onToggle: () => void;
@@ -40,7 +48,7 @@ const BODY_ID = "thread-todo-card-body";
 const TOGGLE_ID = "thread-todo-card-toggle";
 const TODO_HEADER_BUTTON_CLASS = activityRowClass(
   "active",
-  "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80",
+  PROMPT_STACK_CARD_HEADER_BUTTON_CLASS,
 );
 const TODO_ACTIVE_ROW_CLASS = "shadow-none ring-0";
 const TODO_ACTIVE_ICON_CLASS = "text-foreground";
@@ -142,6 +150,7 @@ export function ThreadTodoCard({
   isExpanded,
   onToggle,
 }: ThreadTodoCardProps) {
+  const focus = useDisclosureFocusHandoff(isExpanded, onToggle);
   const items = pendingTodos?.items ?? [];
   if (items.length === 0) {
     return null;
@@ -151,7 +160,7 @@ export function ThreadTodoCard({
     <PromptStackCard
       ariaLabel="To-do list"
       className="overflow-hidden"
-      style={{ minHeight: TODO_CARD_ROW_HEIGHT }}
+      style={{ minHeight: PROMPT_STACK_CARD_ROW_HEIGHT }}
     >
       <div className="flex items-center">
         <button
@@ -160,8 +169,12 @@ export function ThreadTodoCard({
           aria-expanded={isExpanded}
           aria-controls={BODY_ID}
           aria-label={`To-do list: ${summary.aria}`}
-          onClick={onToggle}
-          className={TODO_HEADER_BUTTON_CLASS}
+          ref={focus.triggerRef}
+          onClick={focus.onTriggerClick}
+          className={cn(
+            TODO_HEADER_BUTTON_CLASS,
+            PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
+          )}
         >
           <Icon
             name="ListTodo"
@@ -176,33 +189,20 @@ export function ThreadTodoCard({
           >
             {summary.visible}
           </span>
-          <Icon
-            name="ChevronDown"
-            className={cn(
-              activityIconClass("active"),
-              "size-3.5 shrink-0 transition-transform duration-200",
-              isExpanded && "rotate-180",
-            )}
-            aria-hidden="true"
-          />
+          <PromptStackHoverChevron isExpanded={isExpanded} />
         </button>
       </div>
-      <section
+      <AnimatedDisclosureBody
         id={BODY_ID}
-        role="region"
-        aria-labelledby={TOGGLE_ID}
-        aria-hidden={!isExpanded}
-        className={cn(
-          "grid overflow-hidden transition-[grid-template-rows,opacity,border-color] duration-200 ease-out",
-          isExpanded
-            ? "grid-rows-[1fr] border-t border-border opacity-100"
-            : "pointer-events-none grid-rows-[0fr] opacity-0",
-        )}
+        labelledBy={TOGGLE_ID}
+        isExpanded={isExpanded}
+        collapsedBorder="none"
+        collapseLabel="Collapse to-do list"
+        collapseRef={focus.collapseRef}
+        onCollapse={focus.onCollapseClick}
       >
-        <div className="overflow-hidden bg-popover">
-          <TodoBody items={items} />
-        </div>
-      </section>
+        <TodoBody items={items} />
+      </AnimatedDisclosureBody>
     </PromptStackCard>
   );
 }

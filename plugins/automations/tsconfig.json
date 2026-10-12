@@ -11,14 +11,22 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"],
     "paths": {
-      "@bb/plugin-sdk": [
-        "../../packages/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts"
+      "@/components/ui/icon": [
+        "../../packages/plugin-registry/flavors/components/ui/icon.tsx"
       ],
-      "@bb/plugin-sdk/app": [
-        "../../packages/plugin-sdk/bundled-types/bb-plugin-sdk-app.d.ts"
-      ],
-      "@/*": ["./*"]
+      "@/*": ["../../packages/shared-ui/src/*"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "app.tsx", "detail-view.tsx", "lib"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "actions-menu.tsx",
+    "app.tsx",
+    "automations.stories.tsx",
+    "detail-view.tsx",
+    "metadata.tsx",
+    "overview-view.tsx",
+    "lib",
+    "vitest.config.ts"
+  ]
 }

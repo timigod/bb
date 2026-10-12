@@ -14,8 +14,6 @@ import {
   type SlowDbQueryLogger,
   getDatabaseAutoVacuumMode,
   getDatabaseFreelistStats,
-  getDatabaseMaintenanceActivity,
-  isDatabaseMaintenanceIdle,
   listDeferredLegacyTables,
   migrate,
   noopNotifier,
@@ -25,11 +23,6 @@ import type { ServerLogger } from "../../src/types.js";
 import { runDatabaseMaintenanceSweep } from "../../src/services/system/periodic-sweeps.js";
 import { testLogger } from "../helpers/test-app.js";
 
-const ONE_HOUR_MS = 60 * 60_000;
-// The non-isolated server project shares the production module's last-sweep
-// clock across files. Start beyond wall time so another test that uses
-// Date.now() cannot make these synthetic sweeps look too early.
-const SWEEP_TIME_START_MS = Date.now() + 24 * ONE_HOUR_MS;
 const FREELIST_ROW_COUNT = 1_200;
 const SQLITE_BUSY_HEADROOM_MS = 1_000;
 const TEST_DEFERRED_LEGACY_TABLE_NAMES = [
@@ -40,8 +33,6 @@ const TEST_DEFERRED_LEGACY_TABLE_NAMES = [
   "project_operations",
   "thread_operations",
 ];
-
-let sweepTimeMs = SWEEP_TIME_START_MS;
 
 interface TempDatabasePath {
   dbPath: string;
@@ -72,11 +63,6 @@ function createCapturingServerLogger() {
   };
 
   return { logger, warnMessages };
-}
-
-function nextSweepTime(): number {
-  sweepTimeMs += 2 * ONE_HOUR_MS;
-  return sweepTimeMs;
 }
 
 function createTempDatabasePath(): TempDatabasePath {
@@ -121,7 +107,6 @@ function createDeferredLegacyTables(db: DbConnection): void {
 function markDatabaseBusy(db: DbConnection): void {
   const host = upsertHost(db, noopNotifier, {
     name: "maintenance-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "maintenance-project",
@@ -135,7 +120,6 @@ function markDatabaseBusy(db: DbConnection): void {
 }
 
 function buildFreelist(db: DbConnection): void {
-  // Build a freelist: insert several pages of data, then delete it.
   db.$client.exec(
     "CREATE TABLE scratch_blobs (id INTEGER PRIMARY KEY, blob TEXT)",
   );
@@ -179,7 +163,7 @@ describe("runDatabaseMaintenanceSweep", () => {
       [...TEST_DEFERRED_LEGACY_TABLE_NAMES].sort(),
     );
 
-    runDatabaseMaintenanceSweep({ db, logger: testLogger }, nextSweepTime());
+    runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
     expect(listDeferredLegacyTables(db)).toEqual([]);
   });
@@ -188,28 +172,10 @@ describe("runDatabaseMaintenanceSweep", () => {
     const { db } = setupBusyDatabaseWithFreelist();
     createDeferredLegacyTables(db);
 
-    runDatabaseMaintenanceSweep({ db, logger: testLogger }, nextSweepTime());
+    runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
     expect(listDeferredLegacyTables(db)).toEqual(
       [...TEST_DEFERRED_LEGACY_TABLE_NAMES].sort(),
-    );
-  });
-
-  it("reclaims freed pages incrementally even when the instance is not idle", () => {
-    const { db } = setupBusyDatabaseWithFreelist();
-
-    // Precondition: there is reclaimable space and the instance is busy, so the
-    // old full-VACUUM path would have skipped maintenance.
-    const before = getDatabaseFreelistStats(db);
-    expect(before.freelistCount).toBeGreaterThan(0);
-    expect(isDatabaseMaintenanceIdle(getDatabaseMaintenanceActivity(db))).toBe(
-      false,
-    );
-
-    runDatabaseMaintenanceSweep({ db, logger: testLogger }, nextSweepTime());
-
-    expect(getDatabaseFreelistStats(db).freelistCount).toBeLessThan(
-      before.freelistCount,
     );
   });
 
@@ -230,10 +196,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const before = getDatabaseFreelistStats(db);
         slowQueryLogger.clear();
 
-        runDatabaseMaintenanceSweep(
-          { db, logger: testLogger },
-          nextSweepTime(),
-        );
+        runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
         expect(getDatabaseAutoVacuumMode(db)).toBe("none");
         expect(getDatabaseFreelistStats(db).freelistCount).toBe(
@@ -263,10 +226,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const before = getDatabaseFreelistStats(db);
         const startedAt = performance.now();
 
-        runDatabaseMaintenanceSweep(
-          { db, logger: testLogger },
-          nextSweepTime(),
-        );
+        runDatabaseMaintenanceSweep({ db, logger: testLogger });
 
         const elapsedMs = performance.now() - startedAt;
         expect(elapsedMs).toBeLessThan(
@@ -300,7 +260,7 @@ describe("runDatabaseMaintenanceSweep", () => {
         const { logger, warnMessages } = createCapturingServerLogger();
         const startedAt = performance.now();
 
-        runDatabaseMaintenanceSweep({ db, logger }, nextSweepTime());
+        runDatabaseMaintenanceSweep({ db, logger });
 
         const elapsedMs = performance.now() - startedAt;
         expect(elapsedMs).toBeLessThan(

@@ -1,8 +1,7 @@
-import { buildThreadEvent, getThreadEventScopeTurnId } from "@bb/domain";
-import type { ThreadEvent, ThreadEventRow } from "@bb/domain";
+import { getThreadEventScopeTurnId } from "@bb/domain";
+import type { ThreadEvent } from "@bb/domain";
 import { assertNever } from "./assert-never.js";
 
-/** Extract the optional turnId from any decoded ThreadEvent. */
 export function getEventTurnId(decoded: ThreadEvent): string | undefined {
   return getThreadEventScopeTurnId(decoded.scope);
 }
@@ -23,6 +22,8 @@ export function getEventProviderThreadId(
     case "item/completed":
     case "item/backgroundTask/progress":
     case "item/backgroundTask/completed":
+    case "item/delegation/progress":
+    case "item/delegation/completed":
     case "item/agentMessage/delta":
     case "item/commandExecution/outputDelta":
     case "item/fileChange/outputDelta":
@@ -39,6 +40,8 @@ export function getEventProviderThreadId(
     case "provider/warning":
     case "provider/modelFallback":
     case "provider/rateLimits/updated":
+    case "provider.env-resolved":
+    case "thread/extensionState/updated":
     case "provider/unhandled":
       return decoded.providerThreadId;
     case "turn/completed":
@@ -52,6 +55,7 @@ export function getEventProviderThreadId(
     case "system/manager/user_message":
     case "system/thread/interrupted":
     case "system/operation":
+    case "system/interaction/lifecycle":
     case "system/permissionGrant/lifecycle":
     case "system/userQuestion/lifecycle":
     case "system/thread-provisioning":
@@ -70,6 +74,8 @@ export function getEventParentToolCallId(
     case "item/completed":
     case "item/backgroundTask/progress":
     case "item/backgroundTask/completed":
+    case "item/delegation/progress":
+    case "item/delegation/completed":
       return decoded.item.parentToolCallId;
     case "item/agentMessage/delta":
     case "item/commandExecution/outputDelta":
@@ -99,6 +105,8 @@ export function getEventParentToolCallId(
     case "provider/warning":
     case "provider/modelFallback":
     case "provider/rateLimits/updated":
+    case "provider.env-resolved":
+    case "thread/extensionState/updated":
     case "client/thread/start":
     case "client/turn/requested":
     case "client/turn/rejected":
@@ -107,6 +115,7 @@ export function getEventParentToolCallId(
     case "system/manager/user_message":
     case "system/thread/interrupted":
     case "system/operation":
+    case "system/interaction/lifecycle":
     case "system/permissionGrant/lifecycle":
     case "system/userQuestion/lifecycle":
     case "system/thread-provisioning":
@@ -117,27 +126,8 @@ export function getEventParentToolCallId(
   }
 }
 
-/** Row metadata that travels alongside the decoded event. */
 export interface EventMeta {
   id: string;
   seq: number;
   createdAt: number;
-}
-
-function buildEventMeta(row: ThreadEventRow): EventMeta {
-  return {
-    id: row.id,
-    seq: row.seq,
-    createdAt: row.createdAt,
-  };
-}
-
-export function decodeThreadEventRow(row: ThreadEventRow): {
-  event: ThreadEvent;
-  meta: EventMeta;
-} {
-  return {
-    event: buildThreadEvent(row),
-    meta: buildEventMeta(row),
-  };
 }

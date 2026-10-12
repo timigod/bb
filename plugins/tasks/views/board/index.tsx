@@ -6,7 +6,6 @@ import {
   type ReactNode,
 } from "react";
 import {
-  TASK_STATUSES,
   type Label,
   type Task,
   type TaskStatus,
@@ -14,12 +13,14 @@ import {
 } from "../../shared/contract.js";
 import {
   listAllTasks,
+  signalTaskIds,
   useTasksQuery,
+  type TaskSignal,
   useTasksRpc,
   type TasksRpc,
 } from "../../shell/data.js";
 import { useTasksNavigation } from "../../shell/routes.js";
-import { NewTaskDialog } from "../manage/index.js";
+import { NewTaskDialog } from "../manage/new-task-dialog.js";
 import {
   applyBoardMove,
   BOARD_STATUSES,
@@ -27,11 +28,14 @@ import {
   dropNeighborsForIndex,
   visibleBoardStatuses,
 } from "./drop-position.js";
-import { PriorityIcon, STATUS_LABELS, StatusIcon } from "./icons.js";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
-import { Skeleton } from "@bb/shared-ui/skeleton";
-import { cn } from "@bb/shared-ui/lib/utils";
+import { PriorityIcon, StatusIcon } from "./icons.js";
+import { isActiveThread } from "../detail/meta.js";
+import { STATUS_LABELS } from "../list/lib.js";
+import { Button } from "@/components/ui/button";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
+import { Icon } from "@/components/ui/icon";
+import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 
 const DRAG_THRESHOLD_PX = 5;
 
@@ -43,8 +47,8 @@ interface BoardCardMeta {
 }
 
 interface BoardData {
-  /** Top-level tasks in server order (status, then ascending position). */
   tasks: Task[];
+  subtasks: Task[];
   labelsById: Map<string, Label>;
   metaByTaskId: Map<string, BoardCardMeta>;
 }
@@ -63,7 +67,6 @@ async function fetchBoard(
   const tasks = await listAllTasks(rpc, { projectId });
   const topLevel = tasks.filter((task) => task.parentTaskId === null);
 
-  // Everything below decorates cards; a failure hides chips, never the board.
   const labels = await rpc.call("listLabels", { projectId }).then(
     (result) => result.labels,
     () => [],
@@ -94,14 +97,7 @@ async function fetchBoard(
             (result) => result.taskThreads,
             () => [],
           );
-        workingByTaskId.set(
-          task.id,
-          threads.filter(
-            (thread) =>
-              thread.liveStatus === "working" ||
-              thread.liveStatus === "starting",
-          ),
-        );
+        workingByTaskId.set(task.id, threads.filter(isActiveThread));
       }),
   );
   const attachmentCounts = new Map<string, number>();
@@ -117,6 +113,7 @@ async function fetchBoard(
 
   return {
     tasks: topLevel,
+    subtasks: tasks.filter((task) => task.parentTaskId !== null),
     labelsById: new Map(labels.map((label) => [label.id, label])),
     metaByTaskId: new Map(
       topLevel.map((task) => [
@@ -130,6 +127,99 @@ async function fetchBoard(
       ]),
     ),
   };
+}
+
+async function workingThreadsFor(
+  rpc: TasksRpc,
+  taskId: string,
+): Promise<TaskThread[]> {
+  return rpc.call("listTaskThreads", { taskId }).then(
+    (result) => result.taskThreads.filter(isActiveThread),
+    () => [],
+  );
+}
+
+async function patchBoard(
+  rpc: TasksRpc,
+  projectId: string,
+  current: BoardData,
+  signals: readonly TaskSignal[],
+): Promise<BoardData | null> {
+  if (signals.some((signal) => signal.channel === "projects:changed")) {
+    return null;
+  }
+  const changedIds = signalTaskIds(signals, "tasks:changed");
+  const fetched = await Promise.all(
+    changedIds.map(async (taskId) => {
+      const { task } = await rpc.call("getTask", { taskId });
+      return [taskId, task] as const;
+    }),
+  );
+  const changed = new Map(fetched);
+  const keep = (task: Task) => !changed.has(task.id);
+  const tasks = current.tasks.filter(keep);
+  const subtasks = current.subtasks.filter(keep);
+  const metaByTaskId = new Map(current.metaByTaskId);
+  for (const taskId of changed.keys()) metaByTaskId.delete(taskId);
+  const refreshedCards: Task[] = [];
+  for (const task of changed.values()) {
+    if (task === null || task.projectId !== projectId) continue;
+    if (task.parentTaskId === null) {
+      tasks.push(task);
+      refreshedCards.push(task);
+    } else {
+      subtasks.push(task);
+    }
+  }
+  const topLevelIds = new Set(tasks.map((task) => task.id));
+  const threadIds = signalTaskIds(signals, "threads:changed").filter(
+    (taskId) => topLevelIds.has(taskId) && !changed.has(taskId),
+  );
+  await Promise.all([
+    ...refreshedCards.map(async (task) => {
+      const [workingThreads, attachmentCount] = await Promise.all([
+        workingThreadsFor(rpc, task.id),
+        rpc.call("listAttachments", { taskId: task.id }).then(
+          (result) => result.attachments.length,
+          () => 0,
+        ),
+      ]);
+      metaByTaskId.set(task.id, {
+        ...EMPTY_META,
+        workingThreads,
+        attachmentCount,
+      });
+    }),
+    ...threadIds.map(async (taskId) => {
+      const workingThreads = await workingThreadsFor(rpc, taskId);
+      metaByTaskId.set(taskId, {
+        ...(metaByTaskId.get(taskId) ?? EMPTY_META),
+        workingThreads,
+      });
+    }),
+  ]);
+  const progress = new Map<string, { done: number; total: number }>();
+  for (const task of subtasks) {
+    if (task.parentTaskId === null) continue;
+    const entry = progress.get(task.parentTaskId) ?? { done: 0, total: 0 };
+    entry.total += 1;
+    if (task.status === "done") entry.done += 1;
+    progress.set(task.parentTaskId, entry);
+  }
+  for (const task of tasks) {
+    const meta = metaByTaskId.get(task.id) ?? EMPTY_META;
+    const entry = progress.get(task.id);
+    metaByTaskId.set(task.id, {
+      ...meta,
+      subDone: entry?.done ?? 0,
+      subTotal: entry?.total ?? 0,
+    });
+  }
+  tasks.sort(
+    (a, b) =>
+      a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
+  return { ...current, tasks, subtasks, metaByTaskId };
 }
 
 type ColumnMap = Record<TaskStatus, Task[]>;
@@ -255,37 +345,41 @@ function TaskCard({
 
 function BoardSkeleton() {
   return (
-    <div className="flex h-full items-start gap-3 overflow-x-auto p-4">
-      {BOARD_STATUSES.map((status) => (
-        <div
-          key={status}
-          className="flex w-[230px] shrink-0 flex-col gap-2 p-1"
-        >
-          <Skeleton className="h-5 w-24" />
-          <Skeleton className="h-20 w-full rounded-lg" />
-          <Skeleton className="h-20 w-full rounded-lg" />
-          <Skeleton className="h-14 w-full rounded-lg" />
-        </div>
-      ))}
-    </div>
+    <DelayedLoading>
+      <div className="flex h-full items-start gap-3 overflow-x-auto p-4">
+        {BOARD_STATUSES.map((status) => (
+          <div
+            key={status}
+            className="flex w-[230px] shrink-0 flex-col gap-2 p-1"
+          >
+            <Skeleton className="h-5 w-24" />
+            <Skeleton className="h-20 w-full rounded-lg" />
+            <Skeleton className="h-20 w-full rounded-lg" />
+            <Skeleton className="h-14 w-full rounded-lg" />
+          </div>
+        ))}
+      </div>
+    </DelayedLoading>
   );
 }
 
-export interface BoardViewProps {
+interface BoardViewProps {
   projectId: string;
 }
 
 export function BoardView({ projectId }: BoardViewProps) {
   const rpc = useTasksRpc();
   const navigation = useTasksNavigation();
-  const board = useTasksQuery(
+  const board = useTasksQuery<BoardData>(
     (queryRpc) => fetchBoard(queryRpc, projectId),
     ["tasks:changed", "projects:changed", "threads:changed"],
     [projectId],
+    {
+      applySignals: (queryRpc, current, signals) =>
+        patchBoard(queryRpc, projectId, current, signals),
+    },
   );
 
-  // Local column state renders instantly on drop; realtime refetches replace
-  // it with the server's authoritative fractional-position order.
   const [columns, setColumns] = useState<ColumnMap | undefined>(undefined);
   useEffect(() => {
     setColumns(undefined);
@@ -312,8 +406,6 @@ export function BoardView({ projectId }: BoardViewProps) {
   ): { status: TaskStatus; index: number } | null => {
     const current = columnsRef.current;
     if (!current) return null;
-    // Each column's drop zone is its full-height strip of the board, so a
-    // pointer below a short column's last card still targets that column.
     const boardRect = boardRef.current?.getBoundingClientRect();
     if (
       boardRect &&
@@ -429,7 +521,6 @@ export function BoardView({ projectId }: BoardViewProps) {
         if (target) commitDrop(task.id, target.status, target.index);
       }
       setDrag(null);
-      // The click event fires right after pointerup; swallow that one only.
       suppressClickRef.current = true;
       setTimeout(() => {
         suppressClickRef.current = false;
@@ -479,8 +570,6 @@ export function BoardView({ projectId }: BoardViewProps) {
   const renderColumn = (status: TaskStatus) => {
     const cards = columns[status];
     const isDragOver = drag !== null && drag.overStatus === status;
-    // The dragged card stays in place (dimmed), so the insertion indicator is
-    // positioned among the remaining cards.
     const remaining = drag
       ? cards.filter((task) => task.id !== drag.taskId)
       : cards;

@@ -1,28 +1,30 @@
 import { useStore } from "jotai";
-import { useLayoutEffect, useRef, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  type ReactNode,
+} from "react";
 import { cn } from "@bb/shared-ui/lib/utils";
+import { usePrefersReducedMotion } from "@bb/shared-ui/hooks/use-media-query";
+import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import {
   isDocumentVisible,
   subscribeToDocumentVisibility,
 } from "@/lib/document-visibility";
+import { supportsScrollAnchoring } from "@/lib/scroll-anchoring-support";
+import {
+  observedBorderBoxBlockSize,
+  observeSharedResize,
+} from "@/lib/shared-resize-observer";
 import { layoutAnimationInFlightCountAtom } from "./layoutAnimationAtoms.js";
 
-// Shared animation tokens for height transitions across the timeline.
 const HEIGHT_TRANSITION_DURATION_MS = 180;
-// Cubic-bezier ease-out-expo: fast initial expansion, gentle settle.
 const HEIGHT_TRANSITION_EASE_CSS = "cubic-bezier(0.16, 1, 0.3, 1)";
 const PAUSE_COLLAPSED_DESCENDANT_ANIMATIONS_CLASS =
   "[&_*]:![animation-play-state:paused]";
 
-// While content is reflowing (window/panel resize, sidebar collapse, font
-// load), the wrapper's height changes every frame. Letting the CSS height
-// transition fire in that case queues a fresh 180ms interpolation each frame
-// and the continuously-animating wrapper invalidates layout for the whole
-// subtree underneath — the source of the resize lag. Snap-mode disables the
-// transition for the duration of the resize burst, identified by the inner
-// element's width changing, and re-enables it one quiet rAF after the last
-// width change so streaming-driven height changes (stable width) still
-// animate.
 interface SnapState {
   savedDuration: string | null;
   restoreFrame: number | null;
@@ -44,8 +46,6 @@ function enterSnapMode(target: HTMLElement, state: SnapState): void {
   if (state.savedDuration === null) {
     state.savedDuration = target.style.transitionDuration;
   }
-  // Re-apply on every fire: a parent React render mid-resize would re-write
-  // the `transition` shorthand and reset the duration longhand.
   target.style.transitionDuration = "0s";
 }
 
@@ -67,9 +67,6 @@ function applyHeight(
   snap: boolean,
   state: SnapState,
 ): void {
-  // Snap on decrease: easing a shrink draws attention to content going away
-  // and lets the parent scroll container chase the receding bottom edge.
-  // Only growth animates.
   const currentHeightPx = parseFloat(target.style.height);
   const nextHeightPx = parseFloat(nextHeight);
   const heightDecreasing =
@@ -88,8 +85,6 @@ function cleanupSnapState(target: HTMLElement | null, state: SnapState): void {
     cancelAnimationFrame(state.restoreFrame);
     state.restoreFrame = null;
   }
-  // Restore eagerly so a re-running effect (HeightTransition's `visible`
-  // toggle) doesn't inherit `transitionDuration: 0s` and skip its animation.
   if (state.savedDuration !== null && target) {
     target.style.transitionDuration = state.savedDuration;
     state.savedDuration = null;
@@ -138,28 +133,21 @@ function cancelIntrinsicHeightRestore(
   resizeState.restoreTimerId = null;
 }
 
-export interface HeightTransitionProps {
-  visible: boolean;
-  children: ReactNode;
-  durationMs?: number;
-  className?: string;
+function getObservedInnerHeight(
+  entry: ResizeObserverEntry | undefined,
+  inner: HTMLElement,
+): number {
+  const observed =
+    entry === undefined ? undefined : observedBorderBoxBlockSize(entry);
+  return observed ?? inner.offsetHeight;
 }
 
-/**
- * Animates between collapsed (0 height + 0 opacity) and intrinsic height as
- * `visible` toggles. A `ResizeObserver` tracks the inner content's natural
- * height; the wrapper's inline pixel `height` is set to either that value
- * or `0` based on `visible`, and CSS `transition: height, opacity` smooths
- * the change. Native browser interpolation — no transforms, no spring
- * physics. Children stay mounted across the transition so consumer state
- * (e.g. an expandable panel's open flag) survives a hide/show cycle.
- */
-export function HeightTransition({
-  visible,
-  children,
-  durationMs = HEIGHT_TRANSITION_DURATION_MS,
-  className,
-}: HeightTransitionProps) {
+interface HeightTransitionProps {
+  visible: boolean;
+  children: ReactNode;
+}
+
+export function HeightTransition({ visible, children }: HeightTransitionProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const store = useStore();
@@ -172,31 +160,30 @@ export function HeightTransition({
     let lastWidth: number | null = null;
     let pendingVisibilitySnap = false;
     const snapState: SnapState = { savedDuration: null, restoreFrame: null };
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const { width, height } = entry.contentRect;
-      const widthChanged = lastWidth !== null && width !== lastWidth;
-      // While a CSS layout animation (e.g. ExpandablePanel's grid expansion)
-      // is in flight, the inner is itself animating its size every frame.
-      // Running our own 180ms transition on top compounds the lag and drags
-      // scrollHeight, which the bottom-anchor sentinel then chases.
-      const layoutAnimationActive =
-        store.get(layoutAnimationInFlightCountAtom) > 0;
-      const snap = widthChanged || pendingVisibilitySnap || layoutAnimationActive;
-      pendingVisibilitySnap = false;
-      lastWidth = width;
-      const nextHeight = visible ? `${height}px` : "0px";
-      applyHeight(wrapper, nextHeight, snap, snapState);
+    const unobserveInner = observeSharedResize(inner, {
+      read: (entry) => {
+        const width = entry?.contentRect?.width;
+        const widthChanged =
+          lastWidth !== null && width !== undefined && width !== lastWidth;
+        const layoutAnimationActive =
+          store.get(layoutAnimationInFlightCountAtom) > 0;
+        const snap =
+          widthChanged || pendingVisibilitySnap || layoutAnimationActive;
+        pendingVisibilitySnap = false;
+        if (width !== undefined) {
+          lastWidth = width;
+        }
+        return {
+          nextHeight: visible
+            ? `${getObservedInnerHeight(entry, inner)}px`
+            : "0px",
+          snap,
+        };
+      },
+      write: ({ nextHeight, snap }) => {
+        applyHeight(wrapper, nextHeight, snap, snapState);
+      },
     });
-    observer.observe(inner);
-    // While a tab is hidden, ResizeObserver delivery is throttled and the CSS
-    // height transition stays armed. If content grew during streaming, the
-    // first observer fire after the user returns interpolates the full delta
-    // over 180ms — a visible "catch-up" animation. On visibility return or a
-    // mobile page restore, snap the wrapper to the inner's current height and
-    // arm the next observer fire (in case offsetHeight isn't yet reconciled)
-    // to snap too.
     const onVisibility = () => {
       if (!isDocumentVisible()) return;
       pendingVisibilitySnap = true;
@@ -206,7 +193,7 @@ export function HeightTransition({
     const unsubscribeFromDocumentVisibility =
       subscribeToDocumentVisibility(onVisibility);
     return () => {
-      observer.disconnect();
+      unobserveInner();
       unsubscribeFromDocumentVisibility();
       cleanupSnapState(wrapper, snapState);
     };
@@ -214,31 +201,15 @@ export function HeightTransition({
   return (
     <div
       ref={wrapperRef}
-      className={cn(
-        className,
-        !visible && PAUSE_COLLAPSED_DESCENDANT_ANIMATIONS_CLASS,
-      )}
+      className={cn(!visible && PAUSE_COLLAPSED_DESCENDANT_ANIMATIONS_CLASS)}
       style={{
-        // Clip vertically (so intermediate heights during the animation
-        // don't leak content past the wrapper) without turning the wrapper
-        // into a horizontal scroll container — `overflow-y: hidden` would
-        // force `overflow-x` to compute as `auto` and clip negative-margin
-        // breakouts like the markdown table's bleed past the 760px text
-        // column. `clip` doesn't establish a scroll container, so the
-        // mismatched x: visible / y: clip pair stays as specified.
         overflowX: "visible",
         overflowY: "clip",
         opacity: visible ? 1 : 0,
-        transition: `height ${durationMs}ms ${HEIGHT_TRANSITION_EASE_CSS}, opacity ${durationMs}ms ${HEIGHT_TRANSITION_EASE_CSS}`,
+        transition: `height ${HEIGHT_TRANSITION_DURATION_MS}ms ${HEIGHT_TRANSITION_EASE_CSS}, opacity ${HEIGHT_TRANSITION_DURATION_MS}ms ${HEIGHT_TRANSITION_EASE_CSS}`,
       }}
     >
-      {/*
-        `display: flow-root` gives the inner element a BFC so child margins
-        (e.g. the working indicator's `mt-4`) are contained inside its box.
-        Without this, those margins margin-collapse outward to the wrapper
-        and `inner.offsetHeight` returns less than the visually-needed
-        height — the wrapper would clip the indicator's top.
-      */}
+      {}
       <div ref={innerRef} style={{ display: "flow-root" }}>
         {children}
       </div>
@@ -246,44 +217,39 @@ export function HeightTransition({
   );
 }
 
-export interface AutoHeightContainerProps {
+export const AutoHeightSnapContext = createContext<(() => void) | null>(null);
+
+interface AutoHeightContainerProps {
   children: ReactNode;
-  className?: string;
-  durationMs?: number;
+  snapRevision?: string;
+  animateGrowth?: boolean;
 }
 
-/**
- * Smoothly animates a wrapper's height to match its inner content's natural
- * height via a `ResizeObserver` + CSS `transition: height`. Native browser
- * height interpolation — no transforms, no spring physics, no text warping.
- *
- * The first sync (`auto` → `Npx`) snaps because CSS can't interpolate from
- * `auto`; subsequent `Npx` → `Mpx` changes ease through the transition. Use
- * for surfaces where content size grows over time (a row list receiving new
- * rows) and you want the boundary to glide instead of snap.
- */
-// Window after mount during which size changes snap rather than animate. The
-// initial layout pass for heavy lists (large threads, font swap, secondary
-// React commits) fires several ResizeObserver events at frame boundaries; if
-// each is animated, the wrapper height eases through every intermediate value
-// and the parent scroll container chases the growth, looking like multiple
-// scroll-to-bottom jumps. Snapping during this window means initial settling
-// is invisible; once the inner has been quiet for the window, subsequent
-// changes (streaming) animate as designed.
 const AUTO_HEIGHT_INITIAL_SETTLE_MS = 250;
-// During a window/panel width resize, text and markdown rewrap every frame.
-// Let the wrapper use natural height for the resize burst instead of writing a
-// fresh whole-timeline pixel height on each ResizeObserver tick.
 const AUTO_HEIGHT_WIDTH_RESIZE_SETTLE_MS = 120;
+
+function useSnapHeightGrowth(): boolean {
+  const isPointerCoarse = usePointerCoarse();
+  const prefersReducedMotion = usePrefersReducedMotion();
+  return isPointerCoarse || prefersReducedMotion || !supportsScrollAnchoring();
+}
 
 export function AutoHeightContainer({
   children,
-  className,
-  durationMs = HEIGHT_TRANSITION_DURATION_MS,
+  snapRevision,
+  animateGrowth = true,
 }: AutoHeightContainerProps) {
+  const snapGrowth = useSnapHeightGrowth();
+  const durationMs =
+    snapGrowth || !animateGrowth ? 0 : HEIGHT_TRANSITION_DURATION_MS;
   const wrapperRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
+  const snapToCurrentHeightRef = useRef<(() => void) | null>(null);
+  const previousSnapRevisionRef = useRef(snapRevision);
   const store = useStore();
+  const snapToContentHeight = useCallback(() => {
+    snapToCurrentHeightRef.current?.();
+  }, []);
   useLayoutEffect(() => {
     const wrapper = wrapperRef.current;
     const inner = innerRef.current;
@@ -300,6 +266,12 @@ export function AutoHeightContainer({
       restoreTimerId: null,
       usingIntrinsicHeight: false,
     };
+    const snapToCurrentHeight = () => {
+      cancelIntrinsicHeightRestore(resizeState);
+      resizeState.usingIntrinsicHeight = false;
+      applyHeight(wrapper, `${inner.offsetHeight}px`, true, snapState);
+    };
+    snapToCurrentHeightRef.current = snapToCurrentHeight;
     const deferInitialSettleComplete = () => {
       if (initialSettleComplete) {
         return;
@@ -309,77 +281,84 @@ export function AutoHeightContainer({
         initialSettleComplete = true;
       }, AUTO_HEIGHT_INITIAL_SETTLE_MS);
     };
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const { width, height } = entry.contentRect;
-      const widthChanged = lastWidth !== null && width !== lastWidth;
-      // While a CSS layout animation (e.g. ExpandablePanel's grid expansion)
-      // is in flight, the inner is itself animating its size every frame.
-      // Running our own 180ms transition on top compounds the lag and drags
-      // scrollHeight, which the bottom-anchor sentinel then chases.
-      const layoutAnimationActive =
-        store.get(layoutAnimationInFlightCountAtom) > 0;
-      const snap =
-        widthChanged ||
-        pendingVisibilitySnap ||
-        !initialSettleComplete ||
-        layoutAnimationActive;
-      pendingVisibilitySnap = false;
-      lastWidth = width;
-      if (widthChanged || resizeState.usingIntrinsicHeight) {
-        enterIntrinsicHeightMode(wrapper, resizeState, snapState);
-        scheduleIntrinsicHeightRestore({
-          inner,
-          resizeState,
-          snapState,
-          target: wrapper,
-        });
+    const unobserveInner = observeSharedResize(inner, {
+      read: (entry) => {
+        const width = entry?.contentRect?.width;
+        const widthChanged =
+          lastWidth !== null && width !== undefined && width !== lastWidth;
+        const layoutAnimationActive =
+          store.get(layoutAnimationInFlightCountAtom) > 0;
+        const snap =
+          widthChanged ||
+          pendingVisibilitySnap ||
+          !initialSettleComplete ||
+          layoutAnimationActive;
+        pendingVisibilitySnap = false;
+        if (width !== undefined) {
+          lastWidth = width;
+        }
+        if (widthChanged || resizeState.usingIntrinsicHeight) {
+          return { useIntrinsicHeight: true as const };
+        }
+        return {
+          useIntrinsicHeight: false as const,
+          nextHeight: `${getObservedInnerHeight(entry, inner)}px`,
+          snap,
+        };
+      },
+      write: (sync) => {
+        if (sync.useIntrinsicHeight) {
+          enterIntrinsicHeightMode(wrapper, resizeState, snapState);
+          scheduleIntrinsicHeightRestore({
+            inner,
+            resizeState,
+            snapState,
+            target: wrapper,
+          });
+          deferInitialSettleComplete();
+          return;
+        }
+        applyHeight(wrapper, sync.nextHeight, sync.snap, snapState);
         deferInitialSettleComplete();
-        return;
-      }
-      applyHeight(wrapper, `${height}px`, snap, snapState);
-      deferInitialSettleComplete();
+      },
     });
-    observer.observe(inner);
-    // See HeightTransition's matching block: a hidden tab pauses observer
-    // delivery and the height transition, so content streamed in while the
-    // tab was backgrounded would otherwise animate in over 180ms on return
-    // — and the bottom-anchor scroll would chase the growing wrapper for the
-    // full duration. Snap-sync on visibility return short-circuits that.
     const onVisibility = () => {
       if (!isDocumentVisible()) return;
       pendingVisibilitySnap = true;
-      cancelIntrinsicHeightRestore(resizeState);
-      resizeState.usingIntrinsicHeight = false;
-      applyHeight(wrapper, `${inner.offsetHeight}px`, true, snapState);
+      snapToCurrentHeight();
     };
     const unsubscribeFromDocumentVisibility =
       subscribeToDocumentVisibility(onVisibility);
     return () => {
-      observer.disconnect();
+      snapToCurrentHeightRef.current = null;
+      unobserveInner();
       unsubscribeFromDocumentVisibility();
       window.clearTimeout(initialSettleTimerId);
       cancelIntrinsicHeightRestore(resizeState);
       cleanupSnapState(wrapper, snapState);
     };
   }, [store]);
+  useLayoutEffect(() => {
+    if (previousSnapRevisionRef.current === snapRevision) {
+      return;
+    }
+    previousSnapRevisionRef.current = snapRevision;
+    snapToCurrentHeightRef.current?.();
+  }, [snapRevision]);
   return (
-    <div
-      ref={wrapperRef}
-      className={className}
-      style={{
-        // See HeightTransition: clip vertically without forcing the wrapper
-        // into a horizontal scroll container, so children with intentional
-        // horizontal bleed (markdown table breakout) aren't clipped.
-        overflowX: "visible",
-        overflowY: "clip",
-        transition: `height ${durationMs}ms ${HEIGHT_TRANSITION_EASE_CSS}`,
-      }}
-    >
-      <div ref={innerRef} style={{ display: "flow-root" }}>
-        {children}
+    <AutoHeightSnapContext.Provider value={snapToContentHeight}>
+      <div
+        ref={wrapperRef}
+        style={{
+          overflowX: "visible",
+          overflowY: "clip",
+          transition: `height ${durationMs}ms ${HEIGHT_TRANSITION_EASE_CSS}`,
+        }}
+      >
+        <div ref={innerRef} style={{ display: "flow-root" }}>
+          {children}
+        </div>
       </div>
-    </div>
+    </AutoHeightSnapContext.Provider>
   );
 }

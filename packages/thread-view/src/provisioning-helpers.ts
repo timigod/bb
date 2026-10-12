@@ -5,8 +5,6 @@ import type {
   EventProjectionProvisioningTranscriptEntry,
 } from "./event-projection-types.js";
 
-// --- Helpers used by build-event-projection.ts (event -> draft projection) ---
-
 export function readProvisioningTranscript(
   entries: ProvisioningTranscriptEntry[] | undefined,
 ): EventProjectionProvisioningTranscriptEntry[] | undefined {
@@ -14,10 +12,10 @@ export function readProvisioningTranscript(
 
   const result: EventProjectionProvisioningTranscriptEntry[] = [];
   for (const entry of entries) {
-    const key = entry.key?.trim();
+    const key = entry.key.trim();
     if (!key) continue;
 
-    const text = (entry.text ?? "").trim();
+    const text = entry.text.trim();
     if (!text) continue;
 
     if (entry.type === "step") {
@@ -69,21 +67,26 @@ export function provisioningTitleForStatus(
   }
 }
 
-function mergeProvisioningTranscript(
+function mergeTranscriptEntries(
   existing: EventProjectionProvisioningTranscriptEntry[] | undefined,
   incoming: EventProjectionProvisioningTranscriptEntry[] | undefined,
 ): EventProjectionProvisioningTranscriptEntry[] | undefined {
-  if (!incoming) {
-    return existing?.map((entry) => ({ ...entry }));
+  const result = existing?.map((entry) => ({ ...entry })) ?? [];
+  for (const entry of incoming ?? []) {
+    const existingStepIndex =
+      entry.type === "step"
+        ? result.findIndex(
+            (candidate) =>
+              candidate.type === "step" && candidate.key === entry.key,
+          )
+        : -1;
+    if (existingStepIndex === -1) {
+      result.push({ ...entry });
+    } else {
+      result[existingStepIndex] = { ...entry };
+    }
   }
-  if (!existing) {
-    return incoming.map((entry) => ({ ...entry }));
-  }
-
-  return [
-    ...existing.map((entry) => ({ ...entry })),
-    ...incoming.map((entry) => ({ ...entry })),
-  ];
+  return result.length > 0 ? result : undefined;
 }
 
 export function mergeProvisioningMetadata(
@@ -98,16 +101,13 @@ export function mergeProvisioningMetadata(
       ...incoming,
       ...(incoming.transcript
         ? {
-            transcript: mergeProvisioningTranscript(
-              undefined,
-              incoming.transcript,
-            ),
+            transcript: mergeTranscriptEntries(undefined, incoming.transcript),
           }
         : {}),
     };
   }
 
-  const transcript = mergeProvisioningTranscript(
+  const transcript = mergeTranscriptEntries(
     existing.transcript,
     incoming.transcript,
   );

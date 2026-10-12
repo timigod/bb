@@ -5,7 +5,6 @@ import {
   useMemo,
   type ReactNode,
 } from "react";
-import { useSetAtom } from "jotai";
 import { useNavigate } from "react-router-dom";
 import type { ProjectResponse } from "@bb/server-contract";
 import { useRouteState } from "@/hooks/useRouteState";
@@ -14,7 +13,7 @@ import {
   useDeleteProject,
   useUpdateProject,
 } from "@/hooks/mutations/project-mutations";
-import { useDialogState } from "@/hooks/useDialogState";
+import { useDialogState } from "@bb/shared-ui/use-dialog-state";
 import {
   useLocalPathPicker,
   type LocalPathSubmitParams,
@@ -28,10 +27,9 @@ import {
   ProjectRenameDialog,
   type ProjectRenameDialogTarget,
 } from "@/components/dialogs/ProjectRenameDialog";
-import { collapsedProjectIdsAtom } from "@/components/sidebar/sidebarCollapsedAtoms";
 import { getRootComposeRoutePath } from "@/lib/route-paths";
 
-export interface ProjectActionsContextValue {
+interface ProjectActionsContextValue {
   requestRename: (project: ProjectResponse) => void;
   requestDelete: (project: ProjectResponse) => void;
   requestAddLocalPath: (project: ProjectResponse) => void;
@@ -60,14 +58,9 @@ export function ProjectActionsProvider({
 }: ProjectActionsProviderProps) {
   const navigate = useNavigate();
   const { projectId: routeProjectId } = useRouteState();
-  const setCollapsedProjectIdList = useSetAtom(collapsedProjectIdsAtom);
   const updateProject = useUpdateProject();
   const deleteProject = useDeleteProject();
   const addLocalSource = useAddLocalProjectSource();
-  // Destructure `.mutate` so useCallback deps see a stable reference across
-  // renders. Depending on the full mutation object would churn the callback
-  // identity on every isPending flip and force every useProjectActions()
-  // consumer to re-render.
   const { mutate: updateProjectMutate } = updateProject;
   const { mutate: deleteProjectMutate } = deleteProject;
   const { mutate: addLocalSourceMutate } = addLocalSource;
@@ -122,11 +115,6 @@ export function ProjectActionsProvider({
       deleteProjectMutate(projectId, {
         onSuccess: () => {
           closeDeleteDialog();
-          // Drop the deleted project from the collapsed-state set so stale
-          // ids don't accumulate in localStorage.
-          setCollapsedProjectIdList((current) =>
-            current.filter((id) => id !== projectId),
-          );
           if (routeProjectId === projectId) {
             navigate(getRootComposeRoutePath(), { replace: true });
           }
@@ -138,7 +126,6 @@ export function ProjectActionsProvider({
       deleteProjectMutate,
       navigate,
       routeProjectId,
-      setCollapsedProjectIdList,
     ],
   );
 

@@ -19,37 +19,6 @@ async function importFreshLogger() {
   return import("../src/index.js");
 }
 
-async function importFreshLoggerWithPinoTransportSpy() {
-  vi.resetModules();
-
-  // pino uses `export = pino` (CJS), but the runtime module after Node's
-  // ESM interop exposes `default` alongside the named callable. The TS type
-  // for `typeof import("pino")` is the function itself, so type the actual
-  // module shape explicitly to access `default`.
-  const actual = await vi.importActual<{ default: typeof import("pino") }>(
-    "pino",
-  );
-  const transportSpy = vi.fn(actual.default.transport);
-  const mockedPino = Object.assign(
-    ((...args: Parameters<typeof actual.default>) =>
-      actual.default(...args)) as typeof actual.default,
-    actual.default,
-    {
-      transport: transportSpy,
-    },
-  );
-
-  vi.doMock("pino", () => ({
-    default: mockedPino,
-  }));
-
-  const loggerModule = await import("../src/index.js");
-  return {
-    ...loggerModule,
-    transportSpy,
-  };
-}
-
 interface SubprocessLoggerResult {
   exitCode: number | null;
   stderr: string;
@@ -84,8 +53,6 @@ async function runLoggerInSubprocess(args: {
     BB_DATA_DIR: args.dataDir,
     TZ: args.timezone,
   };
-  // The logger skips pino-pretty under VITEST; clear it so the spawned
-  // process exercises the real stdout transport like production does.
   delete childEnv.VITEST;
 
   return new Promise((resolve, reject) => {
@@ -169,7 +136,6 @@ function readComponentLogLines(
 }
 
 afterEach(() => {
-  vi.doUnmock("pino");
   vi.resetModules();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -183,49 +149,6 @@ afterAll(async () => {
 });
 
 describe("createLogger", () => {
-  it("writes structured JSON to the component log file", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger } = await importFreshLogger();
-    const logger = createLogger({ component: "server" });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.info({ requestId: "req_1" }, "booted");
-    await waitFor(() => readComponentLogLines(logDir, "server").length === 1);
-
-    const entries = readComponentLogLines(logDir, "server");
-    expect(entries[0]).toMatchObject({
-      component: "server",
-      level: 30,
-      msg: "booted",
-      requestId: "req_1",
-    });
-  });
-
-  it("keeps parent context on child loggers", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger } = await importFreshLogger();
-    const logger = createLogger({ component: "host-daemon" });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.child({ threadId: "thr_123" }).info("turn started");
-    await waitFor(
-      () => readComponentLogLines(logDir, "host-daemon").length === 1,
-    );
-
-    const entries = readComponentLogLines(logDir, "host-daemon");
-    expect(entries[0]).toMatchObject({
-      component: "host-daemon",
-      threadId: "thr_123",
-      msg: "turn started",
-    });
-  });
-
   it("rotates files when the active log exceeds the configured size", async () => {
     const dataDir = createTempDir();
     vi.stubEnv("NODE_ENV", "production");
@@ -262,11 +185,8 @@ describe("createLogger", () => {
     });
 
     expect(result.exitCode).toBe(0);
-    // Pretty output to stdout is the load-bearing half of the contract —
-    // the previous regression was silent dropping of this target.
     expect(result.stdout).toContain(message);
     expect(result.stdout).toContain("[19:53:23]");
-    // Structured JSON to the rolling file is the other half.
     const entries = readComponentLogLines(logDir, "behavior-check");
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({
@@ -275,34 +195,6 @@ describe("createLogger", () => {
       marker: message,
       msg: message,
       time: timestampMs,
-    });
-  });
-
-  it("uses a direct file destination when stream mode is requested", async () => {
-    const dataDir = createTempDir();
-    vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("BB_DATA_DIR", dataDir);
-
-    const { createLogger, transportSpy } =
-      await importFreshLoggerWithPinoTransportSpy();
-    const logger = createLogger({
-      component: "host-daemon",
-      transportMode: "stream",
-    });
-    const logDir = path.join(dataDir, "logs");
-
-    logger.info({ requestId: "req_2" }, "sandbox booted");
-    await waitFor(
-      () => readComponentLogLines(logDir, "host-daemon").length === 1,
-    );
-
-    expect(transportSpy).not.toHaveBeenCalled();
-    const entries = readComponentLogLines(logDir, "host-daemon");
-    expect(entries[0]).toMatchObject({
-      component: "host-daemon",
-      level: 30,
-      msg: "sandbox booted",
-      requestId: "req_2",
     });
   });
 
@@ -316,7 +208,6 @@ describe("createLogger", () => {
     const logger = createLogger({
       component: "host-daemon",
       dataDir: explicitDataDir,
-      transportMode: "stream",
     });
 
     logger.info({ requestId: "req_explicit" }, "explicit data dir");

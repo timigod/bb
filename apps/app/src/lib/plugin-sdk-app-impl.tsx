@@ -1,100 +1,177 @@
-import { useMemo } from "react";
-import type { MarkdownProps, PluginSdkApp } from "@bb/plugin-sdk";
+import { ProviderIcon } from "@/components/plugin/ProviderIcon";
+import { Icon } from "@bb/shared-ui/icon";
+import { useCallback, useMemo } from "react";
+import type { MarkdownProps, PluginSdkApp } from "@get-bb/plugin-sdk";
+import { PluginDiff } from "@/components/plugin/PluginDiff";
+import { PluginBranchPicker } from "@/components/plugin/PluginBranchPicker";
+import {
+  usePluginBranches,
+  usePluginCheckoutState,
+} from "@/components/plugin/usePluginBranchPickerState";
 import { PluginNewThreadComposer } from "@/components/plugin/PluginNewThreadComposer";
-import { PluginThreadChat } from "@/components/plugin/PluginThreadChat";
+import { VoiceInputTextarea } from "@/components/promptbox/VoiceInputTextarea";
+import { PluginProviderModelPicker } from "@/components/plugin/PluginProviderModelPicker";
+import { PluginPermissionModePicker } from "@/components/plugin/PluginPermissionModePicker";
+import { PluginSourceCode } from "@/components/plugin/PluginSourceCode";
+import { LazyPluginThreadChat } from "@/components/plugin/LazyPluginThreadChat";
+import { PluginThreadTitle } from "@/components/plugin/PluginThreadTitle";
+import { ThreadStatusGlyph } from "@/components/thread/ThreadStatusGlyph";
+import { PluginUrlLink } from "@/components/plugin/PluginUrlLink";
+import { ExperimentalFileLink } from "@/components/plugin/ExperimentalFileLink";
 import { MarkdownPreview } from "@/components/ui/markdown-preview";
-import type {
-  MarkdownLinkRouting,
-  MarkdownLocalFileLinkRouting,
-} from "@/components/ui/markdown-link-routing";
+import type { MarkdownLinkRouting } from "@/components/ui/markdown-link-routing";
+import { buildMarkdownDocumentLinkRouting } from "@/components/ui/markdown-document-link-routing";
+import { buildMarkdownMessageLinkRouting } from "@/components/ui/markdown-message-link-routing";
+import type { MarkdownPreviewLinkHandler } from "@/components/ui/markdown-link";
 import { useThreadTimelineNavigation } from "@/components/thread/timeline/ThreadTimelineNavigationContext";
+import { usePluginId } from "@/components/plugin/plugin-context";
+import { useQuestionFormHost } from "@bb/shared-ui/question-form-host";
 import { definePluginApp } from "./plugin-app-definition";
 import {
   useBbContext,
   useBbNavigate,
   useComposer,
+  useComposers,
   useComposerView,
+  useEnvironmentProviders,
+  useProviders,
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
+  useSdk,
   useSettings,
+  experimental_useAppPanel,
+  experimental_useFixedTabTarget,
 } from "./plugin-sdk-hooks";
 import {
   useSidebarThreadActions,
+  useSidebarThreadDraft,
+  useSidebarThreadDraftIds,
   useSidebarThreadPullRequest,
+  useSidebarThreadRowStatus,
+  useSidebarThreadRowStatuses,
+  useSidebarThreadShortcut,
   useSidebarThreads,
 } from "./plugin-sidebar-hooks";
-import { useSidebarThreadSplit } from "./plugin-sidebar-split";
+import {
+  useSidebarSplitLayout,
+  useSidebarThreadSplit,
+} from "./plugin-sidebar-split";
+import { useAppNavigationHost } from "./app-navigation-host";
+import { experimental_THREAD_ACTION_GROUPS } from "@get-bb/plugin-sdk";
+import {
+  ThreadActionsContextMenu,
+  ThreadActionsMenu,
+} from "@/components/thread/ThreadActionsMenu";
+import { useThreadActions } from "@/components/thread/ThreadActionsProvider";
+import {
+  useThreadActionEntries,
+  useThreadActionRegistrationInfos,
+} from "./thread-actions/thread-action-registry";
+import { useCodeTheme } from "./plugin-code-theme";
+import { copyToClipboard } from "./clipboard";
 
-/**
- * The real `@bb/plugin-sdk/app` surface (plugin design §5.2), assigned to
- * `globalThis.__bbPluginRuntime.pluginSdkApp` by installPluginRuntime() so
- * `bb plugin build` shims resolve it inside plugin bundles. `satisfies
- * PluginSdkApp` keeps it in type-sync with the facade package; the plugin SDK
- * parity test compares the facade's actual runtime exports with its bundled
- * declarations so declaration-only values cannot leak into the contract.
- *
- * Deliberately hooks-only (the 65-component host-provided UI kit was removed
- * 2026-07-03, plugin design §5.5): plugins vendor shadcn-style component
- * source from the BB registry and own it; the shared-singleton packages
- * (portal radix families, sonner, vaul) reach plugins through their own
- * runtime shims in plugin-frontend.ts, so `import { toast } from "sonner"`
- * hits the host toaster without an SDK member.
- */
+function useArchiveEnvironmentThreads(): (
+  environmentId: string,
+) => Promise<void> {
+  return useThreadActions().archiveEnvironmentThreads;
+}
+
 export const pluginSdkAppImplementation = {
   definePluginApp,
+  experimental_Icon: Icon,
+  experimental_ProviderIcon: ProviderIcon,
   useBbContext,
+  experimental_usePluginId: usePluginId,
+  experimental_useQuestionFormHost: useQuestionFormHost,
   useBbNavigate,
+  experimental_useAppPanel,
+  experimental_useFixedTabTarget,
   useComposer,
+  useComposers,
   useComposerView,
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
   useSettings,
-  // The host-owned components in the SDK (plugin design: deliberate
-  // exception to §5.5) — stable product capabilities, not a UI kit.
-  ThreadChat: PluginThreadChat,
+  ThreadChat: LazyPluginThreadChat,
   Markdown: PluginMarkdown,
-  // Experimental (see docs/api_to_audit.md): the create-side counterpart to
-  // ThreadChat.
+  experimental_FileLink: ExperimentalFileLink,
+  UrlLink: PluginUrlLink,
   experimental_NewThreadComposer: PluginNewThreadComposer,
-  // Experimental (see docs/api_to_audit.md): the sidebar thread-list data
-  // plane, for plugins that replace the list itself.
+  experimental_VoiceInputTextarea: VoiceInputTextarea,
+  experimental_ProviderModelPicker: PluginProviderModelPicker,
+  experimental_PermissionModePicker: PluginPermissionModePicker,
+  experimental_BranchPicker: PluginBranchPicker,
+  experimental_useBranches: usePluginBranches,
+  experimental_useCheckoutState: usePluginCheckoutState,
+  experimental_SourceCode: PluginSourceCode,
+  experimental_Diff: PluginDiff,
   experimental_useSidebarThreads: useSidebarThreads,
   experimental_useSidebarThreadActions: useSidebarThreadActions,
+  experimental_useThreadActions: useThreadActionEntries,
+  experimental_useArchiveEnvironmentThreads: useArchiveEnvironmentThreads,
+  experimental_useThreadActionRegistrations: useThreadActionRegistrationInfos,
+  experimental_ThreadActionsMenu: ThreadActionsMenu,
+  experimental_ThreadActionsContextMenu: ThreadActionsContextMenu,
+  experimental_THREAD_ACTION_GROUPS,
   experimental_useSidebarThreadPullRequest: useSidebarThreadPullRequest,
   experimental_useSidebarThreadSplit: useSidebarThreadSplit,
+  useSidebarThreadDraft,
+  useSidebarThreadDraftIds,
+  useSidebarThreadRowStatus,
+  useSidebarThreadRowStatuses,
+  useSidebarSplitLayout,
+  useSidebarThreadShortcut,
+  ThreadTitle: PluginThreadTitle,
+  experimental_ThreadStatusGlyph: ThreadStatusGlyph,
+  useEnvironmentProviders,
+  useSdk,
+  experimental_useProviders: useProviders,
+  experimental_useCodeTheme: useCodeTheme,
+  experimental_copyToClipboard: copyToClipboard,
 } satisfies PluginSdkApp;
 
-/**
- * The public chat-message markdown renderer: the host's MarkdownPreview with
- * only the stable content/className surface exposed. Renderer options
- * (lightbox, link routing, thread mentions) stay host-internal.
- */
-function PluginMarkdown({ content, className }: MarkdownProps) {
+function PluginMarkdown({
+  content,
+  className,
+  experimental_document,
+}: MarkdownProps) {
   const timelineNavigation = useThreadTimelineNavigation();
-  const onOpenLink = timelineNavigation?.onOpenLink;
   const onOpenLocalFileLink = timelineNavigation?.onOpenLocalFileLink;
+  const threadId = timelineNavigation?.threadId;
   const workspaceRootPath = timelineNavigation?.workspaceRootPath;
-  const linkRouting = useMemo<MarkdownLinkRouting | undefined>(() => {
-    if (onOpenLink === undefined || onOpenLocalFileLink === undefined) {
-      return undefined;
-    }
-    const localFile: MarkdownLocalFileLinkRouting = {
-      absoluteLinks: { kind: "trusted-host" },
-      onOpenLink: onOpenLocalFileLink,
-    };
-    if (workspaceRootPath !== undefined) {
-      localFile.relativeLinks = {
-        baseDir: workspaceRootPath,
-        rootPath: workspaceRootPath,
-      };
-    }
-    return { localFile, onOpenLink };
-  }, [onOpenLink, onOpenLocalFileLink, workspaceRootPath]);
+  const navigation = useAppNavigationHost();
+  const onOpenLink = useCallback<MarkdownPreviewLinkHandler>(
+    ({ href }) => navigation.openUrl({ url: href }),
+    [navigation],
+  );
+  const linkRouting = useMemo<MarkdownLinkRouting>(() => {
+    const messageRouting = buildMarkdownMessageLinkRouting({
+      onOpenLink,
+      onOpenLocalFileLink,
+      threadId,
+      workspaceRootPath,
+    }) ?? { onOpenLink };
+    return experimental_document === undefined
+      ? messageRouting
+      : buildMarkdownDocumentLinkRouting({
+          document: experimental_document,
+          messageRouting,
+          openFilePreview: navigation.openFilePreview,
+        });
+  }, [
+    experimental_document,
+    navigation.openFilePreview,
+    onOpenLink,
+    onOpenLocalFileLink,
+    threadId,
+    workspaceRootPath,
+  ]);
 
   return (
     <MarkdownPreview
+      allowHtml
       content={content}
       className={className}
       linkRouting={linkRouting}

@@ -1,19 +1,39 @@
 import {
-  jsonValueSchema,
-  PLUGIN_SUBMISSION_FORM_URL,
-  type JsonValue,
-} from "@bb/domain";
+  pluginUpdateJobResponseSchema,
+  pluginUpdateJobListResponseSchema,
+  type PluginUpdateJob,
+} from "@bb/server-contract";
+export type { PluginUpdateJob } from "@bb/server-contract";
+import { jsonValueSchema, type JsonValue } from "@bb/domain";
 import {
+  installedPluginSchema,
+  pluginRpcDiscoveryQuerySchema,
+  pluginRpcDiscoveryResponseSchema,
+  type PluginRpcDiscoveryQuery,
+  type PublishedPluginRpcMethod,
+  pluginCatalogInstallPlanResponseSchema,
   pluginCatalogInstallRequestSchema,
   pluginCatalogSearchResponseSchema,
   pluginCatalogStatusResponseSchema,
+  pluginMarketplaceAddRequestSchema,
+  pluginMarketplaceListResponseSchema,
+  pluginMarketplaceMutationResponseSchema,
+  pluginMarketplaceNameSchema,
+  pluginMarketplaceRefreshRequestSchema,
+  pluginMarketplaceRefreshResponseSchema,
+  pluginMarketplaceRemoveResponseSchema,
   pluginApplyUpdateRequestSchema,
   pluginApplyUpdateResultSchema,
-  pluginInstallResponseSchema,
-  pluginInstallSourceRequestSchema,
-  pluginListResponseSchema,
-  pluginReloadResponseSchema,
+  pluginInstallJobListResponseSchema,
+  pluginInstallJobResponseSchema,
+  pluginInstallJobStartResponseSchema,
+  pluginCachePruneRequestSchema,
+  pluginCachePruneResponseSchema,
+  pluginInstallRequestSchema,
   pluginRemoveResponseSchema,
+  pluginSafeModeRequestSchema,
+  pluginSafeModeResponseSchema,
+  pluginSafeModeUpdateResponseSchema,
   pluginSettingsResponseSchema,
   pluginSettingsUpdateRequestSchema,
   pluginSourceDetailSchema,
@@ -22,32 +42,121 @@ import {
   pluginUpdateCheckRequestSchema,
   pluginUpdateCheckResponseSchema,
   type InstalledPlugin,
+  type PluginCatalogInstallPlan as PluginCatalogInstallPlanContract,
+  type PluginCatalogResolvedSource,
+  type PluginCatalogSearchResponse as PluginCatalogSearchResponseContract,
   type PluginCatalogSearchResult as PluginCatalogSearchContract,
+  type PluginMarketplace as PluginMarketplaceContract,
+  type PluginMarketplaceRefreshResult as PluginMarketplaceRefreshContract,
   type PluginCatalogStatus as PluginCatalogStatusContract,
+  type PluginInstallJob as PluginInstallJobContract,
   type PluginApplyUpdateResult as PluginApplyUpdateContract,
+  type PluginCachePruneResponse,
   type PluginListResponse,
   type PluginReloadResponse,
   type PluginRemoveResponse,
+  type PluginSafeModeResponse,
+  type PluginSafeModeUpdateResponse,
   type PluginSettingsResponse,
   type PluginSourceDetail,
+  type PluginSourceSelection,
   type PluginTokenResponse,
   type PluginUpdateCheckEntry,
 } from "@bb/server-contract";
 import { z } from "zod";
 import type { CreateSdkAreaArgs } from "./common.js";
 
+/**
+ * A server older than `providerIds` (bb-app < 0.39) or `icons` answers with
+ * the installed-plugin shape minus those fields. The contract keeps them
+ * required — the server fills them once at its boundary — so the tolerance
+ * lives here, on the response side only: the SDK never sends this shape, and a
+ * default on the contract would leak into request bodies.
+ */
+const installedPluginResponseSchema = installedPluginSchema.extend({
+  screenshots: installedPluginSchema.shape.screenshots.default([]),
+  collections: installedPluginSchema.shape.collections.default([]),
+  providerIds: z.array(z.string()).default([]),
+  icons: z.record(z.string(), z.string()).default({}),
+});
+const pluginListResponseSchema = z.object({
+  plugins: z.array(installedPluginResponseSchema),
+});
+const pluginInstallResponseSchema = z.object({
+  ok: z.literal(true),
+  plugin: installedPluginResponseSchema,
+});
+const pluginInstallStartResponseSchema = z.union([
+  pluginInstallJobStartResponseSchema,
+  pluginInstallResponseSchema,
+]);
+const INSTALL_JOB_POLL_INTERVAL_MS = 500;
+const pluginReloadResponseSchema = z.object({
+  ok: z.literal(true),
+  plugins: z.array(installedPluginResponseSchema),
+});
+const pluginCatalogSearchResponseCompatibilitySchema =
+  pluginCatalogSearchResponseSchema.extend({
+    collections: pluginCatalogSearchResponseSchema.shape.collections.default(
+      [],
+    ),
+  });
+
+export const pluginMutationResponseSchema = z.object({
+  ok: z.boolean(),
+  error: z.string().optional(),
+  plugin: installedPluginResponseSchema.optional(),
+  plugins: z.array(installedPluginResponseSchema).optional(),
+});
+export type PluginMutationResponse = z.infer<
+  typeof pluginMutationResponseSchema
+>;
+
 export interface PluginIdArgs {
   pluginId: string;
 }
 
-/** Install directly from a path:, git:, npm:, or builtin: source spec. */
 export interface PluginInstallArgs {
+  source: string;
+  subdirectory?: string;
+  plugin?: string;
+}
+
+export interface PluginCatalogInstallArgs {
+  entryId: string;
+  marketplace?: string;
+  confirmedSource?: PluginCatalogResolvedSource;
+}
+
+export interface PluginInstallJobArgs {
+  jobId: string;
+}
+
+export interface PluginInstallJobListArgs {
+  signal?: AbortSignal;
+}
+
+export interface PluginCatalogInstallPlanArgs {
+  entryId: string;
+  marketplace?: string;
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceAddArgs {
   source: string;
 }
 
-/** Install an entry from BB's official catalog. */
-export interface PluginCatalogInstallArgs {
-  entryId: string;
+export interface PluginMarketplaceListArgs {
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceRefreshArgs {
+  name?: string;
+  signal?: AbortSignal;
+}
+
+export interface PluginMarketplaceRemoveArgs {
+  name: string;
 }
 
 export interface PluginReloadArgs {
@@ -68,6 +177,7 @@ export interface PluginCheckUpdatesArgs {
 }
 
 export interface PluginRpcArgs<TOutput> extends PluginIdArgs {
+  signal?: AbortSignal;
   input?: JsonValue;
   method: string;
   outputSchema: z.ZodType<TOutput>;
@@ -98,13 +208,34 @@ export interface PluginListUpdateResultsArgs {
   signal?: AbortSignal;
 }
 
+export interface PluginGetSafeModeArgs {
+  signal?: AbortSignal;
+}
+
+export interface PluginRpcDiscoveryArgs extends PluginRpcDiscoveryQuery {
+  signal?: AbortSignal;
+}
+
+export interface PluginSetSafeModeArgs {
+  enabled: boolean;
+}
+
+export interface PluginPruneCacheArgs {
+  dryRun?: boolean;
+  signal?: AbortSignal;
+}
+
 export type PluginDisableResult = InstalledPlugin;
 export type PluginEnableResult = InstalledPlugin;
 export type PluginGetSettingsResult = PluginSettingsResponse;
 export type PluginInstallResult = InstalledPlugin;
+export type PluginInstallJob = PluginInstallJobContract;
 export type PluginListResult = PluginListResponse;
 export type PluginReloadResult = PluginReloadResponse;
 export type PluginRemoveResult = PluginRemoveResponse;
+export type PluginSafeModeResult = PluginSafeModeResponse;
+export type PluginSetSafeModeResult = PluginSafeModeUpdateResponse;
+export type PluginPruneCacheResult = PluginCachePruneResponse;
 export type PluginTokenResult = PluginTokenResponse;
 export type PluginUpdateSettingsResult = PluginSettingsResponse;
 export type PluginGetSourceResult = PluginSourceDetail;
@@ -112,33 +243,78 @@ export type PluginCheckUpdatesResult = PluginUpdateCheckEntry[];
 export type PluginApplyUpdateResult = PluginApplyUpdateContract;
 
 export type PluginCatalogStatusResult = PluginCatalogStatusContract;
-export type PluginCatalogSearchResult = PluginCatalogSearchContract[];
+export type PluginCatalogSearchEntry = PluginCatalogSearchContract;
+export type PluginCatalogSearchResult = PluginCatalogSearchResponseContract;
+export type PluginCatalogInstallPlanResult = PluginCatalogInstallPlanContract;
+export type PluginMarketplaceListResult = PluginMarketplaceContract[];
+export type PluginMarketplaceAddResult = PluginMarketplaceContract;
+export type PluginMarketplaceRefreshResult = PluginMarketplaceRefreshContract[];
 
-export interface PluginCatalogSubmissionResult {
-  /** BB's canonical browser form for proposing a plugin to the marketplace. */
-  url: string;
+export interface PluginMarketplaceRemoveResult {
+  convertedPluginIds: string[];
 }
 
 export interface PluginCatalogArea {
   install(args: PluginCatalogInstallArgs): Promise<PluginInstallResult>;
+  startInstall(args: PluginCatalogInstallArgs): Promise<PluginInstallJob>;
+  installPlan(
+    args: PluginCatalogInstallPlanArgs,
+  ): Promise<PluginCatalogInstallPlanResult>;
   search(args: PluginCatalogSearchArgs): Promise<PluginCatalogSearchResult>;
   status(args?: PluginCatalogStatusArgs): Promise<PluginCatalogStatusResult>;
-  /** Return the canonical marketplace submission form; submitting stays browser-owned. */
-  submission(): PluginCatalogSubmissionResult;
+}
+
+export interface PluginMarketplacesArea {
+  add(args: PluginMarketplaceAddArgs): Promise<PluginMarketplaceAddResult>;
+  list(args?: PluginMarketplaceListArgs): Promise<PluginMarketplaceListResult>;
+  refresh(
+    args?: PluginMarketplaceRefreshArgs,
+  ): Promise<PluginMarketplaceRefreshResult>;
+  remove(
+    args: PluginMarketplaceRemoveArgs,
+  ): Promise<PluginMarketplaceRemoveResult>;
+}
+
+export interface PluginInstallJobsArea {
+  cancel(args: PluginInstallJobArgs): Promise<PluginInstallJob>;
+  get(args: PluginInstallJobArgs): Promise<PluginInstallJob>;
+  list(args?: PluginInstallJobListArgs): Promise<PluginInstallJob[]>;
+}
+
+export interface PluginUpdateJobsArea {
+  get(args: { jobId: string }): Promise<PluginUpdateJob>;
+  list(args?: { signal?: AbortSignal }): Promise<PluginUpdateJob[]>;
 }
 
 export interface PluginsArea {
+  experimental_discoverRpc(
+    args?: PluginRpcDiscoveryArgs,
+  ): Promise<PublishedPluginRpcMethod[]>;
+  experimental_getSafeMode(
+    args?: PluginGetSafeModeArgs,
+  ): Promise<PluginSafeModeResult>;
+  experimental_setSafeMode(
+    args: PluginSetSafeModeArgs,
+  ): Promise<PluginSetSafeModeResult>;
+  experimental_pruneCache(
+    args?: PluginPruneCacheArgs,
+  ): Promise<PluginPruneCacheResult>;
   applyUpdate(args: PluginIdArgs): Promise<PluginApplyUpdateResult>;
+  experimental_startUpdate(args: PluginIdArgs): Promise<PluginUpdateJob>;
+  experimental_updateJobs: PluginUpdateJobsArea;
   callRpc<TOutput>(args: PluginRpcArgs<TOutput>): Promise<TOutput>;
   checkUpdates(
     args?: PluginCheckUpdatesArgs,
   ): Promise<PluginCheckUpdatesResult>;
   catalog: PluginCatalogArea;
+  marketplaces: PluginMarketplacesArea;
   disable(args: PluginIdArgs): Promise<PluginDisableResult>;
   enable(args: PluginIdArgs): Promise<PluginEnableResult>;
   getSettings(args: PluginGetSettingsArgs): Promise<PluginGetSettingsResult>;
   getSource(args: PluginGetSourceArgs): Promise<PluginGetSourceResult>;
   install(args: PluginInstallArgs): Promise<PluginInstallResult>;
+  startInstall(args: PluginInstallArgs): Promise<PluginInstallJob>;
+  installJobs: PluginInstallJobsArea;
   list(args?: PluginListArgs): Promise<PluginListResult>;
   listUpdateResults(
     args?: PluginListUpdateResultsArgs,
@@ -149,6 +325,16 @@ export interface PluginsArea {
   updateSettings(
     args: PluginSettingsUpdateArgs,
   ): Promise<PluginUpdateSettingsResult>;
+}
+
+function pluginSourceSelection(
+  args: PluginInstallArgs,
+): PluginSourceSelection | undefined {
+  if (args.subdirectory !== undefined) {
+    return { kind: "subdirectory", path: args.subdirectory };
+  }
+  if (args.plugin !== undefined) return { kind: "entry", name: args.plugin };
+  return undefined;
 }
 
 function pluginPath(pluginId: string, suffix = ""): string {
@@ -180,24 +366,167 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
     };
   }
 
+  function installJobPath(jobId: string, suffix = ""): string {
+    const id = z.string().min(1).parse(jobId);
+    return `/api/v1/plugins/install-jobs/${encodeURIComponent(id)}${suffix}`;
+  }
+
+  const updateJobs: PluginUpdateJobsArea = {
+    async get(input) {
+      const jobId = z.string().min(1).parse(input.jobId);
+      const response = await requestParsed(
+        `/api/v1/plugins/update-jobs/${encodeURIComponent(jobId)}`,
+        pluginUpdateJobResponseSchema,
+      );
+      return response.job;
+    },
+    async list(input = {}) {
+      const response = await requestParsed(
+        "/api/v1/plugins/update-jobs",
+        pluginUpdateJobListResponseSchema,
+        { signal: input.signal },
+      );
+      return response.jobs;
+    },
+  };
+
+  function requestUpdate(input: PluginIdArgs) {
+    return requestParsed(
+      pluginPath(input.pluginId, "/update"),
+      z.union([pluginUpdateJobResponseSchema, pluginApplyUpdateResultSchema]),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          prefer: "respond-async",
+        },
+        body: JSON.stringify(pluginApplyUpdateRequestSchema.parse({})),
+      },
+    );
+  }
+
+  const installJobs: PluginInstallJobsArea = {
+    async cancel(input) {
+      const response = await requestParsed(
+        installJobPath(input.jobId, "/cancel"),
+        pluginInstallJobResponseSchema,
+        jsonInit("POST", {}),
+      );
+      return response.job;
+    },
+    async get(input) {
+      const response = await requestParsed(
+        installJobPath(input.jobId),
+        pluginInstallJobResponseSchema,
+      );
+      return response.job;
+    },
+    async list(input = {}) {
+      const response = await requestParsed(
+        "/api/v1/plugins/install-jobs",
+        pluginInstallJobListResponseSchema,
+        { signal: input.signal },
+      );
+      return response.jobs;
+    },
+  };
+
+  function requestInstall(path: string, body: unknown) {
+    return requestParsed(path, pluginInstallStartResponseSchema, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        prefer: "respond-async",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function startInstall(
+    path: string,
+    body: unknown,
+  ): Promise<PluginInstallJob> {
+    const response = await requestInstall(path, body);
+    if ("job" in response) return response.job;
+    throw new Error(
+      `installed "${response.plugin.id}" without an install job; this BB server predates background installs`,
+    );
+  }
+
+  async function installAndWait(
+    path: string,
+    body: unknown,
+  ): Promise<InstalledPlugin> {
+    const response = await requestInstall(path, body);
+    if ("plugin" in response) return response.plugin;
+    let job = response.job;
+    while (
+      job.state === "queued" ||
+      job.state === "running" ||
+      job.state === "cancelling"
+    ) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, INSTALL_JOB_POLL_INTERVAL_MS),
+      );
+      job = await installJobs.get({ jobId: job.id });
+    }
+    if (job.state === "succeeded") return job.plugin;
+    throw new Error(job.state === "failed" ? job.error : "install cancelled");
+  }
+
+  function sourceInstallBody(input: PluginInstallArgs) {
+    if (input.subdirectory !== undefined && input.plugin !== undefined) {
+      throw new Error(
+        "plugin install accepts subdirectory or plugin, not both",
+      );
+    }
+    const selection = pluginSourceSelection(input);
+    const body =
+      selection === undefined
+        ? { source: input.source }
+        : { source: input.source, selection };
+    pluginInstallRequestSchema.parse(body);
+    return body;
+  }
+
   const catalog: PluginCatalogArea = {
     async install(input) {
-      const body = pluginCatalogInstallRequestSchema.parse(input);
-      const response = await requestParsed(
+      return installAndWait(
         "/api/v1/plugin-catalog/install",
-        pluginInstallResponseSchema,
-        jsonInit("POST", body),
+        pluginCatalogInstallRequestSchema.parse(input),
       );
-      return response.plugin;
+    },
+    async startInstall(input) {
+      return startInstall(
+        "/api/v1/plugin-catalog/install",
+        pluginCatalogInstallRequestSchema.parse(input),
+      );
+    },
+    async installPlan(input) {
+      const body = pluginCatalogInstallRequestSchema.parse(
+        input.marketplace === undefined
+          ? { entryId: input.entryId }
+          : { entryId: input.entryId, marketplace: input.marketplace },
+      );
+      const query = new URLSearchParams({ entryId: body.entryId });
+      if (body.marketplace !== undefined) {
+        query.set("marketplace", body.marketplace);
+      }
+      const response = await requestParsed(
+        `/api/v1/plugin-catalog/install-plan?${query.toString()}`,
+        pluginCatalogInstallPlanResponseSchema,
+        { signal: input.signal },
+      );
+      return response.plan;
     },
     async search(input) {
       const query = z.string().parse(input.query);
       const response = await requestParsed(
         `/api/v1/plugin-catalog/search?q=${encodeURIComponent(query)}`,
-        pluginCatalogSearchResponseSchema,
+        pluginCatalogSearchResponseCompatibilitySchema,
         { signal: input.signal },
       );
-      return response.results;
+      return response;
     },
     async status(input = {}) {
       const response = await requestParsed(
@@ -207,25 +536,86 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       );
       return response.catalog;
     },
-    submission() {
-      return { url: PLUGIN_SUBMISSION_FORM_URL };
+  };
+
+  const marketplaces: PluginMarketplacesArea = {
+    async add(input) {
+      const body = pluginMarketplaceAddRequestSchema.parse(input);
+      const response = await requestParsed(
+        "/api/v1/marketplaces",
+        pluginMarketplaceMutationResponseSchema,
+        jsonInit("POST", body),
+      );
+      return response.marketplace;
+    },
+    async list(input = {}) {
+      const response = await requestParsed(
+        "/api/v1/marketplaces",
+        pluginMarketplaceListResponseSchema,
+        { signal: input.signal },
+      );
+      return response.marketplaces;
+    },
+    async refresh(input = {}) {
+      const body = pluginMarketplaceRefreshRequestSchema.parse(
+        input.name === undefined ? {} : { name: input.name },
+      );
+      const response = await requestParsed(
+        "/api/v1/marketplaces/refresh",
+        pluginMarketplaceRefreshResponseSchema,
+        { ...jsonInit("POST", body), signal: input.signal },
+      );
+      return response.results;
+    },
+    async remove(input) {
+      const name = pluginMarketplaceNameSchema.parse(input.name);
+      const response = await requestParsed(
+        `/api/v1/marketplaces/${encodeURIComponent(name)}`,
+        pluginMarketplaceRemoveResponseSchema,
+        { method: "DELETE" },
+      );
+      return { convertedPluginIds: response.convertedPluginIds };
     },
   };
 
   return {
     async applyUpdate(input) {
-      const body = pluginApplyUpdateRequestSchema.parse({});
+      const response = await requestUpdate(input);
+      if (!("job" in response)) return response;
+      let job = response.job;
+      while (job.state === "queued" || job.state === "running") {
+        await new Promise((resolve) =>
+          setTimeout(resolve, INSTALL_JOB_POLL_INTERVAL_MS),
+        );
+        job = await updateJobs.get({ jobId: job.id });
+      }
+      if (job.state === "completed") return job.result;
+      throw new Error(job.error);
+    },
+    async experimental_startUpdate(input) {
+      const response = await requestUpdate(input);
+      if ("job" in response) return response.job;
+      throw new Error(
+        "Update completed without a job; this BB server predates background updates",
+      );
+    },
+    experimental_updateJobs: updateJobs,
+    async experimental_discoverRpc(input = {}) {
+      const query = pluginRpcDiscoveryQuerySchema.parse(input);
+      const params = new URLSearchParams();
+      if (query.pluginId !== undefined) params.set("pluginId", query.pluginId);
+      if (query.method !== undefined) params.set("method", query.method);
       return requestParsed(
-        pluginPath(input.pluginId, "/update"),
-        pluginApplyUpdateResultSchema,
-        jsonInit("POST", body),
+        `/api/v1/plugins/rpc?${params}`,
+        pluginRpcDiscoveryResponseSchema,
+        { signal: input.signal },
       );
     },
     async callRpc(input) {
       const envelope = await requestParsed(
         pluginPath(input.pluginId, `/rpc/${encodeURIComponent(input.method)}`),
         z.object({ ok: z.literal(true), result: jsonValueSchema }),
-        jsonInit("POST", input.input ?? null),
+        { ...jsonInit("POST", input.input ?? null), signal: input.signal },
       );
       return input.outputSchema.parse(envelope.result);
     },
@@ -240,7 +630,35 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       );
       return response.results;
     },
+    async experimental_getSafeMode(input = {}) {
+      return requestParsed(
+        "/api/v1/plugins/safe-mode",
+        pluginSafeModeResponseSchema,
+        { signal: input.signal },
+      );
+    },
+    async experimental_setSafeMode(input) {
+      const body = pluginSafeModeRequestSchema.parse({
+        enabled: input.enabled,
+      });
+      return requestParsed(
+        "/api/v1/plugins/safe-mode",
+        pluginSafeModeUpdateResponseSchema,
+        jsonInit("PUT", body),
+      );
+    },
+    async experimental_pruneCache(input = {}) {
+      const body = pluginCachePruneRequestSchema.parse({
+        dryRun: input.dryRun ?? false,
+      });
+      return requestParsed(
+        "/api/v1/plugins/cache/prune",
+        pluginCachePruneResponseSchema,
+        { ...jsonInit("POST", body), signal: input.signal },
+      );
+    },
     catalog,
+    marketplaces,
     async disable(input) {
       const response = await requestParsed(
         pluginPath(input.pluginId, "/disable"),
@@ -272,14 +690,15 @@ export function createPluginsArea(args: CreateSdkAreaArgs): PluginsArea {
       );
     },
     async install(input) {
-      const body = pluginInstallSourceRequestSchema.parse(input);
-      const response = await requestParsed(
+      return installAndWait(
         "/api/v1/plugins/install",
-        pluginInstallResponseSchema,
-        jsonInit("POST", body),
+        sourceInstallBody(input),
       );
-      return response.plugin;
     },
+    startInstall(input) {
+      return startInstall("/api/v1/plugins/install", sourceInstallBody(input));
+    },
+    installJobs,
     async list(input = {}) {
       return requestParsed("/api/v1/plugins", pluginListResponseSchema, {
         signal: input.signal,

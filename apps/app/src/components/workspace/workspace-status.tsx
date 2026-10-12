@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { assertNever } from "@bb/core-ui";
 import type { WorkspaceStatus } from "@bb/domain";
 import type { WorkspaceResolutionFailure } from "@bb/host-daemon-contract";
@@ -16,10 +15,9 @@ export interface ThreadGitStatusDisplay {
     | "Dirty"
     | "Untracked";
   summary: string;
-  summaryContent: ReactNode;
 }
 
-export interface GetGitStatusDisplayOptions {
+interface GetGitStatusDisplayOptions {
   error?: unknown;
   mergeBaseBranch?: string;
   showBranchComparison?: boolean;
@@ -58,17 +56,30 @@ function plainDisplay(
   label: ThreadGitStatusDisplay["label"],
   summary: string,
 ): ThreadGitStatusDisplay {
-  return { label, summary, summaryContent: summary };
+  return { label, summary };
 }
 
-/**
- * Builds the one-line status pill rendered in the info tab and the git-action
- * dialog. The summary intentionally omits working-tree file/diff aggregates —
- * those are surfaced by `ChangedFilesRow` (info tab) and the dialog's own
- * Changed files row, so echoing them here would just duplicate the same numbers.
- * The summary only carries the merge-base comparison (ahead/behind) or a
- * fallback sentence when there is no comparison to show.
- */
+function divergenceDisplay(
+  status: WorkspaceStatus,
+  comparisonSummary: string | null,
+): ThreadGitStatusDisplay | null {
+  const aheadCount = status.mergeBase?.aheadCount ?? 0;
+  const behindCount = status.mergeBase?.behindCount ?? 0;
+  if (aheadCount > 0 && behindCount > 0) {
+    return plainDisplay(
+      "Diverged",
+      comparisonSummary ?? "Branch has diverged.",
+    );
+  }
+  if (behindCount > 0) {
+    return plainDisplay(
+      "Behind",
+      comparisonSummary ?? "Branch is behind its merge base.",
+    );
+  }
+  return null;
+}
+
 export function getGitStatusDisplay(
   status: WorkspaceStatus | undefined,
   options?: GetGitStatusDisplayOptions,
@@ -108,61 +119,34 @@ export function getGitStatusDisplay(
     : null;
 
   switch (status.workingTree.state) {
-    case "clean": {
-      if (
-        (status.mergeBase?.aheadCount ?? 0) > 0 &&
-        (status.mergeBase?.behindCount ?? 0) > 0
-      ) {
-        return plainDisplay(
-          "Diverged",
-          comparisonSummary ?? "Branch has diverged.",
-        );
-      }
-      if ((status.mergeBase?.aheadCount ?? 0) > 0) {
-        return plainDisplay(
-          "Ahead",
-          comparisonSummary ?? "Local commits pending merge.",
-        );
-      }
-      if ((status.mergeBase?.behindCount ?? 0) > 0) {
-        return plainDisplay(
-          "Behind",
-          comparisonSummary ?? "Branch is behind its merge base.",
-        );
-      }
-      return plainDisplay(
-        options?.showBranchComparison ? "Up to date" : "Clean",
-        resolvedMergeBaseBranch
-          ? `No local changes relative to ${resolvedMergeBaseBranch}.`
-          : "No local changes.",
+    case "clean":
+      return (
+        divergenceDisplay(status, comparisonSummary) ??
+        ((status.mergeBase?.aheadCount ?? 0) > 0
+          ? plainDisplay(
+              "Ahead",
+              comparisonSummary ?? "Local commits pending merge.",
+            )
+          : plainDisplay(
+              options?.showBranchComparison ? "Up to date" : "Clean",
+              resolvedMergeBaseBranch
+                ? `No local changes relative to ${resolvedMergeBaseBranch}.`
+                : "No local changes.",
+            ))
       );
-    }
     case "untracked":
       return plainDisplay("Untracked", comparisonSummary ?? "");
     case "dirty_uncommitted":
-      return plainDisplay("Dirty", comparisonSummary ?? "");
-    case "committed_unmerged":
-      if (
-        (status.mergeBase?.aheadCount ?? 0) > 0 &&
-        (status.mergeBase?.behindCount ?? 0) > 0
-      ) {
-        return plainDisplay(
-          "Diverged",
-          comparisonSummary ?? "Branch has diverged.",
-        );
-      }
-      if ((status.mergeBase?.behindCount ?? 0) > 0) {
-        return plainDisplay(
-          "Behind",
-          comparisonSummary ?? "Branch is behind its merge base.",
-        );
-      }
-      return plainDisplay(
-        "Ahead",
-        comparisonSummary ?? "Local commits pending merge.",
-      );
     case "dirty_and_committed_unmerged":
       return plainDisplay("Dirty", comparisonSummary ?? "");
+    case "committed_unmerged":
+      return (
+        divergenceDisplay(status, comparisonSummary) ??
+        plainDisplay(
+          "Ahead",
+          comparisonSummary ?? "Local commits pending merge.",
+        )
+      );
     default:
       return assertNever(status.workingTree.state);
   }

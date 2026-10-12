@@ -1,5 +1,6 @@
 import {
   createThread,
+  InvalidLifecycleOwnerError,
   getThreadSectionById,
   getProjectSourceByHost,
   getProject,
@@ -9,49 +10,33 @@ import {
 import type { DbNotifier } from "@bb/db";
 import type { HostDaemonCommand } from "@bb/host-daemon-contract";
 import type { LocalPathProjectSource } from "@bb/domain";
-import type { BaseBranchSpec } from "@bb/server-contract";
 import type { AppDeps } from "../../types.js";
 import { ApiError } from "../../errors.js";
 import { emitPluginThreadCreated } from "../plugins/plugin-thread-events.js";
 import type { ThreadCreateServiceRequest } from "./thread-create-request.js";
 import { sanitizeGeneratedBranchSlug } from "./title-generation.js";
 
-/**
- * Convert a {@link BaseBranchSpec} to the stored/wire branch-name shape.
- * `{ kind: "default" }` becomes `null`, which means the source's default
- * branch.
- */
-export function baseBranchSpecToStoredName(
-  spec: BaseBranchSpec,
-): string | null {
-  return spec.kind === "named" ? spec.name : null;
-}
-
-export function storedBaseBranchNameToSpec(
-  name: string | null,
-): BaseBranchSpec {
-  return name ? { kind: "named", name } : { kind: "default" };
-}
-
 type EnvironmentProvisionCommand = Extract<
   HostDaemonCommand,
-  { type: "environment.provision" }
+  { type: "environment.attach" }
 >;
 type EnvironmentProvisionCommandInitiator =
   EnvironmentProvisionCommand["initiator"];
 
-export interface ManagedBranchNameArgs {
-  branchSlug?: string | null;
+interface SuggestedBranchNameArgs {
+  branchPrefix: string;
+  title: string | null;
   threadId: string;
 }
 
-export function buildManagedBranchName(args: ManagedBranchNameArgs): string {
-  const branchSlug = args.branchSlug
-    ? sanitizeGeneratedBranchSlug(args.branchSlug)
-    : null;
+export function buildSuggestedBranchName(
+  args: SuggestedBranchNameArgs,
+): string {
+  const branchSlug =
+    args.title === null ? null : sanitizeGeneratedBranchSlug(args.title);
   return branchSlug
-    ? `bb/${branchSlug}-${args.threadId}`
-    : `bb/${args.threadId}`;
+    ? `${args.branchPrefix}${branchSlug}-${args.threadId}`
+    : `${args.branchPrefix}${args.threadId}`;
 }
 
 export function requirePublicProjectForThreadCreate(
@@ -64,8 +49,6 @@ export function requirePublicProjectForThreadCreate(
   }
   return project;
 }
-
-export const SETUP_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 export function requireSourceForHost(
   deps: Pick<AppDeps, "db">,
@@ -83,84 +66,33 @@ export function requireSourceForHost(
   return source;
 }
 
-/**
- * Pre-provision checkout for unmanaged workspaces, fully resolved on the
- * server (the daemon receives an explicit branch name in both kinds).
- */
-export type UnmanagedCheckoutCommand =
-  | { kind: "existing"; name: string }
-  | { kind: "new"; name: string; baseBranch: string };
-
-export type EnvironmentProvisionCommandArgs =
-  | {
-      workspaceProvisionType: "unmanaged";
-      environmentId: string;
-      hostId: string;
-      initiator: EnvironmentProvisionCommandInitiator;
-      path: string;
-      checkout?: UnmanagedCheckoutCommand;
-    }
-  | {
-      workspaceProvisionType: "managed-worktree";
-      environmentId: string;
-      hostId: string;
-      initiator: EnvironmentProvisionCommandInitiator;
-      sourcePath: string;
-      targetPath: string;
-      branchName: string;
-      baseBranch: BaseBranchSpec;
-      setupTimeoutMs: number;
-    }
-  | {
-      workspaceProvisionType: "personal";
-      environmentId: string;
-      hostId: string;
-      initiator: EnvironmentProvisionCommandInitiator;
-      targetPath: string;
-    };
+interface EnvironmentProvisionCommandArgs {
+  environmentId: string;
+  hostId: string;
+  initiator: EnvironmentProvisionCommandInitiator;
+  path: string;
+  setupScriptTimeoutMs: number | null;
+}
 
 export function buildEnvironmentProvisionCommand(
   args: EnvironmentProvisionCommandArgs,
 ): EnvironmentProvisionCommand {
-  switch (args.workspaceProvisionType) {
-    case "unmanaged":
-      return {
-        type: "environment.provision" as const,
-        environmentId: args.environmentId,
-        initiator: args.initiator,
-        workspaceProvisionType: args.workspaceProvisionType,
-        path: args.path,
-        ...(args.checkout ? { checkout: args.checkout } : {}),
-      };
-    case "managed-worktree":
-      return {
-        type: "environment.provision" as const,
-        environmentId: args.environmentId,
-        initiator: args.initiator,
-        workspaceProvisionType: args.workspaceProvisionType,
-        sourcePath: args.sourcePath,
-        targetPath: args.targetPath,
-        branchName: args.branchName,
-        baseBranch: baseBranchSpecToStoredName(args.baseBranch),
-        setupTimeoutMs: args.setupTimeoutMs,
-      };
-    case "personal":
-      return {
-        type: "environment.provision" as const,
-        environmentId: args.environmentId,
-        initiator: args.initiator,
-        workspaceProvisionType: args.workspaceProvisionType,
-        targetPath: args.targetPath,
-      };
-  }
+  return {
+    type: "environment.attach" as const,
+    contributedEnv: [],
+    environmentId: args.environmentId,
+    initiator: args.initiator,
+    path: args.path,
+    setupScriptTimeoutMs: args.setupScriptTimeoutMs,
+  };
 }
 
 export function createThreadRecord(
   deps: Pick<AppDeps, "db"> & { hub: DbNotifier },
   args: {
     environmentId: string | null;
+    startupContext?: string;
     request: ThreadCreateServiceRequest;
-    status?: "starting";
   },
 ) {
   const sectionId = args.request.sectionId ?? null;
@@ -176,16 +108,28 @@ export function createThreadRecord(
       title: args.request.title ?? null,
       titleFallback: args.request.titleFallback,
       sectionId,
+      pinned: args.request.pinned ?? false,
       parentThreadId: args.request.parentThreadId ?? null,
       sourceThreadId: args.request.sourceThreadId ?? null,
+      lifecycleOwnerThreadId: args.request.lifecycleOwnerThreadId,
       originKind: args.request.originKind,
       originPluginId: args.request.originPluginId ?? null,
+      pluginMetadata: args.request.pluginMetadata,
       visibility: args.request.visibility,
-      status: args.status ?? "starting",
+      // Every thread starts `pending`, with no exception to parameterise.
+      // Creation is unhooked and provisions nothing; admission happens at the
+      // first message's dispatch attempt, and clearing it is what moves the
+      // thread to `starting`. A caller that could pass `starting` here would
+      // be claiming a thread had been admitted before anything decided so.
+      status: "pending",
+      startupContext: args.startupContext,
     });
     emitPluginThreadCreated(thread);
     return thread;
   } catch (error) {
+    if (error instanceof InvalidLifecycleOwnerError) {
+      throw new ApiError(400, "invalid_request", error.message);
+    }
     if (
       sectionId !== null &&
       error instanceof Error &&

@@ -11,15 +11,18 @@ import { extractErrorMessage } from "@bb/core-ui";
 import {
   type PatchQueryIdentity,
   getDiffPatchEvictionGeneration,
+  getDiffPatchFreshnessGeneration,
+  isDiffPatchEntryFresh,
+  pruneDiffPatchEntries,
   readDiffPatchEntry,
+  retainDiffPatchQueries,
   writeDiffPatchEntry,
 } from "../cache-owners/environment-diff-patch-cache-owner";
 import { environmentDiffTargetKey } from "./query-keys";
 
-/** Debounce window for coalescing scroll-driven patch requests. */
 const PATCH_REQUEST_DEBOUNCE_MS = 80;
 
-export type DiffPatchStatus = "idle" | "loading" | "loaded" | "error";
+type DiffPatchStatus = "idle" | "loading" | "loaded" | "error";
 
 export interface DiffPatchState {
   status: DiffPatchStatus;
@@ -28,36 +31,29 @@ export interface DiffPatchState {
   error?: string;
 }
 
-/**
- * The visible + overscan `auto` paths the virtualized list wants patches for.
- * `visible` rows are fetched before `overscan` so on-screen content settles
- * first; a path present in both is treated as visible.
- */
-export interface RequestDiffPatchPathsArgs {
+interface RequestDiffPatchPathsArgs {
   visible: string[];
   overscan: string[];
 }
 
-export interface UseEnvironmentDiffPatchesArgs {
+interface UseEnvironmentDiffPatchesArgs {
   target?: WorkspaceDiffTarget;
 }
 
-export type RequestDiffPatchPaths = (args: RequestDiffPatchPathsArgs) => void;
-export type GetDiffPatchState = (path: string) => DiffPatchState;
+type RequestDiffPatchPaths = (args: RequestDiffPatchPathsArgs) => void;
+type GetDiffPatchState = (path: string) => DiffPatchState;
 export type RetryDiffPatchPath = (path: string) => void;
 export type LoadDiffPatchPath = (path: string) => void;
-export type SeedDiffPatchEntries = (entries: DiffPatchEntry[]) => void;
+type SeedDiffPatchEntries = (entries: DiffPatchEntry[]) => void;
+type PruneDiffPatchEntries = (paths: readonly string[]) => void;
 
-export interface UseEnvironmentDiffPatchesResult {
+interface UseEnvironmentDiffPatchesResult {
   requestPaths: RequestDiffPatchPaths;
   getPatchState: GetDiffPatchState;
   retry: RetryDiffPatchPath;
   loadPath: LoadDiffPatchPath;
-  /**
-   * Prime the cache with patches the TOC shipped inline (`initialPatches`) so
-   * the first screen renders without a separate fetch. Idempotent.
-   */
   seedInitialPatches: SeedDiffPatchEntries;
+  prunePaths: PruneDiffPatchEntries;
 }
 
 const IDLE_STATE: DiffPatchState = { status: "idle" };
@@ -67,11 +63,9 @@ interface PendingPaths {
   overscan: string[];
 }
 
-/** In-flight / errored tracking for the active target, keyed by path. */
 interface InFlightState {
-  /** Eviction generation captured when the fetch for a path started. */
   loading: ReadonlyMap<string, number>;
-  errors: ReadonlyMap<string, string>;
+  errors: ReadonlyMap<string, { generation: number; message: string }>;
 }
 
 const EMPTY_IN_FLIGHT: InFlightState = {
@@ -132,20 +126,6 @@ function patchPageError(
   }
 }
 
-/**
- * Drives the diff tab's per-file patch loading. The virtualized list reports
- * which `auto` paths are visible + within overscan; this hook coalesces those
- * reports, fetches the not-yet-loaded ones in viewport-first pages of at most
- * {@link DIFF_PATCH_MAX_PATHS_PER_REQUEST}, and caches each file's patch under a
- * per-(target, path) React Query key so re-scrolling never refetches.
- *
- * Each fetched page is keyed to the active diff target; responses for a target
- * that has since changed are dropped, and switching target resets observed
- * loading/error state. A failed page (network error, or a daemon
- * `unavailable` / `not_applicable` outcome) marks only its paths as a
- * retryable error rather than throwing — call {@link UseEnvironmentDiffPatchesResult.retry}
- * to re-request a single path.
- */
 export function useEnvironmentDiffPatches(
   environmentId: string,
   { target }: UseEnvironmentDiffPatchesArgs,
@@ -154,8 +134,6 @@ export function useEnvironmentDiffPatches(
 
   const targetType = target?.type ?? null;
   const targetKey = environmentDiffTargetKey(target);
-  // Single string identity for the active target; changes here invalidate every
-  // in-flight request and reset observed loading/error state.
   const targetIdentity = `${targetType ?? "none"}:${targetKey ?? ""}`;
 
   const identity = useMemo<PatchQueryIdentity>(
@@ -164,27 +142,21 @@ export function useEnvironmentDiffPatches(
   );
 
   const [inFlight, setInFlight] = useState<InFlightState>(EMPTY_IN_FLIGHT);
+  const [, setPatchCacheRevision] = useState(0);
 
-  // Latest reported paths and the active target identity are held in refs so the
-  // debounced settle tick reads current values without re-subscribing on every
-  // scroll report. `inFlightRef` mirrors the in-flight state so the settle tick
-  // can dedupe against it without taking it as a dependency (which would
-  // reschedule the callback on every state change).
-  const pendingPathsRef = useRef<PendingPaths>({ visible: [], overscan: [] });
+  const pendingPathsRef = useRef<PendingPaths>({
+    visible: [],
+    overscan: [],
+  });
   const targetIdentityRef = useRef(targetIdentity);
   const inFlightRef = useRef(inFlight);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortControllersRef = useRef<Set<AbortController>>(new Set());
 
-  // Mirror in-flight state into a ref from an effect — never during render, which
-  // is unsafe under concurrent rendering — so the debounced settle tick can dedupe
-  // against the latest committed state without taking it as a dependency.
   useEffect(() => {
     inFlightRef.current = inFlight;
   }, [inFlight]);
 
-  // Reset all observed loading/error state and drop any pending settle tick when
-  // the target changes; cached patches for the new target are re-read lazily.
   useEffect(() => {
     targetIdentityRef.current = targetIdentity;
     pendingPathsRef.current = { visible: [], overscan: [] };
@@ -206,18 +178,22 @@ export function useEnvironmentDiffPatches(
     };
   }, []);
 
+  useEffect(() => {
+    if (!environmentId) {
+      return;
+    }
+    return retainDiffPatchQueries({ queryClient, environmentId });
+  }, [environmentId, queryClient]);
+
   const fetchPage = useCallback(
-    async (paths: string[], generationTarget: string) => {
+    async (
+      paths: string[],
+      generationTarget: string,
+      freshnessGeneration: number,
+    ) => {
       if (!environmentId || target === undefined) {
         return;
       }
-      // Snapshot the environment's eviction generation at fetch start. If the
-      // patch cache is evicted (a content edit, ref move, or reconnect) while
-      // this request is in flight, the generation advances and the resolved
-      // response is dropped — re-seeding the just-cleared cache here would leave
-      // a pre-edit patch. A newer `requestPaths` dispatch can start a fresh
-      // fetch because `loading` is generation-tagged; clearing below only
-      // releases this stale generation if no newer fetch has taken over.
       const evictionGeneration = getDiffPatchEvictionGeneration(environmentId);
       const controller = new AbortController();
       abortControllersRef.current.add(controller);
@@ -231,34 +207,35 @@ export function useEnvironmentDiffPatches(
         if (controller.signal.aborted) {
           return;
         }
-        // Drop the response if the target changed while it was in flight.
         if (targetIdentityRef.current !== generationTarget) {
           return;
         }
-        // Drop the response if the patch cache was evicted while it was in
-        // flight, releasing its paths so the panel re-requests them.
         if (
-          getDiffPatchEvictionGeneration(environmentId) !== evictionGeneration
+          getDiffPatchEvictionGeneration(environmentId) !==
+            evictionGeneration ||
+          getDiffPatchFreshnessGeneration(environmentId) !== freshnessGeneration
         ) {
           setInFlight((previous) =>
-            clearLoading(previous, paths, evictionGeneration),
+            clearLoading(previous, paths, freshnessGeneration),
           );
           return;
         }
         if (response.outcome === "available") {
           const returnedPaths = new Set<string>();
           for (const entry of response.patches) {
-            writeDiffPatchEntry({ queryClient, identity, entry });
+            writeDiffPatchEntry({
+              queryClient,
+              identity,
+              entry,
+              freshnessGeneration,
+            });
             returnedPaths.add(entry.path);
           }
-          // Any requested path the server omitted (e.g. it left the TOC after the
-          // list fetch) is settled to a terminal error, not left idle — otherwise
-          // it would be re-requested on every scroll tick.
           setInFlight((previous) =>
             settlePage({
               previous,
               paths,
-              loadingGeneration: evictionGeneration,
+              loadingGeneration: freshnessGeneration,
               returnedPaths,
             }),
           );
@@ -267,7 +244,7 @@ export function useEnvironmentDiffPatches(
             settlePage({
               previous,
               paths,
-              loadingGeneration: evictionGeneration,
+              loadingGeneration: freshnessGeneration,
               error: patchPageError(response),
             }),
           );
@@ -279,13 +256,13 @@ export function useEnvironmentDiffPatches(
         if (targetIdentityRef.current !== generationTarget) {
           return;
         }
-        // An eviction mid-flight supersedes a failure: release the paths so the
-        // panel re-requests them rather than stamping a stale error.
         if (
-          getDiffPatchEvictionGeneration(environmentId) !== evictionGeneration
+          getDiffPatchEvictionGeneration(environmentId) !==
+            evictionGeneration ||
+          getDiffPatchFreshnessGeneration(environmentId) !== freshnessGeneration
         ) {
           setInFlight((previous) =>
-            clearLoading(previous, paths, evictionGeneration),
+            clearLoading(previous, paths, freshnessGeneration),
           );
           return;
         }
@@ -295,7 +272,7 @@ export function useEnvironmentDiffPatches(
           settlePage({
             previous,
             paths,
-            loadingGeneration: evictionGeneration,
+            loadingGeneration: freshnessGeneration,
             error: message,
           }),
         );
@@ -311,29 +288,33 @@ export function useEnvironmentDiffPatches(
     if (!environmentId || target === undefined) {
       return;
     }
-    // Bail if a newer target became active before this debounced tick ran, so a
-    // stale dispatch never marks paths loading under the current target.
     if (targetIdentityRef.current !== targetIdentity) {
       return;
     }
     const ordered = dedupeOrderedPaths(pendingPathsRef.current);
 
-    const currentEvictionGeneration =
-      getDiffPatchEvictionGeneration(environmentId);
+    const currentFreshnessGeneration =
+      getDiffPatchFreshnessGeneration(environmentId);
     const toFetch = ordered.filter((path) => {
-      if (readDiffPatchEntry({ queryClient, identity, path }) !== undefined) {
+      if (
+        readDiffPatchEntry({ queryClient, identity, path }) !== undefined &&
+        isDiffPatchEntryFresh({ queryClient, identity, path })
+      ) {
         return false;
       }
       if (
         isLoadingForCurrentGeneration(
           inFlightRef.current.loading,
           path,
-          currentEvictionGeneration,
+          currentFreshnessGeneration,
         )
       ) {
         return false;
       }
-      if (inFlightRef.current.errors.has(path)) {
+      if (
+        inFlightRef.current.errors.get(path)?.generation ===
+        currentFreshnessGeneration
+      ) {
         return false;
       }
       return true;
@@ -344,11 +325,11 @@ export function useEnvironmentDiffPatches(
     }
 
     setInFlight((previous) =>
-      markLoading(previous, toFetch, currentEvictionGeneration),
+      markLoading(previous, toFetch, currentFreshnessGeneration),
     );
 
     for (const page of chunkPaths(toFetch)) {
-      void fetchPage(page, targetIdentity);
+      void fetchPage(page, targetIdentity, currentFreshnessGeneration);
     }
   }, [environmentId, target, targetIdentity, identity, queryClient, fetchPage]);
 
@@ -369,18 +350,14 @@ export function useEnvironmentDiffPatches(
     [dispatchPending],
   );
 
-  // Fetch a single path immediately, bypassing the debounced shared
-  // `pendingPathsRef`. A scroll-driven `requestPaths` can replace that ref (and
-  // reset its timer) between an `on_demand`/retry click and the debounced
-  // dispatch, dropping the click; going direct sidesteps that race entirely.
   const loadPathNow = useCallback(
     (path: string) => {
       const generationTarget = targetIdentityRef.current;
-      const loadingGeneration = getDiffPatchEvictionGeneration(environmentId);
+      const loadingGeneration = getDiffPatchFreshnessGeneration(environmentId);
       setInFlight((previous) =>
         markLoading(previous, [path], loadingGeneration),
       );
-      void fetchPage([path], generationTarget);
+      void fetchPage([path], generationTarget, loadingGeneration);
     },
     [environmentId, fetchPage],
   );
@@ -393,21 +370,24 @@ export function useEnvironmentDiffPatches(
     [loadPathNow],
   );
 
-  // The `on_demand` "Load diff" CTA: fetch this one path now, but never disturb
-  // a patch that is already loaded, in flight, or errored (an error clears only
-  // via `retry`).
   const loadPath = useCallback(
     (path: string) => {
-      if (readDiffPatchEntry({ queryClient, identity, path }) !== undefined) {
+      const currentFreshnessGeneration =
+        getDiffPatchFreshnessGeneration(environmentId);
+      if (
+        readDiffPatchEntry({ queryClient, identity, path }) !== undefined &&
+        isDiffPatchEntryFresh({ queryClient, identity, path })
+      ) {
         return;
       }
       if (
         isLoadingForCurrentGeneration(
           inFlightRef.current.loading,
           path,
-          getDiffPatchEvictionGeneration(environmentId),
+          currentFreshnessGeneration,
         ) ||
-        inFlightRef.current.errors.has(path)
+        inFlightRef.current.errors.get(path)?.generation ===
+          currentFreshnessGeneration
       ) {
         return;
       }
@@ -427,27 +407,58 @@ export function useEnvironmentDiffPatches(
         };
       }
       const error = inFlight.errors.get(path);
-      if (error !== undefined) {
-        return { status: "error", error };
+      if (
+        error?.generation === getDiffPatchFreshnessGeneration(environmentId)
+      ) {
+        return { status: "error", error: error.message };
       }
       if (inFlight.loading.has(path)) {
         return { status: "loading" };
       }
       return IDLE_STATE;
     },
-    [queryClient, identity, inFlight],
+    [queryClient, identity, inFlight, environmentId],
   );
 
   const seedInitialPatches = useCallback(
     (entries: DiffPatchEntry[]) => {
+      let changed = false;
       for (const entry of entries) {
+        const previous = readDiffPatchEntry({
+          queryClient,
+          identity,
+          path: entry.path,
+        });
+        if (
+          previous?.patch !== entry.patch ||
+          previous.truncated !== entry.truncated
+        ) {
+          changed = true;
+        }
         writeDiffPatchEntry({ queryClient, identity, entry });
+      }
+      if (changed) {
+        setPatchCacheRevision((revision) => revision + 1);
       }
     },
     [queryClient, identity],
   );
 
-  return { requestPaths, getPatchState, retry, loadPath, seedInitialPatches };
+  const prunePaths = useCallback(
+    (paths: readonly string[]) => {
+      pruneDiffPatchEntries({ queryClient, identity, paths });
+    },
+    [queryClient, identity],
+  );
+
+  return {
+    requestPaths,
+    getPatchState,
+    retry,
+    loadPath,
+    seedInitialPatches,
+    prunePaths,
+  };
 }
 
 function markLoading(
@@ -476,22 +487,13 @@ function isLoadingForCurrentGeneration(
   );
 }
 
-/**
- * Stamped on a path the server omitted from an `available` response — e.g. it
- * left the diff's table of contents between the list fetch and this request.
- * Marking it terminal (rather than leaving it idle) stops a re-request loop; a
- * TOC refresh drops the row entirely.
- */
 const MISSING_PATCH_MESSAGE = "No diff was available for this file.";
 
 interface SettlePageArgs {
   previous: InFlightState;
   paths: string[];
-  /** Eviction generation captured when this page started loading. */
   loadingGeneration: number;
-  /** Page-level error: a thrown request, or a non-`available` outcome. */
   error?: string;
-  /** For an `available` page: the paths the server actually returned. */
   returnedPaths?: ReadonlySet<string>;
 }
 
@@ -509,9 +511,12 @@ function settlePage({
       loading.delete(path);
     }
     if (error !== undefined) {
-      errors.set(path, error);
+      errors.set(path, { generation: loadingGeneration, message: error });
     } else if (returnedPaths !== undefined && !returnedPaths.has(path)) {
-      errors.set(path, MISSING_PATCH_MESSAGE);
+      errors.set(path, {
+        generation: loadingGeneration,
+        message: MISSING_PATCH_MESSAGE,
+      });
     } else {
       errors.delete(path);
     }
@@ -528,11 +533,6 @@ function clearError(previous: InFlightState, path: string): InFlightState {
   return { loading: previous.loading, errors };
 }
 
-/**
- * Release paths from `loading` without caching or erroring them — used when a
- * mid-flight eviction supersedes a fetch. Only the matching stale generation is
- * cleared; a newer fetch for the same path remains loading.
- */
 function clearLoading(
   previous: InFlightState,
   paths: string[],

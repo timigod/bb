@@ -14,36 +14,34 @@ import {
   conversationRow,
   delegationRow,
   fileChangeRow,
+  fileReadRow,
+  searchRow,
   toolRow,
   webFetchRow,
   webSearchRow,
 } from "@/test/fixtures/thread-timeline-rows";
 import { StoryCard, StoryRow } from "../../../../../.ladle/story-card";
+import {
+  fileChangeActiveThinkingDelete,
+  fileChangeAssistantStream,
+  fileChangeIndex,
+  fileChangeTimelineService,
+  fileChangeToViewMessages,
+} from "./projection-refactor-story-rows";
 
 export default {
   title: "thread/timeline/rows/Bundle Summary",
 };
 
-function TimelineStage({
-  children,
-}: {
-  children: ReactNode;
-}) {
+function TimelineStage({ children }: { children: ReactNode }) {
   return <div className="w-full max-w-[760px]">{children}</div>;
 }
 
 const baseProps = {
-  // Idle scope — keeps the non-active-latest bundle rendering visible so
-  // a regression in the muted-bundle path stays catchable. The story rows
-  // expand bodies via `initialExpanded` instead of claiming active state.
   threadRuntimeDisplayStatus: "idle" as const,
   workspaceRootPath: undefined,
 };
 
-// The projection composes a bundle's id from its first child row. Mirrored
-// here so stories can target the bundle with `initialExpanded` without
-// flipping the scope to active. If the projection's id formula changes,
-// thread-view's tests will catch it before this helper does.
 function bundleId(children: readonly TimelineRow[]): string {
   const first = children[0];
   if (!first) {
@@ -57,15 +55,11 @@ function bundleId(children: readonly TimelineRow[]): string {
   ].join(":");
 }
 
-interface ExplorationToolRowArgs {
-  id: string;
-  seq: number;
-  toolName: "Read" | "Grep" | "Glob";
-  toolArgs: Record<string, string | number>;
-  intentPath: string | null;
-  intentType: "read" | "search" | "list_files";
-  output: string;
-}
+type ExplorationRowArgs = { id: string; seq: number } & (
+  | { kind: "read"; path: string }
+  | { kind: "search"; query: string; path: string | null }
+  | { kind: "list"; pattern: string; path: string | null }
+);
 
 interface PlainToolRowArgs {
   id: string;
@@ -84,18 +78,6 @@ interface DelegationFixtureRowArgs {
   output: string;
 }
 
-// ---------------------------------------------------------------------------
-// Bundle summaries are NOT raw rows — they're produced by the @bb/thread-view
-// `buildTimelineViewRows` projection when consecutive same-workKind work rows
-// appear inside an open step. We feed real raw rows from
-// thr_zeb7z9afmw / turn 019dd185-ef12-7d50-aa48-47882e9c8aaf and let the
-// projection group them. Raw command outputs and file diffs are pulled from
-// ~/.bb-dev/bb.db sequence ranges 35700..35702 (turbo command run) and
-// 35564..35595 (file-change run during the same turn). Long outputs are
-// trimmed to keep the fixture readable.
-// ---------------------------------------------------------------------------
-
-// ---- Real consecutive build/test commands (sequences 35700-35702) ---------
 const buildDomainCoreUiCommand: TimelineRow = commandRow({
   id: "thr_zeb7z9afmw:command:call_buildDomainCoreUi",
   threadId: "thr_zeb7z9afmw",
@@ -201,8 +183,6 @@ const testCoreUiForceCommand: TimelineRow = commandRow({
   durationMs: 8500,
 });
 
-// Real failing test command, used to give the mixed-status bundle one error
-// child without inventing data.
 const testServerErrorCommand: TimelineRow = commandRow({
   id: "thr_zeb7z9afmw:command:call_testServerError",
   threadId: "thr_zeb7z9afmw",
@@ -240,179 +220,16 @@ const commandBundleMixedStatusRows: TimelineRow[] = [
   testCoreUiForceCommand,
 ];
 
-// ---- Real consecutive file-change rows (sequences 35564..35595) -----------
-// These are all updates from the same turn — the projection groups consecutive
-// `file-change` rows into a single bundle regardless of which file they touch.
-const fileChangeAssistantStream: TimelineRow = fileChangeRow({
-  id: "thr_zeb7z9afmw:fileChange:35564",
-  threadId: "thr_zeb7z9afmw",
-  turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
-  sourceSeqStart: 35564,
-  sourceSeqEnd: 35564,
+const bundleFileChangeAssistantStream: TimelineRow = {
+  ...fileChangeAssistantStream,
   startedAt: 1777337123000,
-  createdAt: 1777337123900,
-  status: "completed",
-  callId: "call_fjGvl1fFJU7cAcw46FcSnbjJ",
-  change: {
-    path: "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/assistant-stream-projection.ts",
-    kind: "update",
-    movePath: null,
-    diff: `@@ -24,3 +24,3 @@
-   visibleReasoningMessageKeys: Set<string>;
--  finalizedReasoningMessageKeys: Set<string>;
-+  finalizedReasoningKeys: Set<string>;
- }
-@@ -131,3 +131,3 @@
-     buffers: state.reasoningTextBuffersByKey,
--    finalizedKeys: state.finalizedReasoningMessageKeys,
-+    finalizedKeys: state.finalizedReasoningKeys,
-     openMessages: state.openReasoningMessagesByKey,`,
-    diffStats: { added: 2, removed: 2 },
-  },
-  stdout: null,
-  stderr: null,
-  approvalStatus: null,
-});
+};
 
-const fileChangeIndex: TimelineRow = fileChangeRow({
-  id: "thr_zeb7z9afmw:fileChange:35573",
-  threadId: "thr_zeb7z9afmw",
-  turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
-  sourceSeqStart: 35573,
-  sourceSeqEnd: 35573,
+const bundleFileChangeIndex: TimelineRow = {
+  ...fileChangeIndex,
   startedAt: 1777337124200,
-  createdAt: 1777337125300,
-  status: "completed",
-  callId: "call_BXK77XTyviYmWUVNOpPG5nwJ",
-  change: {
-    path: "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/index.ts",
-    kind: "update",
-    movePath: null,
-    diff: `@@ -110,3 +110,2 @@
- export { extractThreadContextWindowUsage } from "./thread-context-window-usage.js";
--export { extractActiveThinking } from "./active-thinking.js";
+};
 
-@@ -126,3 +125,7 @@
-
--export { toViewMessages, toViewProjection } from "./to-view-messages.js";
-+export {
-+  toViewMessages,
-+  toViewProjection,
-+  toViewProjectionEntries,
-+} from "./to-view-messages.js";
- export type { ThreadEventWithMeta } from "./to-view-messages.js";`,
-    diffStats: { added: 5, removed: 2 },
-  },
-  stdout: null,
-  stderr: null,
-  approvalStatus: null,
-});
-
-const fileChangeTimelineService: TimelineRow = fileChangeRow({
-  id: "thr_zeb7z9afmw:fileChange:35595",
-  threadId: "thr_zeb7z9afmw",
-  turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
-  sourceSeqStart: 35595,
-  sourceSeqEnd: 35595,
-  startedAt: 1777337125400,
-  createdAt: 1777337127100,
-  status: "completed",
-  callId: "call_v3QQJnCbGh2ErXIJdCf4hX4N",
-  change: {
-    path: "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/apps/server/src/services/threads/timeline.ts",
-    kind: "update",
-    movePath: null,
-    diff: `@@ -6,2 +6,3 @@
-   toViewMessages,
-+  toViewProjectionEntries,
-   toViewProjection,
-@@ -256,2 +257,23 @@
-     thread.parentThreadId !== null && !options.showAllParentEvents;
-+  const contextWindowUsageRows = listContextWindowUsageRows(db, {
-+    threadId: thread.id,
-+  });
-+
-+  if (isDefaultParentView) {
-+    return {
-+      rows: buildParentConversationRows(
-+        toViewMessages(decodedEvents, {
-+          includeInternalSystemMessages: options.showAllParentEvents,
-+          threadStatus: thread.status,
-+          parentThreadId: thread.parentThreadId,
-+        }),
-+      ),
-+      activeThinking: null,
-+      contextWindowUsage:
-+        extractThreadContextWindowUsage(
-+          contextWindowUsageRows.map((row) => parseStoredEventRow(row)),
-+        ) ?? undefined,
-+    };
-+  }`,
-    diffStats: { added: 22, removed: 0 },
-  },
-  stdout: null,
-  stderr: null,
-  approvalStatus: null,
-});
-
-const fileChangeActiveThinkingDelete: TimelineRow = fileChangeRow({
-  id: "thr_zeb7z9afmw:fileChange:35611",
-  threadId: "thr_zeb7z9afmw",
-  turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
-  sourceSeqStart: 35611,
-  sourceSeqEnd: 35611,
-  startedAt: 1777337127200,
-  createdAt: 1777337127900,
-  status: "completed",
-  callId: "call_1JWzaNZyTpVIrB8reX73YYUN",
-  change: {
-    path: "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/active-thinking.ts",
-    kind: "delete",
-    movePath: null,
-    diff: null,
-    diffStats: { added: 0, removed: 0 },
-  },
-  stdout: null,
-  stderr: null,
-  approvalStatus: null,
-});
-
-const fileChangeToViewMessages: TimelineRow = fileChangeRow({
-  id: "thr_zeb7z9afmw:fileChange:35671",
-  threadId: "thr_zeb7z9afmw",
-  turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
-  sourceSeqStart: 35671,
-  sourceSeqEnd: 35671,
-  startedAt: 1777337128000,
-  createdAt: 1777337129500,
-  status: "completed",
-  callId: "call_3qZxJB5I3kVdSM4pPiBCTm92",
-  change: {
-    path: "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/to-view-messages.ts",
-    kind: "update",
-    movePath: null,
-    diff: `@@ -497,2 +497,12 @@
-
-+function trackReasoningTurn(
-+  state: ProjectionState,
-+  identity: BufferedTextInstanceIdentity | null,
-+): void {
-+  if (!identity || state.closedTurnIds.has(identity.turnId)) {
-+    return;
-+  }
-+  state.openTurnIds.add(identity.turnId);
-+}
-+
- function finalizeReasoningLifecycle(`,
-    diffStats: { added: 10, removed: 0 },
-  },
-  stdout: null,
-  stderr: null,
-  approvalStatus: null,
-});
-
-// One interrupted file-change to give the mixed-status bundle a non-completed
-// child without fabricating data.
 const fileChangeInterrupted: TimelineRow = fileChangeRow({
   id: "thr_zeb7z9afmw:fileChange:interrupted",
   threadId: "thr_zeb7z9afmw",
@@ -436,128 +253,87 @@ const fileChangeInterrupted: TimelineRow = fileChangeRow({
 });
 
 const fileChangeBundleRows: TimelineRow[] = [
-  fileChangeAssistantStream,
-  fileChangeIndex,
+  bundleFileChangeAssistantStream,
+  bundleFileChangeIndex,
   fileChangeTimelineService,
   fileChangeActiveThinkingDelete,
   fileChangeToViewMessages,
 ];
 
 const fileChangeBundleMixedStatusRows: TimelineRow[] = [
-  fileChangeAssistantStream,
-  fileChangeIndex,
+  bundleFileChangeAssistantStream,
+  bundleFileChangeIndex,
   fileChangeTimelineService,
   fileChangeInterrupted,
   fileChangeToViewMessages,
 ];
 
-// ---- Exploration bundle ---------------------------------------------------
-// `command` and `tool` rows that carry exploration `activityIntents` (Read,
-// Grep, list_files, search) bundle under the "exploration" concept regardless
-// of underlying workKind. Real intents pulled from thr_zeb7z9afmw / turn
-// 019dd185-... — the agent reading the projection refactor.
-
-function explorationToolRow(args: ExplorationToolRowArgs): TimelineRow {
-  return toolRow({
-    id: `thr_zeb7z9afmw:tool:${args.id}`,
+function explorationRow(args: ExplorationRowArgs): TimelineRow {
+  const base = {
     threadId: "thr_zeb7z9afmw",
     turnId: "019dd185-ef12-7d50-aa48-47882e9c8aaf",
     sourceSeqStart: args.seq,
     sourceSeqEnd: args.seq,
     startedAt: 1777337100000 + args.seq,
     createdAt: 1777337100000 + args.seq + 50,
-    status: "completed",
+    status: "completed" as const,
     callId: args.id,
-    toolName: args.toolName,
-    toolArgs: args.toolArgs,
-    output: args.output,
-    approvalStatus: null,
-    activityIntents:
-      args.intentType === "read"
-        ? [
-            {
-              type: "read",
-              command: args.toolName,
-              name: args.intentPath?.split("/").pop() ?? "unknown",
-              path: args.intentPath,
-            },
-          ]
-        : args.intentType === "search"
-          ? [
-              {
-                type: "search",
-                command: args.toolName,
-                query:
-                  typeof args.toolArgs.pattern === "string"
-                    ? args.toolArgs.pattern
-                    : null,
-                path: args.intentPath,
-              },
-            ]
-          : [
-              {
-                type: "list_files",
-                command: args.toolName,
-                path: args.intentPath,
-              },
-            ],
     durationMs: 50,
-  });
+  };
+  switch (args.kind) {
+    case "read":
+      return fileReadRow({
+        ...base,
+        id: `thr_zeb7z9afmw:file-read:${args.id}`,
+        path: args.path,
+      });
+    case "search":
+      return searchRow({
+        ...base,
+        id: `thr_zeb7z9afmw:search:${args.id}`,
+        mode: "content",
+        query: args.query,
+        path: args.path,
+      });
+    case "list":
+      return searchRow({
+        ...base,
+        id: `thr_zeb7z9afmw:search:${args.id}`,
+        mode: "path",
+        query: args.pattern,
+        path: args.path,
+      });
+  }
 }
 
 const explorationBundleRows: TimelineRow[] = [
-  explorationToolRow({
+  explorationRow({
     id: "call_explore_read_assist_stream",
     seq: 35100,
-    toolName: "Read",
-    toolArgs: {
-      file_path:
-        "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/assistant-stream-projection.ts",
-    },
-    intentPath: "packages/core-ui/src/assistant-stream-projection.ts",
-    intentType: "read",
-    output: "...file contents...",
+    kind: "read",
+    path: "packages/core-ui/src/assistant-stream-projection.ts",
   }),
-  explorationToolRow({
+  explorationRow({
     id: "call_explore_read_index",
     seq: 35110,
-    toolName: "Read",
-    toolArgs: {
-      file_path:
-        "/Users/michael/.bb-dev/worktrees/env_33i22gvcqe/bb/packages/core-ui/src/index.ts",
-    },
-    intentPath: "packages/core-ui/src/index.ts",
-    intentType: "read",
-    output: "...file contents...",
+    kind: "read",
+    path: "packages/core-ui/src/index.ts",
   }),
-  explorationToolRow({
+  explorationRow({
     id: "call_explore_grep_finalized",
     seq: 35120,
-    toolName: "Grep",
-    toolArgs: {
-      pattern: "finalizedReasoningMessageKeys",
-      path: "packages/core-ui/src",
-    },
-    intentPath: "packages/core-ui/src",
-    intentType: "search",
-    output:
-      "src/assistant-stream-projection.ts:24\nsrc/to-view-messages.ts:131",
+    kind: "search",
+    query: "finalizedReasoningMessageKeys",
+    path: "packages/core-ui/src",
   }),
-  explorationToolRow({
+  explorationRow({
     id: "call_explore_glob_tests",
     seq: 35130,
-    toolName: "Glob",
-    toolArgs: { pattern: "packages/thread-view/test/*.test.ts" },
-    intentPath: "packages/thread-view/test",
-    intentType: "list_files",
-    output:
-      "packages/thread-view/test/timeline-view.test.ts\npackages/thread-view/test/timeline-progression.test.ts",
+    kind: "list",
+    pattern: "packages/thread-view/test/*.test.ts",
+    path: "packages/thread-view/test",
   }),
 ];
-
-// ---- Tools bundle ---------------------------------------------------------
-// Non-exploration `tool` rows (TodoWrite / notify_user / ToolSearch) bundle
-// under "tools". Real tool names + arg shapes pulled from threads in the DB.
 
 function plainToolRow(args: PlainToolRowArgs): TimelineRow {
   return toolRow({
@@ -574,7 +350,6 @@ function plainToolRow(args: PlainToolRowArgs): TimelineRow {
     toolArgs: args.toolArgs,
     output: args.output,
     approvalStatus: null,
-    activityIntents: [],
     durationMs: 100,
   });
 }
@@ -610,10 +385,6 @@ const toolsBundleRows: TimelineRow[] = [
     output: "Loaded schemas for: Read, Grep, Glob",
   }),
 ];
-
-// ---- Delegations bundle ---------------------------------------------------
-// Consecutive `delegation` work rows bundle under "delegations". Real Agent
-// dispatches from the DB.
 
 function delegationFixtureRow(args: DelegationFixtureRowArgs): TimelineRow {
   return delegationRow({
@@ -661,11 +432,6 @@ const delegationsBundleRows: TimelineRow[] = [
       "Branch is rebased on main; tests pass. Two minor suggestions inline. Ready to merge.",
   }),
 ];
-
-// ---- Web research bundle --------------------------------------------------
-// `web-search` and `web-fetch` rows bundle together under "webResearch" — the
-// concept switch puts them in the same bucket. Real queries/urls pulled from
-// thr_yr83zs2m7f and thr_3vw9r8igrb.
 
 const webSearchEditors: TimelineRow = webSearchRow({
   id: "thr_yr83zs2m7f:websearch:ws_editor_cli",
@@ -841,19 +607,6 @@ export function Overview() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Interleaved timeline. The states above, rendered as one continuous thread
-// with user + assistant messages, so the prominence ramp reads in context:
-//   - user/agent messages sit at full strength (the top tier);
-//   - finished work rolls up and recedes (the muted past layer);
-//   - the errored and interrupted clusters, and the live frontier, stay
-//     prominent.
-// Note on form: between two messages the projection closes a multi-row step
-// into a *step-summary* — that's the real product behavior, since a genuine
-// bundle-summary only survives at the live frontier. So the trailing
-// "Exploring…" cluster is the one true (active-latest) bundle-summary here.
-// ---------------------------------------------------------------------------
-
 const CONV_THREAD_ID = "thr_zeb7z9afmw";
 const CONV_TURN_ID = "conv-interleaved-turn";
 
@@ -883,16 +636,14 @@ function assistantMessage(seq: number, text: string): TimelineRow {
   });
 }
 
-// Trailing exploration cluster left open under active scope — the one genuine
-// (active-latest) bundle-summary in the thread, shimmering as the frontier.
 function frontierRead(
   idSuffix: string,
   seq: number,
   path: string,
   status: TimelineRowStatus,
 ): TimelineRow {
-  return toolRow({
-    id: `${CONV_THREAD_ID}:tool:frontier_${idSuffix}`,
+  return fileReadRow({
+    id: `${CONV_THREAD_ID}:file-read:frontier_${idSuffix}`,
     threadId: CONV_THREAD_ID,
     turnId: CONV_TURN_ID,
     sourceSeqStart: seq,
@@ -900,17 +651,7 @@ function frontierRead(
     createdAt: status === "pending" ? Date.now() : Date.now() - 4000,
     status,
     callId: `frontier_${idSuffix}`,
-    toolName: "Read",
-    toolArgs: { file_path: path },
-    output: status === "pending" ? "" : "...file contents...",
-    activityIntents: [
-      {
-        type: "read",
-        command: "Read",
-        name: path.split("/").pop() ?? path,
-        path,
-      },
-    ],
+    path,
     durationMs: status === "pending" ? null : 60,
   });
 }

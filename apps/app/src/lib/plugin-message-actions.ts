@@ -1,30 +1,36 @@
 import type {
+  PluginComposerApi,
   PluginMessageActionContext,
   ThreadChatMessageReference,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
+import type { PluginComposerHost } from "@/components/plugin/plugin-composer-host";
+import { createComposerHandleBinding } from "@get-bb/plugin-sdk/internal/composer-handle";
+import { detachedComposerController } from "./plugin-composer-handle";
 import type { MarkdownMessageDirectiveOpenThreadPanel } from "@/components/ui/markdown-message-directives";
 import type { PluginMessageActionSlot } from "./plugin-slots";
 
-/**
- * Bridge between plugin `messageAction` registrations and the timeline's
- * per-message chrome. Actions run in host chrome, so a plugin's `run` must
- * never break the timeline: errors (sync or async) are contained and logged
- * here, mirroring the other host-run registration callbacks
- * (sidebarFooterAction, threadPanelAction).
- */
-
-export interface RunPluginMessageActionArgs {
+interface RunPluginMessageActionArgs {
   slot: PluginMessageActionSlot;
   threadId: string;
   message: ThreadChatMessageReference;
-  /** Present only for selection-menu invocations. */
   selectedText?: string;
-  /**
-   * The surface's thread-panel opener (same one message directives use), or
-   * undefined on surfaces without a side panel — `openPanel` then reports
-   * false to the plugin instead of throwing.
-   */
   openThreadPanel: MarkdownMessageDirectiveOpenThreadPanel | undefined;
+  composerHost: PluginComposerHost | null;
+}
+
+function messageActionComposer(
+  pluginId: string,
+  threadId: string,
+  host: PluginComposerHost | null,
+): PluginComposerApi | null {
+  if (host === null) return null;
+  if (host.scope.kind !== "thread" || host.scope.threadId !== threadId) {
+    return null;
+  }
+  return createComposerHandleBinding(
+    host.textEffectKey,
+    detachedComposerController(pluginId, host, "a message action's"),
+  ).handle;
 }
 
 export function runPluginMessageAction({
@@ -33,15 +39,22 @@ export function runPluginMessageAction({
   message,
   selectedText,
   openThreadPanel,
+  composerHost,
 }: RunPluginMessageActionArgs): void {
   const context: PluginMessageActionContext = {
     threadId,
     message,
     ...(selectedText !== undefined ? { selectedText } : {}),
     openPanel: (options) => {
-      if (openThreadPanel === undefined) return false;
+      if (openThreadPanel === undefined) {
+        console.warn(
+          `[plugin:${slot.pluginId}] messageAction "${slot.id}" openPanel declined: this surface has no thread side panel`,
+        );
+        return false;
+      }
       return openThreadPanel({ ...options, pluginId: slot.pluginId });
     },
+    composer: messageActionComposer(slot.pluginId, threadId, composerHost),
   };
   const warn = (error: unknown) => {
     console.warn(

@@ -1,9 +1,25 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import {
+  installTestPluginRuntime,
+  renderSlot,
+} from "@get-bb/plugin-sdk/testing/app";
+import { makeTask, rpcInput } from "../../test-fixtures.js";
 
-// jsdom lacks matchMedia; the vendored Dialog's responsive root needs it.
+if (!globalThis.ResizeObserver) {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
 if (!window.matchMedia) {
   window.matchMedia = (query: string) => ({
     matches: false,
@@ -17,9 +33,17 @@ if (!window.matchMedia) {
   });
 }
 
-// loadPluginApp installs the fake SDK runtime; nothing SDK-touching may be
-// imported before it runs.
-const app = await loadPluginApp(() => import("../../app"));
+installTestPluginRuntime();
+const { PropertiesRail } = await import("./rail");
+const { TasksRefreshProvider } = await import("../../shell/refresh");
+
+function RailHarness(props: ComponentProps<typeof PropertiesRail>) {
+  return (
+    <TasksRefreshProvider>
+      <PropertiesRail {...props} />
+    </TasksRefreshProvider>
+  );
+}
 
 afterEach(cleanup);
 
@@ -39,73 +63,79 @@ function projectRow(linkedBbProjectId: string | null) {
   };
 }
 
-const task = {
+const task = makeTask({
   id: "01HZZZZZZZZZZZZZZZZZZZZZT5",
   projectId: PROJECT_ID,
   number: 5,
   key: "TSK-5",
   title: "Ship the rail",
-  description: "",
-  status: "todo",
-  priority: "none",
-  dueDate: null,
-  parentTaskId: null,
   position: 1,
-  createdAt: "2026-07-15T00:00:00.000Z",
-  updatedAt: "2026-07-15T00:00:00.000Z",
-  labelIds: [],
+});
+
+const HOME_PROJECT = {
+  ...projectRow(null),
+  id: "01HZZZZZZZZZZZZZZZZZZZZZP2",
+  name: "Home",
+  prefix: "HOME",
+  color: "purple",
 };
 
-function detailRpc(
+function railProps(
   linkedBbProjectId: string | null,
-  overrides: Record<string, unknown> = {},
+  onMoveToProject: (projectId: string) => void = () => {},
 ) {
+  const project = projectRow(linkedBbProjectId);
   return {
-    listProjects: () => ({ projects: [projectRow(linkedBbProjectId)] }),
-    listFolders: () => ({ folders: [] }),
-    listPresets: () => ({ presets: [] }),
-    sidebarSummary: () => ({ projects: [] }),
-    listTasks: (input: { parentTaskId?: string } | null) =>
-      input?.parentTaskId ? { tasks: [] } : { tasks: [task] },
-    getTaskByKey: () => ({ task }),
-    listLabels: () => ({ labels: [] }),
-    listAttachments: () => ({ attachments: [] }),
-    listTaskThreads: () => ({ taskThreads: [] }),
-    listTaskPullRequests: () => ({
-      pullRequests: [],
-      unavailableThreadIds: [],
-    }),
-    listComments: () => ({ comments: [] }),
-    listBbProjects: () => ({ bbProjects: [] }),
-    ...overrides,
+    task,
+    project,
+    projects: [project, HOME_PROJECT],
+    labels: [],
+    threads: [],
+    presets: [],
+    onUpdate: () => {},
+    onMoveToProject,
+    onError: () => {},
   };
 }
+
+describe("project rail control", () => {
+  it("moves the task only when a different project is picked", async () => {
+    const moves: string[] = [];
+    const slot = renderSlot(
+      { component: RailHarness },
+      railProps(null, (projectId) => moves.push(projectId)),
+      { rpc: { listBbProjects: () => ({ bbProjects: [] }) } },
+    );
+    fireEvent.click(slot.getByRole("button", { name: "Move to project" }));
+    fireEvent.click(await slot.findByRole("option", { name: /Tasks Plugin/ }));
+    expect(moves).toEqual([]);
+
+    fireEvent.click(slot.getByRole("button", { name: "Move to project" }));
+    fireEvent.click(await slot.findByRole("option", { name: /Home/ }));
+    expect(moves).toEqual([HOME_PROJECT.id]);
+  });
+});
 
 describe("dispatch target rail control", () => {
   it("links a discovered bb project", async () => {
     const updateCalls: Array<Record<string, unknown>> = [];
-    const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "task/TSK-5" },
-      {
-        rpc: detailRpc(null, {
-          listBbProjects: () => ({
-            bbProjects: [{ id: BB_PROJECT_ID, name: "bb monorepo" }],
-          }),
-          updateProject: (input: Record<string, unknown>) => {
-            updateCalls.push(input);
-            return {
-              project: {
-                ...projectRow(input.linkedBbProjectId as string | null),
-              },
-            };
-          },
+    const slot = renderSlot({ component: RailHarness }, railProps(null), {
+      rpc: {
+        listBbProjects: () => ({
+          bbProjects: [{ id: BB_PROJECT_ID, name: "bb monorepo" }],
         }),
+        updateProject: (raw: unknown) => {
+          const input = rpcInput(raw);
+          updateCalls.push(input);
+          return {
+            project: {
+              ...projectRow(input.linkedBbProjectId as string | null),
+            },
+          };
+        },
       },
-    );
-    fireEvent.click(
-      await slot.findByRole("button", { name: "Edit dispatch target" }),
-    );
+    });
+    fireEvent.click(slot.getByRole("button", { name: "Edit dispatch target" }));
     fireEvent.click(await slot.findByLabelText("Linked bb project"));
     fireEvent.click(await slot.findByRole("option", { name: "bb monorepo" }));
     fireEvent.click(slot.getByRole("button", { name: "Save" }));
@@ -119,14 +149,15 @@ describe("dispatch target rail control", () => {
   it("shows the linked bb project's name and unlinks it", async () => {
     const updateCalls: Array<Record<string, unknown>> = [];
     const slot = renderSlot(
-      app.navPanels[0]!,
-      { subPath: "task/TSK-5" },
+      { component: RailHarness },
+      railProps(BB_PROJECT_ID),
       {
-        rpc: detailRpc(BB_PROJECT_ID, {
+        rpc: {
           listBbProjects: () => ({
             bbProjects: [{ id: BB_PROJECT_ID, name: "bb monorepo" }],
           }),
-          updateProject: (input: Record<string, unknown>) => {
+          updateProject: (raw: unknown) => {
+            const input = rpcInput(raw);
             updateCalls.push(input);
             return {
               project: {
@@ -134,10 +165,10 @@ describe("dispatch target rail control", () => {
               },
             };
           },
-        }),
+        },
       },
     );
-    const trigger = await slot.findByRole("button", {
+    const trigger = slot.getByRole("button", {
       name: "Edit dispatch target",
     });
     await slot.findByText("bb monorepo");

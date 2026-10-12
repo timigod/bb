@@ -1,4 +1,3 @@
-// Real provider active-turn control coverage.
 import { describe, expect, it } from "vitest";
 import {
   getThreadEvents,
@@ -6,8 +5,8 @@ import {
   stopThread,
 } from "../helpers/api.js";
 import { waitForThreadStatus } from "../helpers/assertions.js";
+import { countTurnEvents } from "../helpers/thread-diagnostics.js";
 import {
-  countTurnEvents,
   createRealThread,
   expectNonEmptyOutput,
   resolveExecutionOptions,

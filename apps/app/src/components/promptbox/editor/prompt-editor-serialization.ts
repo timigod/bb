@@ -6,22 +6,23 @@ import {
   type PromptTextMention,
 } from "@bb/domain";
 import type { JSONContent } from "@tiptap/react";
-import type { Node as ProseMirrorNode, Schema, Slice } from "@tiptap/pm/model";
+import {
+  Fragment,
+  Slice,
+  type Node as ProseMirrorNode,
+  type Schema,
+} from "@tiptap/pm/model";
+import type { Selection } from "@tiptap/pm/state";
 import type {
   PromptMentionSuggestion,
   ProviderCommandSuggestion,
-} from "@/components/promptbox/mentions/types";
+} from "@bb/client-core";
 
 export interface PromptEditorValue {
   text: string;
   mentions: PromptTextMention[];
 }
 
-/**
- * One contiguous piece of serialized prompt text that maps back to editable
- * ProseMirror content. Markdown delimiters and block/list prefixes deliberately
- * have no segment because they do not occupy document positions.
- */
 export interface PromptEditorOffsetSegment {
   textFrom: number;
   textTo: number;
@@ -30,16 +31,8 @@ export interface PromptEditorOffsetSegment {
   kind: "text" | "mention";
 }
 
-export interface PromptEditorSerialization extends PromptEditorValue {
+interface PromptEditorSerialization extends PromptEditorValue {
   offsetMapping: PromptEditorOffsetSegment[];
-}
-
-export interface PromptEditorContentOptions {
-  /**
-   * Parse the Markdown surface forms emitted by promptEditorValueFromDoc back
-   * into rich editor nodes. Blockquotes stay enabled regardless of this option.
-   */
-  richTextMarkdown?: boolean;
 }
 
 interface PromptEditorContentValue {
@@ -47,7 +40,7 @@ interface PromptEditorContentValue {
   mentions: readonly PromptTextMention[];
 }
 
-export interface PromptEditorMentionAttrs {
+interface PromptEditorMentionAttrs {
   resource: PromptMentionResource;
   serializedText: string;
 }
@@ -109,300 +102,9 @@ function stripQuotePrefix(line: string): string {
   return line;
 }
 
-interface MarkdownMarkerRange {
-  end: number;
-  start: number;
-}
-
-interface MarkdownMarkRange extends MarkdownMarkerRange {
-  type: "bold" | "italic" | "code";
-}
-
-interface MarkdownParseRanges {
-  marks: MarkdownMarkRange[];
-  markers: MarkdownMarkerRange[];
-}
-
-interface MarkdownListMarker {
-  indent: number;
-  kind: "bullet" | "ordered";
-  markerLength: number;
-  number: number | null;
-}
-
-interface MarkdownLine {
-  start: number;
-  text: string;
-}
-
-function isPositionInRanges(
-  position: number,
-  ranges: readonly MarkdownMarkerRange[],
-): boolean {
-  return ranges.some(
-    (range) => position >= range.start && position < range.end,
-  );
-}
-
-function findClosingMarkdownMarker({
-  canUseMarker,
-  marker,
-  ranges,
-  start,
-  text,
-}: {
-  canUseMarker: (position: number) => boolean;
-  marker: string;
-  ranges: readonly MarkdownMarkerRange[];
-  start: number;
-  text: string;
-}): number {
-  let index = start;
-  while (index < text.length) {
-    const next = text.indexOf(marker, index);
-    if (next === -1) return -1;
-    if (!isPositionInRanges(next, ranges) && canUseMarker(next)) {
-      return next;
-    }
-    index = next + marker.length;
-  }
-  return -1;
-}
-
-function isMarkdownDelimiterBoundary(value: string | undefined): boolean {
-  return value === undefined || !/[\p{Letter}\p{Number}]/u.test(value);
-}
-
-function isItalicMarkerPosition(text: string, position: number): boolean {
-  return (
-    isMarkdownDelimiterBoundary(text[position - 1]) ||
-    isMarkdownDelimiterBoundary(text[position + 1])
-  );
-}
-
-function collectMarkdownMarkRanges(text: string): MarkdownParseRanges {
-  const markers: MarkdownMarkerRange[] = [];
-  const marks: MarkdownMarkRange[] = [];
-  const protectedRanges: MarkdownMarkerRange[] = [];
-
-  const blockedRanges = () => [...markers, ...protectedRanges];
-
-  const collectPairs = (
-    marker: string,
-    type: MarkdownMarkRange["type"],
-    canUseMarker: (position: number) => boolean = () => true,
-  ) => {
-    let index = 0;
-    while (index < text.length) {
-      const open = text.indexOf(marker, index);
-      if (open === -1) break;
-      if (isPositionInRanges(open, blockedRanges()) || !canUseMarker(open)) {
-        index = open + marker.length;
-        continue;
-      }
-      const close = findClosingMarkdownMarker({
-        canUseMarker,
-        marker,
-        ranges: blockedRanges(),
-        start: open + marker.length,
-        text,
-      });
-      if (close === -1 || close === open + marker.length) {
-        index = open + marker.length;
-        continue;
-      }
-      markers.push({ start: open, end: open + marker.length });
-      markers.push({ start: close, end: close + marker.length });
-      marks.push({
-        start: open + marker.length,
-        end: close,
-        type,
-      });
-      if (type === "code") {
-        protectedRanges.push({
-          start: open + marker.length,
-          end: close,
-        });
-      }
-      index = close + marker.length;
-    }
-  };
-
-  collectPairs("`", "code");
-  collectPairs("**", "bold");
-  collectPairs("_", "italic", (position) =>
-    isItalicMarkerPosition(text, position),
-  );
-
-  markers.sort(
-    (left, right) => left.start - right.start || left.end - right.end,
-  );
-  marks.sort((left, right) => left.start - right.start || left.end - right.end);
-
-  return { marks, markers };
-}
-
-function markdownMarksAt(
-  position: number,
-  ranges: readonly MarkdownMarkRange[],
-): JSONContent["marks"] {
-  const markNames = ranges
-    .filter((range) => position >= range.start && position < range.end)
-    .map((range) => range.type);
-
-  if (markNames.length === 0) {
-    return undefined;
-  }
-
-  return markNames.map((type) => ({ type }));
-}
-
-function areMarkdownMarksEqual(
-  left: JSONContent["marks"],
-  right: JSONContent["marks"],
-): boolean {
-  const leftNames = left?.map((mark) => mark.type).join("|") ?? "";
-  const rightNames = right?.map((mark) => mark.type).join("|") ?? "";
-  return leftNames === rightNames;
-}
-
-function nextMarkdownBoundary({
-  mentions,
-  markers,
-  position,
-  text,
-}: {
-  mentions: readonly PromptTextMention[];
-  markers: readonly MarkdownMarkerRange[];
-  position: number;
-  text: string;
-}): number {
-  let boundary = text.length;
-  for (const marker of markers) {
-    if (marker.start > position) {
-      boundary = Math.min(boundary, marker.start);
-    }
-  }
-  for (const mention of mentions) {
-    if (mention.start > position) {
-      boundary = Math.min(boundary, mention.start);
-    }
-  }
-  const newline = text.indexOf("\n", position);
-  if (newline !== -1 && newline > position) {
-    boundary = Math.min(boundary, newline);
-  }
-  return boundary;
-}
-
-function appendMarkedTextContent({
-  content,
-  marks,
-  text,
-}: {
-  content: JSONContent[];
-  marks: JSONContent["marks"];
-  text: string;
-}): void {
-  if (text.length === 0) return;
-
-  const parts = text.split("\n");
-  for (const [index, part] of parts.entries()) {
-    if (index > 0) {
-      content.push({ type: "hardBreak" });
-    }
-    if (part.length > 0) {
-      content.push({ type: "text", text: part, ...(marks ? { marks } : {}) });
-    }
-  }
-}
-
-function promptEditorInlineMarkdownContentFromValue(
-  value: PromptEditorContentValue,
-): JSONContent[] {
-  const mentions = normalizeMentions(value);
-  const ranges = collectMarkdownMarkRanges(value.text);
-  const content: JSONContent[] = [];
-  let cursor = 0;
-  let mentionIndex = 0;
-
-  while (cursor < value.text.length) {
-    const marker = ranges.markers.find((range) => range.start === cursor);
-    if (marker) {
-      cursor = marker.end;
-      continue;
-    }
-
-    while (
-      mentionIndex < mentions.length &&
-      mentions[mentionIndex]!.end <= cursor
-    ) {
-      mentionIndex += 1;
-    }
-    const mention =
-      mentionIndex < mentions.length && mentions[mentionIndex]!.start === cursor
-        ? mentions[mentionIndex]
-        : null;
-    if (mention) {
-      content.push({
-        type: "mention",
-        attrs: {
-          resource: mention.resource,
-          serializedText: value.text.slice(mention.start, mention.end),
-        } satisfies PromptEditorMentionAttrs,
-        ...(markdownMarksAt(cursor, ranges.marks)
-          ? { marks: markdownMarksAt(cursor, ranges.marks) }
-          : {}),
-      });
-      cursor = mention.end;
-      mentionIndex += 1;
-      continue;
-    }
-
-    const marks = markdownMarksAt(cursor, ranges.marks);
-    let end = nextMarkdownBoundary({
-      mentions,
-      markers: ranges.markers,
-      position: cursor,
-      text: value.text,
-    });
-    while (
-      end < value.text.length &&
-      !ranges.markers.some((range) => range.start === end) &&
-      !mentions.some((nextMention) => nextMention.start === end) &&
-      value.text[end] !== "\n" &&
-      areMarkdownMarksEqual(marks, markdownMarksAt(end, ranges.marks))
-    ) {
-      end += 1;
-    }
-    if (end <= cursor) {
-      end = cursor + 1;
-    }
-    appendMarkedTextContent({
-      content,
-      marks,
-      text: value.text.slice(cursor, end),
-    });
-    cursor = end;
-  }
-
-  return content;
-}
-
-/**
- * Shift mentions that fall within a global text span into a sub-value relative
- * to `spanStart`, optionally accounting for characters stripped from the front
- * of each line (the `> `/`>` quote prefix). `lineSpans` lists each source
- * line's global [start,end) plus the cumulative number of characters removed
- * before it in the stripped sub-text, so a mention's offset can be rebased onto
- * the stripped inner text.
- */
 interface StrippedLineSpan {
-  /** Global offset of the first content character of this line (after prefix). */
   contentStart: number;
-  /** Global offset just past this line's content. */
   contentEnd: number;
-  /** Offset of this line's content within the stripped sub-text. */
   innerStart: number;
 }
 
@@ -434,7 +136,6 @@ function blockquoteFromLines(
   value: PromptEditorContentValue,
   lines: readonly string[],
   lineGlobalStarts: readonly number[],
-  options: PromptEditorContentOptions,
 ): JSONContent {
   const strippedLines = lines.map((line) => stripQuotePrefix(line));
   const innerText = strippedLines.join("\n");
@@ -450,36 +151,19 @@ function blockquoteFromLines(
       contentEnd,
       innerStart: innerCursor,
     });
-    innerCursor += strippedLines[index]!.length + 1; // +1 for joining "\n"
+    innerCursor += strippedLines[index]!.length + 1;
   }
 
   const innerMentions = rebaseMentionsToSpan(value, lineSpans);
-  if (options.richTextMarkdown) {
-    const innerDoc = promptEditorContentFromValue(
-      {
-        text: innerText,
-        mentions: innerMentions,
-      },
-      options,
-    );
-    return {
-      type: "blockquote",
-      content: innerDoc.content ?? [{ type: "paragraph", content: [] }],
-    };
-  }
-
   return {
     type: "blockquote",
     content: [
       {
         type: "paragraph",
-        content: promptEditorInlineContentFromValue(
-          {
-            text: innerText,
-            mentions: innerMentions,
-          },
-          options,
-        ),
+        content: promptEditorInlineContentFromValue({
+          text: innerText,
+          mentions: innerMentions,
+        }),
       },
     ],
   };
@@ -489,12 +173,10 @@ function paragraphFromSpan(
   value: PromptEditorContentValue,
   spanStart: number,
   spanEnd: number,
-  options: PromptEditorContentOptions,
 ): JSONContent {
   return {
     type: "paragraph",
     content: promptEditorInlineContentFromSourceSpan({
-      options,
       sourceEnd: spanEnd,
       sourceStart: spanStart,
       value,
@@ -527,12 +209,10 @@ function promptEditorContentValueFromSourceSpan({
 }
 
 function promptEditorInlineContentFromSourceSpan({
-  options,
   sourceEnd,
   sourceStart,
   value,
 }: {
-  options: PromptEditorContentOptions;
   sourceEnd: number;
   sourceStart: number;
   value: PromptEditorContentValue;
@@ -543,138 +223,11 @@ function promptEditorInlineContentFromSourceSpan({
       sourceStart,
       value,
     }),
-    options,
-  );
-}
-
-function markdownHeadingFromLine({
-  line,
-  options,
-  value,
-}: {
-  line: MarkdownLine;
-  options: PromptEditorContentOptions;
-  value: PromptEditorContentValue;
-}): JSONContent | null {
-  const match = /^(#{1,6})[ \t]+(.*)$/u.exec(line.text);
-  if (!match) return null;
-
-  const marker = match[1]!;
-  const body = match[2]!;
-  const bodyStart = line.start + line.text.length - body.length;
-
-  return {
-    type: "heading",
-    attrs: { level: marker.length },
-    content: promptEditorInlineContentFromSourceSpan({
-      options,
-      sourceStart: bodyStart,
-      sourceEnd: line.start + line.text.length,
-      value,
-    }),
-  };
-}
-
-function parseMarkdownListMarker(line: string): MarkdownListMarker | null {
-  const match = /^( *)(?:(-)|(\d+)\.)[ \t]+/u.exec(line);
-  if (!match) return null;
-
-  const numberText = match[3];
-  return {
-    indent: match[1]!.length,
-    kind: numberText === undefined ? "bullet" : "ordered",
-    markerLength: match[0].length,
-    number: numberText === undefined ? null : Number.parseInt(numberText, 10),
-  };
-}
-
-function markdownListFromLines({
-  indent,
-  lines,
-  options,
-  startIndex,
-  value,
-}: {
-  indent: number;
-  lines: readonly MarkdownLine[];
-  options: PromptEditorContentOptions;
-  startIndex: number;
-  value: PromptEditorContentValue;
-}): { nextIndex: number; node: JSONContent } | null {
-  const firstLine = lines[startIndex];
-  if (!firstLine) return null;
-  const firstMarker = parseMarkdownListMarker(firstLine.text);
-  if (!firstMarker || firstMarker.indent !== indent) return null;
-
-  const items: JSONContent[] = [];
-  let index = startIndex;
-  while (index < lines.length) {
-    const line = lines[index]!;
-    const marker = parseMarkdownListMarker(line.text);
-    if (
-      !marker ||
-      marker.indent !== indent ||
-      marker.kind !== firstMarker.kind
-    ) {
-      break;
-    }
-
-    const itemContentStart = line.start + marker.markerLength;
-    const itemContent: JSONContent[] = [
-      {
-        type: "paragraph",
-        content: promptEditorInlineContentFromSourceSpan({
-          options,
-          sourceStart: itemContentStart,
-          sourceEnd: line.start + line.text.length,
-          value,
-        }),
-      },
-    ];
-    index += 1;
-
-    while (index < lines.length) {
-      const childMarker = parseMarkdownListMarker(lines[index]!.text);
-      if (!childMarker || childMarker.indent <= indent) {
-        break;
-      }
-      const childList = markdownListFromLines({
-        indent: childMarker.indent,
-        lines,
-        options,
-        startIndex: index,
-        value,
-      });
-      if (!childList) break;
-      itemContent.push(childList.node);
-      index = childList.nextIndex;
-    }
-
-    items.push({ type: "listItem", content: itemContent });
-  }
-
-  return {
-    nextIndex: index,
-    node:
-      firstMarker.kind === "ordered"
-        ? {
-            type: "orderedList",
-            attrs: { start: firstMarker.number ?? 1 },
-            content: items,
-          }
-        : { type: "bulletList", content: items },
-  };
-}
-
-function isRichMarkdownBlockStart(line: string): boolean {
-  return (
-    /^(#{1,6})[ \t]+.*$/u.test(line) || parseMarkdownListMarker(line) !== null
   );
 }
 
 export function promptEditorContentFromValue(
   value: PromptEditorContentValue,
-  options: PromptEditorContentOptions = {},
 ): JSONContent {
   if (value.text.length === 0) {
     return {
@@ -684,68 +237,25 @@ export function promptEditorContentFromValue(
   }
 
   const lines = value.text.split("\n");
-  // Global start offset of each line within value.text.
   const lineGlobalStarts: number[] = [];
   let offset = 0;
   for (const line of lines) {
     lineGlobalStarts.push(offset);
-    offset += line.length + 1; // +1 for the "\n" delimiter
+    offset += line.length + 1;
   }
 
   const blocks: JSONContent[] = [];
-  const markdownLines: MarkdownLine[] = lines.map((line, lineIndex) => ({
-    start: lineGlobalStarts[lineIndex]!,
-    text: line,
-  }));
   let index = 0;
   while (index < lines.length) {
     const quote = isQuoteLine(lines[index]!);
-    if (!quote && options.richTextMarkdown) {
-      const heading = markdownHeadingFromLine({
-        line: markdownLines[index]!,
-        options,
-        value,
-      });
-      if (heading) {
-        blocks.push(heading);
-        index += 1;
-        continue;
-      }
-
-      const listMarker = parseMarkdownListMarker(lines[index]!);
-      if (listMarker) {
-        const list = markdownListFromLines({
-          indent: listMarker.indent,
-          lines: markdownLines,
-          options,
-          startIndex: index,
-          value,
-        });
-        if (list) {
-          blocks.push(list.node);
-          index = list.nextIndex;
-          continue;
-        }
-      }
-    }
-
     let end = index;
-    while (
-      end < lines.length &&
-      isQuoteLine(lines[end]!) === quote &&
-      !(
-        !quote &&
-        options.richTextMarkdown &&
-        end > index &&
-        isRichMarkdownBlockStart(lines[end]!)
-      )
-    ) {
+    while (end < lines.length && isQuoteLine(lines[end]!) === quote) {
       end += 1;
     }
     const groupLines = lines.slice(index, end);
     const groupStarts = lineGlobalStarts.slice(index, end);
     if (quote) {
-      blocks.push(blockquoteFromLines(value, groupLines, groupStarts, options));
+      blocks.push(blockquoteFromLines(value, groupLines, groupStarts));
       if (
         isBlankLine(lines[end] ?? "") &&
         end + 1 < lines.length &&
@@ -757,7 +267,7 @@ export function promptEditorContentFromValue(
       const spanStart = groupStarts[0]!;
       const lastLine = groupLines[groupLines.length - 1]!;
       const spanEnd = groupStarts[groupStarts.length - 1]! + lastLine.length;
-      blocks.push(paragraphFromSpan(value, spanStart, spanEnd, options));
+      blocks.push(paragraphFromSpan(value, spanStart, spanEnd));
     }
     index = end;
   }
@@ -771,12 +281,7 @@ export function promptEditorContentFromValue(
 
 export function promptEditorInlineContentFromValue(
   value: PromptEditorContentValue,
-  options: PromptEditorContentOptions = {},
 ): JSONContent[] {
-  if (options.richTextMarkdown) {
-    return promptEditorInlineMarkdownContentFromValue(value);
-  }
-
   const content: JSONContent[] = [];
   let cursor = 0;
 
@@ -800,71 +305,21 @@ export function promptEditorInlineContentFromValue(
   return content;
 }
 
-function mentionAttrsFromNode(
-  node: ProseMirrorNode,
-): PromptEditorMentionAttrs | null {
-  return parsePromptEditorMentionAttrs(node.attrs);
-}
-
-/**
- * Markdown delimiters that wrap a text run carrying inline marks. `code` is
- * literal, so it never combines with emphasis. Bold wraps outside italic, e.g.
- * a run with both marks becomes `**_text_**`.
- */
-function markdownDelimitersForMarks(
-  marks: readonly ProseMirrorNode["marks"][number][],
-): { open: string; close: string } {
-  const names = new Set(marks.map((mark) => mark.type.name));
-  if (names.has("code")) {
-    return { open: "`", close: "`" };
-  }
-  let open = "";
-  let close = "";
-  if (names.has("bold")) {
-    open = `${open}**`;
-    close = `**${close}`;
-  }
-  if (names.has("italic")) {
-    open = `${open}_`;
-    close = `_${close}`;
-  }
-  return { open, close };
-}
-
 function serializePromptEditorNode(
   doc: ProseMirrorNode,
   rootPosition: number,
 ): PromptEditorSerialization {
   let text = "";
   let previousSerializedBlockWasBlockquote: boolean | null = null;
-  let activeInlineDelimiters: { close: string; key: string } | null = null;
   const mentions: PromptTextMention[] = [];
   const offsetMapping: PromptEditorOffsetSegment[] = [];
 
-  const closeActiveInlineDelimiters = () => {
-    if (activeInlineDelimiters === null) {
-      return;
-    }
-    text += activeInlineDelimiters.close;
-    activeInlineDelimiters = null;
-  };
-
-  const appendMarkedInlineText = (
+  const appendInlineText = (
     value: string,
-    marks: readonly ProseMirrorNode["marks"][number][],
     docFrom: number,
     docTo: number,
     kind: PromptEditorOffsetSegment["kind"],
   ): { end: number; start: number } => {
-    const { open, close } = markdownDelimitersForMarks(marks);
-    const key = `${open}\0${close}`;
-    if (activeInlineDelimiters?.key !== key) {
-      closeActiveInlineDelimiters();
-      if (open.length > 0) {
-        text += open;
-        activeInlineDelimiters = { close, key };
-      }
-    }
     const start = text.length;
     text += value;
     offsetMapping.push({
@@ -878,7 +333,6 @@ function serializePromptEditorNode(
   };
 
   const appendBlockBoundary = (blockIsBlockquote: boolean) => {
-    closeActiveInlineDelimiters();
     if (previousSerializedBlockWasBlockquote !== null) {
       text +=
         previousSerializedBlockWasBlockquote && !blockIsBlockquote
@@ -894,9 +348,8 @@ function serializePromptEditorNode(
       if (value.length === 0) {
         return;
       }
-      appendMarkedInlineText(
+      appendInlineText(
         value,
-        node.marks,
         nodePosition,
         nodePosition + node.nodeSize,
         "text",
@@ -904,16 +357,14 @@ function serializePromptEditorNode(
       return;
     }
     if (node.type.name === "hardBreak") {
-      closeActiveInlineDelimiters();
       text += "\n";
       return;
     }
     if (node.type.name === "mention") {
-      const attrs = mentionAttrsFromNode(node);
+      const attrs = parsePromptEditorMentionAttrs(node.attrs);
       if (attrs) {
-        const span = appendMarkedInlineText(
+        const span = appendInlineText(
           attrs.serializedText,
-          node.marks,
           nodePosition,
           nodePosition + node.nodeSize,
           "mention",
@@ -929,9 +380,6 @@ function serializePromptEditorNode(
     appendChildren(node, nodePosition);
   };
 
-  // Serialize a blockquote: build its inner value via a fresh walk, then emit
-  // each inner line with a "> "/">" prefix. The prefix characters count toward
-  // text.length, so inner mention offsets are shifted to reflect the prefixes.
   const appendBlockquote = (node: ProseMirrorNode, nodePosition: number) => {
     const inner = serializePromptEditorNode(node, nodePosition);
     const lines = inner.text.split("\n");
@@ -983,56 +431,6 @@ function serializePromptEditorNode(
     }
   };
 
-  // Serialize a bullet/ordered list. Each item gets an indent + marker on its
-  // own line; the marker is appended to the running text before the item's
-  // inline content, so mention offsets recorded during that walk are correct.
-  // Nested lists recurse with deeper indentation.
-  const appendListItems = (
-    listNode: ProseMirrorNode,
-    listPosition: number,
-    ordered: boolean,
-    depth: number,
-  ) => {
-    let itemNumber =
-      ordered && typeof listNode.attrs.start === "number"
-        ? listNode.attrs.start
-        : 1;
-    let itemPosition = listPosition + 1;
-    for (let index = 0; index < listNode.childCount; index += 1) {
-      const item = listNode.child(index);
-      if (depth === 0 && index === 0) {
-        appendBlockBoundary(false);
-      } else {
-        closeActiveInlineDelimiters();
-        text += "\n";
-      }
-      const indent = "  ".repeat(depth);
-      const marker = ordered ? `${itemNumber}. ` : "- ";
-      text += `${indent}${marker}`;
-      let blockPosition = itemPosition + 1;
-      for (let childIndex = 0; childIndex < item.childCount; childIndex += 1) {
-        const block = item.child(childIndex);
-        if (
-          block.type.name === "bulletList" ||
-          block.type.name === "orderedList"
-        ) {
-          appendListItems(
-            block,
-            blockPosition,
-            block.type.name === "orderedList",
-            depth + 1,
-          );
-        } else {
-          // Paragraph (or other inline block) shares the marker line.
-          appendChildren(block, blockPosition);
-        }
-        blockPosition += block.nodeSize;
-      }
-      itemNumber += 1;
-      itemPosition += item.nodeSize;
-    }
-  };
-
   const appendNode = (node: ProseMirrorNode, nodePosition: number) => {
     if (
       node.type.name === "text" ||
@@ -1046,20 +444,6 @@ function serializePromptEditorNode(
     if (node.type.name === "blockquote") {
       appendBlockBoundary(true);
       appendBlockquote(node, nodePosition);
-      return;
-    }
-
-    if (node.type.name === "heading") {
-      appendBlockBoundary(false);
-      const level = typeof node.attrs.level === "number" ? node.attrs.level : 1;
-      const clampedLevel = Math.min(Math.max(level, 1), 6);
-      text += `${"#".repeat(clampedLevel)} `;
-      appendChildren(node, nodePosition);
-      return;
-    }
-
-    if (node.type.name === "bulletList" || node.type.name === "orderedList") {
-      appendListItems(node, nodePosition, node.type.name === "orderedList", 0);
       return;
     }
 
@@ -1079,7 +463,6 @@ function serializePromptEditorNode(
       appendNode(child, childPosition);
       childPosition += child.nodeSize;
     }
-    closeActiveInlineDelimiters();
   };
 
   appendChildren(doc, rootPosition);
@@ -1087,11 +470,6 @@ function serializePromptEditorNode(
   return { text, mentions, offsetMapping };
 }
 
-/**
- * Serialize the editor document and retain the exact plain-text-to-document
- * mapping used by decoration rules. Mention pills map their complete text
- * representation to the single atomic mention node.
- */
 export function promptEditorSerializationFromDoc(
   doc: ProseMirrorNode,
 ): PromptEditorSerialization {
@@ -1118,6 +496,45 @@ export function promptEditorValueFromSlice(
     text: slice.content.textBetween(0, slice.content.size, "\n"),
     mentions: [],
   };
+}
+
+function selectionCoversWholeLines({ $from, $to }: Selection): boolean {
+  const startsLine =
+    $from.parentOffset === 0 || $from.nodeBefore?.type.name === "hardBreak";
+  const endsLine =
+    $to.parentOffset === $to.parent.content.size ||
+    $to.nodeAfter?.type.name === "hardBreak";
+  return startsLine && endsLine;
+}
+
+export function promptEditorCopiedSlice(
+  slice: Slice,
+  selection: Selection,
+): Slice {
+  if (selectionCoversWholeLines(selection)) {
+    return slice;
+  }
+
+  const schema = selection.$from.doc.type.schema;
+  let { content, openStart, openEnd } = slice;
+  let result = slice;
+  while (openStart > 0 && openEnd > 0 && content.childCount === 1) {
+    const ancestor = content.firstChild!;
+    if (ancestor.isTextblock) {
+      return new Slice(
+        Fragment.from(schema.nodes.paragraph!.create(null, ancestor.content)),
+        1,
+        1,
+      );
+    }
+    content = ancestor.content;
+    openStart -= 1;
+    openEnd -= 1;
+    if (schema.topNodeType.validContent(content)) {
+      result = new Slice(content, openStart, openEnd);
+    }
+  }
+  return result;
 }
 
 export function promptEditorClipboardTextFromSlice(
@@ -1162,6 +579,14 @@ export function promptMentionResourceFromSuggestion(
       icon: suggestion.icon,
       itemId: suggestion.itemId,
       label: suggestion.title.trim() || suggestion.itemId,
+    };
+  }
+
+  if (suggestion.kind === "attachment") {
+    return {
+      kind: "attachment",
+      path: suggestion.path,
+      label: suggestion.name,
     };
   }
 

@@ -1,9 +1,14 @@
-import path from "node:path";
-import { updateEnvironmentMetadata } from "@bb/db";
+import { joinHostPathSegments } from "../services/lib/host-path.js";
+import { cleanupEnvironment } from "../services/environments/environment-engine.js";
+import { parsePaginationQuery } from "../services/lib/validation.js";
 import {
-  type GitBranchRefClassification,
-  resolveEnvironmentWorkspaceDisplayKind,
-  type Environment,
+  countLiveThreadsInEnvironment,
+  listEnvironments,
+  updateEnvironmentMetadata,
+} from "@bb/db";
+import {
+  environmentStatusValues,
+  type EnvironmentStatus,
   type ThreadPullRequest,
 } from "@bb/domain";
 import {
@@ -13,6 +18,7 @@ import {
   type EnvironmentDiffFileQuery,
   type EnvironmentDiffQuery,
   type PublicApiSchema,
+  type PullRequestMergeMethod,
 } from "@bb/server-contract";
 import type { Hono } from "hono";
 import type { AppDeps } from "../types.js";
@@ -24,12 +30,24 @@ import {
   WORKSPACE_DIFF_MAX_FILE_LIST_BYTES,
 } from "../constants.js";
 import { ApiError } from "../errors.js";
+import { requestEnvironmentRemoval } from "../services/environments/environment-engine.js";
+import {
+  toEnvironmentResponse,
+  toEnvironmentResponses,
+} from "../services/environments/environment-response.js";
 import {
   requireEnvironment,
   requireReadyEnvironment,
 } from "../services/lib/entity-lookup.js";
 import { runLiveCommandAndWait } from "../services/hosts/live-command-wait.js";
-import { callHostRetryableOnlineRpc } from "../services/hosts/online-rpc.js";
+import {
+  callHostRetryableOnlineRpc,
+  callHostRetryableOnlineRpcForWork,
+} from "../services/hosts/online-rpc.js";
+import {
+  remapDaemonFileRouteError,
+  requireDaemonFileContentResult,
+} from "../services/hosts/daemon-file-response.js";
 import { generateCommitMessage } from "../services/ai/commit-message.js";
 import { archiveEnvironmentThreads } from "../services/threads/thread-archive.js";
 import {
@@ -38,8 +56,18 @@ import {
 } from "./branch-list-query.js";
 import { parseFileListLimit } from "./file-list-query.js";
 import { parsePathKindInclusion } from "./path-list-inclusion.js";
-import { requireWorkspaceCommandTarget } from "../services/environments/workspace-command-target.js";
-import { callEnvironmentWorkspaceStatus } from "../services/environments/workspace-status.js";
+import {
+  DEFAULT_PATH_LIST_EXCLUDE_NAMES,
+  WORKSPACE_PATH_LIST_INCLUDE_HIDDEN,
+} from "./path-list-policy.js";
+import {
+  requireWorkspaceCommandTarget,
+  type WorkspaceCommandTarget,
+} from "../services/environments/workspace-command-target.js";
+import {
+  callEnvironmentWorkspaceStatus,
+  callEnvironmentWorkspaceStatusForWork,
+} from "../services/environments/workspace-status.js";
 import { assembleThreadPullRequest } from "../services/environments/pull-request.js";
 import {
   requireAvailableWorkspaceDiff,
@@ -50,25 +78,14 @@ import {
   selectInitialPatchPaths,
 } from "./diff-tiering.js";
 
-const COMMIT_FALLBACK_MESSAGE = "bb: automated commit";
-const SQUASH_MERGE_FALLBACK_MESSAGE = "bb: squash merge";
-const PRE_MERGE_COMMIT_MESSAGE = "bb: pre-merge commit";
+const LISTED_ENVIRONMENT_STATUSES: readonly EnvironmentStatus[] =
+  environmentStatusValues.filter((status) => status !== "destroyed");
 
-/** Caps for diffs sent to the inference model for commit message generation. */
+const COMMIT_FALLBACK_MESSAGE = "bb: automated commit";
+
 const AI_MAX_DIFF_BYTES = 32_000;
 const AI_MAX_FILE_LIST_BYTES = 4_000;
 
-interface AssertSquashMergeTargetIsLocalArgs {
-  selectedBranch: GitBranchRefClassification | null;
-  targetBranch: string;
-}
-
-/**
- * Maps the daemon's typed `no_changes` failure (nothing to commit / nothing to
- * merge — e.g. a concurrent commit already captured the changes, or the branch
- * has no committed work) to a clean 409, instead of letting it surface as a
- * generic 502 git_command_failed.
- */
 async function mapNoChangesTo409<TResult>(
   conflictMessage: string,
   run: () => Promise<TResult>,
@@ -101,29 +118,6 @@ async function mapPullRequestActionFailureTo409<TResult>(
   }
 }
 
-function assertSquashMergeTargetIsLocal({
-  selectedBranch,
-  targetBranch,
-}: AssertSquashMergeTargetIsLocalArgs): void {
-  if (selectedBranch?.kind === "local") {
-    return;
-  }
-
-  if (selectedBranch?.kind === "remote") {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      `Cannot squash merge into remote branch ${targetBranch}; select a local branch`,
-    );
-  }
-
-  throw new ApiError(
-    409,
-    "invalid_request",
-    `Target branch does not exist: ${targetBranch}`,
-  );
-}
-
 function toWorkspaceDiffTarget(query: EnvironmentDiffQuery) {
   switch (query.target) {
     case "uncommitted":
@@ -150,20 +144,22 @@ function toWorkspaceDiffTarget(query: EnvironmentDiffQuery) {
   }
 }
 
-function isWorktreeEnvironment(environment: Environment): boolean {
-  return resolveEnvironmentWorkspaceDisplayKind({ environment }) !== "other";
+function workspaceReadCacheKey(target: WorkspaceCommandTarget): string {
+  return JSON.stringify(target.workspaceContext);
 }
 
-/**
- * PR lookup for action preconditions (ready/draft/merge). Both "absent" and
- * "unavailable" resolve to `null` here: either way there is no PR the action
- * can operate on, and the action's own 409 carries the user-facing message.
- */
+function workspaceStatusCacheKey(
+  target: WorkspaceCommandTarget,
+  mergeBaseBranch: string | undefined,
+): string {
+  return `${workspaceReadCacheKey(target)} ${mergeBaseBranch ?? ""}`;
+}
+
 async function getPullRequestForWorkspaceTarget(
   deps: AppDeps,
   target: ReturnType<typeof requireWorkspaceCommandTarget>,
 ): Promise<ThreadPullRequest | null> {
-  const result = await callHostRetryableOnlineRpc(deps, {
+  const result = await callHostRetryableOnlineRpcForWork(deps, {
     hostId: target.hostId,
     timeoutMs: COMMAND_TIMEOUT_MS,
     command: {
@@ -177,42 +173,34 @@ async function getPullRequestForWorkspaceTarget(
     : null;
 }
 
-function assertCanMarkPullRequestReady(
+function requirePullRequest(
   pullRequest: ThreadPullRequest | null,
-): void {
+): ThreadPullRequest {
   if (!pullRequest) {
-    throw new ApiError(409, "pull_request_unavailable", "No pull request found");
-  }
-  if (pullRequest.state !== "draft") {
     throw new ApiError(
       409,
-      "invalid_request",
-      "Pull request is not a draft",
+      "pull_request_unavailable",
+      "No pull request found",
     );
+  }
+  return pullRequest;
+}
+
+function assertCanMarkPullRequestReady(pullRequest: ThreadPullRequest): void {
+  if (pullRequest.state !== "draft") {
+    throw new ApiError(409, "invalid_request", "Pull request is not a draft");
   }
 }
 
 function assertCanConvertPullRequestToDraft(
-  pullRequest: ThreadPullRequest | null,
+  pullRequest: ThreadPullRequest,
 ): void {
-  if (!pullRequest) {
-    throw new ApiError(409, "pull_request_unavailable", "No pull request found");
-  }
   if (pullRequest.state !== "open") {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      "Pull request is not open",
-    );
+    throw new ApiError(409, "invalid_request", "Pull request is not open");
   }
 }
 
-function assertCanMergePullRequest(
-  pullRequest: ThreadPullRequest | null,
-): void {
-  if (!pullRequest) {
-    throw new ApiError(409, "pull_request_unavailable", "No pull request found");
-  }
+function assertCanMergePullRequest(pullRequest: ThreadPullRequest): void {
   if (
     pullRequest.state !== "open" ||
     pullRequest.mergeability.state !== "mergeable"
@@ -225,21 +213,40 @@ function assertCanMergePullRequest(
   }
 }
 
-/**
- * Pick the git ref to read for the requested side of a diff. Returns
- * `undefined` when the side should be read from the working tree (no ref —
- * `host.read_file` falls back to its disk-read path).
- *
- * Only `uncommitted` and `all` have a working-tree side; the others read
- * from refs on both sides. `branch_committed` and `all` use the merge-base
- * SHA the diff was computed against as their old side (passed in by the
- * client from `workspace.diff`'s response — reading from the branch tip
- * instead would diverge from the diff's hunk coordinates whenever the
- * branch has moved past the merge-base). `commit` uses the parent commit
- * (`<sha>^`); on a root commit that ref is missing, but the daemon's
- * `git cat-file` fallback already returns empty content for missing
- * objects, so we don't special-case the root-commit edge here.
- */
+async function runPullRequestAction(
+  deps: AppDeps,
+  environment: ReturnType<typeof requireReadyEnvironment>,
+  action:
+    | { operation: "ready" }
+    | { operation: "draft" }
+    | { operation: "merge"; method: PullRequestMergeMethod },
+  assertState: (pullRequest: ThreadPullRequest) => void,
+): Promise<void> {
+  if (!environment.isGitRepo) {
+    throw new ApiError(
+      409,
+      "invalid_request",
+      "Pull request actions require a git environment",
+    );
+  }
+  const target = requireWorkspaceCommandTarget(environment);
+  const pullRequest = await getPullRequestForWorkspaceTarget(deps, target);
+  assertState(requirePullRequest(pullRequest));
+
+  await mapPullRequestActionFailureTo409(() =>
+    runLiveCommandAndWait(deps, {
+      hostId: target.hostId,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+      command: {
+        type: "workspace.pull_request_action",
+        ...action,
+        environmentId: target.environmentId,
+        workspaceContext: target.workspaceContext,
+      },
+    }),
+  );
+}
+
 function resolveDiffFileRef(
   query: EnvironmentDiffFileQuery,
 ): string | undefined {
@@ -259,17 +266,12 @@ function resolveDiffFileRef(
   }
 }
 
-/** Shared `not_applicable` body for the diff routes on non-git environments. */
 const NON_GIT_DIFF_NOT_APPLICABLE = {
   outcome: "not_applicable",
   reason: "non_git_environment",
   message: "Workspace diff is not available for non-git environments",
 } as const;
 
-/**
- * Resolve the workspace command target for a diff route, or `null` when the
- * environment is non-git (callers return {@link NON_GIT_DIFF_NOT_APPLICABLE}).
- */
 function resolveGitDiffWorkspaceTarget(deps: AppDeps, environmentId: string) {
   const environment = requireReadyEnvironment(deps.db, environmentId);
   if (!environment.isGitRepo) {
@@ -279,13 +281,92 @@ function resolveGitDiffWorkspaceTarget(deps: AppDeps, environmentId: string) {
 }
 
 export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
-  const { get, patch, post } = typedRoutes<PublicApiSchema>(app, {
+  const { del, get, patch, post } = typedRoutes<PublicApiSchema>(app, {
     onValidationError: (msg) => new ApiError(400, "invalid_request", msg),
   });
   const routes = publicApiRoutes.environments;
+  post(routes.cleanup, (context) => {
+    const environment = requireEnvironment(deps.db, context.req.param("id"));
+    if (
+      countLiveThreadsInEnvironment(deps.db, {
+        environmentId: environment.id,
+      }) > 0
+    )
+      throw new ApiError(
+        409,
+        "invalid_request",
+        "Environment still has live threads",
+      );
+    if (!cleanupEnvironment(deps, environment.id))
+      throw new ApiError(
+        409,
+        "invalid_request",
+        "Environment is not provider-managed",
+      );
+    return context.json({ ok: true } as const);
+  });
+
+  get(routes.list, async (context, query) => {
+    const { limit, offset } = parsePaginationQuery({
+      limit: query?.limit,
+      offset: query?.offset,
+    });
+    return context.json(
+      toEnvironmentResponses(
+        deps.db,
+        listEnvironments(deps.db, {
+          ...(query?.projectId ? { projectId: query.projectId } : {}),
+          ...(query?.hostId ? { hostId: query.hostId } : {}),
+          ...(query?.environmentProviderId
+            ? { environmentProviderId: query.environmentProviderId }
+            : {}),
+          ...(query?.instanceKey ? { instanceKey: query.instanceKey } : {}),
+          ...(query?.path === undefined ? {} : { path: query.path }),
+          ...(limit === undefined ? {} : { limit }),
+          ...(offset === undefined ? {} : { offset }),
+          statuses: query?.status
+            ? [query.status]
+            : LISTED_ENVIRONMENT_STATUSES,
+        }),
+      ),
+    );
+  });
+
+  del(routes.delete, (context) => {
+    const environment = requireEnvironment(deps.db, context.req.param("id"));
+    if (
+      countLiveThreadsInEnvironment(deps.db, {
+        environmentId: environment.id,
+      }) > 0
+    ) {
+      throw new ApiError(
+        409,
+        "invalid_request",
+        "Environment still has live threads",
+      );
+    }
+    if (environment.status !== "destroyed") {
+      if (!requestEnvironmentRemoval(deps, environment.id)) {
+        throw new ApiError(
+          409,
+          "invalid_request",
+          `Environment cannot be deleted while ${environment.status}`,
+        );
+      }
+      deps.terminalSessions.closeDestroyedEnvironmentTerminals({
+        environmentId: environment.id,
+      });
+    }
+    return context.json({ ok: true } as const);
+  });
 
   get(routes.get, (context) =>
-    context.json(requireEnvironment(deps.db, context.req.param("id"))),
+    context.json(
+      toEnvironmentResponse(
+        deps.db,
+        requireEnvironment(deps.db, context.req.param("id")),
+      ),
+    ),
   );
 
   patch(routes.update, (context, payload) => {
@@ -299,19 +380,11 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
     if (!updated) {
       throw new ApiError(404, "environment_not_found", "Environment not found");
     }
-    return context.json(updated);
+    return context.json(toEnvironmentResponse(deps.db, updated));
   });
 
   post(routes.archiveThreads, (context) => {
     const environment = requireEnvironment(deps.db, context.req.param("id"));
-    if (!isWorktreeEnvironment(environment)) {
-      throw new ApiError(
-        409,
-        "invalid_request",
-        "Only worktree environments can be archived as a group",
-      );
-    }
-
     const archivedThreadIds = archiveEnvironmentThreads(deps, { environment });
     return context.json({
       ok: true,
@@ -332,12 +405,18 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
       });
     }
     const target = requireWorkspaceCommandTarget(environment);
-    const result = await callEnvironmentWorkspaceStatus(deps, {
-      environment,
-      target,
-      ...(query.mergeBaseBranch
-        ? { mergeBaseBranch: query.mergeBaseBranch }
-        : {}),
+    const result = await deps.workspaceReadCaches.status.read({
+      environmentId: environment.id,
+      hostId: target.hostId,
+      key: workspaceStatusCacheKey(target, query.mergeBaseBranch),
+      load: () =>
+        callEnvironmentWorkspaceStatus(deps, {
+          environment,
+          target,
+          ...(query.mergeBaseBranch
+            ? { mergeBaseBranch: query.mergeBaseBranch }
+            : {}),
+        }),
     });
     if (result.outcome === "unavailable") {
       return context.json({
@@ -356,19 +435,24 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
       deps.db,
       context.req.param("id"),
     );
-    // A non-git environment has no branch and therefore no PR; skip the daemon.
     if (!environment.isGitRepo) {
       return context.json({ outcome: "absent" });
     }
     const target = requireWorkspaceCommandTarget(environment);
-    const result = await callHostRetryableOnlineRpc(deps, {
+    const result = await deps.workspaceReadCaches.pullRequest.read({
+      environmentId: environment.id,
       hostId: target.hostId,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-      command: {
-        type: "workspace.pull_request",
-        environmentId: target.environmentId,
-        workspaceContext: target.workspaceContext,
-      },
+      key: workspaceReadCacheKey(target),
+      load: () =>
+        callHostRetryableOnlineRpc(deps, {
+          hostId: target.hostId,
+          timeoutMs: COMMAND_TIMEOUT_MS,
+          command: {
+            type: "workspace.pull_request",
+            environmentId: target.environmentId,
+            workspaceContext: target.workspaceContext,
+          },
+        }),
     });
     if (result.outcome === "available") {
       return context.json({
@@ -383,18 +467,10 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
   });
 
   get(routes.diff, async (context, query) => {
-    const environment = requireReadyEnvironment(
-      deps.db,
-      context.req.param("id"),
-    );
-    if (!environment.isGitRepo) {
-      return context.json({
-        outcome: "not_applicable",
-        reason: "non_git_environment",
-        message: "Workspace diff is not available for non-git environments",
-      });
+    const target = resolveGitDiffWorkspaceTarget(deps, context.req.param("id"));
+    if (target === null) {
+      return context.json(NON_GIT_DIFF_NOT_APPLICABLE);
     }
-    const target = requireWorkspaceCommandTarget(environment);
     const result = await callHostRetryableOnlineRpc(deps, {
       hostId: target.hostId,
       timeoutMs: COMMAND_TIMEOUT_MS,
@@ -421,10 +497,7 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
   });
 
   get(routes.diffFiles, async (context, query) => {
-    const target = resolveGitDiffWorkspaceTarget(
-      deps,
-      context.req.param("id"),
-    );
+    const target = resolveGitDiffWorkspaceTarget(deps, context.req.param("id"));
     if (target === null) {
       return context.json(NON_GIT_DIFF_NOT_APPLICABLE);
     }
@@ -445,18 +518,7 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
         failure: result.failure,
       });
     }
-    if (result.files.length > WORKSPACE_DIFF_MAX_FILES) {
-      return context.json({
-        outcome: "not_applicable",
-        reason: "too_many_files",
-        message: `This diff changes more than ${WORKSPACE_DIFF_MAX_FILES} files; it is too large to display.`,
-      });
-    }
     const files = result.files.map(rawDiffFileStatToEntry);
-    // Ship a small diff's `auto`-tier patches with the TOC so initial content
-    // paints in one round-trip (empty for large diffs — see
-    // selectInitialPatchPaths). A failed/unavailable patch fetch degrades to an
-    // empty list; the client then loads the first screen on demand.
     const initialPatchPaths = selectInitialPatchPaths(files);
     let initialPatches: DiffPatchEntry[] = [];
     if (initialPatchPaths.length > 0) {
@@ -482,14 +544,12 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
       shortstat: result.shortstat,
       mergeBaseRef: result.mergeBaseRef,
       initialPatches,
+      truncated: result.truncated,
     });
   });
 
   post(routes.diffPatch, async (context, payload) => {
-    const target = resolveGitDiffWorkspaceTarget(
-      deps,
-      context.req.param("id"),
-    );
+    const target = resolveGitDiffWorkspaceTarget(deps, context.req.param("id"));
     if (target === null) {
       return context.json(NON_GIT_DIFF_NOT_APPLICABLE);
     }
@@ -529,7 +589,10 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
     ) {
       throw new ApiError(400, "invalid_request", "Invalid path");
     }
-    const absolutePath = path.join(environment.path, repoRelativePath);
+    const absolutePath = joinHostPathSegments(
+      environment.path,
+      repoRelativePath,
+    );
     const ref = resolveDiffFileRef(query);
     const result = await callHostRetryableOnlineRpc(deps, {
       hostId: environment.hostId,
@@ -540,13 +603,14 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
         rootPath: environment.path,
         ...(ref !== undefined ? { ref } : {}),
       },
-    });
+    }).catch(remapDaemonFileRouteError);
+    const contentResult = requireDaemonFileContentResult(result);
     return context.json({
-      path: result.path,
-      content: result.content,
-      contentEncoding: result.contentEncoding,
-      ...(result.mimeType ? { mimeType: result.mimeType } : {}),
-      sizeBytes: result.sizeBytes,
+      path: contentResult.path,
+      content: contentResult.content,
+      contentEncoding: contentResult.contentEncoding,
+      ...(contentResult.mimeType ? { mimeType: contentResult.mimeType } : {}),
+      sizeBytes: contentResult.sizeBytes,
     });
   });
 
@@ -561,11 +625,12 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
       hostId: environment.hostId,
       timeoutMs: COMMAND_TIMEOUT_MS,
       command: {
-        type: "host.list_branches",
+        type: "host.list_branch_options",
         path: environment.path,
         ...(branchQuery ? { query: branchQuery } : {}),
         ...(selectedBranch ? { selectedBranch } : {}),
         limit: parseBranchListLimit(query.limit),
+        remoteRefresh: "background",
       },
     });
     return context.json({
@@ -599,6 +664,9 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
           limit,
           includeFiles: inclusion.includeFiles,
           includeDirectories: inclusion.includeDirectories,
+          includeHidden: WORKSPACE_PATH_LIST_INCLUDE_HIDDEN,
+          respectGitIgnore: true,
+          excludeNames: [...DEFAULT_PATH_LIST_EXCLUDE_NAMES],
         },
       });
       return context.json({
@@ -619,273 +687,118 @@ export function registerEnvironmentRoutes(app: Hono, deps: AppDeps): void {
       context.req.param("id"),
     );
 
-    switch (payload.action) {
-      case "commit": {
-        const target = requireWorkspaceCommandTarget(environment);
-        const { workspaceContext } = target;
+    try {
+      switch (payload.action) {
+        case "commit": {
+          const target = requireWorkspaceCommandTarget(environment);
+          const { workspaceContext } = target;
 
-        const [statusResult, diffResult] = await Promise.all([
-          callEnvironmentWorkspaceStatus(deps, {
-            environment,
-            target,
-          }),
-          callHostRetryableOnlineRpc(deps, {
-            hostId: target.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "workspace.diff",
-              environmentId: target.environmentId,
-              workspaceContext,
-              target: { type: "uncommitted" },
-              maxDiffBytes: AI_MAX_DIFF_BYTES,
-              maxFileListBytes: AI_MAX_FILE_LIST_BYTES,
-              maxUntrackedFiles: WORKSPACE_DIFF_MAX_FILES,
-            },
-          }),
-        ]);
-        const workspaceStatus = requireAvailableWorkspaceStatus(statusResult);
-        const workspaceDiff = requireAvailableWorkspaceDiff(diffResult);
-        if (!workspaceStatus.workingTree.hasUncommittedChanges) {
-          throw new ApiError(
-            409,
-            "no_changes",
-            "No uncommitted changes to commit",
-          );
-        }
-
-        const aiMessage = await generateCommitMessage(deps, {
-          diffDescription: "uncommitted changes",
-          shortstat: workspaceDiff.shortstat,
-          files: workspaceDiff.files,
-          patch: workspaceDiff.diff,
-        });
-        const commitMessage = aiMessage ?? COMMIT_FALLBACK_MESSAGE;
-
-        const result = await mapNoChangesTo409(
-          "No uncommitted changes to commit",
-          () =>
-            runLiveCommandAndWait(deps, {
+          const [statusResult, diffResult] = await Promise.all([
+            callEnvironmentWorkspaceStatusForWork(deps, {
+              environment,
+              target,
+            }),
+            callHostRetryableOnlineRpcForWork(deps, {
               hostId: target.hostId,
               timeoutMs: COMMAND_TIMEOUT_MS,
               command: {
-                type: "workspace.commit",
+                type: "workspace.diff",
                 environmentId: target.environmentId,
                 workspaceContext,
-                message: commitMessage,
+                target: { type: "uncommitted" },
+                maxDiffBytes: AI_MAX_DIFF_BYTES,
+                maxFileListBytes: AI_MAX_FILE_LIST_BYTES,
+                maxUntrackedFiles: WORKSPACE_DIFF_MAX_FILES,
               },
             }),
-        );
-        return context.json({
-          ok: true,
-          action: "commit",
-          message: `Created commit ${result.commitSha}`,
-          commitSha: result.commitSha,
-          commitSubject: result.commitSubject,
-        });
-      }
-      case "squash_merge": {
-        const target = requireWorkspaceCommandTarget(environment);
-        const { workspaceContext } = target;
-        const targetBranch = payload.options.mergeBaseBranch;
+          ]);
+          const workspaceStatus = requireAvailableWorkspaceStatus(statusResult);
+          const workspaceDiff = requireAvailableWorkspaceDiff(diffResult);
+          if (!workspaceStatus.workingTree.hasUncommittedChanges) {
+            throw new ApiError(
+              409,
+              "no_changes",
+              "No uncommitted changes to commit",
+            );
+          }
 
-        const statusResult = await callEnvironmentWorkspaceStatus(deps, {
-          environment,
-          target,
-        });
-        const workspaceStatus = requireAvailableWorkspaceStatus(statusResult);
+          const aiMessage = await generateCommitMessage(deps, {
+            diffDescription: "uncommitted changes",
+            shortstat: workspaceDiff.shortstat,
+            files: workspaceDiff.files,
+            patch: workspaceDiff.diff,
+          });
+          const commitMessage = aiMessage ?? COMMIT_FALLBACK_MESSAGE;
 
-        const currentBranch = workspaceStatus.branch.currentBranch;
-        if (!currentBranch) {
-          throw new ApiError(
-            409,
-            "invalid_request",
-            "Cannot squash merge from a detached workspace",
+          const result = await mapNoChangesTo409(
+            "No uncommitted changes to commit",
+            () =>
+              runLiveCommandAndWait(deps, {
+                hostId: target.hostId,
+                timeoutMs: COMMAND_TIMEOUT_MS,
+                command: {
+                  type: "workspace.commit",
+                  environmentId: target.environmentId,
+                  workspaceContext,
+                  message: commitMessage,
+                },
+              }),
           );
-        }
-
-        const targetBranchResult = await callHostRetryableOnlineRpc(deps, {
-          hostId: environment.hostId,
-          timeoutMs: COMMAND_TIMEOUT_MS,
-          command: {
-            type: "host.list_branches",
-            path: environment.path,
-            selectedBranch: targetBranch,
-            limit: 1,
-          },
-        });
-        assertSquashMergeTargetIsLocal({
-          selectedBranch: targetBranchResult.selectedBranch,
-          targetBranch,
-        });
-
-        if (workspaceStatus.workingTree.hasUncommittedChanges) {
-          await runLiveCommandAndWait(deps, {
-            hostId: target.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "workspace.commit",
-              environmentId: target.environmentId,
-              workspaceContext,
-              message: PRE_MERGE_COMMIT_MESSAGE,
-            },
+          return context.json({
+            ok: true,
+            action: "commit",
+            message: `Created commit ${result.commitSha}`,
+            commitSha: result.commitSha,
+            commitSubject: result.commitSubject,
           });
         }
-
-        const diffResult = await callHostRetryableOnlineRpc(deps, {
-          hostId: target.hostId,
-          timeoutMs: COMMAND_TIMEOUT_MS,
-          command: {
-            type: "workspace.diff",
-            environmentId: target.environmentId,
-            workspaceContext,
-            target: {
-              type: "branch_committed",
-              mergeBaseBranch: targetBranch,
-            },
-            maxDiffBytes: AI_MAX_DIFF_BYTES,
-            maxFileListBytes: AI_MAX_FILE_LIST_BYTES,
-            maxUntrackedFiles: WORKSPACE_DIFF_MAX_FILES,
-          },
-        });
-        const workspaceDiff = requireAvailableWorkspaceDiff(diffResult);
-
-        const aiMessage = await generateCommitMessage(deps, {
-          diffDescription: `squash merge of ${currentBranch} into ${targetBranch}`,
-          shortstat: workspaceDiff.shortstat,
-          files: workspaceDiff.files,
-          patch: workspaceDiff.diff,
-        });
-        const commitMessage = aiMessage ?? SQUASH_MERGE_FALLBACK_MESSAGE;
-
-        const result = await mapNoChangesTo409(
-          `No changes to merge into ${targetBranch}`,
-          () =>
-            runLiveCommandAndWait(deps, {
-              hostId: target.hostId,
-              timeoutMs: COMMAND_TIMEOUT_MS,
-              command: {
-                type: "workspace.squash_merge",
-                environmentId: target.environmentId,
-                workspaceContext,
-                targetBranch,
-                commitMessage,
-              },
-            }),
-        );
-        return context.json({
-          ok: true,
-          action: "squash_merge",
-          merged: result.merged,
-          message: "Squash merge completed",
-          commitSha: result.commitSha,
-          commitSubject: result.commitSubject,
-        });
-      }
-      case "pull_request_ready": {
-        if (!environment.isGitRepo) {
-          throw new ApiError(
-            409,
-            "invalid_request",
-            "Pull request actions require a git environment",
+        case "pull_request_ready": {
+          await runPullRequestAction(
+            deps,
+            environment,
+            { operation: "ready" },
+            assertCanMarkPullRequestReady,
           );
+          return context.json({
+            ok: true,
+            action: "pull_request_ready",
+            message: "Pull request marked ready",
+          });
         }
-        const target = requireWorkspaceCommandTarget(environment);
-        const pullRequest = await getPullRequestForWorkspaceTarget(
-          deps,
-          target,
-        );
-        assertCanMarkPullRequestReady(pullRequest);
-
-        await mapPullRequestActionFailureTo409(() =>
-          runLiveCommandAndWait(deps, {
-            hostId: target.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "workspace.pull_request_action",
-              operation: "ready",
-              environmentId: target.environmentId,
-              workspaceContext: target.workspaceContext,
-            },
-          }),
-        );
-        return context.json({
-          ok: true,
-          action: "pull_request_ready",
-          message: "Pull request marked ready",
-        });
-      }
-      case "pull_request_draft": {
-        if (!environment.isGitRepo) {
-          throw new ApiError(
-            409,
-            "invalid_request",
-            "Pull request actions require a git environment",
+        case "pull_request_draft": {
+          await runPullRequestAction(
+            deps,
+            environment,
+            { operation: "draft" },
+            assertCanConvertPullRequestToDraft,
           );
+          return context.json({
+            ok: true,
+            action: "pull_request_draft",
+            message: "Pull request converted to draft",
+          });
         }
-        const target = requireWorkspaceCommandTarget(environment);
-        const pullRequest = await getPullRequestForWorkspaceTarget(
-          deps,
-          target,
-        );
-        assertCanConvertPullRequestToDraft(pullRequest);
-
-        await mapPullRequestActionFailureTo409(() =>
-          runLiveCommandAndWait(deps, {
-            hostId: target.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "workspace.pull_request_action",
-              operation: "draft",
-              environmentId: target.environmentId,
-              workspaceContext: target.workspaceContext,
-            },
-          }),
-        );
-        return context.json({
-          ok: true,
-          action: "pull_request_draft",
-          message: "Pull request converted to draft",
-        });
-      }
-      case "pull_request_merge": {
-        if (!environment.isGitRepo) {
-          throw new ApiError(
-            409,
-            "invalid_request",
-            "Pull request actions require a git environment",
+        case "pull_request_merge": {
+          await runPullRequestAction(
+            deps,
+            environment,
+            { operation: "merge", method: payload.options.method },
+            assertCanMergePullRequest,
           );
+          return context.json({
+            ok: true,
+            action: "pull_request_merge",
+            method: payload.options.method,
+            message: "Pull request merge started",
+          });
         }
-        const target = requireWorkspaceCommandTarget(environment);
-        const pullRequest = await getPullRequestForWorkspaceTarget(
-          deps,
-          target,
-        );
-        assertCanMergePullRequest(pullRequest);
-
-        await mapPullRequestActionFailureTo409(() =>
-          runLiveCommandAndWait(deps, {
-            hostId: target.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "workspace.pull_request_action",
-              operation: "merge",
-              method: payload.options.method,
-              environmentId: target.environmentId,
-              workspaceContext: target.workspaceContext,
-            },
-          }),
-        );
-        return context.json({
-          ok: true,
-          action: "pull_request_merge",
-          method: payload.options.method,
-          message: "Pull request merge started",
-        });
+        default: {
+          const _exhaustive: never = payload;
+          throw new Error(`Unhandled environment action: ${_exhaustive}`);
+        }
       }
-      default: {
-        const _exhaustive: never = payload;
-        throw new Error(`Unhandled environment action: ${_exhaustive}`);
-      }
+    } finally {
+      deps.workspaceReadCaches.invalidateEnvironment(environment.id);
     }
   });
 }

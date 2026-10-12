@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BB_CLI_REEXEC_ENV,
   maybeReexecViaBbCli,
+  resolveBbCliLaunch,
 } from "../bb-cli-reexec.js";
 
 describe("maybeReexecViaBbCli", () => {
@@ -90,5 +91,40 @@ describe("maybeReexecViaBbCli", () => {
       reexec,
     });
     expect(reexec).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveBbCliLaunch", () => {
+  it("runs an extensionless BB_CLI script through Node on Windows", () => {
+    expect(
+      resolveBbCliLaunch({
+        argv: ["status"],
+        nodePath: "C:\\node\\node.exe",
+        platform: "win32",
+        target: "C:\\bb\\host-daemon\\dist\\bb",
+      }),
+    ).toEqual({
+      command: "C:\\node\\node.exe",
+      args: ["C:\\bb\\host-daemon\\dist\\bb", "status"],
+    });
+  });
+
+  it("executes BB_CLI directly when the platform can run it", () => {
+    expect(
+      resolveBbCliLaunch({
+        argv: ["status"],
+        nodePath: "C:\\node\\node.exe",
+        platform: "win32",
+        target: "C:\\tools\\bb.exe",
+      }),
+    ).toEqual({ command: "C:\\tools\\bb.exe", args: ["status"] });
+    expect(
+      resolveBbCliLaunch({
+        argv: ["status"],
+        nodePath: "/usr/bin/node",
+        platform: "darwin",
+        target: "/opt/bb/host-daemon/dist/bb",
+      }),
+    ).toEqual({ command: "/opt/bb/host-daemon/dist/bb", args: ["status"] });
   });
 });

@@ -1,4 +1,4 @@
-import type { BrowserWindowConstructorOptions } from "electron";
+import type { BrowserWindowConstructorOptions, Event } from "electron";
 import {
   MIN_WINDOW_HEIGHT,
   MIN_WINDOW_WIDTH,
@@ -15,28 +15,22 @@ import {
   type PersistBrowserWindowStateSnapshot,
   type StatefulBrowserWindow,
 } from "./window-state.js";
+import { resolveDesktopExternalUrl } from "./desktop-external-url.js";
 import type { DesktopContextMenuWebContents } from "./desktop-context-menu.js";
 
-export type DesktopWindowIcon = BrowserWindowConstructorOptions["icon"];
+type DesktopWindowIcon = BrowserWindowConstructorOptions["icon"];
 
-// Inset the macOS traffic lights an equal distance from the window's top and
-// left edges so they sit on a 45° diagonal from the top-left corner. The shared
-// value vertically centers the lights within the 48px chrome row and brings them
-// onto the sidebar icon column's left rail. This is the native half of a paired
-// geometry contract: the renderer half is `CHROME_ROW_HEIGHT_CLASS` (48px) and
-// the traffic-light reserve tokens in apps/app/src/lib/bb-desktop.ts. The two
-// bundles can't share a runtime value, so keep this inset in sync with them.
 const MACOS_TRAFFIC_LIGHT_DIAGONAL_INSET = 18;
 const MACOS_TRAFFIC_LIGHT_POSITION = {
   x: MACOS_TRAFFIC_LIGHT_DIAGONAL_INSET,
   y: MACOS_TRAFFIC_LIGHT_DIAGONAL_INSET,
 };
 
-export interface DesktopWindowOpenDetails {
+interface DesktopWindowOpenDetails {
   url: string;
 }
 
-export interface DesktopWindowOpenHandlerResult {
+interface DesktopWindowOpenHandlerResult {
   action: "deny";
 }
 
@@ -50,8 +44,12 @@ export interface DesktopWindowOpenDevToolsOptions {
 
 export interface DesktopWindowWebContents extends DesktopContextMenuWebContents {
   id: number;
+  on(...args: Parameters<DesktopContextMenuWebContents["on"]>): void;
+  on(
+    eventName: "did-change-theme-color",
+    listener: (event: Event, color: string | null) => void,
+  ): void;
   openDevTools(options: DesktopWindowOpenDevToolsOptions): void;
-  send(channel: string, payload: unknown): void;
   setWindowOpenHandler(handler: DesktopWindowOpenHandler): void;
   setZoomFactor(factor: number): void;
 }
@@ -59,7 +57,6 @@ export interface DesktopWindowWebContents extends DesktopContextMenuWebContents 
 export interface DesktopBrowserWindow extends StatefulBrowserWindow {
   readonly id: number;
   focus(): void;
-  isFocused(): boolean;
   isMinimized(): boolean;
   loadURL(url: string): Promise<void>;
   maximize(): void;
@@ -70,6 +67,7 @@ export interface DesktopBrowserWindow extends StatefulBrowserWindow {
   once(eventName: "ready-to-show", listener: () => void): void;
   restore(): void;
   setFullScreen(isFullScreen: boolean): void;
+  setBackgroundColor(color: string): void;
   show(): void;
   webContents: DesktopWindowWebContents;
 }
@@ -78,32 +76,35 @@ export interface DesktopBrowserWindowCreator {
   create(options: BrowserWindowConstructorOptions): DesktopBrowserWindow;
 }
 
-export interface OpenExternalUrlArgs {
+interface OpenExternalUrlArgs {
   url: string;
 }
 
-export interface CreateDesktopWindowFactoryArgs {
+interface CreateDesktopWindowFactoryArgs {
   browserWindowCreator: DesktopBrowserWindowCreator;
   createWindowStateKey(): WindowStateKey;
   displayWorkAreas: DisplayWorkArea[] | null;
   icon: DesktopWindowIcon;
+  isLinuxTransparent: boolean;
   isMac: boolean;
+  isLinuxFrameless: boolean;
   isQuitting(): boolean;
+  shouldUseDarkColors(): boolean;
   openExternalUrl(args: OpenExternalUrlArgs): void;
   preloadPath: string;
   userDataPath: string;
 }
 
-export interface CreateDesktopWindowArgs {
+interface CreateDesktopWindowArgs {
   initialUrl: string | null;
   stateKey: WindowStateKey | null;
 }
 
-export interface RestoreDesktopWindowsArgs {
+interface RestoreDesktopWindowsArgs {
   initialUrl: string | null;
 }
 
-export interface LoadDesktopWindowsUrlArgs {
+interface LoadDesktopWindowsUrlArgs {
   url: string;
 }
 
@@ -111,9 +112,6 @@ export interface DesktopWindowFactory {
   createWindow(args: CreateDesktopWindowArgs): Promise<DesktopBrowserWindow>;
   focusFirstWindow(): boolean;
   hasOpenWindows(): boolean;
-  sendToFocusedWindow(channel: string, payload: unknown): boolean;
-  sendToFirstWindow(channel: string, payload: unknown): boolean;
-  loadUrlInFirstWindow(args: LoadDesktopWindowsUrlArgs): Promise<boolean>;
   loadUrl(args: LoadDesktopWindowsUrlArgs): Promise<void>;
   openDevTools(): void;
   persistOpenWindows(): Promise<void>;
@@ -135,9 +133,12 @@ interface LoadUrlIntoWindowArgs {
 }
 
 interface CreateWindowOptionsArgs {
+  backgroundColor: string;
   bounds: WindowBounds;
   icon: DesktopWindowIcon;
+  isLinuxTransparent: boolean;
   isMac: boolean;
+  isLinuxFrameless: boolean;
   preloadPath: string;
 }
 
@@ -168,13 +169,18 @@ function createWindowOptions(
   args: CreateWindowOptionsArgs,
 ): BrowserWindowConstructorOptions {
   return {
+    backgroundColor: args.backgroundColor,
+    ...(args.isLinuxFrameless ? { frame: false } : {}),
+    ...(args.isLinuxTransparent
+      ? { backgroundColor: "#00000000", transparent: true }
+      : {}),
     ...(args.isMac
       ? {
           frame: false,
           titleBarStyle: "hiddenInset" as const,
           trafficLightPosition: MACOS_TRAFFIC_LIGHT_POSITION,
         }
-      : {}),
+      : { autoHideMenuBar: true }),
     height: args.bounds.height,
     icon: args.icon,
     minHeight: MIN_WINDOW_HEIGHT,
@@ -195,9 +201,6 @@ function createWindowOptions(
 }
 
 async function loadUrlIntoWindow(args: LoadUrlIntoWindowArgs): Promise<void> {
-  // Native macOS traffic lights do not scale with Chromium page zoom, so reset
-  // app-window zoom before loading the renderer chrome that visually aligns to
-  // them. This also clears stale per-origin zoom persisted by Electron sessions.
   args.browserWindow.webContents.setZoomFactor(1);
   try {
     await args.browserWindow.loadURL(args.url);
@@ -235,12 +238,25 @@ export function createDesktopWindowFactory(
       });
       const browserWindow = args.browserWindowCreator.create(
         createWindowOptions({
+          backgroundColor: args.shouldUseDarkColors() ? "#151515" : "#ffffff",
           bounds: restoredState.bounds,
           icon: args.icon,
+          isLinuxTransparent: args.isLinuxTransparent,
           isMac: args.isMac,
+          isLinuxFrameless: args.isLinuxFrameless,
           preloadPath: args.preloadPath,
         }),
       );
+      if (!args.isLinuxTransparent) {
+        browserWindow.webContents.on(
+          "did-change-theme-color",
+          (_event, color) => {
+            if (color !== null) {
+              browserWindow.setBackgroundColor(color);
+            }
+          },
+        );
+      }
       browserWindow.webContents.session.setSpellCheckerEnabled(true);
 
       activeWindows.set(stateKey, browserWindow);
@@ -265,7 +281,10 @@ export function createDesktopWindowFactory(
         }
       });
       browserWindow.webContents.setWindowOpenHandler((details) => {
-        args.openExternalUrl({ url: details.url });
+        const url = resolveDesktopExternalUrl(details.url);
+        if (url !== null) {
+          args.openExternalUrl({ url });
+        }
         return { action: "deny" };
       });
 
@@ -333,46 +352,6 @@ export function createDesktopWindowFactory(
     return false;
   }
 
-  async function loadUrlInFirstWindow(
-    loadArgs: LoadDesktopWindowsUrlArgs,
-  ): Promise<boolean> {
-    for (const browserWindow of activeWindows.values()) {
-      if (browserWindow.isMinimized()) {
-        browserWindow.restore();
-      }
-      await loadUrlIntoWindow({
-        browserWindow,
-        url: loadArgs.url,
-      });
-      browserWindow.focus();
-      return true;
-    }
-    return false;
-  }
-
-  function sendToFirstWindow(channel: string, payload: unknown): boolean {
-    for (const browserWindow of activeWindows.values()) {
-      if (browserWindow.isMinimized()) {
-        browserWindow.restore();
-      }
-      browserWindow.webContents.send(channel, payload);
-      browserWindow.focus();
-      return true;
-    }
-    return false;
-  }
-
-  function sendToFocusedWindow(channel: string, payload: unknown): boolean {
-    for (const browserWindow of activeWindows.values()) {
-      if (!browserWindow.isFocused()) {
-        continue;
-      }
-      browserWindow.webContents.send(channel, payload);
-      return true;
-    }
-    return sendToFirstWindow(channel, payload);
-  }
-
   function openDevTools(): void {
     for (const browserWindow of activeWindows.values()) {
       browserWindow.webContents.openDevTools({ mode: "detach" });
@@ -397,9 +376,6 @@ export function createDesktopWindowFactory(
     hasOpenWindows() {
       return activeWindows.size > 0;
     },
-    sendToFocusedWindow,
-    sendToFirstWindow,
-    loadUrlInFirstWindow,
     loadUrl,
     openDevTools,
     persistOpenWindows,

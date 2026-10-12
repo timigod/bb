@@ -1,3 +1,4 @@
+import { calculateExponentialBackoffDelay } from "@bb/domain";
 import type {
   ParcelAsyncSubscription,
   ParcelWatcherBackend,
@@ -12,10 +13,6 @@ import type {
   SerializedParcelEvent,
 } from "./messages.js";
 
-/**
- * Parent-side handle on one watcher child. Abstracts `child_process.fork` so the
- * proxy's lifecycle logic can be tested against an in-memory child.
- */
 export interface ChildChannel {
   send(message: ParentToChildMessage): void;
   onMessage(listener: (message: ChildToParentMessage) => void): void;
@@ -25,16 +22,12 @@ export interface ChildChannel {
 
 type ProxyLogLevel = "info" | "warn" | "error";
 
-export interface ParcelWatcherProxyOptions {
+interface ParcelWatcherProxyOptions {
   spawnChannel: () => ChildChannel;
-  /** How often to ping the child to detect a wedged (e.g. deadlocked) process. */
   pingIntervalMs?: number;
-  /** Kill + respawn the child if no pong arrives within this window. */
   pingTimeoutMs?: number;
-  /** Base delay before respawning after a *consecutive* failure (the first
-   * failure respawns immediately; only sustained churn backs off). */
+  unsubscribeTimeoutMs?: number;
   baseRestartDelayMs?: number;
-  /** Cap on the exponential respawn backoff. */
   maxRestartDelayMs?: number;
   log?: (
     level: ProxyLogLevel,
@@ -48,11 +41,26 @@ type SubscribeCallback = (
   events: ParcelWatcherEventBatch,
 ) => unknown;
 
+interface SubscribeConfirmation {
+  resolve: (subscription: ParcelAsyncSubscription) => void;
+  reject: (error: Error) => void;
+}
+
 interface SubscriptionRecord {
   id: string;
   dir: string;
   opts?: ParcelWatcherSubscribeOptions;
   callback: SubscribeCallback;
+  confirmation: SubscribeConfirmation | null;
+  requestSource: ChildChannel | null;
+  rescanSource: ChildChannel | null;
+  signal: AbortSignal | null;
+  abortListener: (() => void) | null;
+}
+
+interface PendingUnsubscribe {
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export interface ParcelWatcherProxy extends ParcelWatcherBackend {
@@ -61,6 +69,7 @@ export interface ParcelWatcherProxy extends ParcelWatcherBackend {
 
 const DEFAULT_PING_INTERVAL_MS = 5_000;
 const DEFAULT_PING_TIMEOUT_MS = 15_000;
+const DEFAULT_UNSUBSCRIBE_TIMEOUT_MS = 15_000;
 const DEFAULT_BASE_RESTART_DELAY_MS = 250;
 const DEFAULT_MAX_RESTART_DELAY_MS = 30_000;
 
@@ -70,23 +79,13 @@ function toEventBatch(
   return events.map((event) => ({ path: event.path, type: event.type }));
 }
 
-/**
- * A {@link ParcelWatcherBackend} that runs the real parcel watcher in a child
- * process. The registry of active subscriptions is the source of truth: when
- * the child dies, wedges, or reports a backend error, the proxy SIGKILLs it
- * (the OS reclaims the leaked inotify fds and parked threads atomically), spawns
- * a fresh child, and replays every subscription under its original id — so
- * callers (RootSubscription and up) never observe the restart.
- *
- * Respawns use a capped exponential backoff that resets once a child proves
- * healthy, so an EINTR storm cannot spin in a tight loop yet the watcher always
- * recovers when the storm subsides (it never permanently gives up).
- */
 export function createParcelWatcherProxy(
   options: ParcelWatcherProxyOptions,
 ): ParcelWatcherProxy {
   const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
   const pingTimeoutMs = options.pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS;
+  const unsubscribeTimeoutMs =
+    options.unsubscribeTimeoutMs ?? DEFAULT_UNSUBSCRIBE_TIMEOUT_MS;
   const baseRestartDelayMs =
     options.baseRestartDelayMs ?? DEFAULT_BASE_RESTART_DELAY_MS;
   const maxRestartDelayMs =
@@ -94,16 +93,13 @@ export function createParcelWatcherProxy(
   const log = options.log ?? (() => {});
 
   const subscriptions = new Map<string, SubscriptionRecord>();
+  const pendingUnsubscribes = new Map<string, PendingUnsubscribe>();
   let channel: ChildChannel | null = null;
   let childReady = false;
   let disposed = false;
-  // Counts back-to-back respawns with no healthy interval between them, to back
-  // off an EINTR storm. Reset to 0 once a child proves healthy (answers a ping).
   let consecutiveRestarts = 0;
   let respawnTimer: ReturnType<typeof setTimeout> | null = null;
-  // True while the current child is a replacement, so its replayed subscriptions
-  // request a gap-closing rescan. False for the first child (nothing missed).
-  let restarting = false;
+  let recoveryPending = false;
   let idCounter = 0;
   let pingNonce = 0;
   let lastPongAt = 0;
@@ -150,22 +146,36 @@ export function createParcelWatcherProxy(
       pingNonce += 1;
       channel.send({ kind: "ping", nonce: pingNonce });
     }, pingIntervalMs);
-    // Never let the watcher's ping pin the daemon's event loop open on shutdown.
     pingTimer.unref?.();
   }
 
-  function replaySubscriptions(rescan: boolean): void {
-    if (channel === null) {
+  function sendSubscribe(
+    target: ChildChannel,
+    record: SubscriptionRecord,
+    rescan: boolean,
+  ): void {
+    record.requestSource = target;
+    record.rescanSource = rescan ? target : null;
+    target.send({
+      kind: "subscribe",
+      id: record.id,
+      dir: record.dir,
+      opts: record.opts,
+      rescan,
+    });
+  }
+
+  function replaySubscriptions(): void {
+    const target = channel;
+    if (target === null) {
       return;
     }
+    const rescan = recoveryPending;
     for (const record of subscriptions.values()) {
-      channel.send({
-        kind: "subscribe",
-        id: record.id,
-        dir: record.dir,
-        opts: record.opts,
-        rescan,
-      });
+      if (target !== channel) {
+        return;
+      }
+      sendSubscribe(target, record, rescan);
     }
   }
 
@@ -184,17 +194,17 @@ export function createParcelWatcherProxy(
     if (disposed || channel !== null || respawnTimer !== null) {
       return;
     }
-    restarting = true;
+    recoveryPending = true;
     if (consecutiveRestarts === 0) {
-      // A one-off failure heals instantly; only sustained churn backs off.
       consecutiveRestarts += 1;
       startChild();
       return;
     }
-    const delay = Math.min(
-      baseRestartDelayMs * 2 ** (consecutiveRestarts - 1),
-      maxRestartDelayMs,
-    );
+    const delay = calculateExponentialBackoffDelay({
+      attempt: consecutiveRestarts,
+      baseDelayMs: baseRestartDelayMs,
+      maxDelayMs: maxRestartDelayMs,
+    });
     consecutiveRestarts += 1;
     log("warn", "Backing off before watcher child respawn", {
       delayMs: delay,
@@ -212,23 +222,24 @@ export function createParcelWatcherProxy(
       return;
     }
     const dying = channel;
-    // Detach first so the kill-triggered exit event is treated as stale and we
-    // drive the respawn exactly once from here.
     channel = null;
     childReady = false;
     stopPing();
+    releasePendingUnsubscribes();
+    releaseChildRequests(dying);
     dying.kill();
     scheduleRespawn();
   }
 
   function handleChildExit(source: ChildChannel): void {
     if (source !== channel) {
-      // A stale child we already detached (e.g. via killAndRespawn).
       return;
     }
     channel = null;
     childReady = false;
     stopPing();
+    releasePendingUnsubscribes();
+    releaseChildRequests(source);
     if (disposed) {
       return;
     }
@@ -248,13 +259,13 @@ export function createParcelWatcherProxy(
     switch (message.kind) {
       case "ready":
         childReady = true;
-        replaySubscriptions(restarting);
-        restarting = false;
-        startPing();
+        replaySubscriptions();
+        if (source === channel) {
+          startPing();
+        }
         break;
       case "pong":
         lastPongAt = Date.now();
-        // The child has proven healthy: reset the respawn backoff.
         consecutiveRestarts = 0;
         break;
       case "events": {
@@ -263,58 +274,182 @@ export function createParcelWatcherProxy(
         break;
       }
       case "watch-error":
-        // Parcel's shared inotify backend died in the child (e.g. an EINTR poll
-        // interruption), which takes down every watch at once. Recycle the whole
-        // child: the SIGKILL reclaims the leaked fds/threads, and the respawn
-        // re-arms every subscription on a fresh backend — so the watch
-        // self-heals instead of going permanently dead.
+        if (message.recovery === "rescan-subscription") {
+          const record = subscriptions.get(message.id);
+          if (record) {
+            log("warn", "Watcher subscription requires targeted recovery", {
+              activeSubscriptions: subscriptions.size,
+              watchError: message.message,
+            });
+            record.callback(new Error(message.message), []);
+          }
+          break;
+        }
         log("warn", "Watcher child reported a backend error; recycling", {
           watchError: message.message,
         });
         killAndRespawn();
         break;
-      case "subscribe-failed": {
-        // One subscription failed to establish on the child — typically its path
-        // is transiently missing while a respawn re-arms it. Surface it as
-        // RECOVERABLE so RootSubscription re-establishes it through its
-        // existence-gated, backed-off retry path, instead of the proxy turning a
-        // transient ENOENT into a permanently dead watch.
+      case "subscribed": {
         const record = subscriptions.get(message.id);
-        record?.callback(new Error(RESCAN_REQUIRED_MESSAGE), []);
+        if (record?.rescanSource === source) {
+          record.rescanSource = null;
+          recoveryPending = false;
+        }
+        const confirmation = record?.confirmation ?? null;
+        if (record && confirmation) {
+          record.confirmation = null;
+          releaseAbortListener(record);
+          confirmation.resolve(createSubscriptionHandle(record.id));
+        }
         break;
       }
-      case "subscribed":
-      case "unsubscribed":
+      case "subscribe-failed": {
+        const record = subscriptions.get(message.id);
+        if (record) {
+          subscriptions.delete(message.id);
+          releaseAbortListener(record);
+          if (record.confirmation) {
+            record.confirmation.reject(new Error(message.message));
+          } else {
+            record.callback(new Error(RESCAN_REQUIRED_MESSAGE), []);
+          }
+        }
+        if (message.recovery === "recycle-child") {
+          log(
+            "warn",
+            "Watcher subscribe failed after adding native watches; recycling to release them",
+            {
+              activeSubscriptions: subscriptions.size,
+              watchError: message.message,
+            },
+          );
+          killAndRespawn();
+        }
         break;
+      }
+      case "unsubscribed": {
+        const pending = pendingUnsubscribes.get(message.id);
+        pendingUnsubscribes.delete(message.id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pending.resolve();
+        }
+        break;
+      }
     }
+  }
+
+  function releasePendingUnsubscribes(): void {
+    const pending = [...pendingUnsubscribes.values()];
+    pendingUnsubscribes.clear();
+    for (const unsubscribe of pending) {
+      clearTimeout(unsubscribe.timer);
+      unsubscribe.resolve();
+    }
+  }
+
+  function releaseAbortListener(record: SubscriptionRecord): void {
+    if (record.signal && record.abortListener) {
+      record.signal.removeEventListener("abort", record.abortListener);
+    }
+    record.signal = null;
+    record.abortListener = null;
+  }
+
+  function releaseChildRequests(source: ChildChannel): void {
+    for (const record of subscriptions.values()) {
+      if (record.requestSource === source) {
+        record.requestSource = null;
+      }
+      if (record.rescanSource === source) {
+        record.rescanSource = null;
+      }
+    }
+  }
+
+  function cancelPendingSubscribe(record: SubscriptionRecord): void {
+    if (record.confirmation === null || !subscriptions.delete(record.id)) {
+      return;
+    }
+    const confirmation = record.confirmation;
+    const target = record.requestSource;
+    record.confirmation = null;
+    releaseAbortListener(record);
+    confirmation.reject(new Error("Parcel watcher subscription was cancelled"));
+    if (target !== null && target === channel) {
+      target.send({ kind: "unsubscribe", id: record.id });
+    }
+  }
+
+  function createSubscriptionHandle(id: string): ParcelAsyncSubscription {
+    return {
+      unsubscribe() {
+        const target = channel;
+        const record = subscriptions.get(id);
+        if (!record || !subscriptions.delete(id)) {
+          return Promise.resolve();
+        }
+        releaseAbortListener(record);
+        if (target === null || record.requestSource !== target) {
+          return Promise.resolve();
+        }
+        return new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            if (!pendingUnsubscribes.delete(id)) {
+              return;
+            }
+            resolve();
+            log("warn", "Watcher child unsubscribe timed out; recycling", {
+              unsubscribeTimeoutMs,
+            });
+            killAndRespawn();
+          }, unsubscribeTimeoutMs);
+          timer.unref?.();
+          pendingUnsubscribes.set(id, { resolve, timer });
+          target.send({ kind: "unsubscribe", id });
+        });
+      },
+    };
   }
 
   function subscribe(
     dir: string,
     callback: SubscribeCallback,
     opts?: ParcelWatcherSubscribeOptions,
+    signal?: AbortSignal,
   ): Promise<ParcelAsyncSubscription> {
     if (disposed) {
       return Promise.reject(new Error("Parcel watcher proxy is disposed"));
     }
-    const id = nextId();
-    subscriptions.set(id, { id, dir, opts, callback });
-    if (channel !== null && childReady) {
-      // Steady state: send now. Not replayed again unless the child respawns,
-      // so there is exactly one subscribe per id per child.
-      channel.send({ kind: "subscribe", id, dir, opts, rescan: false });
-    } else if (channel === null && respawnTimer === null) {
-      // No child yet and none pending: spawn one. replay-on-ready issues the
-      // subscribe once it is up.
-      startChild();
+    if (signal?.aborted) {
+      return Promise.reject(
+        new Error("Parcel watcher subscription was cancelled"),
+      );
     }
-    // Otherwise a child is spawning or backing off; replay-on-ready will send
-    // this subscription exactly once when it becomes ready (no double-subscribe).
-    return Promise.resolve({
-      async unsubscribe() {
-        subscriptions.delete(id);
-        channel?.send({ kind: "unsubscribe", id });
-      },
+    const id = nextId();
+    return new Promise<ParcelAsyncSubscription>((resolve, reject) => {
+      const record: SubscriptionRecord = {
+        id,
+        dir,
+        opts,
+        callback,
+        confirmation: { resolve, reject },
+        requestSource: null,
+        rescanSource: null,
+        signal: signal ?? null,
+        abortListener: null,
+      };
+      if (signal) {
+        record.abortListener = () => cancelPendingSubscribe(record);
+        signal.addEventListener("abort", record.abortListener, { once: true });
+      }
+      subscriptions.set(id, record);
+      if (channel !== null && childReady) {
+        sendSubscribe(channel, record, recoveryPending);
+      } else if (channel === null && respawnTimer === null) {
+        startChild();
+      }
     });
   }
 
@@ -325,7 +460,14 @@ export function createParcelWatcherProxy(
       clearTimeout(respawnTimer);
       respawnTimer = null;
     }
+    for (const record of subscriptions.values()) {
+      releaseAbortListener(record);
+      record.confirmation?.reject(
+        new Error("Parcel watcher proxy is disposed"),
+      );
+    }
     subscriptions.clear();
+    releasePendingUnsubscribes();
     if (channel !== null) {
       const dying = channel;
       channel = null;

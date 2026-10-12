@@ -1,128 +1,148 @@
-import {
-  ArrowRight01Icon,
-  CheckmarkCircle02Icon,
-} from "@hugeicons/core-free-icons";
-import { HugeiconsIcon } from "@hugeicons/react";
+import CheckmarkCircle02Icon from "@hugeicons/core-free-icons/CheckmarkCircle02Icon";
+import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
 import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
 import { trackLandingEvent } from "./analytics";
-import type { CtaPlacement } from "./site";
+import { LinuxIcon } from "./icons";
+import type { CtaPlacement, DesktopPlatform } from "./site";
 import {
+  DESKTOP_DOWNLOADS,
   DISCORD_URL,
   GITHUB_URL,
-  PRODUCT_HUNT_URL,
   X_URL,
   SUBSCRIBE_PATH,
-  downloadMacosHref,
+  downloadHref,
 } from "./site";
-
-/* Marketing CTAs shared by the landing page and the changelog. */
 
 type CtaLinkProps = {
   placement: CtaPlacement;
-  /** Omit for a plain inline link (nav/footer); set for button-styled CTAs. */
   className?: string;
   children: ReactNode;
 };
 
-export function DownloadLink({ placement, className, children }: CtaLinkProps) {
+export function DownloadLink({
+  placement,
+  platform,
+  className,
+  children,
+}: CtaLinkProps & { platform: DesktopPlatform }) {
   return (
-    <a className={className} href={downloadMacosHref(placement)}>
+    <a className={className} href={downloadHref(platform, placement)}>
       {children}
     </a>
   );
 }
 
-export function GitHubLink({ placement, className, children }: CtaLinkProps) {
+const AppleSolidIcon: IconSvgElement = [
+  [
+    "path",
+    {
+      d: "M12 5.75C12 3.75 13.5 1.75 15.5 1.75C15.5 3.75 14 5.75 12 5.75Z",
+      fill: "currentColor",
+      key: "0",
+    },
+  ],
+  [
+    "path",
+    {
+      d: "M12.5 8.09001C11.9851 8.09001 11.5867 7.92646 11.1414 7.74368C10.5776 7.51225 9.93875 7.25 8.89334 7.25C7.02235 7.25 4 8.74945 4 12.7495C4 17.4016 7.10471 22.25 9.10471 22.25C9.77426 22.25 10.3775 21.9871 10.954 21.7359C11.4815 21.5059 11.9868 21.2857 12.5 21.2857C13.0132 21.2857 13.5185 21.5059 14.046 21.7359C14.6225 21.9871 15.2257 22.25 15.8953 22.25C17.2879 22.25 18.9573 19.8992 20 16.9008C18.3793 16.2202 17.338 14.618 17.338 12.75C17.338 11.121 18.2036 10.0398 19.5 9.25C18.5 7.75 17.0134 7.25 15.9447 7.25C14.8993 7.25 14.2604 7.51225 13.6966 7.74368C13.2514 7.92646 13.0149 8.09001 12.5 8.09001Z",
+      fill: "currentColor",
+      key: "1",
+    },
+  ],
+];
+
+function DesktopDownloadIcon({ platform }: { platform: DesktopPlatform }) {
+  if (platform === "linux") {
+    return <LinuxIcon className="btn-ic" />;
+  }
+  if (platform === "windows") {
+    return null;
+  }
+  return <HugeiconsIcon icon={AppleSolidIcon} className="btn-ic" />;
+}
+
+export function DesktopDownloadButton({
+  placement,
+  platform,
+  className,
+}: {
+  placement: CtaPlacement;
+  platform: DesktopPlatform;
+  className: string;
+}) {
+  return (
+    <DownloadLink
+      placement={placement}
+      platform={platform}
+      className={className}
+    >
+      <DesktopDownloadIcon platform={platform} />
+      {DESKTOP_DOWNLOADS[platform].buttonLabel}
+    </DownloadLink>
+  );
+}
+
+function TrackedExternalLink({
+  href,
+  event,
+  placement,
+  className,
+  children,
+  "aria-label": ariaLabel,
+}: CtaLinkProps & {
+  href: string;
+  event:
+    | "landing_github_clicked"
+    | "landing_discord_clicked"
+    | "landing_x_clicked";
+  "aria-label"?: string;
+}) {
   return (
     <a
       className={className}
+      aria-label={ariaLabel}
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      onClick={() =>
+        trackLandingEvent({ name: event, properties: { placement } })
+      }
+    >
+      {children}
+    </a>
+  );
+}
+
+export function GitHubLink(props: CtaLinkProps & { "aria-label"?: string }) {
+  return (
+    <TrackedExternalLink
+      {...props}
       href={GITHUB_URL}
-      target="_blank"
-      rel="noreferrer"
-      onClick={() =>
-        trackLandingEvent({
-          name: "landing_github_clicked",
-          properties: { placement },
-        })
-      }
-    >
-      {children}
-    </a>
+      event="landing_github_clicked"
+    />
   );
 }
 
-export function DiscordLink({ placement, className, children }: CtaLinkProps) {
+export function DiscordLink(props: CtaLinkProps) {
   return (
-    <a
-      className={className}
+    <TrackedExternalLink
+      {...props}
       href={DISCORD_URL}
-      target="_blank"
-      rel="noreferrer"
-      onClick={() =>
-        trackLandingEvent({
-          name: "landing_discord_clicked",
-          properties: { placement },
-        })
-      }
-    >
-      {children}
-    </a>
+      event="landing_discord_clicked"
+    />
   );
 }
 
-export function XLink({ placement, className, children }: CtaLinkProps) {
+export function XLink(props: CtaLinkProps & { "aria-label"?: string }) {
   return (
-    <a
-      className={className}
-      href={X_URL}
-      target="_blank"
-      rel="noreferrer"
-      onClick={() =>
-        trackLandingEvent({
-          name: "landing_x_clicked",
-          properties: { placement },
-        })
-      }
-    >
-      {children}
-    </a>
+    <TrackedExternalLink {...props} href={X_URL} event="landing_x_clicked" />
   );
 }
-
-/** Launch-day announcement pill, in the same shape as the release-notes
- *  callout it replaces. This is bb's own markup rather than Product Hunt's
- *  embed, so it inherits the page's type and color and can ask for the vote
- *  outright. */
-export function ProductHuntCallout({ placement }: { placement: CtaPlacement }) {
-  return (
-    <a
-      className="updates-callout ph-callout"
-      href={PRODUCT_HUNT_URL}
-      target="_blank"
-      rel="noreferrer"
-      onClick={() =>
-        trackLandingEvent({
-          name: "landing_product_hunt_clicked",
-          properties: { placement },
-        })
-      }
-    >
-      <span className="updates-label ph-callout-label">Today</span>
-      <span className="updates-title">Vote for bb on Product Hunt</span>
-      <HugeiconsIcon icon={ArrowRight01Icon} className="updates-arrow" />
-    </a>
-  );
-}
-
-/* ── Email signup ─────────────────────────────────────────────────── */
 
 type SubscribeStatus = "idle" | "submitting" | "success" | "error";
 
-// Email capture that POSTs to the first-party /api/subscribe Worker route,
-// which adds the address to the bb marketing audience in Resend. JS-enhanced:
-// it submits inline and swaps to a confirmation rather than navigating.
 export const SUBSCRIBE_EMAIL_ID = "subscribe-email";
 
 export function focusSubscribeEmail() {
@@ -219,5 +239,23 @@ export function EmailSignup({ placement }: { placement: CtaPlacement }) {
         </span>
       ) : null}
     </form>
+  );
+}
+
+export function SubscribeSection({
+  blurb,
+  id,
+  reveal,
+}: {
+  blurb: ReactNode;
+  id?: string;
+  reveal?: boolean;
+}) {
+  return (
+    <section className="subscribe" id={id} data-reveal={reveal || undefined}>
+      <h2 className="subscribe-title">Stay in the loop.</h2>
+      <p>{blurb}</p>
+      <EmailSignup placement="footer" />
+    </section>
   );
 }

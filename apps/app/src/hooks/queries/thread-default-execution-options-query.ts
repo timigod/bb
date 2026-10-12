@@ -1,18 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ResolvedThreadExecutionOptions } from "@bb/domain";
 import { sdk } from "@/lib/sdk";
+import {
+  readCachedThreadExecutionOptions,
+  threadExecutionOptionsCacheKey,
+  writeCachedThreadExecutionOptions,
+} from "@/lib/thread-execution-options-cache";
 import { useThreadDetailRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
-import { requireEnabledQueryArg } from "./query-helpers";
+import { requireThreadId } from "./query-helpers";
 import { threadDefaultExecutionOptionsQueryKey } from "./query-keys";
 import { REALTIME_OWNED_NO_FOCUS_QUERY_POLICY } from "./query-policies";
 
 export {
   allThreadDefaultExecutionOptionsQueryKeyPrefix,
   threadDefaultExecutionOptionsQueryKey,
-} from "./query-keys";
-export type {
-  ThreadDefaultExecutionOptionsQueryKey,
-  ThreadDefaultExecutionOptionsQueryKeyPrefix,
 } from "./query-keys";
 
 interface ThreadDefaultExecutionOptionsQueryOptions {
@@ -21,15 +22,21 @@ interface ThreadDefaultExecutionOptionsQueryOptions {
   staleTime?: number;
 }
 
-function requireThreadId(id: string, hookName: string): string {
-  return requireEnabledQueryArg({ value: id, hookName, argName: "thread id" });
-}
-
-export function fetchThreadDefaultExecutionOptions(
+async function fetchThreadDefaultExecutionOptions(
   threadId: string,
   signal?: AbortSignal,
 ): Promise<ResolvedThreadExecutionOptions | null> {
-  return sdk.threads.defaultExecutionOptions({ threadId, signal });
+  const options = await sdk.threads.defaultExecutionOptions({
+    threadId,
+    signal,
+  });
+  if (options !== null && !signal?.aborted) {
+    writeCachedThreadExecutionOptions(
+      threadExecutionOptionsCacheKey(threadId),
+      options,
+    );
+  }
+  return options;
 }
 
 export function useThreadDefaultExecutionOptions(
@@ -50,5 +57,11 @@ export function useThreadDefaultExecutionOptions(
     refetchOnMount: options?.refetchOnMount ?? true,
     ...REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
     staleTime: options?.staleTime,
+    placeholderData: () =>
+      id
+        ? (readCachedThreadExecutionOptions(
+            threadExecutionOptionsCacheKey(id),
+          ) ?? undefined)
+        : undefined,
   });
 }

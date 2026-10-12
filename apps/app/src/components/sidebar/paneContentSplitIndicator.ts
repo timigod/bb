@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { useAtomValue } from "jotai";
+import { atom, useAtomValue } from "jotai";
 import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
 import { splitLayoutAtom } from "@/lib/split-layout/atoms";
 import {
@@ -15,16 +15,12 @@ import {
 export interface MiniMapSlot {
   paneId: string;
   rect: PaneRect;
-  /** The pane represented by the sidebar item. */
   isMe: boolean;
-  /** The focused pane (drawn in the accent token). */
   isFocused: boolean;
 }
 
-export interface PaneContentSplitIndicator {
-  /** This content is open in a pane while the layout is split (>1 pane). */
+interface PaneContentSplitIndicator {
   isOpenInSplit: boolean;
-  /** Mini-map slots for the sidebar glyph, or null when there is nothing to show. */
   miniMap: MiniMapSlot[] | null;
 }
 
@@ -33,9 +29,17 @@ const NO_INDICATOR: PaneContentSplitIndicator = {
   miniMap: null,
 };
 
-export interface ThreadSplitIndicatorTarget {
-  id: string;
-  projectId: string;
+const NULL_LAYOUT_ATOM = atom<SplitLayout | null>(null);
+
+function useSplitLayoutForIndicator(enabled: boolean): {
+  layout: SplitLayout | null;
+  isCompact: boolean;
+} {
+  const isCompact = useIsCompactViewport();
+  const layout = useAtomValue(
+    enabled && !isCompact ? splitLayoutAtom : NULL_LAYOUT_ATOM,
+  );
+  return { layout, isCompact };
 }
 
 function buildSplitIndicator(
@@ -65,17 +69,11 @@ function buildSplitIndicator(
   };
 }
 
-/**
- * Split-membership state for any routable sidebar item. Reads the global split
- * layout so thread, compose, and plugin rows can draw the same pane-position
- * preview without prop threading through the sidebar tree.
- */
 export function usePaneContentSplitIndicator(
   content: PaneContent,
   enabled: boolean,
 ): PaneContentSplitIndicator {
-  const layout = useAtomValue(splitLayoutAtom);
-  const isCompact = useIsCompactViewport();
+  const { layout, isCompact } = useSplitLayoutForIndicator(enabled);
 
   return useMemo<PaneContentSplitIndicator>(() => {
     if (
@@ -92,42 +90,4 @@ export function usePaneContentSplitIndicator(
     }
     return buildSplitIndicator(layout, new Set([pane.paneId]));
   }, [content, enabled, isCompact, layout]);
-}
-
-/**
- * Split-membership state for a collapsed sidebar area. Every pane occupied by
- * one of the area's hidden threads is filled, so one rollup remains accurate
- * when more than one descendant is open in the split layout.
- */
-export function useThreadGroupSplitIndicator(
-  threads: readonly ThreadSplitIndicatorTarget[],
-  enabled: boolean,
-): PaneContentSplitIndicator {
-  const layout = useAtomValue(splitLayoutAtom);
-  const isCompact = useIsCompactViewport();
-
-  return useMemo<PaneContentSplitIndicator>(() => {
-    if (
-      !enabled ||
-      threads.length === 0 ||
-      layout === null ||
-      isCompact ||
-      countPanes(layout.root) < 2
-    ) {
-      return NO_INDICATOR;
-    }
-    const threadKeys = new Set(
-      threads.map((thread) => `${thread.projectId}\0${thread.id}`),
-    );
-    const matchingPaneIds = new Set<string>();
-    for (const pane of listPanes(layout.root)) {
-      if (
-        pane.content.kind === "thread" &&
-        threadKeys.has(`${pane.content.projectId}\0${pane.content.threadId}`)
-      ) {
-        matchingPaneIds.add(pane.paneId);
-      }
-    }
-    return buildSplitIndicator(layout, matchingPaneIds);
-  }, [enabled, isCompact, layout, threads]);
 }

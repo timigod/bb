@@ -2,20 +2,20 @@ import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { shellSingleQuote } from "@bb/test-helpers";
 import {
   buildStandaloneShellExports,
   buildDaemonRestartCommand,
   buildStandaloneRuntimeEnv,
   cleanupStandaloneOrphans,
+  createHostEnrollKey,
   createProject,
-  createStandaloneHostEnrollKey,
   createTestGitRepo,
   killProcess,
   loadDotEnv,
   repoRoot,
   reservePort,
   resolveStandaloneParentPid,
-  shellQuote,
   startQaServer,
   STANDALONE_INSTANCE_ENV,
   STANDALONE_PARENT_PID_ENV,
@@ -92,13 +92,8 @@ async function main() {
       port: serverPort,
     });
     serverProcess = qaServer.process;
-    if (!serverProcess) {
-      throw new Error(
-        "Standalone QA server unexpectedly reused an existing server",
-      );
-    }
 
-    const enrollKey = await createStandaloneHostEnrollKey(serverUrl);
+    const enrollKey = await createHostEnrollKey(serverUrl);
 
     daemonProcess = spawnLoggedProcess({
       command: "node",
@@ -126,9 +121,9 @@ async function main() {
     });
 
     const cleanupCommand =
-      `pnpm --silent --dir ${shellQuote(repoRoot)} --filter @bb/qa standalone:stop ` +
-      `--state ${shellQuote(statePath)} && ` +
-      `pnpm --silent --dir ${shellQuote(repoRoot)} --filter @bb/qa standalone:cleanup`;
+      `pnpm --silent --dir ${shellSingleQuote(repoRoot)} --filter @bb/qa standalone:stop ` +
+      `--state ${shellSingleQuote(statePath)} && ` +
+      `pnpm --silent --dir ${shellSingleQuote(repoRoot)} --filter @bb/qa standalone:cleanup`;
     const restartDaemonCommand = buildDaemonRestartCommand({
       cwd: repoRoot,
       daemonPid: daemonProcess.pid,

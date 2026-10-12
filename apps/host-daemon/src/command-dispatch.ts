@@ -1,19 +1,26 @@
+import { operationEnvironment } from "./operation-environment.js";
+import {
+  runEnvironmentHook,
+  cancelEnvironmentHook,
+} from "./command-handlers/environment-hook.js";
 import {
   providerCliInstallEventSchema,
+  type DesktopBrowserCommand,
+  type DesktopBrowserResult,
+  type HostDaemonCommand,
+  type HostDaemonCommandResult,
+  type HostDaemonOnlineRpcCommand,
+  type HostDaemonOnlineRpcCommandType,
+  type HostDaemonOnlineRpcResult,
+  type HostDaemonSettledCommandType,
   type ProviderCliInstallEvent,
-  type ProviderCliStatus,
-  HostDaemonCommand,
-  HostDaemonCommandResult,
-  HostDaemonOnlineRpcCommand,
-  HostDaemonOnlineRpcCommandType,
-  HostDaemonOnlineRpcResult,
-  HostDaemonSettledCommandType,
+  type WorkspaceResolutionFailure,
 } from "@bb/host-daemon-contract";
+import type { AgentRuntimeBridgeLaunch } from "@bb/agent-runtime";
 import semver from "semver";
 import {
-  CommandDispatchError,
-  defaultListModels,
   ExpectedCommandDispatchError,
+  resolveRuntimeBridgeLaunch,
   type CommandOf,
   type CommandDispatchOptions,
 } from "./command-dispatch-support.js";
@@ -22,10 +29,9 @@ import {
   provisionEnvironment,
 } from "./command-handlers/environment.js";
 import {
-  createCaffeinateManager,
-  type CaffeinateManager,
-} from "./command-handlers/caffeinate.js";
-import { listHostBranches } from "./command-handlers/host-branches.js";
+  inspectHostGitSource,
+  listHostBranchOptions,
+} from "./command-handlers/host-branches.js";
 import {
   installGlobalSkills,
   readGlobalSkillsStatus,
@@ -42,10 +48,11 @@ import {
   listHostFiles,
   listHostPaths,
   readHostFile,
-  readHostFileMetadata,
+  readHostFileChunk,
   readHostRelativeFile,
 } from "./command-handlers/host-files.js";
 import { writeHostFile } from "./command-handlers/file-write.js";
+import { discoverRepos } from "./command-handlers/discover-repos.js";
 import {
   mkdirHostPath,
   moveHostPath,
@@ -54,27 +61,22 @@ import {
 import { resolveInteractiveRequest } from "./command-handlers/interactive.js";
 import { pickHostFolder } from "./command-handlers/native-folder-picker.js";
 import {
-  completeCodexInference,
-  transcribeCodexVoice,
-} from "./codex-chatgpt-client.js";
-import { discoverRepos } from "./command-handlers/discover-repos.js";
-import { getProviderUsage } from "./provider-usage.js";
-import {
-  getKnownAcpAgentsStatus,
-  getProviderCliStatus,
-  getProviderCliStatusForProvider as inspectProviderCliStatusForProvider,
-  ProviderCliInstallInProgressError,
-  streamProviderCliInstall,
-} from "./provider-cli-health.js";
+  ProviderInstallationInProgressError,
+  streamProviderInstallation,
+} from "./provider-installation.js";
+import type {
+  ProviderInstallationStatus,
+  ProviderInstallationVerification,
+} from "@bb/provider-bridge-protocol";
 import {
   discardThreadRewind,
+  deleteThreadStorage,
   ensureThreadRuntime,
   prepareThreadRewind,
   startThread,
   submitTurn,
 } from "./command-handlers/thread.js";
-import { WorkspaceError } from "@bb/host-workspace";
-import { squashMerge } from "./command-handlers/workspace.js";
+import { WorkspaceError, type HostWorkspace } from "@bb/host-workspace";
 import {
   cloneProject,
   inspectProjectPath,
@@ -85,14 +87,57 @@ import {
   resolveWorkspaceForCommand,
   workspaceResolutionFailureFromError,
 } from "./workspace-resolution.js";
+import { userExecutableProcessOptions } from "./user-executable-env.js";
+import type { ServerMoveService } from "./server-move/service.js";
+import { readWorkspaceAgentContext } from "./command-handlers/workspace-agent-context.js";
 
 const THREAD_STOP_ACTIVE_TURN_WAIT_MS = 5_000;
-const defaultCaffeinateManager = createCaffeinateManager();
+
+type RuntimeStopCommand =
+  | CommandOf<"thread.stop">
+  | CommandOf<"thread.storage.delete">;
+
+async function stopThreadRuntime(
+  command: RuntimeStopCommand,
+  options: CommandDispatchOptions,
+): Promise<HostDaemonCommandResult<"thread.stop">> {
+  const released =
+    await options.runtimeManager.releaseThreadFromOtherEnvironments({
+      activeTurn: "interrupt",
+      environmentId: command.environmentId,
+      threadId: command.threadId,
+    });
+  const entry = await options.runtimeManager.getOrAwait(command.environmentId);
+  if (!entry) {
+    await options.eventSink.flush();
+    return { providerCheckpointId: released.providerCheckpointId };
+  }
+  let providerCheckpointId = released.providerCheckpointId;
+  if (entry.runtime.hasThread(command.threadId)) {
+    if (
+      command.type === "thread.stop" &&
+      command.intent === "release" &&
+      entry.runtime.getActiveTurnId(command.threadId) !== null
+    ) {
+      await options.eventSink.flush();
+      return { providerCheckpointId, activeTurnRetained: true };
+    }
+    if (command.type !== "thread.stop" || command.intent !== "release") {
+      await entry.runtime.waitForActiveTurn(command.threadId, {
+        timeoutMs: THREAD_STOP_ACTIVE_TURN_WAIT_MS,
+      });
+    }
+    const result = await entry.runtime.stopThread({
+      threadId: command.threadId,
+    });
+    providerCheckpointId = result.providerCheckpointId ?? providerCheckpointId;
+  }
+  await options.eventSink.flush();
+  return { providerCheckpointId };
+}
 
 export {
-  CommandDispatchError,
   getErrorCode,
-  noopEventSink,
   type CommandDispatchOptions,
 } from "./command-dispatch-support.js";
 
@@ -121,12 +166,6 @@ function providerCliEnvFromShellEnv(
   shellEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   return shellEnv.PATH ? { ...process.env, PATH: shellEnv.PATH } : process.env;
-}
-
-function getCaffeinateManager(
-  options: CommandDispatchOptions,
-): CaffeinateManager {
-  return options.caffeinateManager ?? defaultCaffeinateManager;
 }
 
 function handleProviderCliInstallEventLine(
@@ -174,162 +213,128 @@ async function readProviderCliInstallEvents(
   return events;
 }
 
-async function tryGetProviderCliStatusForProvider(
-  provider: CommandOf<"provider_cli.install">["provider"],
-  options: CommandDispatchOptions,
-  env: NodeJS.ProcessEnv,
-): Promise<ProviderCliStatus | null> {
-  try {
-    if (options.getProviderCliStatusForProvider !== undefined) {
-      return await options.getProviderCliStatusForProvider(provider);
-    }
-    return await inspectProviderCliStatusForProvider(provider, { env });
-  } catch {
-    return null;
-  }
-}
-
-function verifyClaudeCodeUpdateEvents(args: {
-  before: ProviderCliStatus | null;
-  after: ProviderCliStatus | null;
-  events: ProviderCliInstallEvent[];
-}): ProviderCliInstallEvent[] {
-  const completedIndex = args.events.findIndex(
-    (event) => event.type === "completed" && event.success,
-  );
-  if (completedIndex === -1) {
-    return args.events;
-  }
-  const executable =
-    args.after?.executablePath ??
-    args.before?.executablePath ??
-    args.before?.executableName ??
-    "claude";
-  if (args.before === null) {
-    return failClaudeCodeUpdateVerification({
-      ...args,
-      completedIndex,
-      message: `Claude Code's update command exited successfully, but bb could not read ${executable}'s version before the update. bb cannot confirm that the active executable changed. Run \`claude --version\` and \`claude doctor\` on this machine, then use the command output to update the installation they report.`,
-    });
-  }
-
-  const expectedVersion = args.before.latestVersion;
-  const previousVersion = args.before.currentVersion;
-  const actualVersion = args.after?.currentVersion ?? null;
-
-  const validExpectedVersion =
-    expectedVersion === null ? null : semver.valid(expectedVersion);
-  const validPreviousVersion =
-    previousVersion === null ? null : semver.valid(previousVersion);
-  const validActualVersion =
-    actualVersion === null ? null : semver.valid(actualVersion);
-  const hasKnownTarget = validExpectedVersion !== null;
-  const canVerifyAdvancement =
-    expectedVersion === null && validPreviousVersion !== null;
-  if (!hasKnownTarget && !canVerifyAdvancement) {
-    return failClaudeCodeUpdateVerification({
-      ...args,
-      completedIndex,
-      message: `Claude Code's update command exited successfully, but bb could not compare ${executable}'s version before and after the update. Run \`claude --version\` and \`claude doctor\` on this machine, then use the command output to update the installation they report.`,
-    });
-  }
-  const updateVerified =
-    validActualVersion !== null &&
-    (validExpectedVersion !== null
-      ? semver.gte(validActualVersion, validExpectedVersion)
-      : validPreviousVersion !== null &&
-        semver.gt(validActualVersion, validPreviousVersion));
-  if (updateVerified) {
-    return args.events;
-  }
-
-  const expectation = hasKnownTarget
-    ? `expected ${validExpectedVersion}`
-    : `expected a version newer than ${validPreviousVersion}`;
-  const message = `Claude Code's update command exited successfully, but ${executable} still reports ${actualVersion ?? "an unknown version"} (${expectation}). The executable may be pinned by PATH or managed by another installer. Run \`claude doctor\` on this machine and update the installation it reports.`;
-  return failClaudeCodeUpdateVerification({
-    ...args,
-    completedIndex,
-    message,
-  });
-}
-
-function failClaudeCodeUpdateVerification(args: {
-  completedIndex: number;
+function failProviderInstallationVerification(args: {
+  providerId: string;
   events: ProviderCliInstallEvent[];
   message: string;
 }): ProviderCliInstallEvent[] {
   const verifiedEvents = [...args.events];
-  const completedEvent = verifiedEvents[args.completedIndex];
+  const completedIndex = verifiedEvents.findIndex(
+    (event) => event.type === "completed" && event.success,
+  );
+  const completedEvent = verifiedEvents[completedIndex];
   if (completedEvent?.type !== "completed") {
     return args.events;
   }
-  verifiedEvents[args.completedIndex] = { ...completedEvent, success: false };
-  verifiedEvents.splice(args.completedIndex, 0, {
+  verifiedEvents[completedIndex] = { ...completedEvent, success: false };
+  verifiedEvents.splice(completedIndex, 0, {
     type: "error",
-    provider: "claudeCode",
+    provider: args.providerId,
     message: args.message,
   });
   return verifiedEvents;
 }
 
-async function installProviderCliOnHost(
-  command: CommandOf<"provider_cli.install">,
+function installationVerificationPassed(
+  verification: ProviderInstallationVerification,
+  status: ProviderInstallationStatus,
+): boolean {
+  switch (verification.kind) {
+    case "installed":
+      return status.installed;
+    case "version_at_least": {
+      const actual =
+        status.currentVersion === null
+          ? null
+          : semver.valid(status.currentVersion);
+      const expected = semver.valid(verification.version);
+      return (
+        actual !== null && expected !== null && semver.gte(actual, expected)
+      );
+    }
+    case "version_changed": {
+      const actual = status.currentVersion;
+      if (actual === null) return false;
+      const parsedActual = semver.valid(actual);
+      const parsedPrevious = semver.valid(verification.previousVersion);
+      return parsedActual !== null && parsedPrevious !== null
+        ? semver.gt(parsedActual, parsedPrevious)
+        : actual !== verification.previousVersion;
+    }
+  }
+  return false;
+}
+
+async function runProviderInstallationOnHost(
+  command: CommandOf<"provider.installation.run">,
   options: CommandDispatchOptions,
-): Promise<HostDaemonOnlineRpcResult<"provider_cli.install">> {
+): Promise<HostDaemonOnlineRpcResult<"provider.installation.run">> {
   try {
     const env = providerCliEnvFromShellEnv(
       options.runtimeManager.getShellEnv(),
     );
-    const claudeCodeStatusBefore =
-      command.provider === "claudeCode" && command.actionKind === "update"
-        ? await tryGetProviderCliStatusForProvider(
-            command.provider,
-            options,
-            env,
-          )
-        : null;
-    const streamInstall =
-      options.streamProviderCliInstall ?? streamProviderCliInstall;
-    let events = await readProviderCliInstallEvents(
-      streamInstall({
-        provider: command.provider,
-        actionKind: command.actionKind,
-        env,
-      }),
+    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+      command.bridgeLaunch,
+      options,
     );
-    if (
-      command.provider === "claudeCode" &&
-      command.actionKind === "update" &&
-      events.some((event) => event.type === "completed" && event.success)
-    ) {
-      const claudeCodeStatusAfter = await tryGetProviderCliStatusForProvider(
-        command.provider,
-        options,
-        env,
-      );
-      events = verifyClaudeCodeUpdateEvents({
-        before: claudeCodeStatusBefore,
-        after: claudeCodeStatusAfter,
-        events,
-      });
-    }
-    if (
-      shouldInvalidateProviderMaintenanceRuntimeAfterProviderCliInstall({
-        command,
-        events,
-      })
-    ) {
-      await options.runtimeManager.invalidateProviderMaintenanceRuntime();
-    }
-    return { events };
-  } catch (error) {
-    if (error instanceof ProviderCliInstallInProgressError) {
+    const maintenanceArgs = {
+      providerId: command.providerId,
+      bridgeLaunch,
+    };
+    const run = await options.providerInstallationRun({
+      ...maintenanceArgs,
+      action: command.action,
+    });
+    if (!run.available) {
       return {
         events: [
           {
             type: "error",
-            provider: command.provider,
+            provider: command.providerId,
+            message: run.message,
+          },
+        ],
+      };
+    }
+    const stream =
+      options.streamProviderInstallation ?? streamProviderInstallation;
+    let events = await readProviderCliInstallEvents(
+      stream({
+        providerId: command.providerId,
+        plan: run.command,
+        env,
+      }),
+    );
+    if (events.some((event) => event.type === "completed" && event.success)) {
+      try {
+        const status =
+          await options.providerInstallationStatus(maintenanceArgs);
+        if (!installationVerificationPassed(run.verification, status)) {
+          events = failProviderInstallationVerification({
+            providerId: command.providerId,
+            events,
+            message: `${command.providerId} ${command.action} exited successfully, but the provider could not verify the installed result.`,
+          });
+        }
+      } catch {
+        events = failProviderInstallationVerification({
+          providerId: command.providerId,
+          events,
+          message: `${command.providerId} ${command.action} exited successfully, but its installation status could not be verified.`,
+        });
+      }
+    }
+    if (events.some((event) => event.type === "completed" && event.success)) {
+      await options.runtimeManager.invalidateProviderMaintenanceRuntime();
+    }
+    return { events };
+  } catch (error) {
+    if (error instanceof ProviderInstallationInProgressError) {
+      return {
+        events: [
+          {
+            type: "error",
+            provider: command.providerId,
             message: error.message,
           },
         ],
@@ -339,118 +344,127 @@ async function installProviderCliOnHost(
   }
 }
 
-function shouldInvalidateProviderMaintenanceRuntimeAfterProviderCliInstall(args: {
-  command: CommandOf<"provider_cli.install">;
-  events: readonly ProviderCliInstallEvent[];
-}): boolean {
-  return (
-    // Codex model listing goes through the resident provider-maintenance
-    // app-server, so a Codex CLI update can leave a stale model catalog alive.
-    args.command.provider === "codex" &&
-    args.events.some(
-      (event) =>
-        event.type === "completed" &&
-        event.provider === args.command.provider &&
-        event.success,
-    )
+async function withRetainedThreadEnvironment<TResult>(
+  command: CommandOf<
+    | "thread.rewind.discard"
+    | "thread.rewind.prepare"
+    | "thread.start"
+    | "turn.submit"
+  >,
+  options: CommandDispatchOptions,
+  work: () => Promise<TResult>,
+): Promise<TResult> {
+  const release =
+    await options.runtimeManager.retainEnvironmentForThreadCommand(
+      command.environmentId,
+      command.threadId,
+    );
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+function requireServerMove(options: CommandDispatchOptions): ServerMoveService {
+  if (!options.serverMove) {
+    throw new Error("Server move is unavailable on this daemon");
+  }
+  return options.serverMove;
+}
+
+async function forwardDesktopBrowserCommand<
+  TCommand extends DesktopBrowserCommand,
+>(
+  command: TCommand,
+  options: CommandDispatchOptions,
+): Promise<DesktopBrowserResult<TCommand["type"]>> {
+  if (!options.desktopBrowserBroker)
+    throw new Error("Desktop browser broker unavailable");
+  return options.desktopBrowserBroker.request(command);
+}
+
+async function withResolvedBridgeLaunch<TResult>(
+  command: CommandOf<"provider.list_models" | "provider.health">,
+  options: CommandDispatchOptions,
+  call: (args: {
+    providerId: string;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+  }) => Promise<TResult>,
+): Promise<TResult> {
+  const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+    command.bridgeLaunch,
+    options,
   );
+  return call({
+    providerId: command.providerId,
+    ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
+    bridgeLaunch,
+  });
+}
+
+async function readAvailableWorkspace<TAvailable extends object>(
+  command: CommandOf<
+    | "workspace.status"
+    | "workspace.diff"
+    | "workspace.diffFiles"
+    | "workspace.diffPatch"
+  >,
+  options: CommandDispatchOptions,
+  read: (workspace: HostWorkspace) => Promise<TAvailable>,
+): Promise<
+  | ({ outcome: "available" } & TAvailable)
+  | { outcome: "unavailable"; failure: WorkspaceResolutionFailure }
+> {
+  const resolution = await resolveWorkspaceForCommand({
+    environmentId: command.environmentId,
+    requireGit: true,
+    runtimeManager: options.runtimeManager,
+    workspaceContext: command.workspaceContext,
+  });
+  if (!resolution.ok) {
+    return { outcome: "unavailable", failure: resolution.failure };
+  }
+  try {
+    return {
+      outcome: "available",
+      ...(await read(resolution.entry.workspace)),
+    };
+  } catch (error) {
+    return {
+      outcome: "unavailable",
+      failure: workspaceResolutionFailureFromError({
+        error,
+        workspacePath: command.workspaceContext.workspacePath,
+      }),
+    };
+  }
 }
 
 const commandHandlers: CommandHandlerMap = {
-  "thread.rewind.discard": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await discardThreadRewind(command, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.rewind.prepare": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await prepareThreadRewind(command, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.start": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await startThread(command, options);
-    } finally {
-      release();
-    }
-  },
-  "turn.submit": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
+  "thread.rewind.discard": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      discardThreadRewind(command, options),
+    ),
+  "thread.rewind.prepare": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      prepareThreadRewind(command, options),
+    ),
+  "thread.start": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      startThread(command, options),
+    ),
+  "turn.submit": (command, options) =>
+    withRetainedThreadEnvironment(command, options, async () => {
       const entry = await ensureThreadRuntime(command, options);
-      return await submitTurn(command, entry, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.stop": async (command, options) => {
-    // Release before the target runtime lookup. A moved thread often has no
-    // runtime in its new environment yet, and the old owner must still stop.
-    const released =
-      await options.runtimeManager.releaseThreadFromOtherEnvironments({
-        activeTurn: "interrupt",
-        environmentId: command.environmentId,
-        threadId: command.threadId,
-      });
-    const entry = await options.runtimeManager.getOrAwait(
-      command.environmentId,
-    );
-    if (!entry) {
-      if (released.releasedEnvironmentIds.length === 0) {
-        throw new CommandDispatchError(
-          "unknown_environment",
-          `No runtime exists for environment ${command.environmentId}`,
-        );
-      }
-      // The old owner stopped, so the stop reached the running turn.
-      await options.eventSink.flush();
-      return {
-        providerCheckpointId: released.providerCheckpointId,
-      };
-    }
-    let providerCheckpointId = released.providerCheckpointId;
-    if (entry.runtime.hasThread(command.threadId)) {
-      // Stop can be dispatched while the start/submit RPC is still in flight
-      // and the turn/started event has not been observed yet. Wait for the
-      // runtime to learn the active turn (event-driven, resolves null on
-      // timeout or when the thread goes idle) so the provider stop carries
-      // the right turn id.
-      await entry.runtime.waitForActiveTurn(command.threadId, {
-        timeoutMs: THREAD_STOP_ACTIVE_TURN_WAIT_MS,
-      });
-      const result = await entry.runtime.stopThread({
-        threadId: command.threadId,
-      });
-      providerCheckpointId =
-        result.providerCheckpointId ?? providerCheckpointId;
-    }
-    // Stop completion finalizes server-side thread state. Flush provider
-    // events first so buffered lifecycle events cannot arrive after that.
-    await options.eventSink.flush();
-    return { providerCheckpointId };
+      return submitTurn(command, entry, options);
+    }),
+  "thread.stop": stopThreadRuntime,
+  "thread.storage.delete": async (command, options) => {
+    const result = await stopThreadRuntime(command, options);
+    await deleteThreadStorage(command, options);
+    return result;
   },
   "thread.goal.clear": async (command, options) => {
     const entry = await ensureThreadRuntime(command, options);
@@ -461,8 +475,6 @@ const commandHandlers: CommandHandlerMap = {
     return result;
   },
   "thread.plan.cancel": async (command, options) => {
-    // A moved thread keeps its turn in the environment it left, and the new
-    // environment may hold no runtime yet. Cancel where the turn runs.
     const owners = options.runtimeManager.listThreadOwnerEntries(
       command.threadId,
     );
@@ -491,8 +503,6 @@ const commandHandlers: CommandHandlerMap = {
     if (!entry) {
       return {};
     }
-    // Rename does not move the provider session, so it must not stop a turn
-    // that still runs in the environment the thread left.
     await entry.runtime.renameThread({
       threadId: command.threadId,
       title: command.title,
@@ -501,76 +511,70 @@ const commandHandlers: CommandHandlerMap = {
   },
   "thread.archive": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
-    // Archive works on stored provider state, not on the live session, so it
-    // must not stop a turn in the environment the thread left.
+    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+      command.bridgeLaunch,
+      options,
+    );
     await entry.runtime.archiveThread({
       threadId: command.threadId,
       providerId: command.providerId,
       providerThreadId: command.providerThreadId,
+      bridgeLaunch,
     });
     return {};
   },
   "thread.unarchive": async (command, options) => {
-    const runtime =
-      await options.runtimeManager.ensureProviderMaintenanceRuntime({
-        dataDir: options.dataDir,
-      });
-    await runtime.unarchiveThread({
-      threadId: command.threadId,
-      providerId: command.providerId,
-      providerThreadId: command.providerThreadId,
-    });
+    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+      command.bridgeLaunch,
+      options,
+    );
+    await options.runtimeManager.withProviderMaintenanceRuntime(
+      { dataDir: options.dataDir },
+      (runtime) =>
+        runtime.unarchiveThread({
+          threadId: command.threadId,
+          providerId: command.providerId,
+          providerThreadId: command.providerThreadId,
+          bridgeLaunch,
+        }),
+    );
     return {};
   },
   "interactive.resolve": resolveInteractiveRequest,
-  "codex.inference.complete": completeCodexInference,
-  "codex.voice.transcribe": transcribeCodexVoice,
-  "environment.provision": provisionEnvironment,
+  "environment.attach": provisionEnvironment,
   "project.clone": (command, options) =>
     cloneProject({
       dataDir: options.dataDir,
       projectSlug: command.projectSlug,
+      env: operationEnvironment(
+        command.contributedEnv,
+        {
+          ...process.env,
+          ...options.runtimeManager.getShellEnv(),
+        },
+        true,
+      ),
       remoteUrl: command.remoteUrl,
+      onProgress: (text) =>
+        options.emitEnvironmentHookProgress?.({
+          type: "environment.hook.progress",
+          operationId: command.operationId,
+          entry: { type: "output", text, status: null },
+        }),
+      ...userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
       ...(command.targetPath !== undefined
         ? { targetPath: command.targetPath }
         : {}),
     }),
-  "environment.provision.cancel": cancelEnvironmentProvision,
-  "environment.destroy": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      // Treat already-missing workspaces as successful destroy (idempotent retry).
-      if (resolution.failure.code === "path_not_found") {
-        return {};
-      }
-      throw new ExpectedCommandDispatchError(
-        resolution.failure.code,
-        resolution.failure.message,
-      );
-    }
-    await options.terminalManager?.closeEnvironmentTerminals({
-      environmentId: command.environmentId,
-      reason: "environment-destroyed",
-    });
-    await options.runtimeManager.destroyEnvironment(command.environmentId);
-    return {};
-  },
+  "environment.attach.cancel": cancelEnvironmentProvision,
   "workspace.commit": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
@@ -579,39 +583,37 @@ const commandHandlers: CommandHandlerMap = {
       noVerify: true,
     });
   },
-  "workspace.squash_merge": squashMerge,
   "workspace.pull_request_action": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
-    switch (command.operation) {
-      case "ready":
-        await entry.workspace.runPullRequestAction({ operation: "ready" });
-        break;
-      case "draft":
-        await entry.workspace.runPullRequestAction({ operation: "draft" });
-        break;
-      case "merge":
-        await entry.workspace.runPullRequestAction({
-          operation: "merge",
-          method: command.method,
-        });
-        break;
-      default: {
-        const _exhaustive: never = command;
-        throw new Error(`Unhandled pull request operation: ${_exhaustive}`);
-      }
-    }
+    await entry.workspace.runPullRequestAction(
+      command.operation === "merge"
+        ? { operation: "merge", method: command.method }
+        : { operation: command.operation },
+      userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
+    );
     return {};
   },
 };
 
 const onlineRpcHandlers: OnlineRpcHandlerMap = {
+  "environment.hook.run": runEnvironmentHook,
+  "environment.hook.cancel": cancelEnvironmentHook,
+  "desktop.browser.list_instances": forwardDesktopBrowserCommand,
+  "desktop.browser.list_tabs": forwardDesktopBrowserCommand,
+  "desktop.browser.create_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.reveal_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.close_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.capture_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.acquire_control": forwardDesktopBrowserCommand,
+  "desktop.browser.open_connection": forwardDesktopBrowserCommand,
+  "desktop.browser.release_control": forwardDesktopBrowserCommand,
+  "desktop.browser.list_import_sources": forwardDesktopBrowserCommand,
+  "desktop.browser.import_cookies": forwardDesktopBrowserCommand,
   "connect-tunnel.ensure-identity": async (_command, options) => {
     if (!options.ensureConnectTunnelIdentity) {
       throw new Error("bb connect tunnel identity is unavailable");
@@ -625,191 +627,118 @@ const onlineRpcHandlers: OnlineRpcHandlerMap = {
   "host.remove_path": removeHostPath,
   "host.browse_directory": browseHostDirectory,
   "host.paths_exist": checkHostPathsExist,
-  "project.inspect": async (command) => inspectProjectPath(command.path),
+  "project.inspect": async (command, options) =>
+    inspectProjectPath(
+      command.path,
+      userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
+    ),
   "project.clone_default_path": async (command, options) => ({
     path: resolveProjectCloneDefaultPath(options.dataDir, command.projectSlug),
   }),
   "host.pick_folder": pickHostFolder,
-  "host.caffeinate": async (command, options) =>
-    getCaffeinateManager(options).setEnabled(command.enabled),
+  "plugin.host.call": async () => {
+    throw new Error("plugin.host.call must be routed by CommandRouter");
+  },
+  "plugin.host.cancel": async () => {
+    throw new Error("plugin.host.cancel must be routed by CommandRouter");
+  },
+  "plugin.host.dispose": async () => {
+    throw new Error("plugin.host.dispose must be routed by CommandRouter");
+  },
   "host.list_commands": listHostCommands,
   "host.list_skills": listHostSkills,
+  "host.read_workspace_agent_context": readWorkspaceAgentContext,
   "host.delete_skill": deleteHostSkill,
   "host.write_skill": writeHostSkill,
   "host.install_global_skills": installGlobalSkills,
   "host.global_skills_status": async (command) =>
     readGlobalSkillsStatus(command, {}),
-  "host.list_branches": listHostBranches,
-  "host.file_metadata": readHostFileMetadata,
+  "host.inspect_git_source": inspectHostGitSource,
+  "host.list_branch_options": listHostBranchOptions,
   "host.read_file": readHostFile,
+  "host.read_file_chunk": readHostFileChunk,
   "host.read_file_relative": readHostRelativeFile,
   "host.write_file": writeHostFile,
-  "provider.list_models": async (command, options) =>
-    (options.listModels ?? defaultListModels)({
+  "provider.list_models": (command, options) =>
+    withResolvedBridgeLaunch(command, options, (args) =>
+      options.listModels(args),
+    ),
+  "provider.health": (command, options) =>
+    withResolvedBridgeLaunch(command, options, (args) =>
+      options.providerHealth(args),
+    ),
+  "provider.usage": async (command, options) =>
+    options.providerUsage({
       providerId: command.providerId,
-      ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-      ...(command.acpLaunchSpec !== undefined
-        ? { acpLaunchSpec: command.acpLaunchSpec }
-        : {}),
+      bridgeLaunch: await resolveRuntimeBridgeLaunch(
+        command.bridgeLaunch,
+        options,
+      ),
     }),
-  "known_acp_agents.status": async (command, options) =>
-    getKnownAcpAgentsStatus({
-      agents: command.agents,
-      env: providerCliEnvFromShellEnv(options.runtimeManager.getShellEnv()),
-    }),
-  "provider.usage": async () => getProviderUsage(),
-  "provider_cli.status": async (_command, options) =>
-    getProviderCliStatus({
-      env: providerCliEnvFromShellEnv(options.runtimeManager.getShellEnv()),
-    }),
-  "provider_cli.install": installProviderCliOnHost,
-  "workspace.discover_repos": async (command, options) =>
+  "host.discover_repos": (command) =>
     discoverRepos({
       maxDepth: command.maxDepth,
       sinceDays: command.sinceDays,
       limit: command.limit,
-      env: options.runtimeManager.getShellEnv(),
     }),
-  "workspace.status": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
+  "provider.installation.status": async (command, options) => {
+    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+      command.bridgeLaunch,
+      options,
+    );
+    return options.providerInstallationStatus({
+      providerId: command.providerId,
+      bridgeLaunch,
     });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        workspaceStatus: await resolution.entry.workspace.getStatus({
-          mergeBaseBranch: command.mergeBaseBranch,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
   },
-  "workspace.diff": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        diff: await resolution.entry.workspace.getDiff({
-          target: command.target,
-          maxDiffBytes: command.maxDiffBytes,
-          maxFileListBytes: command.maxFileListBytes,
-          maxUntrackedFiles: command.maxUntrackedFiles,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
-  "workspace.diffFiles": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        ...(await resolution.entry.workspace.diffFiles({
-          target: command.target,
-          maxFiles: command.maxFiles,
-        })),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
-  "workspace.diffPatch": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        patches: await resolution.entry.workspace.diffPatch({
-          target: command.target,
-          paths: command.paths,
-          maxBytesPerFile: command.maxBytesPerFile,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
+  "provider.installation.run": runProviderInstallationOnHost,
+  "workspace.status": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      workspaceStatus: await workspace.getStatus({
+        mergeBaseBranch: command.mergeBaseBranch,
+        maxUntrackedLineStatFiles: command.maxUntrackedLineStatFiles,
+        maxUntrackedLineStatBytes: command.maxUntrackedLineStatBytes,
+      }),
+    })),
+  "workspace.diff": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      diff: await workspace.getDiff({
+        target: command.target,
+        maxDiffBytes: command.maxDiffBytes,
+        maxFileListBytes: command.maxFileListBytes,
+        maxUntrackedFiles: command.maxUntrackedFiles,
+      }),
+    })),
+  "workspace.diffFiles": (command, options) =>
+    readAvailableWorkspace(command, options, (workspace) =>
+      workspace.diffFiles({
+        target: command.target,
+        maxFiles: command.maxFiles,
+      }),
+    ),
+  "workspace.diffPatch": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      patches: await workspace.diffPatch({
+        target: command.target,
+        paths: command.paths,
+        maxBytesPerFile: command.maxBytesPerFile,
+      }),
+    })),
   "workspace.pull_request": async (command, options) => {
     const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
-    // A non-git workspace genuinely has no PR; every other resolution failure
-    // means the lookup cannot run, which must stay distinguishable from
-    // "checked and found nothing".
     if (!resolution.ok) {
       return resolution.failure.code === "not_git_repo"
         ? { outcome: "absent" }
         : { outcome: "unavailable", message: resolution.failure.message };
     }
-    const lookup = await resolution.entry.workspace.getPullRequest();
+    const lookup = await resolution.entry.workspace.getPullRequest(
+      userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
+    );
     switch (lookup.outcome) {
       case "found":
         return { outcome: "available", pullRequest: lookup.pullRequest };
@@ -819,6 +748,18 @@ const onlineRpcHandlers: OnlineRpcHandlerMap = {
         return { outcome: "unavailable", message: lookup.message };
     }
   },
+  "server_move.inspect": (command, options) =>
+    requireServerMove(options).inspect(command),
+  "server_move.probe": (command, options) =>
+    requireServerMove(options).probe(command),
+  "server_move.prepare": (command, options) =>
+    requireServerMove(options).prepare(command),
+  "server_move.activate": (command, options) =>
+    requireServerMove(options).activate(command),
+  "server_move.abort": (command, options) =>
+    requireServerMove(options).abort(command),
+  "server_move.delete_old_copy": (_command, options) =>
+    requireServerMove(options).deleteOldCopy(),
 };
 
 export async function dispatchCommand<

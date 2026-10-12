@@ -8,7 +8,6 @@ import {
   type PromptInput,
 } from "@bb/domain";
 import { createConnection } from "../../src/connection.js";
-import { migrate } from "../../src/migrate.js";
 import { noopNotifier } from "../../src/notifier.js";
 import {
   appendStoredThreadEvent,
@@ -24,6 +23,7 @@ import {
   updateThread,
   upsertThreadSearchSegments,
 } from "../../src/data/threads.js";
+import { createMigratedConnection } from "../helpers/migrated-connection.js";
 
 interface SetupResult {
   db: ReturnType<typeof createConnection>;
@@ -31,11 +31,9 @@ interface SetupResult {
 }
 
 function setup(): SetupResult {
-  const db = createConnection(":memory:");
-  migrate(db);
+  const db = createMigratedConnection();
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
@@ -54,6 +52,7 @@ function runThreadSearchMigrationFiles(
   for (const migrationFile of [
     "0039_thread_search.sql",
     "0040_thread_search_rowid_fts.sql",
+    "0101_thread_search_prefix_fts.sql",
   ]) {
     const migrationSql = readFileSync(
       resolve(__dirname, "../../drizzle", migrationFile),
@@ -129,6 +128,7 @@ describe("thread search data", () => {
           scope: threadScope(),
           itemId: null,
           itemKind: null,
+          parentToolCallId: null,
           data: JSON.stringify(
             turnRequestData([
               textInput("visiblebackfill"),
@@ -143,6 +143,7 @@ describe("thread search data", () => {
           scope: turnScope("turn-1"),
           itemId: "msg-1",
           itemKind: "agentMessage",
+          parentToolCallId: null,
           data: JSON.stringify({
             item: {
               id: "msg-1",
@@ -158,6 +159,7 @@ describe("thread search data", () => {
           scope: threadScope(),
           itemId: null,
           itemKind: null,
+          parentToolCallId: null,
           data: JSON.stringify({ text: "legacybackfill" }),
         },
       ]);
@@ -281,8 +283,6 @@ describe("thread search data", () => {
       expect(assistantResults.active.results[0]?.matches[0]).toMatchObject({
         sourceKind: "assistant_message",
         text: "assistantwriterneedle",
-        // Message matches carry their event sequence so the UI can deep-link to
-        // the matched message in the conversation.
         sourceSeq: expect.any(Number),
       });
 
@@ -325,7 +325,7 @@ describe("thread search data", () => {
     }
   });
 
-  it("caps hydrated snippets for broad matches across limited threads", () => {
+  it("keeps one message match per thread for broad matches across limited threads", () => {
     const { db, project } = setup();
     try {
       const threadIndexesById = new Map<string, number>();
@@ -359,10 +359,489 @@ describe("thread search data", () => {
         expect(threadIndex).toBeDefined();
         expect(result.matches.map((match) => match.text)).toEqual([
           `broadmatchneedle thread ${threadIndex} segment 0`,
-          `broadmatchneedle thread ${threadIndex} segment 1`,
-          `broadmatchneedle thread ${threadIndex} segment 2`,
         ]);
       }
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("ranks title matches first, then the rest by most recent activity", () => {
+    const { db, project } = setup();
+    try {
+      const titled = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Moss plugins",
+      });
+      const older = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Weekly planning",
+      });
+      const newer = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Release notes",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [older, newer].map((thread) => ({
+          threadId: thread.id,
+          sourceKind: "assistant_message",
+          sourceKey: "event:1",
+          sourceSeq: 1,
+          text: "moss plugins moss plugins moss plugins",
+        })),
+      });
+      const setUpdatedAt = db.$client.prepare(
+        "UPDATE threads SET updated_at = ? WHERE id = ?",
+      );
+      setUpdatedAt.run(1, titled.id);
+      setUpdatedAt.run(2, older.id);
+      setUpdatedAt.run(3, newer.id);
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "moss plugins",
+        limitPerGroup: 20,
+      });
+
+      expect(results.active.results.map((result) => result.thread.id)).toEqual([
+        titled.id,
+        newer.id,
+        older.id,
+      ]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("does not rank a titled thread's fallback text as a title match", () => {
+    const { db, project } = setup();
+    try {
+      const titledWithFallback = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Weekly planning",
+        titleFallback: "fallbackneedle in the first prompt",
+      });
+      const newerMessage = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Release notes",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: newerMessage.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "a fallbackneedle message",
+          },
+        ],
+      });
+      const setUpdatedAt = db.$client.prepare(
+        "UPDATE threads SET updated_at = ? WHERE id = ?",
+      );
+      setUpdatedAt.run(1, titledWithFallback.id);
+      setUpdatedAt.run(2, newerMessage.id);
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "fallbackneedle",
+        limitPerGroup: 20,
+      });
+
+      expect(results.active.results.map((result) => result.thread.id)).toEqual([
+        newerMessage.id,
+        titledWithFallback.id,
+      ]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("ranks a title as a title match only when it has every word", () => {
+    const { db, project } = setup();
+    try {
+      const fullTitle = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Moss plugins",
+      });
+      const partialTitle = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Moss editor",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: partialTitle.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "add plugins support",
+          },
+        ],
+      });
+      const setUpdatedAt = db.$client.prepare(
+        "UPDATE threads SET updated_at = ? WHERE id = ?",
+      );
+      setUpdatedAt.run(1, fullTitle.id);
+      setUpdatedAt.run(2, partialTitle.id);
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "moss plugins",
+        limitPerGroup: 20,
+      });
+
+      expect(results.active.results.map((result) => result.thread.id)).toEqual([
+        fullTitle.id,
+        partialTitle.id,
+      ]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("splits an underscored query into words like other punctuation", () => {
+    const { db, project } = setup();
+    try {
+      const titled = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Search the thread list",
+      });
+      const newerMessage = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Weekly planning",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: newerMessage.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "rename thread_search before shipping",
+          },
+        ],
+      });
+      const setUpdatedAt = db.$client.prepare(
+        "UPDATE threads SET updated_at = ? WHERE id = ?",
+      );
+      setUpdatedAt.run(1, titled.id);
+      setUpdatedAt.run(2, newerMessage.id);
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "thread_search",
+        limitPerGroup: 20,
+      });
+
+      expect(results.active.results.map((result) => result.thread.id)).toEqual([
+        titled.id,
+        newerMessage.id,
+      ]);
+      expect(
+        results.active.results[1]?.matches[0]?.highlightRanges,
+      ).toEqual([
+        { start: 7, end: 13 },
+        { start: 14, end: 20 },
+      ]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("shows the message that has every word over an earlier partial match", () => {
+    const { db, project } = setup();
+    try {
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Weekly planning",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: thread.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "moss notes",
+          },
+          {
+            threadId: thread.id,
+            sourceKind: "assistant_message",
+            sourceKey: "event:2",
+            sourceSeq: 2,
+            text: "moss plugins",
+          },
+        ],
+      });
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "moss plugins",
+        limitPerGroup: 20,
+      });
+
+      expect(
+        results.active.results[0]?.matches.map((match) => ({
+          text: match.text,
+          sourceSeq: match.sourceSeq,
+        })),
+      ).toEqual([{ text: "moss plugins", sourceSeq: 2 }]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("returns title matches alongside the single best message match", () => {
+    const { db, project } = setup();
+    try {
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "pairedneedle title",
+        titleFallback: "pairedneedle fallback",
+      });
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: thread.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "first pairedneedle message",
+          },
+          {
+            threadId: thread.id,
+            sourceKind: "assistant_message",
+            sourceKey: "event:2",
+            sourceSeq: 2,
+            text: "second pairedneedle reply",
+          },
+        ],
+      });
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "pairedneedle",
+        limitPerGroup: 20,
+      });
+
+      expect(results.active.total).toBe(1);
+      const matches = results.active.results[0]?.matches ?? [];
+      expect(
+        matches
+          .filter((match) => match.sourceSeq === null)
+          .map((match) => match.sourceKind)
+          .sort(),
+      ).toEqual(["title", "title_fallback"]);
+      expect(matches.filter((match) => match.sourceSeq !== null)).toHaveLength(1);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("limits and counts each group from one partitioned scan", () => {
+    const { db, project } = setup();
+    try {
+      const activeIds: string[] = [];
+      const archivedIds: string[] = [];
+      for (let index = 0; index < 4; index += 1) {
+        const activeThread = createThread(db, noopNotifier, {
+          projectId: project.id,
+          providerId: "codex",
+          title: `partitionneedle active ${index}`,
+        });
+        activeIds.push(activeThread.id);
+        const archivedThread = createThread(db, noopNotifier, {
+          projectId: project.id,
+          providerId: "codex",
+          title: `partitionneedle archived ${index}`,
+        });
+        archiveThread(db, noopNotifier, archivedThread.id);
+        archivedIds.push(archivedThread.id);
+      }
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "partitionneedle",
+        limitPerGroup: 2,
+      });
+
+      expect(results.active.total).toBe(4);
+      expect(results.archived.total).toBe(4);
+      expect(results.active.results).toHaveLength(2);
+      expect(results.archived.results).toHaveLength(2);
+      for (const result of results.active.results) {
+        expect(activeIds).toContain(result.thread.id);
+        expect(result.thread.archivedAt).toBeNull();
+      }
+      for (const result of results.archived.results) {
+        expect(archivedIds).toContain(result.thread.id);
+        expect(result.thread.archivedAt).not.toBeNull();
+      }
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("bounds message snippets around the first highlight with rebased ranges", () => {
+    const { db, project } = setup();
+    try {
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Long message thread",
+      });
+      const filler = Array.from(
+        { length: 80 },
+        (_, index) => `word${index}`,
+      ).join(" ");
+      const text = `${filler} snippetneedle here ${filler} snippetneedle again ${filler}`;
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: thread.id,
+            sourceKind: "assistant_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text,
+          },
+        ],
+      });
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "SnippetNeedle",
+        limitPerGroup: 20,
+      });
+
+      const match = results.active.results[0]?.matches.find(
+        (candidate) => candidate.sourceKind === "assistant_message",
+      );
+      expect(match).toBeDefined();
+      if (match === undefined) {
+        return;
+      }
+      expect(match.text.length).toBeLessThanOrEqual(162);
+      expect(match.text.startsWith("…")).toBe(true);
+      expect(match.text.endsWith("…")).toBe(true);
+      expect(match.text).toContain("snippetneedle here");
+      expect(match.highlightRanges.length).toBeGreaterThan(0);
+      for (const range of match.highlightRanges) {
+        expect(match.text.slice(range.start, range.end)).toBe("snippetneedle");
+      }
+      expect(match.text.slice(1)).toMatch(/^word\d+ /u);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("returns short messages whole and cuts unmatched long text from the start", () => {
+    const { db, project } = setup();
+    try {
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Snippet edge thread",
+      });
+      const longTail = "x".repeat(400);
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: thread.id,
+            sourceKind: "user_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: "wholeneedle stays intact",
+          },
+          {
+            threadId: thread.id,
+            sourceKind: "user_message",
+            sourceKey: "event:2",
+            sourceSeq: 2,
+            text: `leadneedle then ${longTail}`,
+          },
+        ],
+      });
+
+      const wholeResults = searchThreadsWithPendingInteractionState(db, {
+        query: "wholeneedle",
+        limitPerGroup: 20,
+      });
+      expect(wholeResults.active.results[0]?.matches[0]).toMatchObject({
+        text: "wholeneedle stays intact",
+        highlightRanges: [{ start: 0, end: 11 }],
+      });
+
+      const leadResults = searchThreadsWithPendingInteractionState(db, {
+        query: "leadneedle",
+        limitPerGroup: 20,
+      });
+      const leadMatch = leadResults.active.results[0]?.matches[0];
+      expect(leadMatch?.text.startsWith("leadneedle then ")).toBe(true);
+      expect(leadMatch?.text.endsWith("…")).toBe(true);
+      expect(leadMatch?.text.length).toBeLessThanOrEqual(161);
+      expect(leadMatch?.highlightRanges).toEqual([{ start: 0, end: 10 }]);
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("never splits a surrogate pair when cutting a snippet", () => {
+    const { db, project } = setup();
+    try {
+      const thread = createThread(db, noopNotifier, {
+        projectId: project.id,
+        providerId: "codex",
+        title: "Emoji thread",
+      });
+      const emoji = "\u{1F600}".repeat(100);
+      upsertThreadSearchSegments(db, {
+        segments: [
+          {
+            threadId: thread.id,
+            sourceKind: "assistant_message",
+            sourceKey: "event:1",
+            sourceSeq: 1,
+            text: `${emoji}surrogateneedle${emoji}`,
+          },
+        ],
+      });
+
+      const results = searchThreadsWithPendingInteractionState(db, {
+        query: "surrogateneedle",
+        limitPerGroup: 20,
+      });
+
+      const match = results.active.results[0]?.matches[0];
+      expect(match).toBeDefined();
+      if (match === undefined) {
+        return;
+      }
+      expect(match.text).not.toMatch(/[\uD800-\uDFFF]/u);
+      expect(match.text.startsWith("…")).toBe(true);
+      expect(match.text.endsWith("…")).toBe(true);
+      expect(match.highlightRanges).toHaveLength(1);
+      const range = match.highlightRanges[0];
+      expect(
+        range === undefined ? null : match.text.slice(range.start, range.end),
+      ).toBe("surrogateneedle");
+    } finally {
+      closeConnection(db);
+    }
+  });
+
+  it("creates the FTS index with a prefix index for typeahead queries", () => {
+    const { db } = setup();
+    try {
+      const row = db.$client
+        .prepare<[], { sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'thread_search_segments_fts'",
+        )
+        .get();
+      expect(row?.sql).toContain("prefix = '2 3'");
     } finally {
       closeConnection(db);
     }
@@ -420,7 +899,6 @@ describe("thread search data", () => {
       expect(results.active.results[0]?.matches[0]).toMatchObject({
         text: "café planning",
         highlightRanges: [{ start: 0, end: 4 }],
-        // Title matches have no message to anchor a deep-link to.
         sourceSeq: null,
       });
     } finally {

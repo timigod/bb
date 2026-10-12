@@ -13,21 +13,22 @@ import type {
 } from "./thread-create-request.js";
 import { resolveCreateThreadExecutionDefaults } from "./thread-default-policy.js";
 
-export interface RememberProjectExecutionDefaultsForCreateArgs {
+interface RememberProjectExecutionDefaultsForCreateArgs {
   execution: ResolvedThreadExecutionOptions;
   request: ThreadCreateServiceRequest;
 }
 
-export interface ResolveProjectExecutionDefaultsForCreateArgs {
+interface ResolveProjectExecutionDefaultsForCreateArgs {
   executionInputSources?: ThreadCreateServiceRequestInput["executionInputSources"];
   model?: ThreadCreateServiceRequestInput["model"];
   projectId: string;
   providerId?: ThreadCreateServiceRequestInput["providerId"];
 }
 
-export interface ResolvedProjectExecutionDefaultsForCreate {
+interface ResolvedProjectExecutionDefaultsForCreate {
   executionDefaults: ProjectExecutionDefaults | null;
   providerId: string;
+  providerFallbackCandidates: readonly string[];
   requestedModel: string | null;
 }
 
@@ -50,9 +51,6 @@ function shouldRememberProjectExecutionDefaults(args: {
   // a fresh default-shaping event. Don't overwrite the project's stored
   // execution defaults with the picker selections made for that single thread.
   if (args.environment.type === "reuse") return false;
-  // Fork/side-chat spawns inherit execution from their source thread and carry
-  // forced/inherited values the user never picked in the composer (e.g. a side
-  // chat's readonly mode). They must not reshape the project's stored defaults.
   if (args.originKind !== null) return false;
   return args.origin === "app";
 }
@@ -71,8 +69,14 @@ function resolveRequestedCreateExecutionValue<TValue>({
   return sources[field] === undefined ? undefined : value;
 }
 
+/**
+ * Resolves the create's provider through the defaults ladder. This is the only
+ * place a thread's provider is chosen: it is immutable afterwards, because a
+ * provider session IS the conversation and no other provider can continue one
+ * it never started.
+ */
 export function resolveProjectExecutionDefaultsForCreate(
-  deps: Pick<AppDeps, "db">,
+  deps: Pick<AppDeps, "db" | "providerRegistry">,
   args: ResolveProjectExecutionDefaultsForCreateArgs,
 ): ResolvedProjectExecutionDefaultsForCreate {
   const storedDefaults = getProjectExecutionDefaults(deps.db, {
@@ -88,15 +92,20 @@ export function resolveProjectExecutionDefaultsForCreate(
     sources: args.executionInputSources,
     value: args.model,
   });
-  const resolution = resolveCreateThreadExecutionDefaults({
-    requestedProviderId,
-    storedDefaults,
-  });
-  const { executionDefaults, providerId } = resolution;
+  const resolution = resolveCreateThreadExecutionDefaults(
+    deps.providerRegistry,
+    {
+      requestedProviderId,
+      storedDefaults,
+    },
+  );
+  const { executionDefaults, providerId, providerFallbackCandidates } =
+    resolution;
 
   return {
     executionDefaults,
     providerId,
+    providerFallbackCandidates,
     requestedModel: requestedModel ?? null,
   };
 }

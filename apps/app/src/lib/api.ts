@@ -1,23 +1,21 @@
-// Legacy raw-HTTP escape hatch. New call sites must use @/lib/sdk.
 import { extractErrorMessage, toRecord } from "@bb/core-ui";
 import type { SystemVoiceTranscriptionResponse } from "@bb/server-contract";
 import { apiClient, toRelativeUrl } from "./api-server";
 import { appSurfaceRequestInit } from "./app-surface";
 import {
+  FILE_PREVIEW_SAMPLE_BYTES,
   buildFilePreview,
+  buildFilePreviewFromSample,
   normalizeFilePreviewMimeType,
   type FilePreview,
   type FilePreviewTarget,
-} from "./file-preview";
+} from "@bb/client-core";
 import {
   buildThreadHostFileContentUrl,
-  buildThreadStorageContentUrl,
+  buildThreadStorageRawContentUrl,
 } from "./file-content-urls";
 
 const HTML_DOCUMENT_PATTERN = /<!doctype html|<html[\s>]/i;
-const ERROR_EXTRACT_OPTS = {
-  legacyKeys: ["detail"] as const,
-};
 
 function normalizeErrorText(raw: string): string {
   return raw.replace(/\s+/g, " ").trim();
@@ -46,63 +44,41 @@ export class HttpError extends Error {
   }
 }
 
-function deriveHttpErrorMessage(
+function parseHttpError(
   status: number,
   statusText: string,
   rawBody: string,
   contentType: string | null,
-): string {
+): { message: string; body: unknown } {
   const normalized = normalizeErrorText(rawBody);
   if (normalized.length === 0) {
-    return statusText || "Request failed";
+    return { message: statusText || "Request failed", body: undefined };
   }
   const shouldParseAsJson =
     (contentType?.includes("application/json") ?? false) ||
     normalized.startsWith("{") ||
     normalized.startsWith("[");
+  let body: unknown;
   if (shouldParseAsJson) {
     try {
-      const parsed = JSON.parse(normalized) as unknown;
-      const message = extractErrorMessage(parsed, ERROR_EXTRACT_OPTS);
+      body = JSON.parse(normalized);
+      const message = extractErrorMessage(body);
       if (message) {
-        return message;
+        return { message, body };
       }
-    } catch {
-      // Fall through to non-JSON handling.
-    }
+    } catch {}
   }
   if (HTML_DOCUMENT_PATTERN.test(normalized)) {
     if (status === 401 || status === 403) {
-      return "Authentication failed";
+      return { message: "Authentication failed", body };
     }
-    return statusText || "Request failed";
+    return { message: statusText || "Request failed", body };
   }
-  return (
-    (extractErrorMessage(normalized, ERROR_EXTRACT_OPTS) ?? statusText) ||
-    "Request failed"
-  );
-}
-
-function parseHttpErrorBody(
-  rawBody: string,
-  contentType: string | null,
-): unknown | undefined {
-  const normalized = normalizeErrorText(rawBody);
-  if (normalized.length === 0) {
-    return undefined;
-  }
-  const shouldParseAsJson =
-    (contentType?.includes("application/json") ?? false) ||
-    normalized.startsWith("{") ||
-    normalized.startsWith("[");
-  if (!shouldParseAsJson) {
-    return undefined;
-  }
-  try {
-    return JSON.parse(normalized) as unknown;
-  } catch {
-    return undefined;
-  }
+  return {
+    message:
+      (extractErrorMessage(normalized) ?? statusText) || "Request failed",
+    body,
+  };
 }
 
 function extractErrorCode(value: unknown): string | undefined {
@@ -117,14 +93,12 @@ function extractErrorCode(value: unknown): string | undefined {
 
 async function throwHttpError(res: Response): Promise<never> {
   const rawBody = await res.text().catch(() => "");
-  const contentType = res.headers.get("content-type");
-  const message = deriveHttpErrorMessage(
+  const { message, body } = parseHttpError(
     res.status,
     res.statusText,
     rawBody,
-    contentType,
+    res.headers.get("content-type"),
   );
-  const body = parseHttpErrorBody(rawBody, contentType);
   throw new HttpError({
     status: res.status,
     message,
@@ -151,28 +125,73 @@ export async function request<T>(
   return JSON.parse(text) as T;
 }
 
-async function loadFilePreview(
+const FILE_PREVIEW_SAMPLE_RANGE = `bytes=0-${FILE_PREVIEW_SAMPLE_BYTES - 1}`;
+const EMPTY_RANGE_STATUS = 416;
+const PARTIAL_CONTENT_STATUS = 206;
+
+function parseContentRangeSize(value: string | null): number {
+  const size = Number(value?.split("/")[1]);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error("File response has no usable Content-Range size");
+  }
+  return size;
+}
+
+function responseMimeType(response: Response): string {
+  return normalizeFilePreviewMimeType(response.headers.get("content-type"));
+}
+
+export async function loadFilePreview(
   target: FilePreviewTarget,
   signal?: AbortSignal,
 ): Promise<FilePreview> {
+  const sample = await fetch(
+    target.url,
+    appSurfaceRequestInit({
+      method: "GET",
+      cache: "no-store",
+      headers: { range: FILE_PREVIEW_SAMPLE_RANGE },
+      signal,
+    }),
+  );
+  if (sample.status === EMPTY_RANGE_STATUS) {
+    return buildFilePreview({
+      ...target,
+      contentBytes: new Uint8Array(),
+      mimeType: responseMimeType(sample),
+    });
+  }
+  if (!sample.ok) {
+    await throwHttpError(sample);
+  }
+  const sampleBytes = new Uint8Array(await sample.arrayBuffer());
+  const sizeBytes =
+    sample.status === PARTIAL_CONTENT_STATUS
+      ? parseContentRangeSize(sample.headers.get("content-range"))
+      : sampleBytes.byteLength;
+  const mimeType = responseMimeType(sample);
+  if (sampleBytes.byteLength >= sizeBytes) {
+    return buildFilePreview({ ...target, contentBytes: sampleBytes, mimeType });
+  }
+  const samplePreview = buildFilePreviewFromSample({
+    ...target,
+    mimeType,
+    sampleBytes,
+    sizeBytes,
+  });
+  if (samplePreview !== null) {
+    return samplePreview;
+  }
   const response = await requestResponse(
     fetch(
       target.url,
-      appSurfaceRequestInit({
-        method: "GET",
-        signal,
-      }),
+      appSurfaceRequestInit({ method: "GET", cache: "default", signal }),
     ),
   );
-  const contentBytes = new Uint8Array(await response.arrayBuffer());
   return buildFilePreview({
-    contentBytes,
-    mimeType: normalizeFilePreviewMimeType(
-      response.headers.get("content-type"),
-    ),
-    name: target.name,
-    path: target.path,
-    url: target.url,
+    ...target,
+    contentBytes: new Uint8Array(await response.arrayBuffer()),
+    mimeType: responseMimeType(response),
   });
 }
 
@@ -189,19 +208,16 @@ async function postMultipart<T>(
     }
   }
   formData.set("file", file, file.name);
-  const res = await fetch(
-    toRelativeUrl(url),
-    appSurfaceRequestInit({
-      method: "POST",
-      body: formData,
-      signal,
-    }),
+  return request<T>(
+    fetch(
+      toRelativeUrl(url),
+      appSurfaceRequestInit({
+        method: "POST",
+        body: formData,
+        signal,
+      }),
+    ),
   );
-  if (!res.ok) {
-    await throwHttpError(res);
-  }
-  const text = await res.text();
-  return JSON.parse(text) as T;
 }
 
 export async function transcribeVoiceInput(
@@ -226,7 +242,7 @@ export async function getThreadStorageFilePreview(
   return loadFilePreview(
     {
       path,
-      url: buildThreadStorageContentUrl(id, path),
+      url: buildThreadStorageRawContentUrl(id, path),
     },
     signal,
   );

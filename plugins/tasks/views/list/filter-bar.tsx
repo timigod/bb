@@ -5,15 +5,15 @@ import {
   type TaskPriority,
   type TaskStatus,
 } from "../../shared/contract.js";
-import { TASK_SORTS, type TaskSort } from "../../shared/sort.js";
+import { TASK_SORTS, type TaskSort } from "../../shared/pagination.js";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
-import { Icon, type IconName } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/dropdown-menu";
+import { Icon, type IconName } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import { PriorityIcon, StatusIcon } from "./icons.js";
 import {
   PRIORITY_LABELS,
@@ -25,6 +25,15 @@ import {
 function toggled<T>(values: readonly T[], value: T, checked: boolean): T[] {
   if (checked) return values.includes(value) ? [...values] : [...values, value];
   return values.filter((existing) => existing !== value);
+}
+
+function chipTriggerClass(active: boolean): string {
+  return cn(
+    "flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs max-md:pointer-coarse:h-8",
+    active
+      ? "border-border bg-secondary text-foreground"
+      : "border-dashed border-border text-muted-foreground hover:border-input hover:text-foreground",
+  );
 }
 
 function FilterChip({
@@ -42,15 +51,7 @@ function FilterChip({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className={cn(
-            "flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs max-md:pointer-coarse:h-8",
-            active
-              ? "border-border bg-secondary text-foreground"
-              : "border-dashed border-border text-muted-foreground hover:border-input hover:text-foreground",
-          )}
-        >
+        <button type="button" className={chipTriggerClass(active)}>
           <Icon name={icon} className="size-3" />
           {label}
           {active ? (
@@ -78,15 +79,7 @@ function SortChip({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className={cn(
-            "flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs max-md:pointer-coarse:h-8",
-            active
-              ? "border-border bg-secondary text-foreground"
-              : "border-dashed border-border text-muted-foreground hover:border-input hover:text-foreground",
-          )}
-        >
+        <button type="button" className={chipTriggerClass(active)}>
           <Icon name="Sort" className="size-3" />
           Sort
           {active ? (
@@ -94,8 +87,6 @@ function SortChip({
           ) : null}
         </button>
       </DropdownMenuTrigger>
-      {/* Checkbox items with exactly-one-checked semantics: the shared radio
-          primitives render nothing on compact viewports. */}
       <DropdownMenuContent
         align="end"
         className="min-w-44"
@@ -153,14 +144,9 @@ export function ListFilterBar({
   taskCount: number | undefined;
 }) {
   const keepOpen = (event: Event) => event.preventDefault();
-  // Show the Label chip whenever there are options or a remembered selection
-  // (including stale names that no longer exist in the catalog).
   const showLabelChip =
     labelOptions.length > 0 || filters.labelNames.length > 0;
   return (
-    // The chips live in their own horizontal scroller while the task count is
-    // pinned outside it, so the count never wraps and stays visible however
-    // many chips overflow a narrow container.
     <div className="flex shrink-0 items-center gap-1.5 border-b border-border-hairline px-3.5 py-1.5">
       <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
         <FilterChip
@@ -294,8 +280,6 @@ export function ListFilterBar({
           </button>
         ) : null}
       </div>
-      {/* Sort and the count sit outside the scroller so they stay visible and
-          aligned however far the filter chips overflow. */}
       <SortChip sort={sort} onChange={onSortChange} />
       <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-subtle-foreground">
         {taskCount === undefined

@@ -4,7 +4,7 @@ import {
   commandRow,
   conversationRow,
   fileChangeRow,
-  readIntent,
+  fileReadRow,
   systemRow,
   toolRow,
 } from "@/test/fixtures/thread-timeline-rows";
@@ -13,21 +13,6 @@ import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
 export default {
   title: "thread/timeline/Prominence Ramp",
 };
-
-// ---------------------------------------------------------------------------
-// The timeline runs three prominence tiers, and this story exercises every row
-// kind against them so the active/inactive ramp can be judged comprehensively:
-//
-//   1. agent prose                       full `text-foreground`   (most prominent)
-//   2. the live frontier — active rows
-//      AND the active-latest bundle      full opacity             (next)
-//   3. the finished past — completed
-//      leaf rows, bundle/step/turn
-//      summaries, and done system rows    opacity-55              (receded)
-//
-// Errors, interruptions, and still-running rows deliberately stay at full
-// strength so failures and live work keep attention.
-// ---------------------------------------------------------------------------
 
 const THREAD_ID = "thr_ramp";
 const TURN_ID = "turn_ramp_1";
@@ -41,8 +26,6 @@ const baseProps = {
   workspaceRootPath: undefined,
 };
 
-// ---- Tier 1: agent prose --------------------------------------------------
-
 const proseRow: TimelineRow = conversationRow({
   id: `${THREAD_ID}:assistant:1`,
   threadId: THREAD_ID,
@@ -53,8 +36,6 @@ const proseRow: TimelineRow = conversationRow({
   createdAt: 1777944000000,
   text: "The workspace watcher outlives the provider process, so it lingers for the daemon's lifetime. I'll confirm the two call sites, then tighten the idle TTL.",
 });
-
-// ---- Tier 2 vs 3: individual work rows ------------------------------------
 
 const runningTool: TimelineRow = toolRow({
   id: `${THREAD_ID}:tool:active`,
@@ -132,11 +113,6 @@ const leafRampRows: TimelineRow[] = [
   doneFileChange,
 ];
 
-// ---- Tier 2 vs 3: bundle summary ------------------------------------------
-// Consecutive same-concept work rows project into one bundle-summary. Idle
-// scope keeps it receded; active scope makes the trailing bundle the live
-// frontier (shimmering verb, full opacity).
-
 function bundleCommand(
   seq: number,
   command: string,
@@ -168,8 +144,6 @@ const commandBundleRows: TimelineRow[] = [
   bundleCommand(22, "pnpm exec turbo run typecheck --filter=@bb/host-daemon"),
 ];
 
-// Active-latest variant: the last command is still running, so the live
-// frontier's "Running 3 commands" label matches its in-flight child.
 const activeCommandBundleRows: TimelineRow[] = [
   bundleCommand(23, "pnpm exec turbo run build --filter=@bb/host-daemon"),
   bundleCommand(24, "pnpm exec turbo run test --filter=@bb/host-daemon"),
@@ -180,18 +154,14 @@ const activeCommandBundleRows: TimelineRow[] = [
   ),
 ];
 
-// ---- Tier 3: step summary -------------------------------------------------
-// Multiple work rows closed by an assistant-message boundary collapse into a
-// step-summary recap ("Explored N files").
-
 function explorationRead(
   seq: number,
   path: string,
   status: TimelineRowStatus = "completed",
 ): TimelineRow {
   const pending = status === "pending";
-  return toolRow({
-    id: `${THREAD_ID}:tool:explore_${seq}`,
+  return fileReadRow({
+    id: `${THREAD_ID}:file-read:explore_${seq}`,
     threadId: THREAD_ID,
     turnId: TURN_ID,
     sourceSeqStart: seq,
@@ -199,10 +169,7 @@ function explorationRead(
     createdAt: pending ? Date.now() : 1777944020100 + seq,
     status,
     callId: `call_ramp_explore_${seq}`,
-    toolName: "Read",
-    toolArgs: { file_path: path },
-    output: pending ? "" : "...file contents...",
-    activityIntents: [readIntent({ path })],
+    path,
     durationMs: pending ? null : 60,
   });
 }
@@ -213,8 +180,6 @@ const stepExplorationRows: TimelineRow[] = [
   explorationRead(32, "packages/host-daemon/src/runtime/session.ts"),
 ];
 
-// Active-latest variant for the capstone frontier: the last read is still
-// running, so the live "Exploring 3 files" bundle has an in-flight child.
 const activeExplorationRows: TimelineRow[] = [
   explorationRead(34, "packages/host-daemon/src/workspace/watcher.ts"),
   explorationRead(35, "packages/host-daemon/src/runtime/session.ts"),
@@ -236,8 +201,6 @@ const stepSummaryRows: TimelineRow[] = [
   ...stepExplorationRows,
   stepClosingMessage,
 ];
-
-// ---- Tier 2 vs 3: system rows ---------------------------------------------
 
 const activeSystemRow: TimelineRow = systemRow({
   id: `${THREAD_ID}:system:active`,
@@ -265,10 +228,6 @@ const doneSystemRow: TimelineRow = systemRow({
 
 const systemRampRows: TimelineRow[] = [activeSystemRow, doneSystemRow];
 
-// ---- Capstone: full stack -------------------------------------------------
-// A live turn under active scope: bright prose, a finished commands bundle that
-// recedes, then the trailing exploration bundle as the active-latest frontier.
-
 const fullStackRows: TimelineRow[] = [
   proseRow,
   ...commandBundleRows,
@@ -278,7 +237,10 @@ const fullStackRows: TimelineRow[] = [
 export function Overview() {
   return (
     <StoryCard labelWidth="260px">
-      <StoryRow label="tier 1 · agent prose" hint="full foreground — most prominent">
+      <StoryRow
+        label="tier 1 · agent prose"
+        hint="full foreground — most prominent"
+      >
         <TimelineStage>
           <ThreadTimelineRows {...baseProps} timelineRows={[proseRow]} />
         </TimelineStage>
@@ -296,10 +258,7 @@ export function Overview() {
         hint="idle scope — the rolled-up bundle recedes with the rest of the past layer"
       >
         <TimelineStage>
-          <ThreadTimelineRows
-            {...baseProps}
-            timelineRows={commandBundleRows}
-          />
+          <ThreadTimelineRows {...baseProps} timelineRows={commandBundleRows} />
         </TimelineStage>
       </StoryRow>
       <StoryRow

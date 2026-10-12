@@ -1,4 +1,5 @@
 import http from "node:http";
+import { once } from "node:events";
 import net, { type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -31,6 +32,84 @@ afterEach(async () => {
 });
 
 describe("startMachineAuthProxy", () => {
+  it.each(["upstream", "client"])(
+    "contains a %s connection reset after a WebSocket upgrade",
+    async (resetSide) => {
+      const upstream = net.createServer((socket) => {
+        socket.once("data", () => {
+          socket.write(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+          );
+          socket.once("data", () => socket.resetAndDestroy());
+        });
+      });
+      const upstreamConnected = once(upstream, "connection");
+      const upstreamPort = await listen(upstream);
+      const proxy = await startMachineAuthProxy({
+        serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
+        serverUrl: `http://127.0.0.1:${upstreamPort}`,
+      });
+      proxies.push(proxy);
+      const proxyUrl = new URL(proxy.serverUrl);
+      const client = net.connect(Number(proxyUrl.port), proxyUrl.hostname);
+      try {
+        await once(client, "connect");
+        client.write(
+          `GET /ws HTTP/1.1\r\nHost: ${proxyUrl.host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`,
+        );
+        await once(client, "data");
+        const [upstreamSocket] = await upstreamConnected;
+        const upstreamClosed = once(upstreamSocket, "close");
+        const closed = once(client, "close");
+        if (resetSide === "upstream") {
+          client.write("trigger reset");
+        } else {
+          client.resetAndDestroy();
+        }
+        await Promise.all([closed, upstreamClosed]);
+        expect(client.destroyed).toBe(true);
+      } finally {
+        client.destroy();
+      }
+    },
+  );
+
+  it.each(["resets", "closes"])(
+    "fails the caller's response when the upstream connection %s mid-body",
+    async (drop) => {
+      let dropUpstream = () => {};
+      const upstream = http.createServer((_request, response) => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write("data: first\n\n");
+        dropUpstream = () => {
+          if (drop === "resets") response.socket?.resetAndDestroy();
+          else response.socket?.destroy();
+        };
+      });
+      const upstreamPort = await listen(upstream);
+      const proxy = await startMachineAuthProxy({
+        serverHeaders: {},
+        serverUrl: `http://127.0.0.1:${upstreamPort}`,
+      });
+      proxies.push(proxy);
+
+      const response = await new Promise<http.IncomingMessage>(
+        (resolve, reject) => {
+          http.get(`${proxy.serverUrl}/stream`, resolve).on("error", reject);
+        },
+      );
+      const closed = new Promise<void>((resolve) =>
+        response.on("close", resolve),
+      );
+      response.on("error", () => {});
+      response.once("data", () => dropUpstream());
+      response.resume();
+      await closed;
+
+      expect(response.complete).toBe(false);
+    },
+  );
+
   it("forwards HTTP requests to the configured origin with authentication and caller headers", async () => {
     const upstream = http.createServer((request, response) => {
       expect(request.method).toBe("POST");
@@ -47,7 +126,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -108,7 +187,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_attachment_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_attachment_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -144,7 +223,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -173,7 +252,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -213,10 +292,6 @@ describe("startMachineAuthProxy", () => {
     expect(upstreamRequests).toBe(0);
   });
 
-  // The in-app browser can now reach any unreserved loopback port, and this
-  // proxy's port is chosen at random so no reserved list can name it. A browsed
-  // page must not be able to borrow the machine credential with a blind
-  // `no-cors` request, whose response it cannot read but whose effect lands.
   it("rejects browser-originated requests without reaching upstream", async () => {
     let upstreamRequests = 0;
     const upstream = http.createServer((_request, response) => {
@@ -225,15 +300,13 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
 
     const browserHeaders: Array<Record<string, string>> = [
-      // A blind cross-origin POST: no preflight, and the effect still lands.
       { origin: "http://127.0.0.1:3009", "content-type": "text/plain" },
-      // A blind `no-cors` GET carries no Origin, but Chromium still marks it.
       { "sec-fetch-site": "cross-site" },
     ];
     for (const headers of browserHeaders) {
@@ -246,8 +319,6 @@ describe("startMachineAuthProxy", () => {
     }
     expect(upstreamRequests).toBe(0);
 
-    // A runtime process using Node's own `fetch` still gets through. Node sends
-    // `sec-fetch-mode: cors`, so that header must not be a discriminator.
     const allowed = await fetch(`${proxy.serverUrl}/api/v1/threads`, {
       method: "POST",
       body: "{}",
@@ -265,7 +336,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -290,11 +361,6 @@ describe("startMachineAuthProxy", () => {
     expect(upstreamUpgrades).toBe(0);
   });
 
-  // A page on a public hostname that DNS-rebinds to 127.0.0.1 reaches this
-  // socket with that name in `Host`, and Chromium sends no `Origin` or
-  // `Sec-Fetch-*` for a `no-cors` GET to a non-trustworthy URL — so the header
-  // check alone cannot see it. Verified in Electron with
-  // `--host-resolver-rules="MAP rebind.example 127.0.0.1"`.
   it("rejects a rebound public Host without reaching upstream", async () => {
     let upstreamRequests = 0;
     const upstream = http.createServer((_request, response) => {
@@ -303,7 +369,7 @@ describe("startMachineAuthProxy", () => {
     });
     const upstreamPort = await listen(upstream);
     const proxy = await startMachineAuthProxy({
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: `http://127.0.0.1:${upstreamPort}`,
     });
     proxies.push(proxy);
@@ -325,13 +391,10 @@ describe("startMachineAuthProxy", () => {
       });
     }
 
-    // No Origin, no Sec-Fetch-Site: only the Host header gives it away.
     expect(await statusForHost(`rebind.example:${proxyUrl.port}`)).toBe(403);
-    // A mismatched port on a loopback name is not this proxy either.
     expect(await statusForHost("127.0.0.1:1")).toBe(403);
     expect(upstreamRequests).toBe(0);
 
-    // The authorities a real runtime client sends still pass.
     for (const host of [
       `127.0.0.1:${proxyUrl.port}`,
       `localhost:${proxyUrl.port}`,
@@ -348,7 +411,7 @@ describe("startMachineAuthProxy", () => {
 
     await expect(
       startMachineAuthProxy({
-        machineCredential: "bbcm_machine",
+        serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
         port,
         serverUrl: "http://server.test",
       }),

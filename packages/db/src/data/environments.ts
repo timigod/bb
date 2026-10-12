@@ -1,36 +1,42 @@
-import { and, eq, inArray, ne, sql, lt } from "drizzle-orm";
+import { prepareCachedQuery } from "../connection.js";
+import { and, asc, eq, inArray, isNotNull, isNull, ne, or, placeholder, sql } from "drizzle-orm";
 import type {
   DiscoveredWorkspaceProperties,
   EnvironmentChangeKind,
   EnvironmentLifecycleEvent,
   EnvironmentLifecycleNoopReason,
+  EnvironmentProviderSelection,
   EnvironmentStatus,
-  WorkspaceProvisionType,
 } from "@bb/domain";
-import { evaluateEnvironmentLifecycleEvent } from "@bb/domain";
-import type { DbConnection, DbTransaction } from "../connection.js";
+import { areHostPathsEqual, evaluateEnvironmentLifecycleEvent } from "@bb/domain";
+import type { DbConnection, DbTransaction, DbQueryConnection } from "../connection.js";
 import type { DbNotifier } from "../notifier.js";
-import { environments } from "../schema.js";
+import { environments, threads } from "../schema.js";
 import { createEnvironmentId } from "../ids.js";
+import { hostPathContains, hostPathEquals } from "./host-path-sql.js";
 
 type EnvironmentReadConnection = DbConnection | DbTransaction;
 type EnvironmentWriteConnection = DbConnection | DbTransaction;
-type EnvironmentRow = typeof environments.$inferSelect;
+export type EnvironmentRow = typeof environments.$inferSelect;
 
 export interface CreateEnvironmentInput {
   name?: string | null;
   projectId: string;
   hostId: string;
-  workspaceProvisionType: WorkspaceProvisionType;
   path?: string | null;
-  managed?: boolean;
   isGitRepo?: boolean;
-  isWorktree?: boolean;
   branchName?: string | null;
   baseBranch?: string | null;
   defaultBranch?: string | null;
   mergeBaseBranch?: string | null;
   status?: EnvironmentStatus;
+  providerOwnsPath: boolean;
+  environmentProvider?: {
+    environmentProviderId: string;
+    pluginId?: string;
+    instanceKey: string | null;
+    selection: EnvironmentProviderSelection;
+  } | null;
 }
 
 export function createEnvironment(
@@ -48,16 +54,20 @@ export function createEnvironment(
       projectId: input.projectId,
       hostId: input.hostId,
       path: input.path ?? null,
-      managed: input.managed ?? false,
       isGitRepo: input.isGitRepo ?? false,
-      isWorktree: input.isWorktree ?? false,
       branchName: input.branchName ?? null,
       baseBranch: input.baseBranch ?? null,
       defaultBranch: input.defaultBranch ?? null,
       mergeBaseBranch: input.mergeBaseBranch ?? null,
-      workspaceProvisionType: input.workspaceProvisionType,
+      environmentProviderId:
+        input.environmentProvider?.environmentProviderId ?? null,
+      environmentProviderPluginId: input.environmentProvider?.pluginId ?? null,
+      environmentProviderSelection:
+        input.environmentProvider?.selection ?? null,
+      environmentProviderInstanceKey:
+        input.environmentProvider?.instanceKey ?? null,
+      providerOwnsPath: input.providerOwnsPath,
       status: input.status ?? "provisioning",
-      retireRequestedAt: input.status === "retiring" ? now : null,
       createdAt: now,
       updatedAt: now,
     })
@@ -67,10 +77,15 @@ export function createEnvironment(
   return row;
 }
 
+const prepareGetEnvironment = (db: DbQueryConnection) =>
+  db
+    .select()
+    .from(environments)
+    .where(eq(environments.id, placeholder("id")))
+    .prepare();
+
 export function getEnvironment(db: EnvironmentReadConnection, id: string) {
-  return (
-    db.select().from(environments).where(eq(environments.id, id)).get() ?? null
-  );
+  return prepareCachedQuery(db, prepareGetEnvironment).get({ id }) ?? null;
 }
 
 export function findProjectEnvironmentByHostPath(
@@ -87,7 +102,7 @@ export function findProjectEnvironmentByHostPath(
         and(
           eq(environments.projectId, projectId),
           eq(environments.hostId, hostId),
-          eq(environments.path, path),
+          hostPathEquals(environments.path, path),
         ),
       )
       .get() ?? null
@@ -100,12 +115,25 @@ export interface FindForeignManagedEnvironmentAtHostPathArgs {
   projectId: string;
 }
 
-/**
- * A live bb-managed workspace at this directory owned by another project.
- * The environment claim is project-scoped, but the directory is physical:
- * destroying a managed environment deletes it, so no other project may attach
- * to it in place.
- */
+export function findProviderEnvironmentContainingPath(
+  db: DbConnection,
+  path: string,
+) {
+  return (
+    db
+      .select()
+      .from(environments)
+      .where(
+        and(
+          hostPathContains(environments.path, path),
+          eq(environments.providerOwnsPath, true),
+          ne(environments.status, "destroyed"),
+        ),
+      )
+      .get() ?? null
+  );
+}
+
 export function findForeignManagedEnvironmentAtHostPath(
   db: DbConnection,
   args: FindForeignManagedEnvironmentAtHostPathArgs,
@@ -117,8 +145,8 @@ export function findForeignManagedEnvironmentAtHostPath(
       .where(
         and(
           eq(environments.hostId, args.hostId),
-          eq(environments.path, args.path),
-          eq(environments.managed, true),
+          hostPathContains(environments.path, args.path),
+          eq(environments.providerOwnsPath, true),
           ne(environments.projectId, args.projectId),
           ne(environments.status, "destroyed"),
         ),
@@ -127,30 +155,80 @@ export function findForeignManagedEnvironmentAtHostPath(
   );
 }
 
-export function listEnvironments(db: DbConnection, projectId?: string) {
-  if (projectId) {
-    return db
-      .select()
-      .from(environments)
-      .where(eq(environments.projectId, projectId))
-      .all();
-  }
-  return db.select().from(environments).all();
+export interface ListEnvironmentsFilters {
+  environmentProviderId?: string;
+  hostId?: string;
+  instanceKey?: string;
+  limit?: number;
+  offset?: number;
+  path?: string;
+  projectId?: string;
+  statuses?: readonly EnvironmentStatus[];
 }
 
-export function listEnvironmentsByIds(
+export function listEnvironments(
   db: DbConnection,
-  environmentIds: readonly string[],
+  filters: ListEnvironmentsFilters = {},
 ) {
-  if (environmentIds.length === 0) {
-    return [];
-  }
-
-  return db
+  const conditions = [
+    filters.projectId === undefined
+      ? undefined
+      : eq(environments.projectId, filters.projectId),
+    filters.hostId === undefined
+      ? undefined
+      : eq(environments.hostId, filters.hostId),
+    filters.environmentProviderId === undefined
+      ? undefined
+      : eq(environments.environmentProviderId, filters.environmentProviderId),
+    filters.instanceKey === undefined
+      ? undefined
+      : eq(environments.environmentProviderInstanceKey, filters.instanceKey),
+    filters.path === undefined
+      ? undefined
+      : hostPathEquals(environments.path, filters.path),
+    filters.statuses === undefined
+      ? undefined
+      : inArray(environments.status, [...filters.statuses]),
+  ].filter((condition) => condition !== undefined);
+  const query = db
     .select()
     .from(environments)
-    .where(inArray(environments.id, [...environmentIds]))
+    .where(conditions.length === 0 ? undefined : and(...conditions))
+    .orderBy(asc(environments.createdAt), asc(environments.id))
+    .$dynamic();
+  const limited =
+    filters.limit === undefined ? query : query.limit(filters.limit);
+  const paged =
+    filters.offset === undefined ? limited : limited.offset(filters.offset);
+  return paged.all();
+}
+
+export function markHostEnvironmentsDestroyed(
+  db: EnvironmentWriteConnection,
+  notifier: DbNotifier,
+  hostId: string,
+): EnvironmentRow[] {
+  const updated = db
+    .update(environments)
+    .set({
+      path: null,
+      resource: null,
+      retireAt: null,
+      status: "destroyed",
+      teardownMessage: null,
+      teardownStatus: "removed",
+      updatedAt: Date.now(),
+    })
+    .where(eq(environments.hostId, hostId))
+    .returning()
     .all();
+  for (const environment of updated) {
+    notifier.notifyEnvironment(environment.id, [
+      "metadata-changed",
+      "status-changed",
+    ]);
+  }
+  return updated;
 }
 
 interface EnvironmentMetadataUpdateColumns {
@@ -262,7 +340,10 @@ function updateEnvironmentMetadataRecord(
   const metadata = buildEnvironmentMetadataUpdateSet(metadataInput);
   const updated = db
     .update(environments)
-    .set({ ...metadata, updatedAt: Date.now() })
+    .set({
+      ...metadata,
+      updatedAt: Date.now(),
+    })
     .where(eq(environments.id, id))
     .returning()
     .get();
@@ -306,11 +387,6 @@ export interface RecordProvisionedEnvironmentWorkspaceInput extends DiscoveredWo
   mergeBaseBranch?: string | null;
 }
 
-/**
- * Persists the workspace properties a provision result discovered. Pure
- * metadata — the status change rides the separate `provision.succeeded`
- * lifecycle event.
- */
 export function recordProvisionedEnvironmentWorkspace(
   db: EnvironmentWriteConnection,
   notifier: DbNotifier,
@@ -328,31 +404,6 @@ export function recordProvisionedEnvironmentWorkspace(
       ? { mergeBaseBranch: input.mergeBaseBranch }
       : {}),
   });
-}
-
-export interface ListStaleDestroyingManagedEnvironmentsArgs {
-  updatedBefore: number;
-}
-
-/**
- * Managed environments stuck in "destroying" whose destroy RPC result was
- * presumably lost. The sweep applies `destroy.lost` to each.
- */
-export function listStaleDestroyingManagedEnvironments(
-  db: DbConnection,
-  args: ListStaleDestroyingManagedEnvironmentsArgs,
-) {
-  return db
-    .select()
-    .from(environments)
-    .where(
-      and(
-        eq(environments.managed, true),
-        eq(environments.status, "destroying"),
-        lt(environments.updatedAt, args.updatedBefore),
-      ),
-    )
-    .all();
 }
 
 export type ApplyEnvironmentLifecycleEventNoopReason =
@@ -377,41 +428,8 @@ export interface ApplyEnvironmentLifecycleEventArgs {
   event: EnvironmentLifecycleEvent;
 }
 
-interface EnvironmentLifecycleEventNotAppliedErrorArgs {
-  detail: string;
-  reason: ApplyEnvironmentLifecycleEventNoopReason;
-}
-
-export class EnvironmentLifecycleEventNotAppliedError extends Error {
-  readonly detail: string;
-  readonly reason: ApplyEnvironmentLifecycleEventNoopReason;
-
-  constructor(args: EnvironmentLifecycleEventNotAppliedErrorArgs) {
-    super(
-      `Environment lifecycle event not applied (${args.reason}): ${args.detail}`,
-    );
-    this.name = "EnvironmentLifecycleEventNotAppliedError";
-    this.detail = args.detail;
-    this.reason = args.reason;
-  }
-}
-
-/**
- * For boundary callers where a no-op outcome is a real error (e.g. a 4xx
- * response): returns the updated row, or throws
- * EnvironmentLifecycleEventNotAppliedError.
- */
-export function requireEnvironmentLifecycleEventApplied(
-  outcome: ApplyEnvironmentLifecycleEventOutcome,
-) {
-  if (!outcome.applied) {
-    throw new EnvironmentLifecycleEventNotAppliedError(outcome);
-  }
-  return outcome.environment;
-}
-
-function applyEnvironmentLifecycleEventRecord(
-  db: EnvironmentWriteConnection,
+export function applyEnvironmentLifecycleEventInTransaction(
+  db: DbTransaction,
   args: ApplyEnvironmentLifecycleEventArgs,
 ): ApplyEnvironmentLifecycleEventOutcome {
   const environment = getEnvironment(db, args.environmentId);
@@ -440,53 +458,35 @@ function applyEnvironmentLifecycleEventRecord(
     status: evaluation.to,
     updatedAt: now,
   };
-  if (args.event.type === "retire.requested") {
-    set.retireRequestedAt = now;
-  } else if (
-    evaluation.to === "ready" ||
-    evaluation.to === "provisioning" ||
-    evaluation.to === "destroyed"
-  ) {
-    set.retireRequestedAt = null;
-  }
-  if (args.event.type === "destroy.started") {
-    set.destroyAttemptId = args.event.destroyAttemptId;
-  }
-  if (
-    args.event.type === "destroy.failed" ||
-    evaluation.to === "ready" ||
-    evaluation.to === "provisioning"
-  ) {
-    set.destroyAttemptId = null;
-  }
   if (evaluation.to === "destroyed") {
-    set.destroyAttemptId = null;
-    // The workspace no longer exists. Release its path claim and avoid
-    // retaining stale host-local filesystem data on the terminal row.
     set.path = null;
   }
 
-  // Compare-and-set on the loaded status: belt-and-braces under
-  // better-sqlite3's synchronous transactions, and the contract that survives
-  // any future executor change. The destroy claim additionally re-asserts the
-  // cross-table thread conditions the row cannot express, atomically with the
-  // status write.
   const conditions = [
     eq(environments.id, args.environmentId),
     eq(environments.status, environment.status),
   ];
-  if (args.event.type === "destroy.started") {
+  if (args.event.type === "destroy.recorded") {
     conditions.push(
-      sql`NOT EXISTS (
-        SELECT 1 FROM threads
-        WHERE threads.environment_id = ${environments.id}
-        AND threads.archived_at IS NULL
-        AND threads.deleted_at IS NULL
-      )`,
-      sql`NOT EXISTS (
-        SELECT 1 FROM threads
-        WHERE threads.environment_id = ${environments.id}
-        AND threads.status = 'stopping'
+      sql`(
+        EXISTS (
+          SELECT 1 FROM hosts
+          WHERE hosts.id = ${environments.hostId}
+          AND hosts.phase = 'removing'
+        )
+        OR (
+          NOT EXISTS (
+            SELECT 1 FROM threads
+            WHERE threads.environment_id = ${environments.id}
+            AND threads.archived_at IS NULL
+            AND threads.deleted_at IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM threads
+            WHERE threads.environment_id = ${environments.id}
+            AND threads.status = 'stopping'
+          )
+        )
       )`,
     );
   }
@@ -508,22 +508,13 @@ function applyEnvironmentLifecycleEventRecord(
   return { applied: true, changes: ["status-changed"], environment: updated };
 }
 
-/**
- * Single writer for environment lifecycle events: loads the row, evaluates
- * the event against ENVIRONMENT_LIFECYCLE and its supersession predicates,
- * applies the transition with a status compare-and-set, and stamps or clears
- * destroyAttemptId on start/settlement — all in one transaction. Never throws on stale or
- * illegal events; returns a typed outcome for the caller to log. Use
- * applyEnvironmentLifecycleEventInTransaction from inside an existing
- * transaction (the caller then owns notification of `outcome.changes`).
- */
 export function applyEnvironmentLifecycleEvent(
   db: DbConnection,
   notifier: DbNotifier,
   args: ApplyEnvironmentLifecycleEventArgs,
 ): ApplyEnvironmentLifecycleEventOutcome {
   const outcome = db.transaction(
-    (tx) => applyEnvironmentLifecycleEventRecord(tx, args),
+    (tx) => applyEnvironmentLifecycleEventInTransaction(tx, args),
     { behavior: "immediate" },
   );
   if (outcome.applied) {
@@ -532,9 +523,67 @@ export function applyEnvironmentLifecycleEvent(
   return outcome;
 }
 
-export function applyEnvironmentLifecycleEventInTransaction(
-  tx: DbTransaction,
-  args: ApplyEnvironmentLifecycleEventArgs,
-): ApplyEnvironmentLifecycleEventOutcome {
-  return applyEnvironmentLifecycleEventRecord(tx, args);
+export function getPreparingEnvironment(db: EnvironmentWriteConnection, threadId: string) {
+  return db.select().from(environments).where(eq(environments.ownerThreadId, threadId)).get() ?? null;
+}
+
+export function reserveEnvironment(db: EnvironmentWriteConnection, input: Omit<typeof environments.$inferInsert, "id" | "createdAt" | "updatedAt">) {
+  return db.transaction((tx) => {
+    if (input.ownerThreadId == null) throw new Error("Missing environment preparation owner");
+    const existing = getPreparingEnvironment(tx, input.ownerThreadId);
+    const now = Date.now();
+    if (existing !== null) {
+      if (existing.teardownStatus !== "removed") throw new Error("Previous environment cleanup is incomplete");
+      return tx.update(environments).set({ ...input, path: null, resource: null, claimPath: null, teardownStatus: null, teardownMessage: null, teardownAttempt: 0, retireAt: null, pendingLog: "", updatedAt: now }).where(eq(environments.id, existing.id)).returning().get()!;
+    }
+    return tx.insert(environments).values({ ...input, id: createEnvironmentId(), createdAt: now, updatedAt: now }).returning().get();
+  });
+}
+
+export function updatePreparingEnvironment(db: EnvironmentWriteConnection, row: EnvironmentRow): boolean {
+  return db.update(environments).set({ ...row, updatedAt: Date.now() }).where(and(eq(environments.id, row.id), row.ownerThreadId === null ? isNull(environments.ownerThreadId) : eq(environments.ownerThreadId, row.ownerThreadId), eq(environments.attempt, row.attempt))).run().changes > 0;
+}
+
+export function listProviderLifecycleEnvironments(db: EnvironmentWriteConnection, providerId: string, blocked: { pluginId: string; teardownMessage: string }) {
+  return db.select().from(environments).where(and(eq(environments.environmentProviderId, providerId), sql`not (${environments.ownerThreadId} is null and ${environments.teardownStatus} is 'failed' and ${environments.teardownMessage} is ${blocked.teardownMessage} and ${environments.environmentProviderPluginId} is not ${blocked.pluginId})`, or(isNull(environments.ownerThreadId), sql`${environments.teardownStatus} is not null`), sql`(${environments.retireAt} is not null or ${environments.teardownStatus} is not null or not exists (select 1 from ${threads} where ${threads.environmentId} = ${environments.id} and ${threads.archivedAt} is null and ${threads.deletedAt} is null))`, sql`(${environments.status} <> 'destroyed' OR ${environments.teardownStatus} IS NOT 'removed')`)).all();
+}
+
+export function environmentHasLiveThreads(db: EnvironmentWriteConnection, environmentId: string): boolean {
+  return db.select({ id: threads.id }).from(threads).where(and(eq(threads.environmentId, environmentId), or(and(isNull(threads.archivedAt), isNull(threads.deletedAt)), eq(threads.status, "stopping"), eq(threads.status, "active")))).limit(1).get() !== undefined;
+}
+
+export function releaseFinishedEnvironmentPreparationOwners(db: EnvironmentWriteConnection): void {
+  db.update(environments).set({ ownerThreadId: null }).where(and(isNotNull(environments.ownerThreadId), eq(environments.teardownStatus, "removed"), sql`not exists (select 1 from ${threads} where ${threads.id} = ${environments.ownerThreadId} and ${threads.deletedAt} is null)`)).run();
+}
+
+export function claimEnvironmentPath(db: DbConnection, provisioning: EnvironmentRow, path: string, allowCancelled = false): boolean {
+  return db.transaction((tx) => {
+    const current = getEnvironment(tx, provisioning.id);
+    if (current === null || current.attempt !== provisioning.attempt || current.ownerThreadId !== provisioning.ownerThreadId || (current.status !== "creating" && !(allowCancelled && current.teardownStatus === "running"))) return false;
+    if (current.claimPath !== null && !areHostPathsEqual(current.claimPath, path)) return false;
+    if (findEnvironmentPathClaim(tx, current.hostId, path, current) !== null) return false;
+    return updatePreparingEnvironment(tx, { ...current, claimPath: path });
+  }, { behavior: "immediate" });
+}
+
+export function findEnvironmentPathClaim(db: EnvironmentWriteConnection, hostId: string, path: string | null, owner: EnvironmentRow | null): EnvironmentRow | null {
+  return db.select().from(environments).where(and(
+    eq(environments.hostId, hostId),
+    path === null ? sql`${environments.claimPath} is not null` : hostPathEquals(environments.claimPath, path),
+    owner === null ? undefined : ne(environments.id, owner.id),
+    ne(environments.status, "destroyed"),
+  )).limit(1).get() ?? null;
+}
+
+export function bindEnvironmentPath(db: DbConnection, provisioning: EnvironmentRow, path: string): EnvironmentRow {
+  return db.transaction((tx) => {
+    const current = getEnvironment(tx, provisioning.id);
+    if (current === null || current.attempt !== provisioning.attempt || current.ownerThreadId !== provisioning.ownerThreadId) throw new Error("Environment preparation is no longer current");
+    const existing = tx.select().from(environments).where(and(eq(environments.hostId, current.hostId), hostPathEquals(environments.path, path), eq(environments.projectId, current.projectId))).get();
+    if (existing === undefined || existing.id === current.id) return current;
+    if (existing.teardownStatus !== null || (existing.status !== "ready" && existing.status !== "provisioning")) throw new Error("Workspace is not ready or cleanup is still pending");
+    if (existing.ownerThreadId !== null) throw new Error("Workspace is still being prepared by another thread");
+    tx.update(environments).set({ ownerThreadId: null, status: "destroyed", teardownStatus: "removed", claimPath: null, resource: null, path: null }).where(eq(environments.id, current.id)).run();
+    return tx.update(environments).set({ ownerThreadId: current.ownerThreadId, attempt: current.attempt, status: existing.status === "ready" ? "ready" : current.status, teardownStatus: current.teardownStatus, retireAt: current.retireAt, statusMessage: current.statusMessage, pendingLog: current.pendingLog, claimPath: current.claimPath, environmentProviderId: existing.environmentProviderId ?? current.environmentProviderId, environmentProviderPluginId: existing.environmentProviderId === null ? current.environmentProviderPluginId : existing.environmentProviderPluginId, environmentProviderSelection: existing.environmentProviderId === null ? current.environmentProviderSelection : existing.environmentProviderSelection, environmentProviderInstanceKey: existing.environmentProviderId === null ? current.environmentProviderInstanceKey : existing.environmentProviderInstanceKey }).where(eq(environments.id, existing.id)).returning().get()!;
+  }, { behavior: "immediate" });
 }

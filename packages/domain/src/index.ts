@@ -1,16 +1,16 @@
-// NOTE: "./thread-status.js" is deliberately not re-exported here. It has its
-// own subpath export (@bb/domain/thread-status) for low-level consumers, and
-// thread.ts re-exports its public names; starring it here would collide with
-// "./thread.js".
+export * from "./context-snapshot.js";
 export * from "./active-thinking.js";
 export * from "./acp-cli.js";
+export * from "./native-roots.js";
+export * from "./ai-services.js";
 export * from "./app-settings.js";
+export * from "./ui-preferences.js";
 export * from "./app-keybindings.js";
 export * from "./app-theme.js";
 export * from "./background-task.js";
 export * from "./change-kinds.js";
 export * from "./code-theme.js";
-export * from "./claude-task-tools.js";
+export * from "./completed-turn-display.js";
 export * from "./debounced-callback-scheduler.js";
 export * from "./environment-lifecycle.js";
 export * from "./environment.js";
@@ -19,26 +19,41 @@ export * from "./feature-flags.js";
 export * from "./git-checkout.js";
 export * from "./host-list-limits.js";
 export * from "./host.js";
-export * from "./html-escape.js";
+export * from "./item-presentation.js";
 export * from "./json-value.js";
+export * from "./legacy-image-generation.js";
 export * from "./lifecycle-diagram.js";
 export * from "./number-utils.js";
 export * from "./pending-interactions.js";
+export * from "./legacy-thread-events.js";
+export * from "./plugin-icon.js";
+export * from "./plugin-metadata.js";
+export * from "./plugin-catalog-category.js";
+export * from "./plugin-marketplace-entry.js";
 export * from "./plugin-id.js";
 export * from "./plugin-manifest.js";
 export * from "./plugin-sdk-version.js";
-export * from "./plugin-submission.js";
+export * from "./host-path.js";
 export * from "./project-path.js";
 export * from "./project.js";
+export * from "./prompt-attachment-limits.js";
 export * from "./prompt-history.js";
 export * from "./protocol-ids.js";
+export * from "./queued-message.js";
+export * from "./system-message.js";
 export * from "./provider-event.js";
+export * from "./thread-provider-state.js";
+export * from "./provider-extension-kind.js";
+export * from "./provider-fork.js";
+export * from "./provider-model-catalog.js";
 export * from "./provider-types.js";
 export * from "./raw-thread-id.js";
 export * from "./reasoning-efforts.js";
 export * from "./reasoning-level.js";
 export * from "./retry.js";
 export * from "./setup-script.js";
+export * from "./server-move.js";
+export * from "./service-tier.js";
 export * from "./shared-types.js";
 export * from "./stored-thread-event.js";
 export * from "./terminal.js";
@@ -46,6 +61,8 @@ export * from "./thread-dynamic-context.js";
 export * from "./thread-event-scope.js";
 export * from "./thread-events.js";
 export * from "./thread-git-diff.js";
+export * from "./started-on-behalf-of.js";
+export * from "./thread-create-origin.js";
 export * from "./thread-lifecycle.js";
 export * from "./thread-name-tags.js";
 export * from "./thread-search.js";
@@ -55,3 +72,10 @@ export * from "./thread-timeline-model-fallback.js";
 export * from "./thread-timeline-pending-todos.js";
 export * from "./thread-visibility.js";
 export * from "./thread.js";
+
+export * from "./project-attachment.js";
+
+export * from "./mobile-app.js";
+export * from "./environment-removal.js";
+
+export const ARCHIVE_UNDO_GRACE_MS = 30_000;

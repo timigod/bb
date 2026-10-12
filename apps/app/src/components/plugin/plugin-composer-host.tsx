@@ -5,27 +5,36 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import type { ComposerView, PluginComposerScope } from "@bb/plugin-sdk";
-import { isComposerDraftEmpty } from "@bb/plugin-sdk/internal/composer-view";
-import type { PromptDraftState } from "@/lib/prompt-draft";
+import type {
+  ComposerSelection,
+  ComposerSubmitOptions,
+  ComposerView,
+  JsonValue,
+  PluginComposerScope,
+} from "@get-bb/plugin-sdk";
+import { isComposerDraftEmpty } from "@get-bb/plugin-sdk/internal/composer-view";
+import type { PromptDraftState } from "@bb/client-core";
 
-/**
- * Binds plugin composer hooks to the exact composer owned by a pane. This is
- * authoritative even when the route points at another split pane and also
- * carries host-only state such as root-project selection or an inline queued
- * message editor.
- */
 export interface PluginComposerHost {
   scope: PluginComposerScope;
-  draft: PromptDraftState;
   textEffectKey: string;
   getCurrent(): PromptDraftState;
+  subscribeDraft(listener: () => void): () => void;
+  getSelection?(): ComposerSelection;
+  subscribeSelection?(listener: () => void): () => void;
   setDraft(next: PromptDraftState): void;
+  isAvailable?(): boolean;
   focus(): void;
+  submit?(
+    options: ComposerSubmitOptions,
+    pluginSubmission: { pluginId: string; data: JsonValue } | undefined,
+  ): Promise<void>;
+  setSelection?(selection: ComposerSelection): Promise<ComposerSelection>;
 }
 
 export function composerScopeIdentity(scope: PluginComposerScope): string {
@@ -34,14 +43,85 @@ export function composerScopeIdentity(scope: PluginComposerScope): string {
       return `thread/${scope.threadId}`;
     case "queued-message":
       return `queued-message/${scope.threadId}/${scope.queuedMessageId}`;
-    case "side-chat":
-      return `side-chat/${scope.projectId}/${scope.parentThreadId}/${scope.tabId}/${scope.childThreadId ?? "draft"}`;
     case "new-thread":
       return `new-thread/${scope.projectId ?? "unresolved"}`;
   }
 }
 
-export interface PluginComposerViewModelInput {
+const subscribeToNoDraft = () => () => {};
+const getNoDraft = () => null;
+
+export function usePluginComposerHostDraft(
+  host: PluginComposerHost | null,
+): PromptDraftState | null {
+  const subscribe = host?.subscribeDraft ?? subscribeToNoDraft;
+  const getSnapshot = host?.getCurrent ?? getNoDraft;
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+export function useComposerHostDraftNotifier(
+  draft: PromptDraftState | null,
+): (listener: () => void) => () => void {
+  const [store] = useState(() => {
+    const listeners = new Set<() => void>();
+    return {
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      notify: () => {
+        for (const listener of [...listeners]) listener();
+      },
+    };
+  });
+  const previousDraftRef = useRef(draft);
+  useLayoutEffect(() => {
+    if (previousDraftRef.current === draft) return;
+    previousDraftRef.current = draft;
+    store.notify();
+  }, [draft, store]);
+  return store.subscribe;
+}
+
+function createComposerSelectionStore(key: string, initial: ComposerSelection) {
+  let current = initial;
+  const listeners = new Set<() => void>();
+  return {
+    key,
+    getSelection: () => current,
+    subscribeSelection: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    publish: (next: ComposerSelection) => {
+      if (current === next) return;
+      current = next;
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+export function useComposerHostSelection(
+  key: string,
+  selection: ComposerSelection,
+): Required<Pick<PluginComposerHost, "getSelection" | "subscribeSelection">> {
+  const [binding, setBinding] = useState(() =>
+    createComposerSelectionStore(key, selection),
+  );
+  let store = binding;
+  if (binding.key !== key) {
+    store = createComposerSelectionStore(key, selection);
+    setBinding(store);
+  }
+  useLayoutEffect(() => {
+    store.publish(selection);
+  }, [selection, store]);
+  return store;
+}
+
+interface PluginComposerViewModelInput {
   scope: PluginComposerScope;
   layout: ComposerView["layout"];
   text: string;
@@ -50,7 +130,6 @@ export interface PluginComposerViewModelInput {
   isSubmitting: boolean;
 }
 
-/** The single model builder shared by concrete composer shells and the editor. */
 export function usePluginComposerViewModel({
   scope,
   layout,
@@ -78,9 +157,14 @@ const PluginComposerHostContext = createContext<
   PluginComposerHost | null | undefined
 >(undefined);
 
-/** Reactive composer state supplied by the concrete prompt-box host. */
-export const PluginComposerViewContext = createContext<
-  ComposerView | undefined
+export type PluginComposerStaticView = Omit<ComposerView, "draft">;
+
+const PluginComposerStaticViewContext = createContext<
+  PluginComposerStaticView | undefined
+>(undefined);
+
+const PluginComposerDraftViewContext = createContext<
+  ComposerView["draft"] | undefined
 >(undefined);
 
 export function PluginComposerViewProvider({
@@ -90,15 +174,40 @@ export function PluginComposerViewProvider({
   children: ReactNode;
   value: ComposerView;
 }) {
+  const { isRunning, isSubmitting } = value.run;
+  const staticView = useMemo<PluginComposerStaticView>(
+    () => ({
+      scope: value.scope,
+      layout: value.layout,
+      run: { isRunning, isSubmitting },
+    }),
+    [isRunning, isSubmitting, value.layout, value.scope],
+  );
   return (
-    <PluginComposerViewContext.Provider value={value}>
-      {children}
-    </PluginComposerViewContext.Provider>
+    <PluginComposerStaticViewContext.Provider value={staticView}>
+      <PluginComposerDraftViewContext.Provider value={value.draft}>
+        {children}
+      </PluginComposerDraftViewContext.Provider>
+    </PluginComposerStaticViewContext.Provider>
   );
 }
 
+export function useOptionalPluginComposerStaticView():
+  | PluginComposerStaticView
+  | undefined {
+  return useContext(PluginComposerStaticViewContext);
+}
+
 export function useOptionalPluginComposerView(): ComposerView | undefined {
-  return useContext(PluginComposerViewContext);
+  const staticView = useContext(PluginComposerStaticViewContext);
+  const draft = useContext(PluginComposerDraftViewContext);
+  return useMemo(
+    () =>
+      staticView === undefined || draft === undefined
+        ? undefined
+        : { ...staticView, draft },
+    [draft, staticView],
+  );
 }
 
 interface PluginComposerHostStore {
@@ -152,10 +261,6 @@ export function PluginComposerHostProvider({
   );
 }
 
-/**
- * Shares an active composer host with sibling plugin surfaces in one compose
- * pane without forcing the pane owner to lift the transient draft state.
- */
 export function PluginComposerHostScopeProvider({
   children,
 }: {
@@ -169,7 +274,6 @@ export function PluginComposerHostScopeProvider({
   );
 }
 
-/** Publishes a nested composer's current host to its enclosing pane scope. */
 export function usePublishPluginComposerHost(
   host: PluginComposerHost | null,
 ): void {

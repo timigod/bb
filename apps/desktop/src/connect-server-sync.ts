@@ -5,8 +5,7 @@ import {
   type ConnectCredential,
 } from "@bb/connect-client";
 
-/** POST /api/v1/plugins/connect/rpc/listAccountServers result body. */
-export const connectAccountServerSchema = z
+const connectAccountServerSchema = z
   .object({
     handle: z.string().min(1),
     name: z.string().min(1),
@@ -16,14 +15,14 @@ export const connectAccountServerSchema = z
   .strict();
 export type ConnectAccountServer = z.infer<typeof connectAccountServerSchema>;
 
-export const connectListAccountServersResultSchema = z
+const connectListAccountServersResultSchema = z
   .object({
     servers: z.array(connectAccountServerSchema),
     selfHandle: z.string().min(1),
   })
   .strict();
 
-export type ConnectListAccountServersResult = z.infer<
+type ConnectListAccountServersResult = z.infer<
   typeof connectListAccountServersResultSchema
 >;
 
@@ -37,40 +36,44 @@ const rpcSuccessSchema = z
 const rpcFailureSchema = z
   .object({
     ok: z.literal(false),
-    error: z.string().optional(),
+    error: z.union([
+      z.string(),
+      z.object({ code: z.string(), message: z.string() }).passthrough(),
+    ]),
   })
   .passthrough();
 
-export const CONNECT_PLUGIN_ID = "connect";
-export const LIST_ACCOUNT_SERVERS_RPC = "listAccountServers";
-export const CONNECT_SERVER_SYNC_INTERVAL_MS = 10 * 60 * 1000;
-export const CONNECT_SERVER_SYNC_MIN_INTERVAL_MS = 60 * 1000;
+export type ConnectServerSyncSkipReason =
+  | "no-credential"
+  | "plugin-disabled"
+  | "not-paired"
+  | "unauthorized"
+  | "unavailable";
 
-export type ConnectServerSyncFetch = (
+export type FetchConnectAccountServersResult =
+  | { ok: true; result: ConnectListAccountServersResult }
+  | { ok: false; reason: ConnectServerSyncSkipReason };
+
+const CONNECT_PLUGIN_ID = "connect";
+const LIST_ACCOUNT_SERVERS_RPC = "listAccountServers";
+const CONNECT_SERVER_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+const CONNECT_SERVER_SYNC_MIN_INTERVAL_MS = 60 * 1000;
+
+type ConnectServerSyncFetch = (
   input: string,
   init?: RequestInit,
 ) => Promise<Pick<Response, "ok" | "status" | "json" | "text">>;
 
-export type ConnectServerSyncLog = (message: string) => void;
+type ConnectServerSyncLog = (message: string) => void;
 
-export interface FetchConnectAccountServersArgs {
-  /** Local builtin server origin, e.g. `http://127.0.0.1:38886`. */
+interface FetchConnectAccountServersArgs {
   serverUrl: string;
   fetchImpl?: ConnectServerSyncFetch;
 }
 
-/**
- * Call the local bb server's connect plugin RPC:
- * `POST /api/v1/plugins/connect/rpc/listAccountServers`
- *
- * Auth is the plugin route "local" policy: `content-type: application/json`
- * on POST (no Origin required when the header is absent). Returns null when
- * the plugin is unavailable, unpaired, or the server is down — callers treat
- * that as a silent no-op.
- */
 export async function fetchConnectAccountServers(
   args: FetchConnectAccountServersArgs,
-): Promise<ConnectListAccountServersResult | null> {
+): Promise<FetchConnectAccountServersResult> {
   const fetchImpl = args.fetchImpl ?? globalThis.fetch;
   const base = args.serverUrl.replace(/\/$/u, "");
   const url = `${base}/api/v1/plugins/${encodeURIComponent(CONNECT_PLUGIN_ID)}/rpc/${encodeURIComponent(LIST_ACCOUNT_SERVERS_RPC)}`;
@@ -83,110 +86,78 @@ export async function fetchConnectAccountServers(
       body: "null",
     });
   } catch {
-    return null;
+    return { ok: false, reason: "unavailable" };
   }
 
   let body: unknown;
   try {
     body = await response.json();
   } catch {
-    return null;
+    return { ok: false, reason: "unavailable" };
   }
 
   const success = rpcSuccessSchema.safeParse(body);
   if (success.success) {
-    return success.data.result;
+    return { ok: true, result: success.data.result };
   }
 
-  // ok:false, wrong shape, HTTP error body — all map to silent no-op.
-  rpcFailureSchema.safeParse(body);
-  return null;
+  if (response.status === 503) {
+    return { ok: false, reason: "plugin-disabled" };
+  }
+  const failure = rpcFailureSchema.safeParse(body);
+  if (
+    failure.success &&
+    typeof failure.data.error === "object" &&
+    failure.data.error.code === "handler_error" &&
+    failure.data.error.message === "not_paired"
+  ) {
+    return { ok: false, reason: "not-paired" };
+  }
+  return { ok: false, reason: "unavailable" };
 }
 
-/**
- * The account servers a desktop can target: everything except `selfHandle`
- * (the local server's own tunnel twin, already reachable as "This Mac").
- */
-export function selectTargetableConnectServers(
+function selectTargetableConnectServers(
   result: ConnectListAccountServersResult,
 ): ConnectAccountServer[] {
   return result.servers.filter((server) => server.handle !== result.selfHandle);
 }
 
-export interface CreateConnectServerSyncArgs {
-  /**
-   * The app's own cached machine credential, or null when it has none. Used
-   * when no local runtime is up, so a remote target still lists servers.
-   */
+interface CreateConnectServerSyncArgs {
   getCredential: () => ConnectCredential | null;
-  /** Builtin/local server URL when the runtime is up; null when not. */
   getLocalServerUrl: () => string | null;
-  /** Fresh targetable server list after every successful sync. */
   onServers: (servers: ConnectAccountServer[]) => void;
-  /** The gate refused the cached credential — the caller must drop it. */
+  onSkipped: (reason: ConnectServerSyncSkipReason) => void;
   onUnauthorized: () => void;
-  /**
-   * Transport for the direct gate call. Separate from `fetchImpl` because the
-   * gate client needs a full `fetch`, while the local RPC needs only a slice
-   * of the response.
-   */
   gateFetchImpl?: typeof fetch;
   fetchImpl?: ConnectServerSyncFetch;
   log?: ConnectServerSyncLog;
   now?: () => number;
-  intervalMs?: number;
-  minIntervalMs?: number;
   setIntervalFn?: (handler: () => void, timeout: number) => unknown;
-  clearIntervalFn?: (handle: unknown) => void;
 }
 
 export interface ConnectServerSync {
-  /** Start the 10-minute background timer (unref'd so it does not keep the app alive). */
   start(): void;
-  stop(): void;
-  /** After local runtime attach/spawn — sync immediately. */
   onRuntimeReady(): void;
-  /**
-   * On Server-menu open: sync when the last successful/attempted sync is
-   * older than minIntervalMs (default 60s).
-   */
   onListRequested(): void;
-  /** Sync once, now, coalescing with a sync already in flight. */
   syncNow(): Promise<void>;
 }
 
-/**
- * Periodically pull Connect account servers from the local builtin server's
- * connect plugin RPC and hand them to `onServers` for the Server menu.
- */
 export function createConnectServerSync(
   args: CreateConnectServerSyncArgs,
 ): ConnectServerSync {
-  const intervalMs = args.intervalMs ?? CONNECT_SERVER_SYNC_INTERVAL_MS;
-  const minIntervalMs =
-    args.minIntervalMs ?? CONNECT_SERVER_SYNC_MIN_INTERVAL_MS;
+  const intervalMs = CONNECT_SERVER_SYNC_INTERVAL_MS;
   const now = args.now ?? Date.now;
   const setIntervalFn =
     args.setIntervalFn ??
     ((handler: () => void, timeout: number) => setInterval(handler, timeout));
-  const clearIntervalFn =
-    args.clearIntervalFn ??
-    ((handle: unknown) => {
-      clearInterval(handle as ReturnType<typeof setInterval>);
-    });
   const log = args.log;
 
   let timer: unknown = null;
   let lastSyncAttemptAt = 0;
   let inFlight: Promise<void> | null = null;
-  let loggedFailure = false;
+  let loggedSkipReason: ConnectServerSyncSkipReason | null = null;
 
-  /**
-   * Prefer the local server: it holds the pairing secret and always reflects
-   * whether the plugin is on. Fall back to the app's own credential so a
-   * remote target keeps a live server list with no local runtime.
-   */
-  async function fetchServers(): Promise<ConnectListAccountServersResult | null> {
+  async function fetchServers(): Promise<FetchConnectAccountServersResult> {
     const serverUrl = args.getLocalServerUrl();
     if (serverUrl !== null) {
       return fetchConnectAccountServers({
@@ -196,33 +167,34 @@ export function createConnectServerSync(
     }
     const credential = args.getCredential();
     if (credential === null) {
-      return null;
+      return { ok: false, reason: "no-credential" };
     }
     try {
-      return await listAccountServers(credential, args.gateFetchImpl);
+      const result = await listAccountServers(credential, args.gateFetchImpl);
+      return { ok: true, result };
     } catch (error) {
       if (error instanceof ConnectListError && error.code === "unauthorized") {
         args.onUnauthorized();
+        return { ok: false, reason: "unauthorized" };
       }
-      return null;
+      return { ok: false, reason: "unavailable" };
     }
   }
 
   async function runSync(): Promise<void> {
     lastSyncAttemptAt = now();
-    const result = await fetchServers();
-    if (result === null) {
-      if (!loggedFailure) {
-        loggedFailure = true;
-        log?.(
-          "connect server sync skipped (plugin disabled, not paired, or no local server and no cached credential)",
-        );
+    const outcome = await fetchServers();
+    if (!outcome.ok) {
+      if (loggedSkipReason !== outcome.reason) {
+        loggedSkipReason = outcome.reason;
+        log?.(`connect server sync skipped (${outcome.reason})`);
       }
+      args.onSkipped(outcome.reason);
       return;
     }
 
-    loggedFailure = false;
-    args.onServers(selectTargetableConnectServers(result));
+    loggedSkipReason = null;
+    args.onServers(selectTargetableConnectServers(outcome.result));
   }
 
   function syncNow(): Promise<void> {
@@ -240,7 +212,7 @@ export function createConnectServerSync(
   }
 
   function onListRequested(): void {
-    if (now() - lastSyncAttemptAt < minIntervalMs) {
+    if (now() - lastSyncAttemptAt < CONNECT_SERVER_SYNC_MIN_INTERVAL_MS) {
       return;
     }
     void syncNow();
@@ -253,7 +225,6 @@ export function createConnectServerSync(
     const handle = setIntervalFn(() => {
       void syncNow();
     }, intervalMs);
-    // Electron/Node timers: unref so the interval cannot keep the app alive.
     if (
       typeof handle === "object" &&
       handle !== null &&
@@ -265,17 +236,8 @@ export function createConnectServerSync(
     timer = handle;
   }
 
-  function stop(): void {
-    if (timer === null) {
-      return;
-    }
-    clearIntervalFn(timer);
-    timer = null;
-  }
-
   return {
     start,
-    stop,
     onRuntimeReady,
     onListRequested,
     syncNow,

@@ -1,54 +1,34 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { BbDesktopBrowserTarget } from "@bb/desktop-contract";
+import { COARSE_POINTER_TEXT_SM_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
+import { Button } from "@bb/shared-ui/button";
+import { Icon } from "@bb/shared-ui/icon";
+import { cn } from "@bb/shared-ui/lib/utils";
 import type { BrowserFixedPanelTab } from "@/lib/fixed-panel-tabs-state";
 import { getDesktopBrowserApi } from "@/lib/bb-desktop";
+import { copyToClipboardWithToast } from "@/lib/clipboard";
+import { sdk } from "@/lib/sdk";
+import { openUrlInExternalBrowser } from "@/lib/url-open-routing";
 import {
   BrowserTabContent,
   type BrowserAddressFocusRequest,
 } from "./BrowserTabContent";
-import {
-  createBrowserViewVisibilityCoordinator,
-  destroyPersistedBrowserView,
-} from "./browserViewVisibilityCoordinator";
+import { createBrowserViewVisibilityCoordinator } from "./browserViewVisibilityCoordinator";
 import type { UpdateBrowserTabArgs } from "./useThreadFileTabs";
 
-export interface BrowserTabDeckProps {
+interface BrowserTabDeckProps {
   browserTabs: readonly BrowserFixedPanelTab[];
   activeBrowserTabId: string | null;
   addressFocusRequest?: BrowserAddressFocusRequest | null;
   onAddressFocusRequestConsumed?: (request: BrowserAddressFocusRequest) => void;
   environmentId: string | null;
-  /**
-   * Readiness-gated permission for the active native browser view to become
-   * visible. Wide layout passes logical panel-open state; compact layout waits
-   * for drawer animation completion plus the post-open bounds sync.
-   */
   canShowNativeBrowserView: boolean;
+  canHandleBrowserCommands?: boolean;
+  onNativeFocus?: () => void;
   threadId: string;
   onUpdate: (args: UpdateBrowserTabArgs) => void;
 }
 
-interface BrowserTabIdSnapshot {
-  tabIds: ReadonlySet<string>;
-  threadId: string;
-}
-
-interface BuildBrowserTabIdSetArgs {
-  browserTabs: readonly BrowserFixedPanelTab[];
-}
-
-export function buildBrowserTabIdSet({
-  browserTabs,
-}: BuildBrowserTabIdSetArgs): ReadonlySet<string> {
-  return new Set(browserTabs.map((tab) => tab.id));
-}
-
-/**
- * Picks the single browser tab whose content the deck mounts. Returns the tab
- * matching `activeBrowserTabId`, or null when there is no active id or the
- * active id is not an open browser tab. Selecting exactly one tab (never the
- * inactive persisted ones) is what keeps thread restore lazy: only the active
- * tab's native `WebContentsView` is ever created/shown.
- */
 export function selectActiveBrowserTab(
   browserTabs: readonly BrowserFixedPanelTab[],
   activeBrowserTabId: string | null,
@@ -59,20 +39,43 @@ export function selectActiveBrowserTab(
   return browserTabs.find((tab) => tab.id === activeBrowserTabId) ?? null;
 }
 
-/**
- * Mounts only the active browser tab's content. Inactive persisted tabs remain
- * tab metadata until selected, so restoring a thread never eagerly creates and
- * loads a batch of hidden native `WebContentsView`s from stale persisted URLs.
- *
- * The native view manager keeps already-created views keyed by tab id, so
- * switching away unmounts the React content and hides the native view without
- * destroying the page. A tab's view is torn down when it leaves this thread's
- * open-tab list; thread navigation only unmounts this deck, so retained views
- * stay alive for when the user returns.
- *
- * When no browser tab is the active panel tab, React content unmounts but the
- * native views remain retained and hidden by their component cleanup.
- */
+const WINDOW_TARGET_PENDING_ATTEMPTS = 4;
+const WINDOW_CHECK_MAX_ATTEMPTS = 32;
+const WINDOW_TARGET_MAX_RETRY_MS = 2000;
+
+function windowRetryDelay(attempt: number): number {
+  return Math.min(250 * 2 ** (attempt - 1), WINDOW_TARGET_MAX_RETRY_MS);
+}
+
+type WindowTargetCheck =
+  | { status: "pending" }
+  | { status: "ready"; target: BbDesktopBrowserTarget | null };
+
+type SavedWindowCheck = {
+  key: string;
+  status: "live" | "gone" | "unknown";
+};
+
+type BrowserTabPlacement =
+  | "open"
+  | "attach"
+  | "check-saved-window"
+  | "pending"
+  | "unavailable";
+
+function resolveBrowserTabPlacement(
+  saved: BbDesktopBrowserTarget | undefined,
+  windowTarget: WindowTargetCheck,
+): BrowserTabPlacement {
+  if (windowTarget.status === "pending") return "pending";
+  if (saved === undefined) return "open";
+  const actual = windowTarget.target;
+  if (actual === null || actual.hostId !== saved.hostId) return "unavailable";
+  return actual.instanceId === saved.instanceId
+    ? "attach"
+    : "check-saved-window";
+}
+
 export function BrowserTabDeck({
   browserTabs,
   activeBrowserTabId,
@@ -80,11 +83,12 @@ export function BrowserTabDeck({
   onAddressFocusRequestConsumed,
   environmentId,
   canShowNativeBrowserView,
+  canHandleBrowserCommands = canShowNativeBrowserView,
+  onNativeFocus,
   threadId,
   onUpdate,
 }: BrowserTabDeckProps) {
   const desktopBrowser = useMemo(() => getDesktopBrowserApi(), []);
-  const previousTabIdsRef = useRef<BrowserTabIdSnapshot | null>(null);
   const visibilityCoordinator = useMemo(
     () =>
       desktopBrowser === null
@@ -93,29 +97,149 @@ export function BrowserTabDeck({
     [desktopBrowser],
   );
 
-  useEffect(() => {
-    const tabIds = buildBrowserTabIdSet({ browserTabs });
-    const previous = previousTabIdsRef.current;
-    if (
-      desktopBrowser !== null &&
-      previous !== null &&
-      previous.threadId === threadId
-    ) {
-      for (const tabId of previous.tabIds) {
-        if (!tabIds.has(tabId)) {
-          destroyPersistedBrowserView({ desktopBrowser, tabId });
-        }
-      }
-    }
-    previousTabIdsRef.current = { tabIds, threadId };
-  }, [browserTabs, desktopBrowser, threadId]);
-
   const activeBrowserTab = selectActiveBrowserTab(
     browserTabs,
     activeBrowserTabId,
   );
+  const target = activeBrowserTab?.desktopTarget;
+  const targetHostId = target?.hostId;
+  const [windowTarget, setWindowTarget] = useState<WindowTargetCheck>(() =>
+    desktopBrowser?.getTarget === undefined
+      ? { status: "ready", target: null }
+      : { status: "pending" },
+  );
+  const [checkRound, setCheckRound] = useState(0);
+  const checkKey =
+    target === undefined
+      ? null
+      : `${activeBrowserTab?.id}:${checkRound}:${target.hostId}:${target.instanceId}:${target.generation}`;
+  const [stoppedCheckKey, setStoppedCheckKey] = useState<string | null>(null);
+  useEffect(() => {
+    const getTarget = desktopBrowser?.getTarget?.bind(desktopBrowser);
+    if (getTarget === undefined) return;
+    let current = true;
+    let attempt = 0;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      void getTarget()
+        .catch(() => null)
+        .then((actual) => {
+          if (!current) return;
+          if (actual !== null) {
+            setWindowTarget({ status: "ready", target: actual });
+            return;
+          }
+          attempt += 1;
+          if (attempt >= WINDOW_TARGET_PENDING_ATTEMPTS)
+            setWindowTarget({ status: "ready", target: null });
+          if (attempt >= WINDOW_CHECK_MAX_ATTEMPTS) {
+            setStoppedCheckKey(checkKey);
+            return;
+          }
+          retry = setTimeout(check, windowRetryDelay(attempt));
+        });
+    };
+    check();
+    return () => {
+      current = false;
+      clearTimeout(retry);
+    };
+  }, [
+    desktopBrowser,
+    targetHostId,
+    target?.instanceId,
+    target?.generation,
+    checkKey,
+  ]);
+
+  const placement = resolveBrowserTabPlacement(target, windowTarget);
+  const savedWindowKey = placement === "check-saved-window" ? checkKey : null;
+  const [savedWindowCheck, setSavedWindowCheck] =
+    useState<SavedWindowCheck | null>(null);
+  const savedInstanceId = target?.instanceId;
+  useEffect(() => {
+    if (
+      savedWindowKey === null ||
+      targetHostId === undefined ||
+      savedInstanceId === undefined
+    )
+      return;
+    let current = true;
+    let attempt = 0;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      void sdk.experimental_desktopBrowsers
+        .listInstances({ hostId: targetHostId })
+        .then(
+          ({ instances }) => {
+            if (!current) return;
+            const live = instances.some(
+              (instance) => instance.instanceId === savedInstanceId,
+            );
+            setSavedWindowCheck({
+              key: savedWindowKey,
+              status: live ? "live" : "gone",
+            });
+          },
+          () => {
+            if (!current) return;
+            attempt += 1;
+            if (attempt >= WINDOW_TARGET_PENDING_ATTEMPTS)
+              setSavedWindowCheck({ key: savedWindowKey, status: "unknown" });
+            if (attempt >= WINDOW_CHECK_MAX_ATTEMPTS) {
+              setStoppedCheckKey(checkKey);
+              return;
+            }
+            retry = setTimeout(check, windowRetryDelay(attempt));
+          },
+        );
+    };
+    check();
+    return () => {
+      current = false;
+      clearTimeout(retry);
+    };
+  }, [savedWindowKey, targetHostId, savedInstanceId, checkKey]);
+
   if (activeBrowserTab === null) {
     return null;
+  }
+  const savedWindowStatus =
+    savedWindowCheck?.key === savedWindowKey ? savedWindowCheck.status : null;
+  const checksStopped = checkKey !== null && stoppedCheckKey === checkKey;
+  if (
+    placement === "pending" ||
+    (placement === "check-saved-window" && savedWindowStatus === null)
+  ) {
+    return <div className="flex min-h-0 flex-1 bg-sidebar" />;
+  }
+  if (
+    placement === "unavailable" ||
+    (placement === "check-saved-window" && savedWindowStatus !== "gone")
+  ) {
+    return (
+      <BrowserTabElsewhere
+        url={activeBrowserTab.url}
+        onRetry={
+          checksStopped || savedWindowStatus === "live"
+            ? () => setCheckRound((round) => round + 1)
+            : null
+        }
+        reason={
+          desktopBrowser === null
+            ? "desktop-required"
+            : savedWindowStatus === "live"
+              ? "other-window"
+              : windowTarget.status === "ready" &&
+                  windowTarget.target !== null &&
+                  windowTarget.target.hostId !== target?.hostId
+                ? "other-computer"
+                : checksStopped
+                  ? "unreachable"
+                  : "reconnecting"
+        }
+      />
+    );
   }
 
   return (
@@ -123,6 +247,8 @@ export function BrowserTabDeck({
       <BrowserTabContent
         key={activeBrowserTab.id}
         tabId={activeBrowserTab.id}
+        desktopTarget={target}
+        existingOnly={placement === "attach" ? true : undefined}
         initialUrl={activeBrowserTab.url}
         addressFocusRequest={
           addressFocusRequest?.tabId === activeBrowserTab.id
@@ -131,11 +257,114 @@ export function BrowserTabDeck({
         }
         onAddressFocusRequestConsumed={onAddressFocusRequestConsumed}
         canShowNativeBrowserView={canShowNativeBrowserView}
+        canHandleBrowserCommands={canHandleBrowserCommands}
+        onNativeFocus={onNativeFocus}
         visibilityCoordinator={visibilityCoordinator}
         environmentId={environmentId}
         threadId={threadId}
         onUpdate={onUpdate}
       />
+    </div>
+  );
+}
+
+const BROWSER_TAB_ELSEWHERE_COPY = {
+  "desktop-required": {
+    title: "Browser tabs need the desktop app",
+    body: "This tab is open in the bb desktop app.",
+  },
+  "other-window": {
+    title: "This tab is open in another bb window",
+    body: "Switch to that window to keep browsing.",
+  },
+  "other-computer": {
+    title: "This tab is open on another computer",
+    body: "It was opened in bb on a different computer.",
+  },
+  reconnecting: {
+    title: "Reconnecting to this tab",
+    body: "bb can't reach this computer's browser right now. The tab opens once it reconnects.",
+  },
+  unreachable: {
+    title: "Can't reach this tab",
+    body: "bb couldn't reach this computer's browser. Try again once bb has reconnected.",
+  },
+} as const;
+
+function BrowserTabElsewhere({
+  url,
+  reason,
+  onRetry,
+}: {
+  url: string;
+  reason: keyof typeof BROWSER_TAB_ELSEWHERE_COPY;
+  onRetry: (() => void) | null;
+}) {
+  const copy = BROWSER_TAB_ELSEWHERE_COPY[reason];
+  const parsedUrl = URL.canParse(url) ? new URL(url) : null;
+  const canOpenExternally =
+    parsedUrl?.protocol === "https:" || parsedUrl?.protocol === "http:";
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-sidebar px-6 text-center">
+      <span className="flex size-11 items-center justify-center rounded-lg border border-border bg-card text-muted-foreground">
+        <Icon name="Globe" className="size-6" aria-hidden />
+      </span>
+      <div className="text-sm font-medium text-foreground">{copy.title}</div>
+      <p
+        className={cn(
+          "max-w-xs text-muted-foreground",
+          COARSE_POINTER_TEXT_SM_CLASS,
+        )}
+      >
+        {copy.body}
+      </p>
+      {url.length > 0 ? (
+        <p
+          className={cn(
+            "max-w-full truncate font-mono text-muted-foreground select-text",
+            COARSE_POINTER_TEXT_SM_CLASS,
+          )}
+          title={url}
+        >
+          {url}
+        </p>
+      ) : null}
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        {onRetry !== null ? (
+          <Button type="button" variant="outline" size="sm" onClick={onRetry}>
+            <Icon name="RotateCcw" aria-hidden />
+            Try again
+          </Button>
+        ) : null}
+        {url.length > 0 ? (
+          <>
+            {canOpenExternally ? (
+              <Button
+                type="button"
+                variant={onRetry !== null ? "ghost" : "outline"}
+                size="sm"
+                onClick={() => openUrlInExternalBrowser(url)}
+              >
+                <Icon name="ExternalLink" aria-hidden />
+                Open in browser
+              </Button>
+            ) : null}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                void copyToClipboardWithToast(url, {
+                  successMessage: "Link copied",
+                });
+              }}
+            >
+              <Icon name="Copy" aria-hidden />
+              Copy link
+            </Button>
+          </>
+        ) : null}
+      </div>
     </div>
   );
 }

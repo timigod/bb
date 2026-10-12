@@ -1,6 +1,6 @@
 export type TimelinePathDisplayMode = "compact" | "full";
 
-export interface FormatTimelinePathArgs {
+interface FormatTimelinePathArgs {
   mode: TimelinePathDisplayMode;
   path: string;
 }
@@ -12,7 +12,6 @@ export function fileNameFromPath(path: string): string {
   return candidate && candidate.length > 0 ? candidate : path;
 }
 
-/** The directory portion of a path, or "" when the path has no directory. */
 export function directoryFromPath(path: string): string {
   const lastSlash = path.lastIndexOf("/");
   return lastSlash === -1 ? "" : path.slice(0, lastSlash);

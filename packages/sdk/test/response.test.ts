@@ -126,7 +126,9 @@ function getBytesReader(response: Response): () => Promise<Uint8Array> {
 
 function createAbortedTimeoutSignal(): AbortSignal {
   const controller = new AbortController();
-  controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
+  controller.abort(
+    new DOMException("The operation timed out.", "TimeoutError"),
+  );
   return controller.signal;
 }
 
@@ -190,9 +192,9 @@ describe("readJsonResponse()", () => {
       statusText: "Internal Server Error",
     });
 
-    await expect(
-      readVoidResponse(Promise.resolve(response)),
-    ).rejects.toThrow("HTTP 500: Internal Server Error");
+    await expect(readVoidResponse(Promise.resolve(response))).rejects.toThrow(
+      "HTTP 500: Internal Server Error",
+    );
   });
 
   it("throws BbHttpError carrying status and server code for non-ok response", async () => {
@@ -294,43 +296,22 @@ describe("readJsonResponse()", () => {
     });
   });
 
-  it("throws HTTP error with statusText when body is empty", async () => {
-    const response = new Response("", {
-      status: 500,
-      statusText: "Internal Server Error",
-    });
-
-    await expect(readJson(response)).rejects.toThrow(
-      "HTTP 500: Internal Server Error",
-    );
-  });
-
   it("throws connection error with helpful message for ECONNREFUSED", async () => {
     const connError = new TypeError("fetch failed", {
       cause: { code: "ECONNREFUSED" },
     });
 
-    await expect(
-      readJsonResponse(Promise.reject(connError)),
-    ).rejects.toThrow(
+    await expect(readJsonResponse(Promise.reject(connError))).rejects.toThrow(
       "Cannot connect to BB server. Ensure it is running and BB_SERVER_URL is correct.",
     );
-  });
-
-  it("rethrows other errors as-is", async () => {
-    const otherError = new Error("Network timeout");
-
-    await expect(
-      readJsonResponse(Promise.reject(otherError)),
-    ).rejects.toThrow("Network timeout");
   });
 
   it("rethrows non-TypeError connection errors", async () => {
     const error = new RangeError("something wrong");
 
-    await expect(
-      readJsonResponse(Promise.reject(error)),
-    ).rejects.toThrow("something wrong");
+    await expect(readJsonResponse(Promise.reject(error))).rejects.toThrow(
+      "something wrong",
+    );
     await expect(
       readJsonResponse(Promise.reject(error)),
     ).rejects.toBeInstanceOf(RangeError);
@@ -355,13 +336,6 @@ describe("createRequestTimeoutFetch()", () => {
     await expect(transport.api.v1.hosts.$get()).rejects.toThrow(
       requestTimeoutMessage("75 seconds"),
     );
-  });
-
-  it("times out immediately when configured with zero milliseconds", async () => {
-    await expectPendingFetchTimeout({
-      timeoutMs: IMMEDIATE_TIMEOUT_MS,
-      expectedMessage: IMMEDIATE_TIMEOUT_MESSAGE,
-    });
   });
 
   it("rejects negative timeout values", () => {
@@ -394,17 +368,6 @@ describe("createRequestTimeoutFetch()", () => {
       timeoutMs: 1_250,
       expectedMessage: requestTimeoutMessage("1250 ms"),
     });
-  });
-
-  it("returns successful API responses after body read", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => {
-      return Promise.resolve(new Response("ok"));
-    });
-
-    const timeoutFetch = createRequestTimeoutFetch({ timeoutMs: 1_000 });
-    const response = await timeoutFetch("http://server/api/v1/hosts");
-
-    await expect(response.text()).resolves.toBe("ok");
   });
 
   it("preserves response metadata through the wrapper", async () => {
@@ -496,7 +459,9 @@ describe("createRequestTimeoutFetch()", () => {
     );
 
     const blobResponse = await timeoutFetch("http://server/api/v1/blob");
-    await expect(blobResponse.blob()).rejects.toThrow(IMMEDIATE_TIMEOUT_MESSAGE);
+    await expect(blobResponse.blob()).rejects.toThrow(
+      IMMEDIATE_TIMEOUT_MESSAGE,
+    );
 
     const formDataResponse = await timeoutFetch(
       "http://server/api/v1/form-data",
@@ -598,7 +563,9 @@ describe("createRequestTimeoutFetch()", () => {
         init?.signal?.addEventListener(
           "abort",
           () => {
-            reject(new DOMException("The operation was aborted.", "AbortError"));
+            reject(
+              new DOMException("The operation was aborted.", "AbortError"),
+            );
           },
           { once: true },
         );

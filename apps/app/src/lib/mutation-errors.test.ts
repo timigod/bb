@@ -1,5 +1,7 @@
 import { isValidElement, type ReactElement, type ReactNode } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import { attachSonnerToast } from "@/components/ui/app-toast-runtime";
 import { HttpError } from "./api";
 import {
   getMutationErrorMessage,
@@ -71,6 +73,10 @@ function readLatestToastProps(): CapturedToastProps {
   }
   return element.props;
 }
+
+beforeAll(() => {
+  attachSonnerToast(toast);
+});
 
 afterEach(() => {
   mutationToastState.invocations.splice(0);
@@ -159,7 +165,7 @@ describe("getMutationErrorMessage", () => {
 
     const fallbackHttpError = new HttpError({
       code: "invalid_request",
-      message: "Squash merge failed",
+      message: "Commit failed",
       status: 409,
     });
 
@@ -168,7 +174,7 @@ describe("getMutationErrorMessage", () => {
         error: fallbackHttpError,
         fallbackMessage: "Request failed.",
       }),
-    ).toBe("Squash merge failed");
+    ).toBe("Commit failed");
   });
 });
 
@@ -194,6 +200,46 @@ describe("showMutationErrorToast", () => {
     expect(props.tone).toBe("error");
     expect(props.title).toBe("Request failed");
     expect(props.description).toBe("Please try again");
+  });
+
+  it("keeps the submission context in the title and the server explanation in the body", () => {
+    showMutationErrorToast({
+      error: new Error(
+        "The selected workspace is unavailable. Choose another workspace and try again.",
+      ),
+      fallbackMessage: "Failed to create thread.",
+      lifecycleOperation: "create_thread",
+    });
+    expect(readLatestToastProps()).toMatchObject({
+      title: "Failed to create thread",
+      description:
+        "The selected workspace is unavailable. Choose another workspace and try again",
+    });
+  });
+
+  it("keeps structured lifecycle titles separate from their explanation", () => {
+    showMutationErrorToast({
+      error: new HttpError({
+        body: {
+          code: "thread_not_writable",
+          message: "Thread is not active",
+          details: {
+            archivedAt: null,
+            reason: "not_started",
+            threadStatus: "starting",
+          },
+        },
+        code: "thread_not_writable",
+        message: "Thread is not active",
+        status: 409,
+      }),
+      fallbackMessage: "Failed to send message.",
+      lifecycleOperation: "send_message",
+    });
+    expect(readLatestToastProps()).toMatchObject({
+      title: "Failed to send message",
+      description: "The thread is still starting.",
+    });
   });
 
   it("strips trailing periods from fallback toast titles", () => {

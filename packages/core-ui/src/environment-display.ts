@@ -1,95 +1,142 @@
-import type { Environment, EnvironmentWorkspaceDisplayKind } from "@bb/domain";
-import { resolveEnvironmentWorkspaceDisplayKind } from "@bb/domain";
+import type { Environment } from "@bb/domain";
 
-export type EnvironmentDisplayHostLocality = "local" | "remote";
+type EnvironmentDisplayHostLocality = "local" | "remote";
 
-/** Identity of the machine an environment lives on, for multi-machine
- * surfaces that name the machine (thread metadata, offline notices). */
-export interface EnvironmentDisplayHostIdentity {
+interface EnvironmentDisplayHostIdentity {
   name: string;
   connected: boolean;
 }
 
 export interface EnvironmentDisplayHostContext {
   locality: EnvironmentDisplayHostLocality;
-  /** Null when the machine shouldn't be named — single-host setups or the
-   * only one machine being available. */
   identity: EnvironmentDisplayHostIdentity | null;
 }
 
-export interface EnvironmentDisplayInfo {
-  /**
-   * Human-readable environment label: a custom environment name when present,
-   * "Provisioning" while the environment is still being set up, otherwise
-   * "Working locally", "Working remotely", or "Worktree".
-   */
-  modeLabel: string;
-  /**
-   * Compact mode label for constrained prompt/composer surfaces. Custom names
-   * stay custom names; generated direct-workspace labels compact to "Local" or
-   * "Remote".
-   */
-  compactModeLabel: string;
+export interface EnvironmentDisplayProvider {
   id: string;
-  mode: "direct" | "worktree";
-  workspaceDisplayKind: EnvironmentWorkspaceDisplayKind;
+  displayName: string;
+  icon: string | null;
+}
+
+export type EnvironmentDisplayProviderLookup =
+  | { status: "loading" }
+  | { status: "loaded"; provider: EnvironmentDisplayProvider | null };
+
+export interface EnvironmentDisplayNameSource {
+  name: string | null;
+  branchName: string | null;
+  path: string | null;
+  environmentProviderId: string | null;
+}
+
+export interface EnvironmentDisplayInfo {
+  modeLabel: string;
+  compactModeLabel: string;
+  providerLabel: string | null;
+  lifecycle:
+    | "provisioning"
+    | "destroyed"
+    | "removed"
+    | "removing"
+    | "cleanup-failed"
+    | null;
+  id: string;
 }
 
 interface FormatEnvironmentDisplayArgs {
   environment: Environment;
   host: EnvironmentDisplayHostContext;
+  providerLookup: EnvironmentDisplayProviderLookup;
 }
 
-/**
- * Format an environment for display across app, CLI, and prompt labels.
- */
+export function resolveEnvironmentDisplayProvider(
+  lookup: EnvironmentDisplayProviderLookup,
+): EnvironmentDisplayProvider | null {
+  return lookup.status === "loaded" ? lookup.provider : null;
+}
+
+export function resolveEnvironmentProviderLabel(
+  environmentProviderId: string | null,
+  lookup: EnvironmentDisplayProviderLookup,
+): string | null {
+  if (environmentProviderId === null || lookup.status === "loading") {
+    return null;
+  }
+  return lookup.provider === null
+    ? environmentProviderId
+    : lookup.provider.displayName;
+}
+
+function resolveWorkspaceFolderName(
+  workspacePath: string | null,
+): string | null {
+  if (workspacePath === null) return null;
+  const segments = workspacePath.split(/[\\/]+/u).filter(Boolean);
+  return segments[segments.length - 1] ?? null;
+}
+
+export function resolveEnvironmentDisplayName(
+  source: EnvironmentDisplayNameSource,
+  lookup: EnvironmentDisplayProviderLookup,
+): string | null {
+  return (
+    source.name ??
+    source.branchName ??
+    (source.environmentProviderId === null
+      ? resolveWorkspaceFolderName(source.path)
+      : resolveEnvironmentProviderLabel(source.environmentProviderId, lookup))
+  );
+}
+
 export function formatEnvironmentDisplay({
   environment,
   host,
+  providerLookup,
 }: FormatEnvironmentDisplayArgs): EnvironmentDisplayInfo {
-  const mode: EnvironmentDisplayInfo["mode"] = environment.isWorktree
-    ? "worktree"
-    : "direct";
-  const workspaceDisplayKind = resolveEnvironmentWorkspaceDisplayKind({
-    environment: {
-      isWorktree: environment.isWorktree,
-      workspaceProvisionType: environment.workspaceProvisionType,
-    },
-  });
-
-  // While the workspace is still being provisioned, discovered properties such
-  // as `isWorktree` are not yet populated, so the mode is not yet knowable.
-  // Managed worktrees can also sit in a prepared metadata-inference stage with
-  // no workspace path before the actual provision request is queued. Report the
-  // setup lifecycle honestly instead of guessing "Working locally".
-  const isProvisioningDisplay =
-    environment.status === "provisioning" ||
-    (environment.workspaceProvisionType === "managed-worktree" &&
-      environment.path === null);
-  const directModeLabel =
-    host.locality === "remote" ? "Working remotely" : "Working locally";
-  const directCompactModeLabel =
-    host.locality === "remote" ? "Remote" : "Local";
-  const generatedModeLabel =
-    isProvisioningDisplay
-      ? "Provisioning"
-      : mode === "worktree"
-        ? "Worktree"
-        : directModeLabel;
-  const generatedCompactModeLabel =
-    isProvisioningDisplay
-      ? "Provisioning"
-      : mode === "worktree"
-        ? "Worktree"
-        : directCompactModeLabel;
-  const modeLabel = environment.name ?? generatedModeLabel;
-  const compactModeLabel = environment.name ?? generatedCompactModeLabel;
+  const hostLifecycle =
+    environment.hostLifecycle === "active" ? null : environment.hostLifecycle;
+  const lifecycle: EnvironmentDisplayInfo["lifecycle"] =
+    hostLifecycle ??
+    (environment.status === "destroyed"
+      ? "destroyed"
+      : environment.status === "provisioning"
+        ? "provisioning"
+        : null);
+  const lifecycleLabel =
+    lifecycle === "removed"
+      ? "Unavailable — machine removed"
+      : lifecycle === "removing"
+        ? "Machine removal in progress"
+        : lifecycle === "cleanup-failed"
+          ? "Machine cleanup failed"
+          : lifecycle === "destroyed"
+            ? "Environment unavailable"
+            : lifecycle === "provisioning"
+              ? "Provisioning"
+              : null;
+  const providerLabel = resolveEnvironmentProviderLabel(
+    environment.environmentProviderId,
+    providerLookup,
+  );
+  const localityLabel = host.locality === "remote" ? "Remote" : "Local";
+  const namedLabel =
+    providerLabel ??
+    (host.locality === "remote" ? "Working remotely" : "Working locally");
+  const namedCompactLabel = providerLabel ?? localityLabel;
 
   return {
-    modeLabel,
-    compactModeLabel,
+    modeLabel:
+      (hostLifecycle ? lifecycleLabel : null) ??
+      environment.name ??
+      lifecycleLabel ??
+      namedLabel,
+    compactModeLabel:
+      (hostLifecycle ? lifecycleLabel : null) ??
+      environment.name ??
+      lifecycleLabel ??
+      namedCompactLabel,
+    providerLabel,
+    lifecycle,
     id: environment.id,
-    mode,
-    workspaceDisplayKind,
   };
 }

@@ -1,4 +1,4 @@
-import { execFile, spawn, type ExecFileException } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +8,12 @@ import type {
   GitCheckoutRef,
   WorkspaceGitOperation,
 } from "@bb/domain";
-import { sanitizeInheritedChildProcessEnv } from "@bb/process-utils";
+import {
+  execPortableFile,
+  spawnManagedProcess,
+  pathExists,
+  sanitizeInheritedChildProcessEnv,
+} from "@bb/process-utils";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -22,7 +27,11 @@ export class WorkspaceError extends Error {
   }
 }
 
-export interface RunGitOptions {
+export interface GitProcessOptions {
+  shellPath?: string;
+}
+
+export interface RunGitOptions extends GitProcessOptions {
   cwd: string;
   timeoutMs?: number;
   allowFailure?: boolean;
@@ -30,27 +39,41 @@ export interface RunGitOptions {
   signal?: AbortSignal;
   maxBufferBytes?: number;
   allowTruncatedStdout?: boolean;
+  onStderr?: (chunk: string) => void;
+  input?: string;
 }
 
 interface ResolveGitProcessEnvArgs {
   env: NodeJS.ProcessEnv | undefined;
+  shellPath: string | undefined;
 }
 
-export interface GitTimeoutOptions {
+interface GitTimeoutOptions extends GitProcessOptions {
   timeoutMs?: number;
 }
 
-export interface FetchRemoteBranchesResult {
+interface FetchRemoteBranchesResult {
   status: "fetched" | "failed" | "skipped";
 }
 
-export interface DefaultBranchRefs {
+interface FetchRemoteBranchesOptions extends GitTimeoutOptions {
+  interactive: boolean;
+}
+
+interface DefaultBranchRefs {
   defaultBranch: string | undefined;
   defaultBranchRelation: DefaultBranchRelation | undefined;
   originDefaultBranch: string | undefined;
 }
 
-export interface RunShellPipelineOptions extends GitTimeoutOptions {
+interface BranchRefsWithDefaults {
+  branches: string[];
+  defaultBranch: string | undefined;
+  originDefaultBranch: string | undefined;
+  remoteBranches: string[];
+}
+
+interface RunShellPipelineOptions extends GitTimeoutOptions {
   cwd: string;
   allowFailure?: boolean;
   signal?: AbortSignal;
@@ -62,27 +85,19 @@ export interface GitCommandResult {
   exitCode: number;
 }
 
-export type GitNullRecordFormat = "single" | "name-status";
+export type GitNullRecordFormat = "single" | "name-status" | "numstat";
 
 export interface GitNullRecordLimitResult extends GitCommandResult {
-  /** Complete records retained in stdout. */
   recordCount: number;
-  /** True when the child was stopped as soon as maxRecords was collected. */
   recordLimitReached: boolean;
 }
-
-type BranchStatus = {
-  branchName?: string;
-  aheadCount: number;
-  behindCount: number;
-};
 
 type ActiveWorkspaceGitOperationKind = Exclude<
   WorkspaceGitOperation["kind"],
   "none" | "unknown"
 >;
 
-export interface PorcelainEntry {
+interface PorcelainEntry {
   path: string;
   status: string;
   indexStatus: string;
@@ -150,7 +165,10 @@ function resolveGitProcessEnv(
   args: ResolveGitProcessEnvArgs,
 ): NodeJS.ProcessEnv {
   return {
-    ...sanitizeInheritedChildProcessEnv({ env: process.env }),
+    ...sanitizeInheritedChildProcessEnv({
+      env: process.env,
+      ...(args.shellPath !== undefined ? { shellPath: args.shellPath } : {}),
+    }),
     ...args.env,
   };
 }
@@ -258,13 +276,20 @@ export async function runGit(
     throw createGitCommandCancelledError(args, options.signal.reason);
   }
   try {
-    const result = await execFileAsync("git", args, {
+    const processOptions = {
       cwd: options.cwd,
-      encoding: "utf8",
-      env: resolveGitProcessEnv({ env: options.env }),
+      env: resolveGitProcessEnv({
+        env: options.env,
+        shellPath: options.shellPath,
+      }),
       maxBuffer: options.maxBufferBytes ?? DEFAULT_BUFFER_BYTES,
       signal: options.signal,
       timeout: options.timeoutMs,
+    } as const;
+    const result = await execPortableFile("git", args, {
+      ...processOptions,
+      input: options.input,
+      onStderr: options.onStderr,
     });
     return {
       stdout: result.stdout,
@@ -310,16 +335,6 @@ export async function runGit(
   }
 }
 
-/**
- * Runs Git while collecting at most `maxRecords` complete NUL-delimited
- * records, then stops the child. `single` records contain one token (for
- * example `ls-files -z`); `name-status` records contain a status plus one path,
- * or a status plus old/new paths for renames and copies.
- *
- * This is deliberately record-bounded instead of byte-buffer-bounded: callers
- * enforcing a file-count ceiling can collect exactly the ceiling plus one
- * sentinel without first buffering the repository's complete output.
- */
 export async function runGitWithNullRecordLimit(
   args: string[],
   options: RunGitOptions,
@@ -337,11 +352,17 @@ export async function runGitWithNullRecordLimit(
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
+    const managed = spawnManagedProcess({
+      command: "git",
+      args,
       cwd: options.cwd,
-      env: resolveGitProcessEnv({ env: options.env }),
-      stdio: ["ignore", "pipe", "pipe"],
+      env: resolveGitProcessEnv({
+        env: options.env,
+        shellPath: options.shellPath,
+      }),
     });
+    const { child } = managed;
+    child.stdin.end();
     const stdoutRecords: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let pending = Buffer.alloc(0);
@@ -354,9 +375,19 @@ export async function runGitWithNullRecordLimit(
     let spawnError: Error | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
+    let stopping: Promise<void> | undefined;
     const stopChild = (): void => {
-      child.stdout.pause();
-      child.kill();
+      stopping ??= managed.stop({ gracePeriodMs: 0 }).then(
+        () => undefined,
+        (error: unknown) => {
+          if (timeout !== undefined) clearTimeout(timeout);
+          options.signal?.removeEventListener("abort", onAbort);
+          child.stdin.destroy();
+          child.stderr.destroy();
+          reject(error);
+        },
+      );
+      child.stdout.destroy();
     };
     const onAbort = (): void => {
       if (recordLimitReached) return;
@@ -384,9 +415,15 @@ export async function runGitWithNullRecordLimit(
 
         const token = Buffer.from(input.subarray(tokenStart, index));
         currentRecord.push(token);
-        if (recordFormat === "name-status" && currentRecord.length === 1) {
-          const statusLetter = token[0];
-          expectedTokens = statusLetter === 82 || statusLetter === 67 ? 3 : 2;
+        if (currentRecord.length === 1) {
+          if (recordFormat === "name-status") {
+            const statusLetter = token[0];
+            expectedTokens = statusLetter === 82 || statusLetter === 67 ? 3 : 2;
+          } else if (recordFormat === "numstat") {
+            const firstTab = token.indexOf(9);
+            const secondTab = token.indexOf(9, firstTab + 1);
+            expectedTokens = secondTab === token.length - 1 ? 3 : 1;
+          }
         }
 
         if (currentRecord.length === expectedTokens) {
@@ -413,7 +450,13 @@ export async function runGitWithNullRecordLimit(
     child.once("error", (error) => {
       spawnError = error;
     });
-    child.once("close", (code) => {
+    child.once("close", async (code) => {
+      try {
+        await stopping;
+      } catch (error) {
+        reject(error);
+        return;
+      }
       if (timeout !== undefined) clearTimeout(timeout);
       options.signal?.removeEventListener("abort", onAbort);
 
@@ -460,8 +503,14 @@ export async function runGitWithNullRecordLimit(
   });
 }
 
-export async function getAbsoluteGitDir(cwd: string): Promise<string> {
-  const result = await runGit(["rev-parse", "--absolute-git-dir"], { cwd });
+export async function getAbsoluteGitDir(
+  cwd: string,
+  options: GitProcessOptions = {},
+): Promise<string> {
+  const result = await runGit(["rev-parse", "--absolute-git-dir"], {
+    cwd,
+    ...options,
+  });
   const gitDir = result.stdout.trim();
   if (!gitDir) {
     throw new WorkspaceError(
@@ -472,8 +521,14 @@ export async function getAbsoluteGitDir(cwd: string): Promise<string> {
   return path.resolve(gitDir);
 }
 
-export async function getGitCommonDir(cwd: string): Promise<string> {
-  const result = await runGit(["rev-parse", "--git-common-dir"], { cwd });
+export async function getGitCommonDir(
+  cwd: string,
+  options: GitProcessOptions & { signal?: AbortSignal } = {},
+): Promise<string> {
+  const result = await runGit(["rev-parse", "--git-common-dir"], {
+    cwd,
+    ...options,
+  });
   const commonDir = result.stdout.trim();
   if (!commonDir) {
     throw new WorkspaceError(
@@ -484,16 +539,6 @@ export async function getGitCommonDir(cwd: string): Promise<string> {
   return path.resolve(cwd, commonDir);
 }
 
-/**
- * Run a POSIX shell pipeline and capture stdout. Arguments are passed as
- * positional shell parameters (`$1`, `$2`, ...) so interpolation doesn't
- * evaluate them — `mergeBaseBranch = "; rm -rf /"` is treated as the literal
- * value of `$2`, not as additional shell tokens.
- *
- * Use this for building short git pipelines (e.g. `git diff | git patch-id`)
- * where Node-side buffer-and-resend would otherwise be required. All
- * supported platforms (macOS, Linux, WSL2) ship POSIX `sh`.
- */
 export async function runShellPipeline(
   script: string,
   positionalArgs: string[],
@@ -503,17 +548,30 @@ export async function runShellPipeline(
     throw createShellPipelineCancelledError(options.signal.reason);
   }
   try {
-    const result = await execFileAsync(
-      "sh",
+    const processOptions = {
+      cwd: options.cwd,
+      env: resolveGitProcessEnv({
+        env: undefined,
+        shellPath: options.shellPath,
+      }),
+      maxBuffer: DEFAULT_BUFFER_BYTES,
+      signal: options.signal,
+      timeout: options.timeoutMs,
+    };
+    const shell =
+      process.platform === "win32"
+        ? (
+            await execPortableFile(
+              "git",
+              ["var", "GIT_SHELL_PATH"],
+              processOptions,
+            )
+          ).stdout.trim()
+        : "/bin/sh";
+    const result = await execPortableFile(
+      shell,
       ["-c", script, "sh", ...positionalArgs],
-      {
-        cwd: options.cwd,
-        encoding: "utf8",
-        env: resolveGitProcessEnv({ env: undefined }),
-        maxBuffer: DEFAULT_BUFFER_BYTES,
-        signal: options.signal,
-        timeout: options.timeoutMs,
-      },
+      processOptions,
     );
     return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
@@ -542,10 +600,6 @@ export async function runShellPipeline(
   }
 }
 
-/**
- * Parse the patch-id SHA from a single line of `git patch-id` output. The
- * output format is `<patch-id> <commit-sha>` with one line per input commit.
- */
 export function parsePatchId(line: string | undefined): string | undefined {
   const trimmed = line?.trim();
   if (!trimmed) {
@@ -553,15 +607,6 @@ export function parsePatchId(line: string | undefined): string | undefined {
   }
   const [patchId] = trimmed.split(/\s+/);
   return patchId || undefined;
-}
-
-export async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.access(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function findWorkspaceGitOperationMarker(
@@ -577,23 +622,63 @@ async function findWorkspaceGitOperationMarker(
   return undefined;
 }
 
+export type GitRepoKind = "work-tree" | "bare" | "none";
+
+export async function detectGitRepoKind(
+  cwd: string,
+  options: GitTimeoutOptions = {},
+): Promise<GitRepoKind> {
+  const result = await runGit(
+    ["rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
+    { cwd, ...options, allowFailure: true },
+  );
+  if (result.exitCode !== 0) {
+    return "none";
+  }
+  const [insideWorkTree, bare] = trimOutput(result.stdout).split("\n");
+  if (insideWorkTree === "true") {
+    return "work-tree";
+  }
+  if (bare === "true") {
+    return "bare";
+  }
+  return "none";
+}
+
 export async function detectGitRepo(
   cwd: string,
   options: GitTimeoutOptions = {},
 ): Promise<boolean> {
-  const result = await runGit(["rev-parse", "--is-inside-work-tree"], {
+  return (await detectGitRepoKind(cwd, options)) === "work-tree";
+}
+
+export async function detectLinkedWorktree(
+  cwd: string,
+  options: GitTimeoutOptions = {},
+): Promise<boolean> {
+  const gitDirResult = await runGit(["rev-parse", "--git-dir"], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
-  return result.exitCode === 0 && trimOutput(result.stdout) === "true";
+  if (gitDirResult.exitCode !== 0) {
+    return false;
+  }
+  return gitDirResult.stdout.trim().includes("/worktrees/");
+}
+
+export async function detectGitSource(
+  cwd: string,
+  options: GitTimeoutOptions = {},
+): Promise<boolean> {
+  return (await detectGitRepoKind(cwd, options)) !== "none";
 }
 
 export async function ensureGitRepo(
   cwd: string,
   options: GitTimeoutOptions = {},
 ): Promise<void> {
-  if (await detectGitRepo(cwd, options)) {
+  if (await detectGitSource(cwd, options)) {
     return;
   }
 
@@ -603,30 +688,14 @@ export async function ensureGitRepo(
   );
 }
 
-export type GitRepositoryState = "not_git" | "no_commits" | "has_commits";
-
-export async function readGitRepositoryState(
-  cwd: string,
-  options: GitTimeoutOptions = {},
-): Promise<GitRepositoryState> {
-  if (!(await detectGitRepo(cwd, options))) {
-    return "not_git";
-  }
-  const result = await runGit(["rev-list", "--all", "--max-count=1"], {
-    cwd,
-    timeoutMs: options.timeoutMs,
-  });
-  return trimOutput(result.stdout).length > 0 ? "has_commits" : "no_commits";
-}
-
 async function readHeadSha(
   cwd: string,
   options: GitTimeoutOptions = {},
 ): Promise<string | null> {
   const result = await runGit(["rev-parse", "--verify", "HEAD"], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   if (result.exitCode !== 0) {
     return null;
@@ -646,8 +715,8 @@ export async function getCurrentBranch(
 
   const result = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   if (result.exitCode !== 0) {
     return undefined;
@@ -661,15 +730,15 @@ export async function getCheckoutRef(
   cwd: string,
   options: GitTimeoutOptions = {},
 ): Promise<GitCheckoutRef> {
-  if (!(await detectGitRepo(cwd, options))) {
+  if (!(await detectGitSource(cwd, options))) {
     return { kind: "unknown", reason: "Path is not a git repository" };
   }
 
   const [symbolicRef, headSha] = await Promise.all([
     runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], {
       cwd,
+      ...options,
       allowFailure: true,
-      timeoutMs: options.timeoutMs,
     }),
     readHeadSha(cwd, options),
   ]);
@@ -689,23 +758,6 @@ export async function getCheckoutRef(
   return {
     kind: "unknown",
     reason: "HEAD is not symbolic and no commit is checked out",
-  };
-}
-
-export function parseBranchStatus(line: string | undefined): BranchStatus {
-  const cleaned = line?.trim() ?? "";
-  if (!cleaned.startsWith("##")) {
-    return { aheadCount: 0, behindCount: 0 };
-  }
-
-  const branchMatch = cleaned.match(/^##\s+([^.\s]+)(?:\.\.\.[^\s]+)?/u);
-  const aheadMatch = cleaned.match(/ahead (\d+)/u);
-  const behindMatch = cleaned.match(/behind (\d+)/u);
-
-  return {
-    branchName: branchMatch?.[1],
-    aheadCount: aheadMatch ? Number.parseInt(aheadMatch[1], 10) : 0,
-    behindCount: behindMatch ? Number.parseInt(behindMatch[1], 10) : 0,
   };
 }
 
@@ -855,16 +907,20 @@ function buildActiveWorkspaceGitOperation(
 
 export async function getWorkspaceGitOperation(
   cwd: string,
+  options: GitProcessOptions = {},
 ): Promise<WorkspaceGitOperation> {
-  await ensureGitRepo(cwd);
+  await ensureGitRepo(cwd, options);
 
   const [gitDir, status] = await Promise.all([
-    getAbsoluteGitDir(cwd),
-    // --no-optional-locks: status must not take index.lock, or background
-    // polling races concurrent commits in the same checkout.
+    getAbsoluteGitDir(cwd, options),
     runGit(
-      ["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"],
-      { cwd },
+      [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ],
+      { cwd, ...options },
     ),
   ]);
   const hasConflicts = hasPorcelainConflict(
@@ -877,27 +933,15 @@ export async function getWorkspaceGitOperation(
   return buildActiveWorkspaceGitOperation(marker.kind, hasConflicts);
 }
 
-export interface NameStatusEntry {
+interface NameStatusEntry {
   path: string;
-  /** Raw status letter from `git diff --name-status` (M, A, D, R, C, T, U). */
   status: string;
 }
 
 export interface NameStatusSourceEntry extends NameStatusEntry {
-  /**
-   * Rename/copy source path (the "old" path) for `R`/`C` entries; `null` for
-   * every other status letter, which has no source path.
-   */
   previousPath: string | null;
 }
 
-/**
- * Parses the null-delimited output of `git diff --name-status -z`, retaining
- * the rename/copy source path. Rename (R) and copy (C) entries are followed by
- * two paths (old then new); the new path is the entry path and the old path is
- * `previousPath`. All other statuses have a single path and `previousPath:
- * null`.
- */
 export function parseNameStatusSourceEntries(
   output: string,
 ): NameStatusSourceEntry[] {
@@ -938,11 +982,6 @@ export function parseNameStatusSourceEntries(
   return entries;
 }
 
-/**
- * Parses the null-delimited output of `git diff --name-status -z`. Rename (R)
- * and copy (C) entries are followed by two paths (old then new); we keep only
- * the new path, which is what consumers want to highlight.
- */
 export function parseNameStatusEntries(output: string): NameStatusEntry[] {
   return parseNameStatusSourceEntries(output).map(({ path, status }) => ({
     path,
@@ -977,22 +1016,10 @@ export function summarizeNumstat(output: string): {
 
 export interface NumstatEntry {
   path: string;
-  /** Null for binary files — `git diff --numstat` reports `-` for those. */
   insertions: number | null;
   deletions: number | null;
 }
 
-/**
- * Parses the NUL-delimited output of `git diff --numstat -z`. Each record is
- * one of two shapes; renames are detected by the extra NUL after the second
- * tab:
- *
- *   ADD \t DEL \t PATH \0                       — normal entry
- *   ADD \t DEL \t \0 OLD_PATH \0 NEW_PATH \0    — rename / copy
- *
- * The new path is kept for renames so entries can be joined by path to the
- * porcelain/name-status outputs (which also report the new path).
- */
 export function parseNumstatEntriesZ(output: string): NumstatEntry[] {
   const entries: NumstatEntry[] = [];
   let cursor = 0;
@@ -1023,7 +1050,7 @@ export function parseNumstatEntriesZ(output: string): NumstatEntry[] {
   return entries;
 }
 
-export function parseNumstatCount(text: string): number | null {
+function parseNumstatCount(text: string): number | null {
   const value = Number.parseInt(text, 10);
   return Number.isFinite(value) ? value : null;
 }
@@ -1033,33 +1060,14 @@ export async function readDefaultBranch(
   options: GitTimeoutOptions = {},
 ): Promise<string | undefined> {
   await ensureGitRepo(cwd, options);
-
-  const originHead = await runGit(
-    ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-    { cwd, allowFailure: true, timeoutMs: options.timeoutMs },
+  const originHeadBranch = await readOriginHeadBranchName(cwd, options);
+  if (originHeadBranch !== undefined) {
+    return originHeadBranch;
+  }
+  return resolvePreferredLocalDefaultBranch(
+    await readLocalBranches(cwd, options),
+    undefined,
   );
-  const remoteHead = trimOutput(originHead.stdout);
-  if (remoteHead.startsWith("refs/remotes/origin/")) {
-    return remoteHead.replace("refs/remotes/origin/", "");
-  }
-
-  const branches = await runGit(
-    ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    { cwd, timeoutMs: options.timeoutMs },
-  );
-  const localBranches = branches.stdout
-    .split("\n")
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  if (localBranches.includes("main")) {
-    return "main";
-  }
-  if (localBranches.includes("master")) {
-    return "master";
-  }
-
-  return localBranches[0];
 }
 
 async function readLocalBranches(
@@ -1068,7 +1076,7 @@ async function readLocalBranches(
 ): Promise<string[]> {
   const branches = await runGit(
     ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    { cwd, timeoutMs: options.timeoutMs },
+    { cwd, ...options },
   );
   return branches.stdout
     .split("\n")
@@ -1080,7 +1088,10 @@ function resolvePreferredLocalDefaultBranch(
   localBranches: readonly string[],
   originDefaultBranchName: string | undefined,
 ): string | undefined {
-  if (originDefaultBranchName && localBranches.includes(originDefaultBranchName)) {
+  if (
+    originDefaultBranchName &&
+    localBranches.includes(originDefaultBranchName)
+  ) {
     return originDefaultBranchName;
   }
   if (localBranches.includes("main")) {
@@ -1106,7 +1117,7 @@ async function readOriginHeadBranchName(
 ): Promise<string | undefined> {
   const originHead = await runGit(
     ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-    { cwd, allowFailure: true, timeoutMs: options.timeoutMs },
+    { cwd, ...options, allowFailure: true },
   );
   return parseOriginHeadBranchName(originHead.stdout);
 }
@@ -1119,8 +1130,8 @@ export async function hasRef(
   await ensureGitRepo(cwd, options);
   const result = await runGit(["show-ref", "--verify", "--quiet", ref], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   return result.exitCode === 0;
 }
@@ -1155,8 +1166,8 @@ async function revParseRef(
 ): Promise<string | undefined> {
   const result = await runGit(["rev-parse", "--verify", `${ref}^{commit}`], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   if (result.exitCode !== 0) {
     return undefined;
@@ -1172,7 +1183,7 @@ async function isAncestorRef(
 ): Promise<boolean | undefined> {
   const result = await runGit(
     ["merge-base", "--is-ancestor", ancestorRef, descendantRef],
-    { cwd, allowFailure: true, timeoutMs: options.timeoutMs },
+    { cwd, ...options, allowFailure: true },
   );
   if (result.exitCode === 0) {
     return true;
@@ -1206,7 +1217,12 @@ async function readDefaultBranchRelation(
     return "equal";
   }
 
-  const localIsAncestor = await isAncestorRef(cwd, localRef, originRef, options);
+  const localIsAncestor = await isAncestorRef(
+    cwd,
+    localRef,
+    originRef,
+    options,
+  );
   if (localIsAncestor === true) {
     return "local-behind";
   }
@@ -1214,7 +1230,12 @@ async function readDefaultBranchRelation(
     return "unknown";
   }
 
-  const originIsAncestor = await isAncestorRef(cwd, originRef, localRef, options);
+  const originIsAncestor = await isAncestorRef(
+    cwd,
+    originRef,
+    localRef,
+    options,
+  );
   if (originIsAncestor === true) {
     return "local-ahead";
   }
@@ -1255,16 +1276,42 @@ export async function readDefaultBranchRefs(
   };
 }
 
+async function fetchRemoteBranchesNonInteractively(
+  cwd: string,
+  options: GitTimeoutOptions,
+): Promise<FetchRemoteBranchesResult> {
+  try {
+    await execPortableFile("git", ["fetch", "--all", "--prune", "--quiet"], {
+      cwd,
+      timeout: options.timeoutMs,
+      maxBuffer: DEFAULT_BUFFER_BYTES,
+      env: resolveGitProcessEnv({
+        shellPath: options.shellPath,
+        env: {
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_ASKPASS: "false",
+          SSH_ASKPASS: "false",
+          SSH_ASKPASS_REQUIRE: "never",
+          GCM_INTERACTIVE: "never",
+        },
+      }),
+    });
+    return { status: "fetched" };
+  } catch {
+    return { status: "failed" };
+  }
+}
+
 export async function fetchRemoteBranches(
   cwd: string,
-  options: GitTimeoutOptions = {},
+  { interactive, ...options }: FetchRemoteBranchesOptions,
 ): Promise<FetchRemoteBranchesResult> {
   await ensureGitRepo(cwd, options);
 
   const remotes = await runGit(["remote"], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   if (
     remotes.exitCode !== 0 ||
@@ -1276,15 +1323,22 @@ export async function fetchRemoteBranches(
     return { status: "skipped" };
   }
 
+  if (!interactive) {
+    return fetchRemoteBranchesNonInteractively(cwd, options);
+  }
+
   try {
     const result = await runGit(["fetch", "--all", "--prune", "--quiet"], {
       cwd,
+      ...options,
       allowFailure: true,
-      timeoutMs: options.timeoutMs,
     });
     return { status: result.exitCode === 0 ? "fetched" : "failed" };
   } catch (error) {
-    if (error instanceof WorkspaceError && error.code === "git_command_timeout") {
+    if (
+      error instanceof WorkspaceError &&
+      error.code === "git_command_timeout"
+    ) {
       return { status: "failed" };
     }
     throw error;
@@ -1299,8 +1353,8 @@ export async function readMergeBaseRef(
   await ensureGitRepo(cwd, options);
   const result = await runGit(["merge-base", ref, "HEAD"], {
     cwd,
+    ...options,
     allowFailure: true,
-    timeoutMs: options.timeoutMs,
   });
   if (result.exitCode !== 0) {
     return undefined;
@@ -1310,33 +1364,35 @@ export async function readMergeBaseRef(
   return mergeBaseRef || undefined;
 }
 
-export async function revParse(cwd: string, ref: string): Promise<string> {
-  await ensureGitRepo(cwd);
-  const result = await runGit(["rev-parse", ref], { cwd });
+export async function revParse(
+  cwd: string,
+  ref: string,
+  options: GitProcessOptions = {},
+): Promise<string> {
+  await ensureGitRepo(cwd, options);
+  const result = await runGit(["rev-parse", ref], { cwd, ...options });
   return trimOutput(result.stdout);
 }
 
-export interface ReadGitBlobResult {
-  /** Object bytes, or `null` if no blob exists at `<ref>:<relativePath>`. */
+interface ReadGitBlobResult {
   contents: Buffer | null;
-  /** Git blob byte size; equals `contents.byteLength`, or 0 when missing. */
   sizeBytes: number;
 }
 
-/**
- * Look up the byte size of a blob at `<ref>:<relativePath>`. Returns
- * `undefined` only when git reports the ref/path/object target is absent.
- * Non-blob objects and other git failures surface as `git_command_failed`.
- */
-export async function gitBlobSize(
+async function gitBlobSize(
   cwd: string,
   ref: string,
   relativePath: string,
+  options: GitProcessOptions,
 ): Promise<number | undefined> {
-  await ensureGitRepo(cwd);
+  await ensureGitRepo(cwd, options);
   const target = `${ref}:${relativePath}`;
   const typeArgs = ["cat-file", "-t", target];
-  const typeResult = await runGit(typeArgs, { cwd, allowFailure: true });
+  const typeResult = await runGit(typeArgs, {
+    cwd,
+    ...options,
+    allowFailure: true,
+  });
   if (typeResult.exitCode !== 0) {
     const stderr = trimOutput(typeResult.stderr);
     if (isMissingGitBlobTargetError(stderr)) {
@@ -1354,7 +1410,11 @@ export async function gitBlobSize(
   }
 
   const sizeArgs = ["cat-file", "-s", target];
-  const sizeResult = await runGit(sizeArgs, { cwd, allowFailure: true });
+  const sizeResult = await runGit(sizeArgs, {
+    cwd,
+    ...options,
+    allowFailure: true,
+  });
   if (sizeResult.exitCode !== 0) {
     const stderr = trimOutput(sizeResult.stderr);
     if (isMissingGitBlobTargetError(stderr)) {
@@ -1375,20 +1435,15 @@ export async function gitBlobSize(
   return parsed;
 }
 
-/**
- * Read a blob at `<ref>:<relativePath>` as raw bytes. Returns
- * `{ contents: null, sizeBytes: 0 }` only when git reports the target is
- * absent. `sizeBytes` is the blob size reported by git and equals
- * `contents.byteLength` when content is returned.
- */
 export async function readGitBlob(
   cwd: string,
   ref: string,
   relativePath: string,
   maxBytes: number,
+  options: GitProcessOptions = {},
 ): Promise<ReadGitBlobResult> {
   const target = `${ref}:${relativePath}`;
-  const size = await gitBlobSize(cwd, ref, relativePath);
+  const size = await gitBlobSize(cwd, ref, relativePath, options);
   if (size === undefined) {
     return { contents: null, sizeBytes: 0 };
   }
@@ -1403,7 +1458,10 @@ export async function readGitBlob(
     const result = await execFileAsync("git", ["cat-file", "blob", target], {
       cwd,
       encoding: "buffer",
-      env: resolveGitProcessEnv({ env: undefined }),
+      env: resolveGitProcessEnv({
+        env: undefined,
+        shellPath: options.shellPath,
+      }),
       maxBuffer: maxBytes,
     });
     const contents = Buffer.from(result.stdout);
@@ -1427,23 +1485,22 @@ export async function readGitBlob(
   }
 }
 
-export async function listBranches(cwd: string): Promise<string[]> {
-  await ensureGitRepo(cwd);
-  const result = await runGit(
-    ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    { cwd },
-  );
-  return result.stdout
-    .split("\n")
-    .map((branch) => branch.trim())
-    .filter(Boolean);
+export async function listBranches(
+  cwd: string,
+  options: GitProcessOptions = {},
+): Promise<string[]> {
+  await ensureGitRepo(cwd, options);
+  return readLocalBranches(cwd, options);
 }
 
-export async function listRemoteBranches(cwd: string): Promise<string[]> {
-  await ensureGitRepo(cwd);
+export async function listRemoteBranches(
+  cwd: string,
+  options: GitProcessOptions = {},
+): Promise<string[]> {
+  await ensureGitRepo(cwd, options);
   const result = await runGit(
     ["for-each-ref", "--format=%(refname:short)%09%(symref)", "refs/remotes"],
-    { cwd },
+    { cwd, ...options },
   );
   return result.stdout
     .split("\n")
@@ -1455,11 +1512,48 @@ export async function listRemoteBranches(cwd: string): Promise<string[]> {
     .map((ref) => ref.branch);
 }
 
-export async function hasUncommittedChanges(cwd: string): Promise<boolean> {
-  await ensureGitRepo(cwd);
+export async function listBranchRefsWithDefaults(
+  cwd: string,
+  options: GitProcessOptions = {},
+): Promise<BranchRefsWithDefaults> {
+  const [branches, remoteBranches, originHeadBranch] = await Promise.all([
+    listBranches(cwd, options),
+    listRemoteBranches(cwd, options),
+    readOriginHeadBranchName(cwd, options),
+  ]);
+  const defaultBranch = resolvePreferredLocalDefaultBranch(
+    branches,
+    originHeadBranch,
+  );
+  const originDefaultBranch = [
+    originHeadBranch ? `origin/${originHeadBranch}` : undefined,
+    defaultBranch ? `origin/${defaultBranch}` : undefined,
+  ].find(
+    (branch): branch is string =>
+      branch !== undefined && remoteBranches.includes(branch),
+  );
+
+  return {
+    branches,
+    defaultBranch,
+    originDefaultBranch,
+    remoteBranches,
+  };
+}
+
+export async function hasUncommittedChanges(
+  cwd: string,
+  options: GitProcessOptions = {},
+): Promise<boolean> {
+  await ensureGitRepo(cwd, options);
   const status = await runGit(
-    ["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"],
-    { cwd },
+    [
+      "--no-optional-locks",
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ],
+    { cwd, ...options },
   );
   return status.stdout.trim().length > 0;
 }

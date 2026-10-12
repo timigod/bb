@@ -1,4 +1,4 @@
-import type { TerminalSession } from "@bb/server-contract";
+import { openSecondaryPanelTabInState } from "@bb/client-core";
 import { describe, expect, it } from "vitest";
 import {
   createEmptyFixedPanelTabsState,
@@ -7,38 +7,13 @@ import {
 } from "@/lib/fixed-panel-tabs-state";
 import {
   buildTerminalSyncedSecondaryFileTabs,
-  findActiveTerminalIdInSecondaryFileTabs,
-  getRetainedTerminalTabId,
   pruneTerminalTabsForSessions,
   syncTerminalTabsInFixedPanelState,
 } from "./terminalPanelTabs";
-
-type TerminalSessionOverrides = Partial<TerminalSession>;
+import { makeTerminalSession as terminalSession } from "@/test/fixtures/terminal-sessions";
 
 interface TabIdentity {
   id: string;
-}
-
-function terminalSession(
-  overrides: TerminalSessionOverrides,
-): TerminalSession {
-  return {
-    id: "term_1",
-    threadId: "thr_1",
-    environmentId: "env_1",
-    hostId: "host_1",
-    title: "Terminal",
-    initialCwd: "/workspace",
-    cols: 100,
-    rows: 30,
-    status: "running",
-    exitCode: null,
-    closeReason: null,
-    createdAt: 1,
-    updatedAt: 1,
-    lastUserInputAt: null,
-    ...overrides,
-  };
 }
 
 function tabIds(tabs: readonly TabIdentity[]): string[] {
@@ -46,38 +21,7 @@ function tabIds(tabs: readonly TabIdentity[]): string[] {
 }
 
 describe("terminalPanelTabs", () => {
-  it("resolves a retained terminal id only from the open active terminal tab", () => {
-    const terminalTab = createTerminalFixedPanelTab({ terminalId: "term_1" });
-    const fileTab = createHostFilePreviewFixedPanelTab({
-      environmentId: "env_1",
-      tab: {
-        lineRange: null,
-        path: "/workspace/file.ts",
-      },
-      threadId: "thr_1",
-    });
-
-    expect(
-      getRetainedTerminalTabId({
-        activeTab: terminalTab,
-        isPanelOpen: true,
-      }),
-    ).toBe("term_1");
-    expect(
-      getRetainedTerminalTabId({
-        activeTab: terminalTab,
-        isPanelOpen: false,
-      }),
-    ).toBeNull();
-    expect(
-      getRetainedTerminalTabId({
-        activeTab: fileTab,
-        isPanelOpen: true,
-      }),
-    ).toBeNull();
-  });
-
-  it("prunes terminal tabs against active or retained terminal sessions", () => {
+  it("prunes terminal tabs whose sessions exited or vanished but keeps disconnected ones", () => {
     const infoTab = createHostFilePreviewFixedPanelTab({
       environmentId: "env_1",
       tab: {
@@ -86,11 +30,14 @@ describe("terminalPanelTabs", () => {
       },
       threadId: "thr_1",
     });
-    const retainedTerminal = createTerminalFixedPanelTab({
-      terminalId: "term_retained",
+    const disconnectedTerminal = createTerminalFixedPanelTab({
+      terminalId: "term_disconnected",
     });
-    const unretainedTerminal = createTerminalFixedPanelTab({
-      terminalId: "term_unretained",
+    const exitedTerminal = createTerminalFixedPanelTab({
+      terminalId: "term_exited",
+    });
+    const missingTerminal = createTerminalFixedPanelTab({
+      terminalId: "term_missing",
     });
     const runningTerminal = createTerminalFixedPanelTab({
       terminalId: "term_running",
@@ -98,27 +45,28 @@ describe("terminalPanelTabs", () => {
 
     expect(
       pruneTerminalTabsForSessions({
-        retainedTerminalId: "term_retained",
-        tabs: [infoTab, retainedTerminal, unretainedTerminal, runningTerminal],
+        tabs: [
+          infoTab,
+          disconnectedTerminal,
+          exitedTerminal,
+          missingTerminal,
+          runningTerminal,
+        ],
         terminalSessions: [
           terminalSession({
-            id: "term_retained",
+            id: "term_disconnected",
             status: "disconnected",
           }),
-          terminalSession({
-            id: "term_unretained",
-            status: "disconnected",
-          }),
+          terminalSession({ id: "term_exited", status: "exited" }),
           terminalSession({ id: "term_running" }),
         ],
       }),
-    ).toEqual([infoTab, retainedTerminal, runningTerminal]);
+    ).toEqual([infoTab, disconnectedTerminal, runningTerminal]);
   });
 
   it("adds server terminal sessions missing from local tabs", () => {
     const tabs = buildTerminalSyncedSecondaryFileTabs({
       orderedTabs: [],
-      retainedTerminalId: null,
       terminalSessions: [
         terminalSession({ id: "term_1" }),
         terminalSession({ id: "term_2" }),
@@ -148,7 +96,6 @@ describe("terminalPanelTabs", () => {
     });
     const tabs = buildTerminalSyncedSecondaryFileTabs({
       orderedTabs: [localTerminal2, localFile, localTerminal1],
-      retainedTerminalId: null,
       terminalSessions: [
         terminalSession({ id: "term_1" }),
         terminalSession({ id: "term_2" }),
@@ -170,14 +117,13 @@ describe("terminalPanelTabs", () => {
         createTerminalFixedPanelTab({ terminalId: "term_stale" }),
         createTerminalFixedPanelTab({ terminalId: "term_1" }),
       ],
-      retainedTerminalId: null,
       terminalSessions: [terminalSession({ id: "term_1" })],
     });
 
     expect(tabIds(tabs)).toEqual(["terminal:term_1:none"]);
   });
 
-  it("drops disconnected terminal tabs unless they are retained", () => {
+  it("keeps disconnected terminal tabs", () => {
     const disconnectedTerminal = createTerminalFixedPanelTab({
       terminalId: "term_disconnected",
     });
@@ -196,17 +142,6 @@ describe("terminalPanelTabs", () => {
       tabIds(
         buildTerminalSyncedSecondaryFileTabs({
           orderedTabs: [disconnectedTerminal, runningTerminal],
-          retainedTerminalId: null,
-          terminalSessions: sessions,
-        }),
-      ),
-    ).toEqual(["terminal:term_running:none"]);
-
-    expect(
-      tabIds(
-        buildTerminalSyncedSecondaryFileTabs({
-          orderedTabs: [disconnectedTerminal, runningTerminal],
-          retainedTerminalId: "term_disconnected",
           terminalSessions: sessions,
         }),
       ),
@@ -214,37 +149,6 @@ describe("terminalPanelTabs", () => {
       "terminal:term_disconnected:none",
       "terminal:term_running:none",
     ]);
-  });
-
-  it("finds the active terminal id only for displayed terminal tabs", () => {
-    const terminalTab = createTerminalFixedPanelTab({ terminalId: "term_1" });
-    const fileTab = createHostFilePreviewFixedPanelTab({
-      environmentId: "env_1",
-      tab: {
-        lineRange: null,
-        path: "/workspace/file.ts",
-      },
-      threadId: "thr_1",
-    });
-
-    expect(
-      findActiveTerminalIdInSecondaryFileTabs({
-        activeTabId: terminalTab.id,
-        tabs: [fileTab, terminalTab],
-      }),
-    ).toBe("term_1");
-    expect(
-      findActiveTerminalIdInSecondaryFileTabs({
-        activeTabId: fileTab.id,
-        tabs: [fileTab, terminalTab],
-      }),
-    ).toBeNull();
-    expect(
-      findActiveTerminalIdInSecondaryFileTabs({
-        activeTabId: "terminal:term_stale",
-        tabs: [fileTab, terminalTab],
-      }),
-    ).toBeNull();
   });
 
   it("syncs missing server terminal sessions into fixed panel state", () => {
@@ -264,7 +168,6 @@ describe("terminalPanelTabs", () => {
       },
     });
     const nextState = syncTerminalTabsInFixedPanelState({
-      retainedTerminalId: null,
       state,
       terminalSessions: [
         terminalSession({ id: "term_1" }),
@@ -280,7 +183,7 @@ describe("terminalPanelTabs", () => {
     expect(nextState.secondary.activeTabId).toBe(fileTab.id);
   });
 
-  it("removes stale fixed terminal tabs and clears stale active state", () => {
+  it("removes stale fixed terminal tabs and selects the remaining neighbor", () => {
     const staleTerminalTab = createTerminalFixedPanelTab({
       terminalId: "term_stale",
     });
@@ -295,20 +198,17 @@ describe("terminalPanelTabs", () => {
       },
     });
     const nextState = syncTerminalTabsInFixedPanelState({
-      retainedTerminalId: null,
       state,
       terminalSessions: [terminalSession({ id: "term_1" })],
     });
 
-    expect(tabIds(nextState.secondary.tabs)).toEqual([
-      "terminal:term_1:none",
-    ]);
-    expect(nextState.secondary.activeTabId).toBeNull();
+    expect(tabIds(nextState.secondary.tabs)).toEqual(["terminal:term_1:none"]);
+    expect(nextState.secondary.activeTabId).toBe(currentTerminalTab.id);
   });
 
-  it("removes a disconnected terminal without disturbing the active file tab", () => {
+  it("removes an exited terminal without disturbing the active file tab", () => {
     const terminalTab = createTerminalFixedPanelTab({
-      terminalId: "term_disconnected",
+      terminalId: "term_exited",
     });
     const activeFileTab = createHostFilePreviewFixedPanelTab({
       environmentId: "env_1",
@@ -327,12 +227,11 @@ describe("terminalPanelTabs", () => {
     });
 
     const nextState = syncTerminalTabsInFixedPanelState({
-      retainedTerminalId: null,
       state,
       terminalSessions: [
         terminalSession({
-          id: "term_disconnected",
-          status: "disconnected",
+          id: "term_exited",
+          status: "exited",
           title: "zsh",
         }),
       ],
@@ -354,29 +253,27 @@ describe("terminalPanelTabs", () => {
 
     expect(
       syncTerminalTabsInFixedPanelState({
-        retainedTerminalId: null,
         state,
         terminalSessions: [terminalSession({ id: "term_1" })],
       }),
     ).toBe(state);
   });
 
-  it("keeps only a retained disconnected terminal in fixed panel state", () => {
+  it("keeps disconnected terminals in fixed panel state", () => {
     const disconnectedTerminal = createTerminalFixedPanelTab({
       terminalId: "term_disconnected",
     });
-    const unretainedTerminal = createTerminalFixedPanelTab({
-      terminalId: "term_unretained",
+    const otherDisconnectedTerminal = createTerminalFixedPanelTab({
+      terminalId: "term_other_disconnected",
     });
     const state = createEmptyFixedPanelTabsState({
       secondary: {
         activeTabId: disconnectedTerminal.id,
         isOpen: true,
-        tabs: [disconnectedTerminal, unretainedTerminal],
+        tabs: [disconnectedTerminal, otherDisconnectedTerminal],
       },
     });
     const nextState = syncTerminalTabsInFixedPanelState({
-      retainedTerminalId: "term_disconnected",
       state,
       terminalSessions: [
         terminalSession({
@@ -384,7 +281,7 @@ describe("terminalPanelTabs", () => {
           status: "disconnected",
         }),
         terminalSession({
-          id: "term_unretained",
+          id: "term_other_disconnected",
           status: "disconnected",
         }),
       ],
@@ -392,7 +289,37 @@ describe("terminalPanelTabs", () => {
 
     expect(tabIds(nextState.secondary.tabs)).toEqual([
       "terminal:term_disconnected:none",
+      "terminal:term_other_disconnected:none",
     ]);
     expect(nextState.secondary.activeTabId).toBe(disconnectedTerminal.id);
   });
+});
+
+it("returns to the source if session synchronization removes an active terminal before its close callback", () => {
+  const source = createHostFilePreviewFixedPanelTab({
+    environmentId: "env_1",
+    threadId: "thr_1",
+    tab: { path: "/source.txt", lineRange: null },
+  });
+  const neighbor = createHostFilePreviewFixedPanelTab({
+    environmentId: "env_1",
+    threadId: "thr_1",
+    tab: { path: "/neighbor.txt", lineRange: null },
+  });
+  const terminal = createTerminalFixedPanelTab({ terminalId: "closing" });
+  const state = openSecondaryPanelTabInState({
+    state: createEmptyFixedPanelTabsState({
+      secondary: {
+        tabs: [source, neighbor],
+        activeTabId: source.id,
+        isOpen: true,
+      },
+    }),
+    tab: terminal,
+  });
+  const next = syncTerminalTabsInFixedPanelState({
+    state,
+    terminalSessions: [],
+  });
+  expect(next.secondary.activeTabId).toBe(source.id);
 });

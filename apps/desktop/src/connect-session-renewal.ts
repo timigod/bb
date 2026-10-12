@@ -1,60 +1,35 @@
-export const CONNECT_SESSION_RENEWAL_LEAD_MS = 5 * 60 * 1000;
-export const CONNECT_SESSION_MIN_RENEWAL_DELAY_MS = 30 * 1000;
+const CONNECT_SESSION_RENEWAL_LEAD_MS = 5 * 60 * 1000;
+const CONNECT_SESSION_MIN_RENEWAL_DELAY_MS = 30 * 1000;
 
 export type ConnectSessionAuthenticateResult =
   | { expiresAt: number; ok: true }
   | { detail: string; ok: false };
 
-/**
- * Mint and install a session cookie for `remoteServerUrl`.
- *
- * `isCurrent` reports whether that server is still the app's target. A slow
- * authentication must consult it before any expensive fallback, because the
- * user can switch targets while it runs.
- */
-export type ConnectSessionAuthenticate = (
+type ConnectSessionAuthenticate = (
   remoteServerUrl: string,
   isCurrent: () => boolean,
 ) => Promise<ConnectSessionAuthenticateResult>;
 
-export interface CreateConnectSessionRenewalArgs {
+interface CreateConnectSessionRenewalArgs {
   authenticate: ConnectSessionAuthenticate;
   clearTimeoutFn?: (handle: unknown) => void;
-  leadMs?: number;
   log?: (message: string) => void;
-  minDelayMs?: number;
   now?: () => number;
   setTimeoutFn?: (handler: () => void, timeout: number) => unknown;
 }
 
 export interface ConnectSessionRenewal {
-  /** Renew now when the session is spent or nearly spent. */
   renewIfDue(): void;
-  /** Renew now, coalescing with a renewal already in flight. */
   renewNow(): Promise<void>;
-  /** Track a fresh session for this server, and renew it before it expires. */
   start(args: { expiresAt: number; remoteServerUrl: string }): void;
-  /** Forget the current session: a target switch, or quit. */
   stop(): void;
 }
 
-/**
- * Keep a Connect session cookie alive.
- *
- * The gate issues a one-hour cookie, and the app can hold one remote target far
- * longer than that. So it re-mints ahead of expiry, and on demand when the app
- * becomes active — a sleeping Mac holds timers, and waking must not land on a
- * dead session.
- *
- * Every session gets a generation. `stop()` and `start()` both retire the
- * current one, so a renewal that finishes after the user left its target
- * neither reschedules itself nor revives that target.
- */
 export function createConnectSessionRenewal(
   args: CreateConnectSessionRenewalArgs,
 ): ConnectSessionRenewal {
-  const leadMs = args.leadMs ?? CONNECT_SESSION_RENEWAL_LEAD_MS;
-  const minDelayMs = args.minDelayMs ?? CONNECT_SESSION_MIN_RENEWAL_DELAY_MS;
+  const leadMs = CONNECT_SESSION_RENEWAL_LEAD_MS;
+  const minDelayMs = CONNECT_SESSION_MIN_RENEWAL_DELAY_MS;
   const now = args.now ?? Date.now;
   const setTimeoutFn =
     args.setTimeoutFn ??
@@ -112,8 +87,6 @@ export function createConnectSessionRenewal(
     const isCurrent = (): boolean => generation === startedGeneration;
     const result = await args.authenticate(remoteServerUrl, isCurrent);
     if (!isCurrent()) {
-      // The user left this server while the call ran. Scheduling again here
-      // would resurrect a target they already dropped.
       return;
     }
     if (result.ok) {
@@ -123,8 +96,6 @@ export function createConnectSessionRenewal(
     args.log?.(
       `could not renew the bb Connect session: ${result.detail} — retrying`,
     );
-    // Retry on the same cadence rather than giving up: the window still shows
-    // the remote server, and the next attempt may find the gate reachable.
     start({ expiresAt: now() + leadMs, remoteServerUrl });
   }
 

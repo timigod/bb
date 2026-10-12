@@ -1,49 +1,73 @@
 import type { TimelineRow } from "@bb/server-contract";
 
-/**
- * Tracks the most recent full window rows the server sent for a given request
- * shape (params key — everything except `maxSeq`). A delta request supplies the
- * `maxSeq` it last received; when this cache still holds exactly that revision,
- * the server diffs the current window against it to produce a row patch. When
- * the cache has moved on (another client advanced it, or it was evicted) the
- * server falls back to a full response, so this is purely an optimization and
- * never affects correctness.
- *
- * Bounded by entry count. Entries can be large (an expanded active turn is
- * hundreds of rows), so the bound is small — only actively-viewed threads need
- * a live entry.
- */
 const DEFAULT_MAX_ENTRIES = 64;
+const DEFAULT_RING_SIZE = 4;
 
-export interface TimelineLatestRows {
+interface TimelineLatestRows {
   maxSeq: number;
   rows: readonly TimelineRow[];
 }
 
-export interface TimelineLatestRowsCache {
-  get(paramsKey: string): TimelineLatestRows | undefined;
-  set(paramsKey: string, value: TimelineLatestRows): void;
+interface TimelineLatestRowsCache {
+  get(
+    threadId: string,
+    paramsKey: string,
+    maxSeq: number,
+  ): TimelineLatestRows | undefined;
+  invalidateThread(threadId: string): void;
+  set(threadId: string, paramsKey: string, value: TimelineLatestRows): void;
   readonly size: number;
 }
 
+interface TimelineLatestRowsCacheEntry {
+  ring: TimelineLatestRows[];
+  threadId: string;
+}
+
 export function createTimelineLatestRowsCache(
-  options: { maxEntries?: number } = {},
+  options: { maxEntries?: number; ringSize?: number } = {},
 ): TimelineLatestRowsCache {
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  const entries = new Map<string, TimelineLatestRows>();
+  const ringSize = options.ringSize ?? DEFAULT_RING_SIZE;
+  const entries = new Map<string, TimelineLatestRowsCacheEntry>();
+
+  function touch(paramsKey: string, entry: TimelineLatestRowsCacheEntry): void {
+    entries.delete(paramsKey);
+    entries.set(paramsKey, entry);
+  }
 
   return {
-    get(paramsKey) {
-      const value = entries.get(paramsKey);
-      if (value !== undefined) {
-        entries.delete(paramsKey);
-        entries.set(paramsKey, value);
+    get(threadId, paramsKey, maxSeq) {
+      const entry = entries.get(paramsKey);
+      if (entry === undefined || entry.threadId !== threadId) {
+        return undefined;
       }
-      return value;
+      touch(paramsKey, entry);
+      return entry.ring.find((value) => value.maxSeq === maxSeq);
     },
-    set(paramsKey, value) {
-      entries.delete(paramsKey);
-      entries.set(paramsKey, value);
+    invalidateThread(threadId) {
+      for (const [paramsKey, entry] of entries) {
+        if (entry.threadId === threadId) {
+          entries.delete(paramsKey);
+        }
+      }
+    },
+    set(threadId, paramsKey, value) {
+      const cached = entries.get(paramsKey);
+      const entry =
+        cached?.threadId === threadId ? cached : { ring: [], threadId };
+      const ring = entry.ring;
+      const existingIndex = ring.findIndex(
+        (entry) => entry.maxSeq === value.maxSeq,
+      );
+      if (existingIndex !== -1) {
+        ring.splice(existingIndex, 1);
+      }
+      ring.push(value);
+      while (ring.length > ringSize) {
+        ring.shift();
+      }
+      touch(paramsKey, entry);
       while (entries.size > maxEntries) {
         const oldest = entries.keys().next().value;
         if (oldest === undefined) {

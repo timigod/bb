@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import {
   cp,
   lstat,
+  mkdir,
   open,
   readdir,
   readFile,
@@ -10,47 +11,61 @@ import {
   realpath,
   rename,
   rm,
+  stat,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import semver from "semver";
-import { spawnPortableOutputProcess } from "@bb/process-utils";
+import { resolveBundledNpmCli } from "@bb/plugin-build";
+import {
+  killPortableProcess,
+  killProcessGroup,
+  omitNpmScriptPolicyEnv,
+  spawnPortableOutputProcess,
+  supportsProcessGroups,
+} from "@bb/process-utils";
+import {
+  installCancellationSignal,
+  PluginInstallCancelledError,
+} from "./install-cancellation.js";
 
-/**
- * Parsed `bb plugin install` source spec (design §6). The original spec is
- * retained for display/diagnostics; normalized persistence is authoritative.
- */
-export type ParsedPluginSource =
+type ParsedGitSelector =
+  | { kind: "ref"; ref: string }
+  | { kind: "range"; range: string; tagPrefix: string }
+  | { kind: "ref-or-range"; ref: string; range: string };
+
+type ParsedPluginSource =
   | { kind: "path"; path: string }
   | { kind: "builtin"; name: string }
   | {
       kind: "git";
-      /** Clone URL (https, or an on-disk repo path). */
       url: string;
-      /** Requested branch, tag, or commit. Classified with ls-remote. */
-      ref: string;
-      /** Managed dir relative to <dataDir>/plugins/git: "<host>/<path>@<ref>". */
-      installDir: string;
-      /** Cache namespace relative to plugins/cache/git: "<host>/<path>". */
+      spec: string;
+      selector: ParsedGitSelector;
       cachePath: string;
     }
   | {
       kind: "npm";
       name: string;
-      /** Empty for an omitted spec (`npm:pkg`). */
       spec: string;
       specKind: "default" | "exact" | "tag" | "range";
     };
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
 export const DEFAULT_GIT_REF = "HEAD";
-// Loose npm package-name shape; enough to keep names safe as path segments.
-const NPM_NAME_PATTERN =
-  /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+const GIT_RANGE_SPEC_PREFIX = "semver:";
+const GIT_REF_SPEC_PREFIX = "ref:";
+const BARE_VERSION_SPEC_PATTERN = /^v?\d+(?:\.\d+)*$/u;
+const GIT_TAG_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
+const MAX_GIT_TAG_PREFIX_LENGTH = 128;
+const NPM_NAME_PATTERN = /^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
 const BUILTIN_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 
 export function isCommitSha(ref: string): boolean {
   return COMMIT_SHA_PATTERN.test(ref);
 }
+
+const WINDOWS_DRIVE_PATH_PATTERN = /^([A-Za-z]):[\\/]+/u;
+const WINDOWS_LOCAL_CACHE_DIGEST_LENGTH = 12;
 
 function assertSafeSegments(value: string, label: string): void {
   const segments = value.split("/");
@@ -63,6 +78,88 @@ function assertSafeSegments(value: string, label: string): void {
   }
 }
 
+function isGitSemverRangeSpec(spec: string): boolean {
+  return (
+    semver.validRange(spec) !== null &&
+    semver.valid(spec) === null &&
+    !BARE_VERSION_SPEC_PATTERN.test(spec)
+  );
+}
+
+export function normalizeGitTagPrefix(value: string): string {
+  if (value.length === 0) return value;
+  if (
+    value.length > MAX_GIT_TAG_PREFIX_LENGTH ||
+    !GIT_TAG_PREFIX_PATTERN.test(value) ||
+    value.includes("..") ||
+    value.includes("//") ||
+    value.endsWith(".") ||
+    value
+      .split("/")
+      .some((segment) => segment.startsWith(".") || segment.endsWith(".lock"))
+  ) {
+    throw new Error(`invalid git tag prefix "${value}"`);
+  }
+  return value;
+}
+
+export function gitRangeSourceSpec(args: {
+  url: string;
+  range: string;
+  tagPrefix: string;
+}): string {
+  const prefix =
+    args.tagPrefix.length === 0
+      ? ""
+      : `${normalizeGitTagPrefix(args.tagPrefix)}:`;
+  return `git:${args.url}@${GIT_RANGE_SPEC_PREFIX}${prefix}${args.range}`;
+}
+
+export function gitSemverTagName(tagPrefix: string, version: string): string {
+  return `${tagPrefix}v${version}`;
+}
+
+export function gitSemverTagVersion(
+  tag: string,
+  tagPrefix: string,
+): string | null {
+  if (!tag.startsWith(tagPrefix)) return null;
+  const rest = tag.slice(tagPrefix.length);
+  if (!rest.startsWith("v")) return null;
+  const version = rest.slice(1);
+  return semver.parse(version)?.version === version ? version : null;
+}
+
+function parseGitSelector(spec: string): ParsedGitSelector {
+  if (spec.startsWith(GIT_REF_SPEC_PREFIX)) {
+    const ref = spec.slice(GIT_REF_SPEC_PREFIX.length);
+    if (ref.length === 0) throw new Error("git source has an empty ref");
+    return { kind: "ref", ref };
+  }
+  if (spec.startsWith(GIT_RANGE_SPEC_PREFIX)) {
+    const parts = spec.slice(GIT_RANGE_SPEC_PREFIX.length).split(":");
+    if (parts.length > 2) {
+      throw new Error(`invalid git semver spec "${spec}"`);
+    }
+    const range = parts[parts.length - 1] ?? "";
+    const tagPrefix = normalizeGitTagPrefix(
+      parts.length === 2 ? (parts[0] ?? "") : "",
+    );
+    if (semver.validRange(range) === null) {
+      throw new Error(`invalid git semver range "${range}"`);
+    }
+    return { kind: "range", range, tagPrefix };
+  }
+  if (spec.includes(":")) {
+    throw new Error(
+      `invalid git spec "${spec}" — use "ref:<name>" or "semver:[<tagPrefix>:]<range>"`,
+    );
+  }
+  return isGitSemverRangeSpec(spec)
+    ? { kind: "ref-or-range", ref: spec, range: spec }
+    : { kind: "ref", ref: spec };
+}
+
 function parseGitSource(spec: string): ParsedPluginSource {
   const at = spec.lastIndexOf("@");
   if (at === spec.length - 1) {
@@ -73,6 +170,7 @@ function parseGitSource(spec: string): ParsedPluginSource {
   if (ref.startsWith("-") || ref.includes("..")) {
     throw new Error(`invalid git ref "${ref}"`);
   }
+  const selector = parseGitSelector(ref);
   let url: string;
   let host: string;
   let repoPath: string;
@@ -82,7 +180,12 @@ function parseGitSource(spec: string): ParsedPluginSource {
   } catch {
     throw new Error(`invalid git url "${urlish}"`);
   }
-  if (decodedUrlish.split("/").some((segment) => segment === "..")) {
+  const isWindowsPath = WINDOWS_DRIVE_PATH_PATTERN.test(urlish);
+  if (
+    decodedUrlish
+      .split(isWindowsPath ? /[\\/]/u : "/")
+      .some((segment) => segment === "..")
+  ) {
     throw new Error(`invalid git repository path "${urlish}"`);
   }
   if (/^https?:\/\//.test(urlish)) {
@@ -91,12 +194,24 @@ function parseGitSource(spec: string): ParsedPluginSource {
     host = parsed.host;
     repoPath = parsed.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
   } else if (urlish.startsWith("/")) {
-    // An on-disk repository (dev setups, tests). Grouped under "local".
     url = urlish;
     host = "local";
     repoPath = urlish.replace(/^\/+/, "").replace(/\.git$/, "");
+  } else if (isWindowsPath) {
+    url = urlish;
+    host = "local";
+    const normalized = urlish
+      .replace(WINDOWS_DRIVE_PATH_PATTERN, "$1/")
+      .replaceAll("\\", "/")
+      .replace(/\/+$/u, "")
+      .replace(/\.git$/, "");
+    const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+    const digest = createHash("sha256")
+      .update(normalized.toLowerCase())
+      .digest("hex")
+      .slice(0, WINDOWS_LOCAL_CACHE_DIGEST_LENGTH);
+    repoPath = name.length === 0 ? "" : `${name}-${digest}`;
   } else if (/^[a-z0-9]/i.test(urlish)) {
-    // Shorthand: git:github.com/user/repo@ref
     url = `https://${urlish}`;
     const parsed = new URL(url);
     host = parsed.host;
@@ -114,8 +229,8 @@ function parseGitSource(spec: string): ParsedPluginSource {
   return {
     kind: "git",
     url,
-    ref,
-    installDir: `${host}/${repoPath}@${ref}`,
+    spec: ref,
+    selector,
     cachePath: `${host}/${repoPath}`,
   };
 }
@@ -155,7 +270,6 @@ function parseBuiltinSource(spec: string): ParsedPluginSource {
   return { kind: "builtin", name: spec };
 }
 
-/** Parse an install source spec. Bare HTTP(S) URLs are managed Git sources. */
 export function parsePluginSource(source: string): ParsedPluginSource {
   if (source.startsWith("builtin:")) return parseBuiltinSource(source.slice(8));
   if (source.startsWith("git:")) return parseGitSource(source.slice(4));
@@ -166,7 +280,51 @@ export function parsePluginSource(source: string): ParsedPluginSource {
   return { kind: "path", path };
 }
 
-/** Managed npm install prefix; the plugin root is <prefix>/node_modules/<name>. */
+export function normalizePluginSubdirectory(value: string): string {
+  const trimmed = value.startsWith("./") ? value.slice(2) : value;
+  if (
+    trimmed.length === 0 ||
+    trimmed.startsWith("/") ||
+    trimmed.includes("\\") ||
+    /^[a-zA-Z]:/.test(trimmed)
+  ) {
+    throw new Error(`invalid plugin subdirectory "${value}"`);
+  }
+  assertSafeSegments(trimmed, "plugin subdirectory");
+  if (trimmed.split("/").includes(".git")) {
+    throw new Error(`invalid plugin subdirectory "${value}"`);
+  }
+  return trimmed;
+}
+
+export function nestedPluginRoots(root: string, paths: string[]): string[] {
+  const relatives = paths
+    .map((path) => relative(root, path))
+    .filter(
+      (path) =>
+        path.length > 0 && path !== ".." && !path.startsWith(`..${sep}`),
+    )
+    .sort((left, right) => left.length - right.length);
+  const kept: string[] = [];
+  for (const candidate of relatives) {
+    if (kept.includes(candidate)) continue;
+    if (kept.some((parent) => candidate.startsWith(`${parent}${sep}`))) {
+      continue;
+    }
+    kept.push(candidate);
+  }
+  return kept;
+}
+
+export function pluginRootDir(
+  checkoutDir: string,
+  subdirectory: string | null,
+): string {
+  return subdirectory === null
+    ? checkoutDir
+    : join(checkoutDir, ...subdirectory.split("/"));
+}
+
 export function npmInstallPrefix(
   dataDir: string,
   name: string,
@@ -175,7 +333,15 @@ export function npmInstallPrefix(
   return join(dataDir, "plugins", "npm", ...`${name}@${version}`.split("/"));
 }
 
-function resolveInside(root: string, segments: string[], label: string): string {
+export function npmPackageRoot(prefix: string, packageName: string): string {
+  return join(prefix, "node_modules", ...packageName.split("/"));
+}
+
+function resolveInside(
+  root: string,
+  segments: string[],
+  label: string,
+): string {
   for (const segment of segments) assertSafeSegments(segment, label);
   const absoluteRoot = resolve(root);
   const target = resolve(absoluteRoot, ...segments);
@@ -190,24 +356,26 @@ function resolveInside(root: string, segments: string[], label: string): string 
   return target;
 }
 
-/** Resolve symlinks and require target to remain within root. */
 export async function realPathInside(
   root: string,
   target: string,
   label: string,
+  allowRoot = false,
 ): Promise<string> {
   const [realRoot, realTarget] = await Promise.all([
     realpath(root),
     realpath(target),
   ]);
   const fromRoot = relative(realRoot, realTarget);
+  if (fromRoot === "" && !allowRoot) {
+    throw new Error(`${label} resolves to its root`);
+  }
   if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) {
     throw new Error(`${label} resolves outside its root`);
   }
   return realTarget;
 }
 
-/** Immutable npm install prefix: node_modules lives beneath this directory. */
 export function npmArtifactCacheDir(
   dataDir: string,
   packageName: string,
@@ -223,7 +391,6 @@ export function npmArtifactCacheDir(
   );
 }
 
-/** Immutable git checkout directory for an exact commit. */
 export function gitArtifactCacheDir(
   dataDir: string,
   cachePath: string,
@@ -237,7 +404,6 @@ export function gitArtifactCacheDir(
   );
 }
 
-/** Stable hash of names, kinds, link targets, and file bytes in a directory. */
 export async function hashInstallDir(rootDir: string): Promise<string> {
   const hash = createHash("sha256");
   async function visit(directory: string, prefix: string): Promise<void> {
@@ -284,11 +450,42 @@ async function fsyncTree(rootDir: string): Promise<void> {
   }
 }
 
-/**
- * Promote staged bytes into a never-overwritten cache path. EXDEV falls back
- * to a fully fsynced sibling copy followed by an atomic rename. An identical
- * target left by an interrupted attempt wins and the staging copy is dropped.
- */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+export async function recoverInterruptedGitPluginPromotion(
+  targetDir: string,
+): Promise<void> {
+  const corruptDir = `${targetDir}.corrupt`;
+  const promotingDir = `${targetDir}.promoting`;
+  const corruptExists = await pathExists(corruptDir);
+  if (!corruptExists) {
+    await rm(promotingDir, { recursive: true, force: true });
+    return;
+  }
+  const targetExists = await pathExists(targetDir);
+  if (targetExists) {
+    await rm(corruptDir, { recursive: true, force: true });
+  } else {
+    await mkdir(dirname(targetDir), { recursive: true });
+    await rename(corruptDir, targetDir);
+  }
+  await rm(promotingDir, { recursive: true, force: true });
+}
+
 export async function promoteImmutableDir(args: {
   stagingDir: string;
   targetDir: string;
@@ -305,20 +502,25 @@ export async function promoteImmutableDir(args: {
     await rm(corruptDir, { recursive: true, force: true });
     await rename(args.targetDir, corruptDir);
     movedCorruptTarget = true;
-  } catch {
-    // Missing targets are the normal first-install case.
-  }
+  } catch {}
   await rm(`${args.targetDir}.promoting`, { recursive: true, force: true });
   try {
     await rename(args.stagingDir, args.targetDir);
   } catch (error) {
-    if (!(error instanceof Error) || !("code" in error) || error.code !== "EXDEV") {
+    if (
+      !(error instanceof Error) ||
+      !("code" in error) ||
+      error.code !== "EXDEV"
+    ) {
       if (movedCorruptTarget) await rename(corruptDir, args.targetDir);
       throw error;
     }
     const copyDir = `${args.targetDir}.promoting`;
     try {
-      await cp(args.stagingDir, copyDir, { recursive: true, preserveTimestamps: true });
+      await cp(args.stagingDir, copyDir, {
+        recursive: true,
+        preserveTimestamps: true,
+      });
       await fsyncTree(copyDir);
       await rename(copyDir, args.targetDir);
       const parent = await open(dirname(args.targetDir), constants.O_RDONLY);
@@ -340,39 +542,128 @@ export async function promoteImmutableDir(args: {
   }
 }
 
+export async function promoteGitPluginArtifact(args: {
+  stagingDir: string;
+  targetDir: string;
+  subdirectory: string | null;
+  contentHash: string;
+  preserveNestedRoots: string[];
+}): Promise<string> {
+  const targetExists = await stat(args.targetDir)
+    .then(() => true)
+    .catch(() => false);
+  if (!targetExists) {
+    await promoteImmutableDir({
+      stagingDir: args.stagingDir,
+      targetDir: args.targetDir,
+      contentHash: args.contentHash,
+    });
+    return args.contentHash;
+  }
+  const stagingRoot = await realPathInside(
+    args.stagingDir,
+    pluginRootDir(args.stagingDir, args.subdirectory),
+    "git plugin subdirectory",
+    args.subdirectory === null,
+  );
+  const targetRoot = pluginRootDir(args.targetDir, args.subdirectory);
+  let preservedCount = 0;
+  try {
+    if (
+      (await hashInstallDir(targetRoot).catch(() => null)) === args.contentHash
+    ) {
+      await rm(args.stagingDir, { recursive: true, force: true });
+      return args.contentHash;
+    }
+    await mkdir(dirname(targetRoot), { recursive: true });
+    for (const nested of args.preserveNestedRoots) {
+      const from = join(targetRoot, nested);
+      const exists = await stat(from)
+        .then(() => true)
+        .catch(() => false);
+      if (!exists) continue;
+      const to = join(stagingRoot, nested);
+      await rm(to, { recursive: true, force: true });
+      const resolvedFrom = await realPathInside(
+        args.targetDir,
+        from,
+        "nested git plugin root",
+      );
+      await cp(resolvedFrom, to, {
+        recursive: true,
+        preserveTimestamps: true,
+      });
+      preservedCount += 1;
+    }
+    await promoteImmutableDir({
+      stagingDir: stagingRoot,
+      targetDir: targetRoot,
+      contentHash: args.contentHash,
+    });
+  } finally {
+    await rm(args.stagingDir, { recursive: true, force: true });
+  }
+  return preservedCount === 0
+    ? args.contentHash
+    : await hashInstallDir(targetRoot);
+}
 
-export const INSTALL_COMMAND_TIMEOUT_MS = 5 * 60_000;
-
-/**
- * Run a materialization command (git/npm), buffering output. Throws a clear
- * error when the binary is missing, the command times out, or it exits
- * non-zero (with the stderr tail — that is where git/npm explain themselves).
- */
 export async function runInstallCommand(
   command: string,
   args: string[],
-  options?: { timeoutMs?: number; notFoundHint?: string },
+  options?: {
+    notFoundHint?: string;
+    maxStdoutBytes?: number;
+  },
 ): Promise<string> {
-  const timeoutMs = options?.timeoutMs ?? INSTALL_COMMAND_TIMEOUT_MS;
-  const child = spawnPortableOutputProcess({ command, args });
+  const timeoutMs = 5 * 60_000;
+  const cancellation = installCancellationSignal();
+  if (cancellation?.aborted) throw new PluginInstallCancelledError();
+  const npmCliPath = command === "npm" ? resolveBundledNpmCli() : null;
+  const child = spawnPortableOutputProcess({
+    command: npmCliPath === null ? command : process.execPath,
+    args: npmCliPath === null ? args : [npmCliPath, ...args],
+    detached: supportsProcessGroups(),
+    env: omitNpmScriptPolicyEnv(process.env),
+  });
+  const killCommand = () => {
+    if (supportsProcessGroups()) killProcessGroup({ child, signal: "SIGKILL" });
+    else killPortableProcess(child, "SIGKILL");
+  };
   let stderr = "";
   let stdout = "";
+  let stdoutBytes = 0;
+  let overflowed = false;
   child.stdout.on("data", (chunk: Buffer) => {
     stdout += chunk.toString("utf8");
-    if (stdout.length > 8192) stdout = stdout.slice(-8192);
+    stdoutBytes += chunk.byteLength;
+    const limit = options?.maxStdoutBytes;
+    if (limit === undefined) {
+      if (stdout.length > 8192) stdout = stdout.slice(-8192);
+    } else if (stdoutBytes > limit && !overflowed) {
+      overflowed = true;
+      killCommand();
+    }
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderr += chunk.toString("utf8");
     if (stderr.length > 8192) stderr = stderr.slice(-8192);
   });
+  let cancelled = false;
+  const cancel = () => {
+    cancelled = true;
+    killCommand();
+  };
+  cancellation?.addEventListener("abort", cancel, { once: true });
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killCommand();
       reject(new Error(`${command} ${args[0]} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     timer.unref?.();
     child.on("error", (error: NodeJS.ErrnoException) => {
       clearTimeout(timer);
+      cancellation?.removeEventListener("abort", cancel);
       if (error.code === "ENOENT") {
         reject(
           new Error(
@@ -385,6 +676,19 @@ export async function runInstallCommand(
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      cancellation?.removeEventListener("abort", cancel);
+      if (cancelled) {
+        reject(new PluginInstallCancelledError());
+        return;
+      }
+      if (overflowed) {
+        reject(
+          new Error(
+            `${command} ${args[0]} produced more than ${options?.maxStdoutBytes} bytes of output`,
+          ),
+        );
+        return;
+      }
       if (code === 0) {
         resolve();
         return;

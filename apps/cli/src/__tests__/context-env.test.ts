@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createCliRuntimeContext,
-  requireProjectId,
   requireThreadId,
   requireThreadIdOrSelf,
   resolveContextProjectId,
@@ -22,57 +21,9 @@ describe("context-env", () => {
   });
 
   it("requires project and thread context when missing", () => {
-    expect(() => requireProjectId(undefined)).toThrow(
-      "Missing project ID. Pass --project <id>.",
-    );
     expect(() => requireThreadId(undefined)).toThrow(
       "Missing thread ID. Pass <threadId>.",
     );
-  });
-
-  it("does not use BB_PROJECT_ID and BB_THREAD_ID as explicit ID defaults", () => {
-    vi.stubEnv("BB_PROJECT_ID", "proj-env");
-    vi.stubEnv("BB_THREAD_ID", "thread-env");
-
-    expect(
-      resolveExplicitIdFlag({ flagName: "--project flag", value: undefined }),
-    ).toBeUndefined();
-    expect(
-      resolveExplicitIdFlag({
-        flagName: "<threadId> argument",
-        value: undefined,
-      }),
-    ).toBeUndefined();
-  });
-
-  it("resolves explicit project and thread flags", () => {
-    vi.stubEnv("BB_PROJECT_ID", "proj-env");
-    vi.stubEnv("BB_THREAD_ID", "thread-env");
-
-    expect(
-      resolveExplicitIdFlag({ flagName: "--project flag", value: "proj-flag" }),
-    ).toBe("proj-flag");
-    expect(
-      resolveExplicitIdFlag({
-        flagName: "<threadId> argument",
-        value: "thread-flag",
-      }),
-    ).toBe("thread-flag");
-  });
-
-  it("normalizes empty values as undefined", () => {
-    vi.stubEnv("BB_PROJECT_ID", "");
-    vi.stubEnv("BB_THREAD_ID", "   ");
-
-    expect(
-      resolveExplicitIdFlag({ flagName: "--project flag", value: undefined }),
-    ).toBeUndefined();
-    expect(
-      resolveExplicitIdFlag({
-        flagName: "<threadId> argument",
-        value: undefined,
-      }),
-    ).toBeUndefined();
   });
 
   it("resolves explicit ID flags without environment fallback", () => {

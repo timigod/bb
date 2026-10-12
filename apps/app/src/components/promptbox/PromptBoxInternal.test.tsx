@@ -1,11 +1,29 @@
 // @vitest-environment jsdom
+import { buildMessageClipboardHtml } from "../../lib/message-clipboard";
 
+import { TooltipProvider } from "@bb/shared-ui/tooltip";
+import { focusPaneComposer } from "@/lib/pane-composer-focus";
+import {
+  AttachmentOpenerContext,
+  type OpenAttachmentRequest,
+} from "@/components/secondary-panel/AttachmentOpenerContext";
+import { registerComposerMenuPlugins } from "@/test/fixtures/composer-menu";
+import { resolveThreadMentionDropTarget } from "@/lib/thread-mention-drop";
+import { sdk } from "@/lib/sdk";
 import type { PromptTextMention } from "@bb/domain";
+import { createDeferredPromise } from "@bb/test-helpers";
+import type { TiptapEditorHTMLElement } from "@tiptap/core";
+import { TextSelection } from "@tiptap/pm/state";
+import { CompactViewportOverrideProvider } from "@bb/shared-ui/hooks/use-compact-viewport";
+import { EditorView } from "@tiptap/pm/view";
 import {
   createRef,
+  useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  type ComponentType,
   type ComponentProps,
   type RefObject,
 } from "react";
@@ -13,14 +31,19 @@ import {
   act,
   cleanup,
   fireEvent,
-  render,
+  render as renderWithoutProviders,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { emptyPromptDraftState } from "@/lib/prompt-draft";
+import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
+import { ThreadContextWindowIndicator } from "@/components/thread/timeline/ThreadContextWindowIndicator";
+import {
+  EMPTY_ORDERED_MENTION_SUGGESTIONS,
+  emptyPromptDraftState,
+} from "@bb/client-core";
 import {
   getComposerInputLock,
   useComposer,
@@ -44,27 +67,38 @@ import {
   type PluginComposerHost,
 } from "@/components/plugin/plugin-composer-host";
 import { resetAllCrashedPluginSlotsForTest } from "@/components/plugin/PluginSlotMount";
+import { getComposerEditorBridge } from "@/lib/composer-editor-registry";
+import { QueuedEditorTypeaheadLayoutContext } from "@/components/promptbox/queued-editor-typeahead-layout";
 import {
   resetPluginLogoStoreForTest,
   setPluginLogoUrls,
 } from "@/lib/plugin-logos";
-import {
-  AUTOMATION_PROMPT_ACTION,
-  CREATE_PLUGIN_PROMPT_ACTION,
-} from "./PromptBoxActionsMenu";
+import { makePluginRegistrationSet } from "@/test/fixtures/plugins";
 import {
   INERT_TYPEAHEAD_COMMAND_CONFIG,
   PromptBoxInternal,
+  arePromptEditorValuesEqual,
   suppressPromptEditorAnchorActivation,
   type PromptBoxAction,
   type PromptBoxHandle,
   type PromptVoiceConfig,
   type TypeaheadConfig,
 } from "./PromptBoxInternal";
+import {
+  promptMentionClipboardDataAttributes,
+  serializedTextForPromptMentionResource,
+} from "./mentions/prompt-mention-clipboard";
+import { orderPromptMentionSuggestions } from "@/hooks/promptMentionCandidates";
 import type {
+  PromptDraftAttachment,
   PromptMentionSuggestion,
   ProviderCommandSuggestion,
-} from "./mentions/types";
+} from "@bb/client-core";
+
+const render = (
+  ui: Parameters<typeof renderWithoutProviders>[0],
+  options?: Parameters<typeof renderWithoutProviders>[1],
+) => renderWithoutProviders(ui, { wrapper: TooltipProvider, ...options });
 
 type PromptBoxProps = ComponentProps<typeof PromptBoxInternal>;
 
@@ -73,17 +107,9 @@ function pluginRegistrationSet(
     PluginRegistrationSet["composerCustomizations"]
   >,
 ): PluginRegistrationSet {
-  return {
-    homepageSections: [],
-    settingsSections: [],
-    navPanels: [],
-    threadPanelActions: [],
+  return makePluginRegistrationSet({
     composerCustomizations,
-    pendingInteractions: [],
-    sidebarFooterActions: [],
-    fileOpeners: [],
-    messageDirectives: [],
-  };
+  });
 }
 
 interface PromptChange {
@@ -103,8 +129,6 @@ const promptActions: readonly PromptBoxAction[] = [
     command: { trigger: "/", name: "goal", trailingText: " " },
     text: "/goal ",
   },
-  AUTOMATION_PROMPT_ACTION,
-  CREATE_PLUGIN_PROMPT_ACTION,
 ];
 
 function createPromptBoxProps(
@@ -118,7 +142,7 @@ function createPromptBoxProps(
     mentionMenuPlacement: "bottom",
     typeahead: {
       mention: {
-        suggestions: [],
+        results: EMPTY_ORDERED_MENTION_SUGGESTIONS,
         isLoading: false,
         isError: false,
         onQueryChange: vi.fn(),
@@ -137,7 +161,7 @@ function buildTypeaheadConfig({
   onCommandQueryChange = () => {},
 }: {
   mentionTriggers?: TypeaheadConfig["mention"]["triggers"];
-  mentionSuggestions?: TypeaheadConfig["mention"]["suggestions"];
+  mentionSuggestions?: readonly PromptMentionSuggestion[];
   onMentionQueryChange?: TypeaheadConfig["mention"]["onQueryChange"];
   commandSuggestions?: TypeaheadConfig["command"]["suggestions"];
   onCommandQueryChange?: (query: string | null) => void;
@@ -145,13 +169,16 @@ function buildTypeaheadConfig({
   return {
     mention: {
       triggers: mentionTriggers,
-      suggestions: mentionSuggestions,
+      results: orderPromptMentionSuggestions({
+        query: "",
+        suggestions: mentionSuggestions,
+      }),
       isLoading: false,
       isError: false,
       onQueryChange: onMentionQueryChange,
     },
     command: {
-      trigger: "/",
+      triggers: ["/"],
       suggestions: commandSuggestions,
       isLoading: false,
       isError: false,
@@ -264,54 +291,136 @@ function renderPromptBox(
   options: {
     initialMentionRanges?: PromptTextMention[];
     mentionTriggers?: TypeaheadConfig["mention"]["triggers"];
-    mentionSuggestions?: TypeaheadConfig["mention"]["suggestions"];
+    mentionSuggestions?: readonly PromptMentionSuggestion[];
     commandSuggestions?: TypeaheadConfig["command"]["suggestions"];
+    onAttachFiles?: (files: File[]) => Promise<PromptDraftAttachment[]>;
+    upload?: (files: File[]) => Promise<PromptDraftAttachment[]>;
+    initialAttachments?: PromptDraftAttachment[];
+    openAttachment?: (request: OpenAttachmentRequest) => void;
+    compact?: boolean;
+    props?: Partial<PromptBoxProps>;
   } = {},
 ) {
+  registerComposerMenuPlugins();
   const changes: PromptChange[] = [];
   const onMentionQueryChange = vi.fn();
   const onCommandQueryChange = vi.fn();
   const onSubmit = vi.fn();
   const promptBoxRef = createRef<PromptBoxHandle>();
+  const attachmentState = { items: options.initialAttachments ?? [] };
 
   function PromptBoxHarness() {
     const [value, setValue] = useState(initialValue);
+    const [attachmentItems, setAttachmentItems] = useState(
+      attachmentState.items,
+    );
+    useEffect(() => {
+      attachmentState.items = attachmentItems;
+    }, [attachmentItems]);
+    const upload = options.upload;
     const [mentionRanges, setMentionRanges] = useState<PromptTextMention[]>(
       options.initialMentionRanges ?? [],
     );
+    const draft = useMemo(
+      () => ({ text: value, mentions: mentionRanges, attachments: [] }),
+      [value, mentionRanges],
+    );
+    const host = useMemo<PluginComposerHost>(
+      () => ({
+        scope: { kind: "new-thread", projectId: null },
+        textEffectKey: "prompt-action-composer",
+        getCurrent: () => draft,
+        subscribeDraft: () => () => {},
+        setDraft: (next) => {
+          changes.push({ value: next.text, mentions: next.mentions });
+          setValue(next.text);
+          setMentionRanges(next.mentions);
+        },
+        focus: () => getPromptEditorElement().focus(),
+      }),
+      [draft],
+    );
     return (
-      <PromptBoxInternal
-        value={value}
-        mentionRanges={mentionRanges}
-        onChange={(nextValue, nextMentions) => {
-          changes.push({ mentions: nextMentions, value: nextValue });
-          setValue(nextValue);
-          setMentionRanges(nextMentions);
-        }}
-        onSubmit={onSubmit}
-        typeahead={buildTypeaheadConfig({
-          mentionTriggers: options.mentionTriggers,
-          mentionSuggestions: options.mentionSuggestions,
-          onMentionQueryChange,
-          commandSuggestions: options.commandSuggestions,
-          onCommandQueryChange,
-        })}
-        mentionMenuPlacement="bottom"
-        attachments={{}}
-        promptActions={promptActions}
-        promptBoxRef={promptBoxRef}
-      />
+      <PluginComposerHostProvider value={host}>
+        <PromptBoxInternal
+          value={value}
+          mentionRanges={mentionRanges}
+          onChange={(nextValue, nextMentions) => {
+            changes.push({ mentions: nextMentions, value: nextValue });
+            setValue(nextValue);
+            setMentionRanges(nextMentions);
+          }}
+          onSubmit={onSubmit}
+          typeahead={buildTypeaheadConfig({
+            mentionTriggers: options.mentionTriggers,
+            mentionSuggestions: options.mentionSuggestions,
+            onMentionQueryChange,
+            commandSuggestions: options.commandSuggestions,
+            onCommandQueryChange,
+          })}
+          mentionMenuPlacement="bottom"
+          attachments={
+            upload
+              ? {
+                  items: attachmentItems,
+                  onAttachFiles: async (files) => {
+                    const added = await upload(files);
+                    setAttachmentItems((current) => [...current, ...added]);
+                    return added;
+                  },
+                  onUpdate: (update) => setAttachmentItems(update),
+                }
+              : { onAttachFiles: options.onAttachFiles }
+          }
+          promptActions={promptActions}
+          promptBoxRef={promptBoxRef}
+          {...options.props}
+        />
+      </PluginComposerHostProvider>
     );
   }
 
-  render(<PromptBoxHarness />);
+  const ui = (
+    <MemoryRouter>
+      <AttachmentOpenerContext.Provider value={options.openAttachment ?? null}>
+        <PromptBoxHarness />
+      </AttachmentOpenerContext.Provider>
+    </MemoryRouter>
+  );
+  const view = render(
+    options.compact === undefined ? (
+      ui
+    ) : (
+      <CompactViewportOverrideProvider isCompactViewport={options.compact}>
+        {ui}
+      </CompactViewportOverrideProvider>
+    ),
+  );
   return {
+    view,
     changes,
     onMentionQueryChange,
     onCommandQueryChange,
     onSubmit,
     promptBoxRef,
+    attachmentPaths: () => attachmentState.items.map((item) => item.path),
   };
+}
+
+function pressUndo({ redo = false }: { redo?: boolean } = {}) {
+  fireEvent.keyDown(getPromptEditorElement(), {
+    key: "z",
+    ctrlKey: true,
+    shiftKey: redo,
+  });
+}
+
+function uploadedAs(files: File[]): PromptDraftAttachment[] {
+  return files.map((file) => ({
+    type: "localFile",
+    path: `uploads/${file.name}`,
+    name: file.name,
+  }));
 }
 
 function dispatchThroughEditorTarget({
@@ -341,9 +450,6 @@ function dispatchThroughEditorTarget({
 }
 
 async function selectPromptAction(label: string) {
-  // The prompt schedules passive autofocus on its first animation frame. Let
-  // that settle before opening the portaled menu so the frame cannot move
-  // focus back to the editor while the menu item is being selected.
   await waitFor(() =>
     expect(document.activeElement).toBe(getPromptEditorElement()),
   );
@@ -356,9 +462,6 @@ async function selectPromptAction(label: string) {
   const menu = await screen.findByRole("menu", { name: "Prompt actions" });
   const menuItem = within(menu).getByRole("menuitem", { name: label });
   fireEvent.click(menuItem);
-  // Radix removes the portaled menu asynchronously. Let that close settle so
-  // a following test or second action cannot select an item from the stale
-  // closing portal.
   await waitFor(() =>
     expect(screen.queryByRole("menu", { name: "Prompt actions" })).toBeNull(),
   );
@@ -410,15 +513,20 @@ function pastePlainText(text: string) {
 }
 
 function pasteClipboard({
+  files = [],
   html = "",
   plainText = "",
 }: {
+  files?: File[];
   html?: string;
   plainText?: string;
 }) {
   fireEvent.paste(getPromptEditorElement(), {
     clipboardData: {
-      items: [],
+      items: files.map((file) => ({
+        kind: "file",
+        getAsFile: () => file,
+      })),
       getData: (type: string) => {
         if (type === "text/html") return html;
         if (type === "text/plain") return plainText;
@@ -498,8 +606,10 @@ function mockIPadOSWebKit(): () => void {
   });
 }
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  fireEvent.pointerDown(document);
+  await new Promise<void>((resolve) => setTimeout(resolve, 2));
   resetPluginLogoStoreForTest();
   resetPluginSlotStoreForTest();
   resetAllCrashedPluginSlotsForTest();
@@ -508,6 +618,32 @@ afterEach(() => {
 });
 
 describe("suppressPromptEditorAnchorActivation", () => {
+  it("restores the editor selection when pane navigation returns focus", async () => {
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({ value: "Retained draft" })}
+      />,
+    );
+    const element = getPromptEditorElement() as TiptapEditorHTMLElement;
+    const editor = element.editor;
+    if (!editor) throw new Error("Editor was not mounted");
+    act(() => {
+      editor.commands.setTextSelection({ from: 3, to: 7 });
+    });
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    outside.focus();
+    act(() => {
+      focusPaneComposer(element);
+    });
+    expect(document.activeElement).toBe(element);
+    expect(editor.state.selection.from).toBe(3);
+    expect(editor.state.selection.to).toBe(7);
+    expect(window.getSelection()?.toString()).toBe("tain");
+    expect(editor.getText()).toBe("Retained draft");
+    outside.remove();
+  });
+
   it("cancels anchor clicks inside the prompt editor", () => {
     const anchor = document.createElement("a");
     anchor.href = "https://example.com";
@@ -553,8 +689,330 @@ describe("suppressPromptEditorAnchorActivation", () => {
   });
 });
 
+describe("PromptBoxInternal composer popups", () => {
+  function SavedPrompts() {
+    const composer = useComposer();
+    return (
+      <div>
+        <input aria-label="Search saved prompts" />
+        <button
+          type="button"
+          onClick={() => {
+            composer.insert("saved ");
+            composer.experimental_closePopup();
+          }}
+        >
+          Insert saved prompt
+        </button>
+        <button
+          type="button"
+          onClick={() => composer.experimental_openPopup("recent-files")}
+        >
+          Open recent files
+        </button>
+      </div>
+    );
+  }
+
+  function RecentFiles() {
+    const composer = useComposer();
+    return (
+      <div>
+        <input aria-label="Search recent files" />
+        <button
+          type="button"
+          onClick={() => composer.experimental_openPopup("saved-prompts")}
+        >
+          Open saved prompts
+        </button>
+      </div>
+    );
+  }
+
+  function registerPopup(
+    scopes?: readonly ("thread" | "new-thread")[],
+    opener?: ComponentType,
+  ) {
+    setPluginSlotRegistrations(
+      "saved-prompts",
+      pluginRegistrationSet([
+        {
+          id: "library",
+          scopes,
+          experimental_popups: [
+            {
+              id: "saved-prompts",
+              label: "Saved prompts",
+              component: SavedPrompts,
+            },
+            {
+              id: "recent-files",
+              label: "Recent files",
+              component: RecentFiles,
+            },
+          ],
+          plusMenu: [
+            {
+              id: "open",
+              label: "Saved prompts",
+              run: ({ composer }) => {
+                composer.experimental_openPopup("saved-prompts");
+              },
+            },
+          ],
+        },
+        ...(opener
+          ? [
+              {
+                id: "opener",
+                actions: [{ id: "open-popup", component: opener }],
+              },
+            ]
+          : []),
+      ]),
+    );
+  }
+
+  async function openPopupFromMenu() {
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Prompt actions" }),
+      { button: 0 },
+    );
+    const menu = await screen.findByRole("menu", { name: "Prompt actions" });
+    fireEvent.click(
+      within(menu).getByRole("menuitem", { name: "Saved prompts" }),
+    );
+  }
+
+  it.each(["top", "bottom"] as const)(
+    "opens from a composer menu %s and inserts at the preserved cursor",
+    async (placement) => {
+      registerPopup();
+      renderPromptBox("hello world", {
+        props: { mentionMenuPlacement: placement },
+      });
+      await waitForPromptFocus();
+      const editor = (getPromptEditorElement() as TiptapEditorHTMLElement)
+        .editor;
+      if (!editor) throw new Error("Composer editor is missing");
+      act(() => editor.commands.setTextSelection(7));
+      await openPopupFromMenu();
+      const popup = await screen.findByRole("dialog", {
+        name: "Saved prompts",
+      });
+      expect(
+        popup.classList.contains(
+          placement === "top" ? "bottom-full" : "top-full",
+        ),
+      ).toBe(true);
+      await waitFor(() =>
+        expect(document.activeElement).toBe(within(popup).getByRole("textbox")),
+      );
+      fireEvent.click(
+        within(popup).getByRole("button", { name: "Insert saved prompt" }),
+      );
+      await waitFor(() => expect(editor.getText()).toBe("hello saved world"));
+      expect(
+        screen.queryByRole("dialog", { name: "Saved prompts" }),
+      ).toBeNull();
+      await waitForPromptFocus();
+    },
+  );
+
+  it("switches between popups in one customization by popup id", async () => {
+    registerPopup();
+    renderPromptBox("draft");
+    await waitForPromptFocus();
+    await openPopupFromMenu();
+    const saved = await screen.findByRole("dialog", { name: "Saved prompts" });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(saved).getByRole("textbox")),
+    );
+    fireEvent.click(
+      within(saved).getByRole("button", { name: "Open recent files" }),
+    );
+    const recent = await screen.findByRole("dialog", { name: "Recent files" });
+    expect(screen.queryByRole("dialog", { name: "Saved prompts" })).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(recent).getByRole("textbox")),
+    );
+    fireEvent.click(
+      within(recent).getByRole("button", { name: "Open saved prompts" }),
+    );
+    const reopened = await screen.findByRole("dialog", {
+      name: "Saved prompts",
+    });
+    expect(screen.queryByRole("dialog", { name: "Recent files" })).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(reopened).getByRole("textbox"),
+      ),
+    );
+  });
+
+  it("replaces suggestions and keeps their trigger dismissed through popup focus transfer", async () => {
+    registerPopup();
+    renderPromptBox("@");
+    await waitForPromptFocus();
+    await screen.findByText("Type to search mentions");
+    await openPopupFromMenu();
+    const search = await screen.findByRole("textbox", {
+      name: "Search saved prompts",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(search));
+    expect(screen.queryByText("Type to search mentions")).toBeNull();
+    fireEvent.keyDown(search, { key: "Escape" });
+    await waitForPromptFocus();
+    expect(screen.queryByRole("dialog", { name: "Saved prompts" })).toBeNull();
+    expect(screen.queryByText("Type to search mentions")).toBeNull();
+    const editor = (getPromptEditorElement() as TiptapEditorHTMLElement).editor;
+    if (!editor) throw new Error("Composer editor is missing");
+    act(() => {
+      editor.commands.setContent("next @");
+      editor.commands.setTextSelection(7);
+    });
+    await screen.findByText("Type to search mentions");
+    fireEvent.keyDown(editor.view.dom, { key: "Escape" });
+    expect(screen.queryByText("Type to search mentions")).toBeNull();
+  });
+
+  it("honors scope, rejects another plugin's close, and closes on plugin removal", async () => {
+    const openResult = vi.fn();
+    function OpenScopedPopup() {
+      const composer = useComposer();
+      return (
+        <button
+          type="button"
+          onClick={() =>
+            openResult(composer.experimental_openPopup("saved-prompts"))
+          }
+        >
+          Open scoped popup
+        </button>
+      );
+    }
+    registerPopup(["thread"], OpenScopedPopup);
+    renderPromptBox("draft");
+    await waitForPromptFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Open scoped popup" }));
+    expect(openResult).toHaveBeenLastCalledWith(false);
+    act(() => registerPopup(undefined, OpenScopedPopup));
+    const foreignClose = vi.fn();
+    function OtherPlugin() {
+      const composer = useComposer();
+      return (
+        <button
+          type="button"
+          onClick={() => foreignClose(composer.experimental_closePopup())}
+        >
+          Other plugin close
+        </button>
+      );
+    }
+    act(() =>
+      setPluginSlotRegistrations(
+        "other-plugin",
+        pluginRegistrationSet([
+          {
+            id: "tools",
+            actions: [{ id: "close", component: OtherPlugin }],
+          },
+        ]),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open scoped popup" }));
+    expect(openResult).toHaveBeenLastCalledWith(true);
+    await screen.findByRole("dialog", { name: "Saved prompts" });
+    fireEvent.click(screen.getByRole("button", { name: "Other plugin close" }));
+    expect(foreignClose).toHaveBeenCalledWith(false);
+    expect(screen.getByRole("dialog", { name: "Saved prompts" })).toBeTruthy();
+    act(() => resetPluginSlotStoreForTest());
+    expect(screen.queryByRole("dialog", { name: "Saved prompts" })).toBeNull();
+  });
+
+  it("defers compact content and retains it without making the app root inert", async () => {
+    function OpenPopup() {
+      const composer = useComposer();
+      return (
+        <button
+          type="button"
+          onClick={() => composer.experimental_openPopup("saved-prompts")}
+        >
+          Open popup
+        </button>
+      );
+    }
+    registerPopup(undefined, OpenPopup);
+    const { view } = renderPromptBox("draft", { compact: true });
+    await waitForPromptFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Open popup" }));
+    expect(
+      screen.queryByRole("textbox", { name: "Search saved prompts" }),
+    ).toBeNull();
+    expect(
+      document.querySelector("[data-responsive-drawer-placeholder]"),
+    ).not.toBeNull();
+    const search = await screen.findByRole("textbox", {
+      name: "Search saved prompts",
+    });
+    expect(view.container.hasAttribute("inert")).toBe(false);
+    expect(view.container.hasAttribute("aria-hidden")).toBe(false);
+    fireEvent.change(search, { target: { value: "keep this" } });
+    fireEvent.keyDown(search, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        document.querySelector(
+          "[data-persistent-drawer-content][data-state='closed']",
+        ),
+      ).not.toBeNull(),
+    );
+    expect(document.contains(search)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Open popup" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("textbox", { name: "Search saved prompts" }),
+      ).toBe(search),
+    );
+    expect(search).toHaveProperty("value", "keep this");
+  });
+});
+
 describe("PromptBoxInternal controlled value sync", () => {
-  it("suppresses and restores plugin customizations without remounting the editor", () => {
+  it("compares cloned mention values without serializing the prompt text", () => {
+    const resource = {
+      kind: "path" as const,
+      source: "workspace" as const,
+      entryKind: "file" as const,
+      path: "src/a.ts",
+      label: "a.ts",
+    };
+    const mention: PromptTextMention = {
+      start: 4,
+      end: 10,
+      resource,
+    };
+    const left = { text: "see @a.ts", mentions: [mention] };
+
+    expect(
+      arePromptEditorValuesEqual(left, {
+        text: left.text,
+        mentions: [{ ...mention, resource: { ...resource } }],
+      }),
+    ).toBe(true);
+    expect(
+      arePromptEditorValuesEqual(left, {
+        text: left.text,
+        mentions: [
+          {
+            ...mention,
+            resource: { ...resource, path: "src/b.ts" },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("suppresses and restores plugin customizations without remounting the editor, keeping plus-menu rows", () => {
     setPluginSlotRegistrations(
       "pending-test",
       pluginRegistrationSet([
@@ -585,7 +1043,7 @@ describe("PromptBoxInternal controlled value sync", () => {
     );
 
     expect(screen.queryByRole("button", { name: "Plugin action" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Prompt actions" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Prompt actions" })).toBeTruthy();
     expect(getPromptEditorElement()).toBe(editor);
 
     view.rerender(
@@ -762,6 +1220,36 @@ describe("PromptBoxInternal controlled value sync", () => {
     expect(getPromptEditorElement()).toBe(editor);
   });
 
+  it("unregisters the previous composer when the prompt box switches drafts", () => {
+    const draft = emptyPromptDraftState();
+    const host = (queuedMessageId: string): PluginComposerHost => ({
+      scope: { kind: "queued-message", threadId: "thread-1", queuedMessageId },
+      textEffectKey: `queued-message:${queuedMessageId}`,
+      getCurrent: () => draft,
+      subscribeDraft: () => () => {},
+      setDraft: vi.fn(),
+      focus: vi.fn(),
+    });
+    const props = createPromptBoxProps({ value: "" });
+    const rendered = render(
+      <PluginComposerHostProvider value={host("message-1")}>
+        <PromptBoxInternal {...props} />
+      </PluginComposerHostProvider>,
+    );
+    expect(getComposerEditorBridge("queued-message:message-1")).not.toBeNull();
+
+    rendered.rerender(
+      <PluginComposerHostProvider value={host("message-2")}>
+        <PromptBoxInternal {...props} />
+      </PluginComposerHostProvider>,
+    );
+    expect(getComposerEditorBridge("queued-message:message-1")).toBeNull();
+    expect(getComposerEditorBridge("queued-message:message-2")).not.toBeNull();
+
+    rendered.unmount();
+    expect(getComposerEditorBridge("queued-message:message-2")).toBeNull();
+  });
+
   it("refreshes draft observers when the composer scope identity changes", async () => {
     const onDraftChange = vi.fn();
     setPluginSlotRegistrations(
@@ -784,9 +1272,9 @@ describe("PromptBoxInternal controlled value sync", () => {
         threadId: "thread-1",
         queuedMessageId,
       },
-      draft,
       textEffectKey: `queued-message:${queuedMessageId}`,
       getCurrent: () => draft,
+      subscribeDraft: () => () => {},
       setDraft: vi.fn(),
       focus: vi.fn(),
     });
@@ -939,6 +1427,34 @@ describe("PromptBoxInternal controlled value sync", () => {
     }
   });
 
+  it("preserves an active sidebar rename when composer autofocus starts", async () => {
+    const restoreMatchMedia = mockPointerCoarse(false);
+    const rename = document.createElement("span");
+    rename.setAttribute("data-sidebar-rename-editor", "");
+    const input = document.createElement("input");
+    rename.append(input);
+    document.body.append(rename);
+    try {
+      const props = createPromptBoxProps({ autoFocus: false });
+      const view = render(<PromptBoxInternal {...props} />);
+      await waitFor(() =>
+        expect(getPromptEditorElement()).toBeInstanceOf(HTMLElement),
+      );
+      input.focus();
+      view.rerender(<PromptBoxInternal {...props} autoFocus />);
+      await act(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => resolve()),
+          ),
+      );
+      expect(document.activeElement).toBe(input);
+    } finally {
+      rename.remove();
+      restoreMatchMedia();
+    }
+  });
+
   it("releases passive editor focus when autofocus becomes blocked", async () => {
     const restoreMatchMedia = mockPointerCoarse(false);
     try {
@@ -1018,10 +1534,12 @@ describe("PromptBoxInternal controlled value sync", () => {
             promptBoxRef,
             voice: {
               state: "idle",
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start,
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -1153,6 +1671,31 @@ describe("PromptBoxInternal controlled value sync", () => {
 });
 
 describe("PromptBoxInternal submit shortcuts", () => {
+  it("exposes the disabled submit reason as its label and hover tooltip", async () => {
+    const reason = "Loading models from the selected machine...";
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({
+          value: "Investigate this",
+          submission: { disabled: true, disabledReason: reason },
+        })}
+      />,
+    );
+
+    const submit = screen.getByRole("button", { name: reason });
+    expect(submit.hasAttribute("disabled")).toBe(true);
+
+    const tooltipTrigger = submit.closest(
+      "[data-promptbox-submit-disabled-reason]",
+    );
+    expect(tooltipTrigger).not.toBeNull();
+    fireEvent.pointerMove(tooltipTrigger!, { pointerType: "mouse" });
+
+    await waitFor(() => {
+      expect(screen.getByRole("tooltip").textContent).toBe(reason);
+    });
+  });
+
   it("continues to submit unmodified Enter on a fine-pointer device", () => {
     const restoreMatchMedia = mockPointerCoarse(false);
     try {
@@ -1206,36 +1749,6 @@ describe("PromptBoxInternal submit shortcuts", () => {
       expect(onSubmit).toHaveBeenCalledOnce();
       expect(onChange).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(editor);
-    } finally {
-      restoreNavigator();
-      restoreMatchMedia();
-    }
-  });
-
-  it("keeps software-keyboard Enter as a newline on coarse-pointer iPadOS WebKit", async () => {
-    const restoreMatchMedia = mockPointerCoarse(true);
-    const restoreNavigator = mockIPadOSWebKit();
-    try {
-      const onChange = vi.fn();
-      const onSubmit = vi.fn();
-      render(
-        <PromptBoxInternal
-          {...createPromptBoxProps({
-            value: "First line",
-            onChange,
-            onSubmit,
-          })}
-        />,
-      );
-
-      const editor = getPromptEditorElement();
-      fireEvent.keyDown(editor, { key: "Enter", code: "" });
-
-      expect(editor.getAttribute("enterkeyhint")).toBe("enter");
-      expect(onSubmit).not.toHaveBeenCalled();
-      await waitFor(() =>
-        expect(onChange).toHaveBeenLastCalledWith("First line\n", []),
-      );
     } finally {
       restoreNavigator();
       restoreMatchMedia();
@@ -1350,6 +1863,294 @@ describe("PromptBoxInternal submit shortcuts", () => {
     }
   });
 
+  describe.each([false, true])(
+    "swapped submit actions: %s",
+    (swapSubmitActions) => {
+      it.each(["", "Follow up"])(
+        "sends with the same action and queues only draft input (%j)",
+        (value) => {
+          const onSubmit = vi.fn();
+          const onModifierSubmit = vi.fn();
+          const onStop = vi.fn();
+          render(
+            <PromptBoxInternal
+              {...createPromptBoxProps({
+                value,
+                onSubmit,
+                submission: {
+                  onModifierSubmit,
+                  swapSubmitActions,
+                  isRunning: true,
+                  onStop,
+                },
+              })}
+            />,
+          );
+
+          const editor = getPromptEditorElement();
+          fireEvent.keyDown(editor, {
+            key: "Enter",
+            metaKey: !swapSubmitActions,
+          });
+          expect(onModifierSubmit).toHaveBeenCalledOnce();
+          expect(onSubmit).not.toHaveBeenCalled();
+
+          fireEvent.keyDown(editor, {
+            key: "Enter",
+            metaKey: swapSubmitActions,
+          });
+          expect(onSubmit).toHaveBeenCalledTimes(value ? 1 : 0);
+          expect(onModifierSubmit).toHaveBeenCalledOnce();
+          if (!value) {
+            fireEvent.click(screen.getByRole("button", { name: "Stop run" }));
+            expect(onStop).toHaveBeenCalledOnce();
+          }
+        },
+      );
+    },
+  );
+
+  it.each([
+    { swapSubmitActions: false, touch: true },
+    { swapSubmitActions: true, touch: true },
+    { swapSubmitActions: false, touch: false },
+    { swapSubmitActions: true, touch: false },
+  ])(
+    "offers alternate send actions and existing draft/scheduling registrations (Enter steers: $swapSubmitActions, touch: $touch)",
+    ({ swapSubmitActions, touch: isTouch }) => {
+      const restoreMatchMedia = mockPointerCoarse(isTouch);
+      vi.useFakeTimers();
+      try {
+        const onSubmit = vi.fn();
+        const onModifierSubmit = vi.fn();
+        const schedule = vi.fn();
+        const saveDraft = vi.fn();
+        setPluginSlotRegistrations(
+          "scheduled-send",
+          pluginRegistrationSet([
+            {
+              id: "send-later",
+              plusMenu: [{ id: "other", label: "Other action", run: vi.fn() }],
+              sendMenu: [
+                {
+                  id: "send-later",
+                  label: "Send later",
+                  run: schedule,
+                },
+              ],
+            },
+          ]),
+        );
+        setPluginSlotRegistrations(
+          "drafts",
+          pluginRegistrationSet([
+            {
+              id: "drafts",
+              sendMenu: [{ id: "drafts", label: "Save draft", run: saveDraft }],
+            },
+          ]),
+        );
+        const draft = { ...emptyPromptDraftState(), text: "Follow up" };
+        const host: PluginComposerHost = {
+          scope: { kind: "thread", threadId: "thread-1" },
+          textEffectKey: "send-menu-test",
+          getCurrent: () => draft,
+          subscribeDraft: () => () => {},
+          setDraft: vi.fn(),
+          focus: vi.fn(),
+        };
+        const renderComposer = (value: string, disabled = false) => (
+          <MemoryRouter>
+            <PluginComposerHostProvider value={host}>
+              <PromptBoxInternal
+                {...createPromptBoxProps({
+                  value,
+                  onSubmit,
+                  submission: {
+                    onModifierSubmit,
+                    swapSubmitActions,
+                    disabled,
+                    showModifierSubmitAction: true,
+                  },
+                  compact: { isCompact: true, placeholder: "Ask a follow-up" },
+                })}
+              />
+            </PluginComposerHostProvider>
+          </MemoryRouter>
+        );
+        const { rerender } = render(renderComposer("Follow up"));
+        const touch = {
+          button: 0,
+          pointerType: "touch",
+          pointerId: 1,
+          isPrimary: true,
+          clientX: 20,
+          clientY: 20,
+        };
+        const openMenu = () => {
+          if (!isTouch) {
+            fireEvent.pointerDown(
+              screen.getByRole("button", { name: "Send options" }),
+              { button: 0, ctrlKey: false, pointerType: "mouse" },
+            );
+            return;
+          }
+          const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+          vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+            new DOMRect(0, 0, 40, 40),
+          );
+          fireEvent.pointerDown(submit, touch);
+          act(() => vi.advanceTimersByTime(700));
+          act(() => vi.advanceTimersByTime(500));
+          fireEvent.pointerUp(submit, touch);
+          fireEvent.click(submit, { detail: 1 });
+        };
+        openMenu();
+        expect(onSubmit).not.toHaveBeenCalled();
+        expect(onModifierSubmit).not.toHaveBeenCalled();
+        expect(
+          screen.getAllByRole("menuitem").map((item) => item.textContent),
+        ).toEqual([
+          swapSubmitActions ? "Queue" : "Steer",
+          "Save draft",
+          "Send later",
+        ]);
+        const alternateAction = screen.getByRole("menuitem", {
+          name: swapSubmitActions ? "Queue" : "Steer",
+        });
+        expect(
+          alternateAction.querySelector(
+            `[data-icon="${swapSubmitActions ? "ListEnd" : "CornerDownRight"}"]`,
+          ),
+        ).not.toBeNull();
+        expect(getPromptEditorElement().textContent).toBe("Follow up");
+        fireEvent.click(alternateAction);
+        expect(onSubmit).toHaveBeenCalledTimes(swapSubmitActions ? 1 : 0);
+        expect(onModifierSubmit).toHaveBeenCalledTimes(
+          swapSubmitActions ? 0 : 1,
+        );
+
+        openMenu();
+        fireEvent.click(screen.getByRole("menuitem", { name: "Save draft" }));
+        expect(saveDraft).toHaveBeenCalledOnce();
+        expect(saveDraft.mock.calls[0]?.[0].view.draft.text).toBe("Follow up");
+
+        openMenu();
+        fireEvent.click(screen.getByRole("menuitem", { name: "Send later" }));
+        expect(schedule).toHaveBeenCalledOnce();
+        expect(schedule.mock.calls[0]?.[0].view.draft.text).toBe("Follow up");
+        expect(onSubmit).toHaveBeenCalledTimes(swapSubmitActions ? 1 : 0);
+        expect(onModifierSubmit).toHaveBeenCalledTimes(
+          swapSubmitActions ? 0 : 1,
+        );
+
+        openMenu();
+        rerender(renderComposer(""));
+        act(() => vi.advanceTimersByTime(500));
+        expect(screen.queryByRole("menuitem")).toBeNull();
+        expect(
+          screen
+            .getByRole("button", { name: "Submit (Enter)" })
+            .hasAttribute("disabled"),
+        ).toBe(true);
+        expect(
+          screen.queryByRole("button", { name: "Send options" }),
+        ).toBeNull();
+        if (isTouch) {
+          openMenu();
+          expect(screen.queryByRole("menuitem")).toBeNull();
+        }
+
+        rerender(renderComposer("Follow up", true));
+        openMenu();
+        expect(screen.queryByRole("menuitem")).toBeNull();
+
+        rerender(renderComposer("Follow up"));
+        expect(screen.queryByRole("menuitem")).toBeNull();
+        openMenu();
+        expect(screen.getAllByRole("menuitem")).toHaveLength(3);
+      } finally {
+        vi.useRealTimers();
+        restoreMatchMedia();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps save shortcuts without advertising steering in an editor (touch: %s)",
+    (isTouch) => {
+      const restoreMatchMedia = mockPointerCoarse(isTouch);
+      vi.useFakeTimers();
+      try {
+        const save = vi.fn();
+        render(
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value: "Edit the queued message",
+              onSubmit: save,
+              submission: { onModifierSubmit: save },
+              compact: { isCompact: true, placeholder: "Edit message" },
+            })}
+          />,
+        );
+        expect(
+          screen.queryByRole("button", { name: "Send options" }),
+        ).toBeNull();
+        const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+        vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+          new DOMRect(0, 0, 40, 40),
+        );
+        fireEvent.pointerDown(submit, {
+          button: 0,
+          pointerType: "touch",
+          pointerId: 1,
+          isPrimary: true,
+          clientX: 20,
+          clientY: 20,
+        });
+        act(() => vi.advanceTimersByTime(700));
+        act(() => vi.advanceTimersByTime(500));
+        expect(screen.queryByRole("menuitem")).toBeNull();
+        expect(save).not.toHaveBeenCalled();
+        if (!isTouch) {
+          fireEvent.keyDown(getPromptEditorElement(), { key: "Enter" });
+          fireEvent.keyDown(getPromptEditorElement(), {
+            key: "Enter",
+            metaKey: true,
+          });
+          expect(save).toHaveBeenCalledTimes(2);
+        }
+      } finally {
+        vi.useRealTimers();
+        restoreMatchMedia();
+      }
+    },
+  );
+
+  it("blocks both swapped actions while disabled", () => {
+    const onSubmit = vi.fn();
+    const onModifierSubmit = vi.fn();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({
+          value: "Follow up",
+          onSubmit,
+          submission: {
+            onModifierSubmit,
+            swapSubmitActions: true,
+            disabled: true,
+          },
+        })}
+      />,
+    );
+
+    const editor = getPromptEditorElement();
+    fireEvent.keyDown(editor, { key: "Enter" });
+    fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onModifierSubmit).not.toHaveBeenCalled();
+  });
+
   it("routes Magic Keyboard Command+Enter to modifier submit on coarse-pointer iPadOS WebKit", () => {
     const restoreMatchMedia = mockPointerCoarse(true);
     const restoreNavigator = mockIPadOSWebKit();
@@ -1381,6 +2182,60 @@ describe("PromptBoxInternal submit shortcuts", () => {
     } finally {
       restoreNavigator();
       restoreMatchMedia();
+    }
+  });
+
+  it("routes Control+Enter to modifier submit and labels the shortcut for the platform", () => {
+    const platformMock = vi
+      .spyOn(navigator, "platform", "get")
+      .mockReturnValue("Linux x86_64");
+    try {
+      const onModifierSubmit = vi.fn();
+      const onSubmit = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "Follow up",
+            onSubmit,
+            submission: { onModifierSubmit },
+          })}
+        />,
+      );
+
+      const editor = getPromptEditorElement();
+      expect(editor.getAttribute("aria-keyshortcuts")).toBe("Control+Enter");
+      act(() => editor.focus());
+      fireEvent.keyDown(editor, {
+        key: "Enter",
+        code: "Enter",
+        ctrlKey: true,
+      });
+
+      expect(onModifierSubmit).toHaveBeenCalledOnce();
+      expect(onSubmit).not.toHaveBeenCalled();
+    } finally {
+      platformMock.mockRestore();
+    }
+  });
+
+  it("labels the modifier submit shortcut with Meta on Mac", () => {
+    const platformMock = vi
+      .spyOn(navigator, "platform", "get")
+      .mockReturnValue("MacIntel");
+    try {
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "Follow up",
+            submission: { onModifierSubmit: vi.fn() },
+          })}
+        />,
+      );
+      expect(getPromptEditorElement().getAttribute("aria-keyshortcuts")).toBe(
+        "Meta+Enter",
+      );
+    } finally {
+      platformMock.mockRestore();
     }
   });
 
@@ -1455,10 +2310,6 @@ describe("PromptBoxInternal submit shortcuts", () => {
         />,
       );
 
-      // A `compositionend` with no matching `compositionstart` leaves the view
-      // outside a composition. ProseMirror ignores that event, so the 500 ms
-      // guard must ignore it too, or it would swallow a real Magic Keyboard
-      // Enter.
       const editor = getPromptEditorElement();
       fireEvent.compositionEnd(editor, { data: "候補" });
       fireEvent.keyDown(editor, {
@@ -1473,131 +2324,136 @@ describe("PromptBoxInternal submit shortcuts", () => {
       restoreMatchMedia();
     }
   });
+});
 
-  it("keeps hardware Enter as a newline in zen mode", async () => {
-    const restoreMatchMedia = mockPointerCoarse(true);
-    const restoreNavigator = mockIPadOSWebKit();
-    const storageKey = "bb.test.promptbox.zen-submit-shortcut";
-    window.localStorage.removeItem(storageKey);
-    try {
-      const onChange = vi.fn();
-      const onSubmit = vi.fn();
-      render(
-        <PromptBoxInternal
-          {...createPromptBoxProps({
-            value: "First line",
-            onChange,
-            onSubmit,
-            zenMode: { storageKey },
-          })}
-        />,
-      );
-      fireEvent.click(
-        screen.getByRole("button", { name: "Make prompt box larger" }),
-      );
+describe("PromptBoxInternal escape", () => {
+  it("blurs the editor when no host Escape action is provided", async () => {
+    const promptBoxRef = createRef<PromptBoxHandle>();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({ value: "Follow-up message" })}
+        promptBoxRef={promptBoxRef}
+      />,
+    );
+    await focusPromptEnd(promptBoxRef);
+    const editor = getPromptEditorElement();
 
-      fireEvent.keyDown(getPromptEditorElement(), {
-        key: "Enter",
-        code: "Enter",
-      });
+    const wasNotCanceled = fireEvent.keyDown(editor, { key: "Escape" });
 
-      expect(onSubmit).not.toHaveBeenCalled();
-      await waitFor(() =>
-        expect(onChange).toHaveBeenLastCalledWith("First line\n", []),
-      );
-    } finally {
-      window.localStorage.removeItem(storageKey);
-      restoreNavigator();
-      restoreMatchMedia();
-    }
+    expect(wasNotCanceled).toBe(false);
+    expect(document.activeElement).not.toBe(editor);
+  });
+
+  it("routes Escape to onEscape instead of blurring the editor", async () => {
+    const onEscape = vi.fn();
+    const promptBoxRef = createRef<PromptBoxHandle>();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({ onEscape, value: "Edited message" })}
+        promptBoxRef={promptBoxRef}
+      />,
+    );
+    await focusPromptEnd(promptBoxRef);
+
+    const wasNotCanceled = fireEvent.keyDown(getPromptEditorElement(), {
+      key: "Escape",
+    });
+
+    expect(onEscape).toHaveBeenCalledTimes(1);
+    expect(wasNotCanceled).toBe(false);
+    expect(document.activeElement).toBe(getPromptEditorElement());
+  });
+
+  it("dismisses an open typeahead before Escape reaches onEscape", async () => {
+    const onEscape = vi.fn();
+    const promptBoxRef = createRef<PromptBoxHandle>();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({
+          onEscape,
+          value: "/re",
+          typeahead: buildTypeaheadConfig({
+            commandSuggestions: [
+              {
+                kind: "command",
+                name: "review",
+                source: "command",
+                origin: "user",
+                description: null,
+                argumentHint: null,
+              },
+            ],
+          }),
+        })}
+        promptBoxRef={promptBoxRef}
+      />,
+    );
+    await focusPromptEnd(promptBoxRef);
+    await screen.findByRole("button", { name: "review" });
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Escape" });
+
+    expect(onEscape).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "review" })).toBeNull(),
+    );
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Escape" });
+    expect(onEscape).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("PromptBoxInternal zen mode layout", () => {
-  it("animates the prompt box height when toggling zen mode", async () => {
-    const storageKey = "bb.test.promptbox.zen-height-animation";
-    window.localStorage.removeItem(storageKey);
+describe("PromptBoxInternal size controls", () => {
+  it.each([
+    [
+      "thread",
+      "min(calc(50dvh - 3rem), var(--composer-editor-available-height, 100dvh))",
+    ],
+    [
+      "root-compose",
+      "min(calc(70dvh - 3rem), var(--composer-editor-available-height, 100dvh))",
+    ],
+  ] as const)(
+    "caps the %s editor at its intended viewport height or the host's available space",
+    (layout, maxHeight) => {
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({ editorLayout: layout })}
+        />,
+      );
 
-    render(
-      <PromptBoxInternal
-        {...createPromptBoxProps({
-          zenMode: { storageKey },
-        })}
-      />,
-    );
-
-    const form = document.querySelector("[data-promptbox]");
-    if (!(form instanceof HTMLFormElement)) {
-      throw new Error("Prompt box form was not rendered");
-    }
-
-    vi.spyOn(form, "getBoundingClientRect")
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 96))
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 512))
-      .mockReturnValue(new DOMRect(0, 0, 320, 512));
-
-    expect(
-      screen.queryByRole("button", { name: "Make prompt box smaller" }),
-    ).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Make prompt box larger" }),
-    );
-
-    await waitFor(() => {
-      expect(form.style.transition).toContain("height 240ms");
-      expect(form.style.height).toBe("512px");
-    });
-    expect(
-      screen.getByRole("button", { name: "Make prompt box smaller" }),
-    ).toBeTruthy();
-    expect(
-      screen.queryByRole("button", { name: "Make prompt box larger" }),
-    ).toBeNull();
-
-    fireEvent.transitionEnd(form, { propertyName: "height" });
-    window.localStorage.removeItem(storageKey);
-  });
-
-  it("keeps long editor content constrained to the scroll area", async () => {
-    const storageKey = "bb.test.promptbox.zen-layout";
-    window.localStorage.removeItem(storageKey);
-
-    render(
-      <PromptBoxInternal
-        {...createPromptBoxProps({
-          value: Array.from(
-            { length: 40 },
-            (_, index) => `Line ${index + 1}`,
-          ).join("\n"),
-          promptActions,
-          zenMode: { storageKey },
-        })}
-      />,
-    );
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Make prompt box larger" }),
-    );
-
-    await waitFor(() => {
-      const scrollContainer = document.querySelector(
+      const editorScroll = document.querySelector<HTMLElement>(
         "[data-promptbox-editor-scroll]",
       );
-      if (!(scrollContainer instanceof HTMLElement)) {
-        throw new Error("Prompt editor scroll container was not rendered");
-      }
+      expect(editorScroll?.style.maxHeight).toBe(maxHeight);
+    },
+  );
 
-      expect(scrollContainer.classList.contains("min-h-0")).toBe(true);
-      expect(scrollContainer.parentElement?.classList.contains("min-h-0")).toBe(
-        true,
-      );
+  it("offers only the collapse action and releases editor focus", async () => {
+    const onCollapse = vi.fn();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({
+          onCollapse,
+        })}
+      />,
+    );
+    await waitForPromptFocus();
+
+    const collapseButton = screen.getByRole("button", {
+      name: "Collapse prompt box",
     });
+    expect(collapseButton.classList).toContain("text-subtle-foreground/75");
+    expect(collapseButton.classList).toContain("w-6");
+    expect(collapseButton.classList).toContain("px-0");
+    expect(collapseButton.parentElement?.classList).toContain("right-[13px]");
+    expect(
+      collapseButton.querySelector('[data-icon="ChevronDown"]')?.classList,
+    ).toContain("size-3.5");
+    fireEvent.click(collapseButton);
 
-    const footerRow = screen.getByRole("button", { name: "Prompt actions" })
-      .parentElement?.parentElement;
-    expect(footerRow?.classList.contains("shrink-0")).toBe(true);
-
-    window.localStorage.removeItem(storageKey);
+    expect(onCollapse).toHaveBeenCalledOnce();
+    expect(document.activeElement).not.toBe(getPromptEditorElement());
   });
 });
 
@@ -1640,10 +2496,12 @@ describe("PromptBoxInternal plugin composer actions", () => {
         {...createPromptBoxProps({
           voice: {
             state: "idle",
+            microphoneWarning: null,
             isSupported: true,
             stream: null,
             start: vi.fn(),
             stop: vi.fn(),
+            send: vi.fn(),
             cancel: vi.fn(),
           },
         })}
@@ -1691,9 +2549,9 @@ describe("PromptBoxInternal plugin composer actions", () => {
     const draft = emptyPromptDraftState();
     const host: PluginComposerHost = {
       scope: { kind: "thread", threadId: "crashing-action-thread" },
-      draft,
       textEffectKey: "crashing-action-composer",
       getCurrent: () => draft,
+      subscribeDraft: () => () => {},
       setDraft: vi.fn(),
       focus: vi.fn(),
     };
@@ -1778,9 +2636,9 @@ describe("PromptBoxInternal plugin composer actions", () => {
     const draft = emptyPromptDraftState();
     const host: PluginComposerHost = {
       scope: { kind: "thread", threadId: "thread-1" },
-      draft,
       textEffectKey: "promptbox-lock-test",
       getCurrent: () => draft,
+      subscribeDraft: () => () => {},
       setDraft: vi.fn(),
       focus: vi.fn(),
     };
@@ -1867,9 +2725,9 @@ describe("PromptBoxInternal plugin composer actions", () => {
     const draft = emptyPromptDraftState();
     const host = (threadId: string): PluginComposerHost => ({
       scope: { kind: "thread", threadId },
-      draft,
       textEffectKey: `scope-action:${threadId}`,
       getCurrent: () => draft,
+      subscribeDraft: () => () => {},
       setDraft: vi.fn(),
       focus: vi.fn(),
     });
@@ -1928,6 +2786,89 @@ describe("PromptBoxInternal plugin composer actions", () => {
 });
 
 describe("PromptBoxInternal compact layout", () => {
+  it("shows only an attachment count when compact and removal controls when expanded", () => {
+    const items: NonNullable<
+      NonNullable<PromptBoxProps["attachments"]>["items"]
+    > = [
+      {
+        type: "localImage",
+        name: "photo.png",
+        path: "photo.png",
+        sizeBytes: 1,
+      },
+      { type: "localFile", name: "notes.txt", path: "notes.txt", sizeBytes: 1 },
+    ];
+    const props = createPromptBoxProps({
+      attachments: { items, onUpdate: vi.fn() },
+      compact: { isCompact: true },
+    });
+    const { rerender } = render(<PromptBoxInternal {...props} />);
+    expect(screen.getByRole("img", { name: "2 attachments" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Remove / })).toBeNull();
+    expect(
+      document.querySelector("[data-promptbox-attachments] button"),
+    ).toBeNull();
+    rerender(<PromptBoxInternal {...props} compact={{ isCompact: false }} />);
+    expect(
+      screen.getByRole("button", { name: "Remove photo.png" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove notes.txt" }),
+    ).toBeTruthy();
+    rerender(
+      <PromptBoxInternal
+        {...props}
+        attachments={{ ...props.attachments, items: items.slice(1) }}
+      />,
+    );
+    expect(screen.getByRole("img", { name: "1 attachment" })).toBeTruthy();
+    rerender(
+      <PromptBoxInternal
+        {...props}
+        attachments={{ ...props.attachments, items: [] }}
+      />,
+    );
+    expect(document.querySelector("[data-promptbox-attachments]")).toBeNull();
+  });
+
+  it("shows attachment upload progress on the submit button", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            attachments: { isAttaching: true },
+            compact: {
+              isCompact: true,
+              placeholder: "Ask a follow-up",
+            },
+            voice: {
+              state: "idle",
+              microphoneWarning: null,
+              isSupported: true,
+              stream: null,
+              start: vi.fn(),
+              stop: vi.fn(),
+              send: vi.fn(),
+              cancel: vi.fn(),
+            },
+          })}
+        />,
+      );
+
+      const submit = screen.getByRole("button", {
+        name: "Uploading attachments...",
+      });
+      expect(submit.hasAttribute("disabled")).toBe(true);
+      expect(submit.querySelector('[data-icon="Loading"]')).not.toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Start voice input" }),
+      ).toBeTruthy();
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
   it("publishes the container-compact placeholder for CSS", () => {
     const baseProps = createPromptBoxProps();
     const view = render(
@@ -1951,67 +2892,44 @@ describe("PromptBoxInternal compact layout", () => {
     ).toBe("");
   });
 
-  it("animates between compact and full layouts", async () => {
-    const promptBoxRef = createRef<PromptBoxHandle>();
-    const baseProps = createPromptBoxProps({ promptBoxRef });
-    const view = render(
-      <PromptBoxInternal
-        {...baseProps}
-        compact={{ isCompact: true, placeholder: "Ask a follow-up" }}
-      />,
-    );
-    const form = document.querySelector("[data-promptbox]");
-    if (!(form instanceof HTMLFormElement)) {
-      throw new Error("Prompt box form was not rendered");
-    }
-    vi.spyOn(form, "getBoundingClientRect")
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 48))
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 144))
-      .mockReturnValue(new DOMRect(0, 0, 320, 144));
+  it.each([
+    {
+      trigger: "the compact layout",
+      before: { compact: { isCompact: true, placeholder: "Ask a follow-up" } },
+      after: { compact: { isCompact: false, placeholder: "Ask a follow-up" } },
+    },
+    {
+      trigger: "an external animation key",
+      before: { heightAnimationKey: "compact" },
+      after: { heightAnimationKey: "expanded" },
+    },
+  ])(
+    "animates a height change driven by $trigger",
+    async ({ before, after }) => {
+      const promptBoxRef = createRef<PromptBoxHandle>();
+      const baseProps = createPromptBoxProps({ promptBoxRef });
+      const view = render(<PromptBoxInternal {...baseProps} {...before} />);
+      const form = document.querySelector("[data-promptbox]");
+      if (!(form instanceof HTMLFormElement)) {
+        throw new Error("Prompt box form was not rendered");
+      }
+      vi.spyOn(form, "getBoundingClientRect")
+        .mockReturnValueOnce(new DOMRect(0, 0, 320, 48))
+        .mockReturnValueOnce(new DOMRect(0, 0, 320, 144))
+        .mockReturnValue(new DOMRect(0, 0, 320, 144));
 
-    act(() => promptBoxRef.current?.captureHeightForLayoutChange());
-    view.rerender(
-      <PromptBoxInternal
-        {...baseProps}
-        compact={{ isCompact: false, placeholder: "Ask a follow-up" }}
-      />,
-    );
+      act(() => promptBoxRef.current?.captureHeightForLayoutChange());
+      view.rerender(<PromptBoxInternal {...baseProps} {...after} />);
 
-    await waitFor(() => {
-      expect(form.style.transition).toContain("height 240ms");
-      expect(form.style.height).toBe("144px");
-      expect(form.style.overflow).toBe("hidden");
-    });
-    fireEvent.transitionEnd(form, { propertyName: "height" });
-    expect(form.style.overflow).toBe("");
-  });
-
-  it("animates an externally driven layout change", async () => {
-    const promptBoxRef = createRef<PromptBoxHandle>();
-    const baseProps = createPromptBoxProps({ promptBoxRef });
-    const view = render(
-      <PromptBoxInternal {...baseProps} heightAnimationKey="compact" />,
-    );
-    const form = document.querySelector("[data-promptbox]");
-    if (!(form instanceof HTMLFormElement)) {
-      throw new Error("Prompt box form was not rendered");
-    }
-    vi.spyOn(form, "getBoundingClientRect")
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 48))
-      .mockReturnValueOnce(new DOMRect(0, 0, 320, 144))
-      .mockReturnValue(new DOMRect(0, 0, 320, 144));
-
-    act(() => promptBoxRef.current?.captureHeightForLayoutChange());
-    view.rerender(
-      <PromptBoxInternal {...baseProps} heightAnimationKey="expanded" />,
-    );
-
-    await waitFor(() => {
-      expect(form.style.transition).toContain("height 240ms");
-      expect(form.style.height).toBe("144px");
-    });
-    fireEvent.transitionEnd(form, { propertyName: "height" });
-  });
+      await waitFor(() => {
+        expect(form.style.transition).toContain("height 240ms");
+        expect(form.style.height).toBe("144px");
+        expect(form.style.overflow).toBe("hidden");
+      });
+      fireEvent.transitionEnd(form, { propertyName: "height" });
+      expect(form.style.overflow).toBe("");
+    },
+  );
 
   it("skips an external layout animation when the height did not change", () => {
     const promptBoxRef = createRef<PromptBoxHandle>();
@@ -2036,13 +2954,15 @@ describe("PromptBoxInternal compact layout", () => {
     expect(form.style.height).toBe("");
   });
 
-  it("keeps only the one-line editor and primary action", () => {
+  it("keeps the one-line editor, voice input, and submit action", () => {
     const voice: PromptVoiceConfig = {
       state: "idle",
+      microphoneWarning: null,
       isSupported: true,
       stream: null,
       start: vi.fn(),
       stop: vi.fn(),
+      send: vi.fn(),
       cancel: vi.fn(),
     };
 
@@ -2065,22 +2985,15 @@ describe("PromptBoxInternal compact layout", () => {
 
     const form = document.querySelector("[data-promptbox]");
     expect(form?.getAttribute("data-promptbox-compact")).toBe("");
-    const submitButton = screen.getByRole("button", {
-      name: "Submit (Enter)",
-    });
-    expect(submitButton.classList.contains("size-8")).toBe(true);
-    expect(submitButton.classList.contains("p-0")).toBe(true);
-    expect(submitButton.classList.contains("ml-1")).toBe(false);
-    expect(submitButton.classList.contains("transition-colors")).toBe(true);
-    expect(submitButton.classList.contains("transition-all")).toBe(false);
+    expect(screen.getByRole("button", { name: "Submit (Enter)" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Prompt actions" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Model selector" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Attach files" })).toBeNull();
     expect(
-      screen.queryByRole("button", { name: "Start voice input" }),
-    ).toBeNull();
+      screen.getByRole("button", { name: "Start voice input" }),
+    ).toBeTruthy();
     expect(
-      screen.queryByRole("button", { name: /Make prompt box/u }),
+      screen.queryByRole("button", { name: "Collapse prompt box" }),
     ).toBeNull();
     expect(getPromptEditorElement().getAttribute("data-placeholder")).toBe(
       "Ask a follow-up",
@@ -2089,12 +3002,6 @@ describe("PromptBoxInternal compact layout", () => {
       "[data-promptbox-compact-content]",
     );
     expect(compactContent).toBeTruthy();
-    expect(compactContent?.classList.contains("items-center")).toBe(true);
-    expect(
-      document
-        .querySelector("[data-promptbox-editor-scroll]")
-        ?.classList.contains("pt-0"),
-    ).toBe(true);
   });
 
   it("uses voice as the primary action for an empty coarse-pointer prompt", () => {
@@ -2110,10 +3017,12 @@ describe("PromptBoxInternal compact layout", () => {
             },
             voice: {
               state: "idle",
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start,
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -2145,6 +3054,533 @@ describe("PromptBoxInternal compact layout", () => {
     }
   });
 
+  it.each([false, true])(
+    "keeps voice input available beside stop while running (compact: %s)",
+    (isCompact) => {
+      const restoreMatchMedia = mockPointerCoarse(true);
+      try {
+        const start = vi.fn();
+        const onStop = vi.fn();
+        render(
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              submission: { isRunning: true, onStop },
+              compact: { isCompact, placeholder: "Ask a follow-up" },
+              voice: {
+                state: "idle",
+                microphoneWarning: null,
+                isSupported: true,
+                stream: null,
+                start,
+                stop: vi.fn(),
+                send: vi.fn(),
+                cancel: vi.fn(),
+              },
+            })}
+          />,
+        );
+
+        const voiceButton = screen.getByRole("button", {
+          name: "Start voice input",
+        });
+        const stopButton = screen.getByRole("button", { name: "Stop run" });
+        expect(voiceButton.hasAttribute("disabled")).toBe(false);
+        fireEvent.pointerDown(voiceButton, {
+          button: 0,
+          pointerType: "touch",
+        });
+        fireEvent.click(voiceButton, { detail: 1 });
+        expect(start).toHaveBeenCalledOnce();
+        expect(onStop).not.toHaveBeenCalled();
+
+        fireEvent.pointerDown(stopButton, {
+          button: 0,
+          pointerType: "touch",
+        });
+        fireEvent.click(stopButton, { detail: 1 });
+        expect(onStop).toHaveBeenCalledOnce();
+      } finally {
+        restoreMatchMedia();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "dictates into a compact draft without submitting (running: %s)",
+    (isRunning) => {
+      const restoreMatchMedia = mockPointerCoarse(true);
+      try {
+        const start = vi.fn();
+        const onSubmit = vi.fn();
+        render(
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value: "Please also check the mobile layout.",
+              onSubmit,
+              submission: { isRunning, onStop: vi.fn() },
+              compact: { isCompact: true, placeholder: "Ask a follow-up" },
+              voice: {
+                state: "idle",
+                microphoneWarning: null,
+                isSupported: true,
+                stream: null,
+                start,
+                stop: vi.fn(),
+                send: vi.fn(),
+                cancel: vi.fn(),
+              },
+            })}
+          />,
+        );
+
+        const voiceButton = screen.getByRole("button", {
+          name: "Start voice input",
+        });
+        expect(
+          screen.getByRole("button", { name: "Submit (Enter)" }),
+        ).toBeTruthy();
+        fireEvent.pointerDown(voiceButton, {
+          button: 0,
+          pointerType: "touch",
+        });
+        fireEvent.click(voiceButton, { detail: 1 });
+        expect(start).toHaveBeenCalledOnce();
+        expect(onSubmit).not.toHaveBeenCalled();
+        expect(getPromptEditorElement().textContent).toBe(
+          "Please also check the mobile layout.",
+        );
+      } finally {
+        restoreMatchMedia();
+      }
+    },
+  );
+
+  it("does not start voice input from the trailing click of a touch submit", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      const start = vi.fn();
+      const voice = {
+        state: "idle" as const,
+        microphoneWarning: null,
+        isSupported: true,
+        stream: null,
+        start,
+        stop: vi.fn(),
+        send: vi.fn(),
+        cancel: vi.fn(),
+      };
+      const onSubmit = vi.fn();
+      const { rerender } = render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "Send this",
+            onSubmit,
+            voice,
+            compact: { isCompact: true, placeholder: "Ask a follow-up" },
+          })}
+        />,
+      );
+
+      const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+      vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+        new DOMRect(0, 0, 40, 40),
+      );
+      const touch = {
+        button: 0,
+        pointerType: "touch",
+        pointerId: 1,
+        isPrimary: true,
+        clientX: 20,
+        clientY: 20,
+      };
+      fireEvent.pointerDown(submit, touch);
+      fireEvent.pointerUp(submit, touch);
+      expect(onSubmit).toHaveBeenCalledOnce();
+
+      rerender(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "",
+            onSubmit,
+            voice,
+            compact: { isCompact: true, placeholder: "Ask a follow-up" },
+          })}
+        />,
+      );
+
+      const replacement = screen.getByRole("button", {
+        name: "Start voice input",
+      });
+      expect(replacement).not.toBe(submit);
+
+      fireEvent.click(replacement, { detail: 1 });
+
+      expect(start).not.toHaveBeenCalled();
+      expect(onSubmit).toHaveBeenCalledOnce();
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it.each([false, true])(
+    "does not stop from the trailing click of a touch submit (already running: %s)",
+    (isRunning) => {
+      const restoreMatchMedia = mockPointerCoarse(true);
+      try {
+        const onSubmit = vi.fn();
+        const onStop = vi.fn();
+        const props = createPromptBoxProps({
+          value: "Send this follow-up",
+          onSubmit,
+          submission: { isRunning, onStop },
+          compact: { isCompact: true, placeholder: "Ask a follow-up" },
+        });
+        const { rerender } = render(<PromptBoxInternal {...props} />);
+        const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+        vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+          new DOMRect(0, 0, 40, 40),
+        );
+        const touch = {
+          button: 0,
+          pointerType: "touch",
+          pointerId: 1,
+          isPrimary: true,
+          clientX: 20,
+          clientY: 20,
+        };
+        fireEvent.pointerDown(submit, touch);
+        fireEvent.pointerUp(submit, touch);
+        expect(onSubmit).toHaveBeenCalledOnce();
+
+        rerender(
+          <PromptBoxInternal
+            {...props}
+            value=""
+            submission={{ isRunning: true, onStop }}
+          />,
+        );
+        const stop = screen.getByRole("button", { name: "Stop run" });
+        expect(stop).not.toBe(submit);
+        fireEvent.click(stop, { detail: 1 });
+        expect(onStop).not.toHaveBeenCalled();
+        expect(onSubmit).toHaveBeenCalledOnce();
+
+        fireEvent.pointerDown(stop, touch);
+        fireEvent.pointerUp(stop, touch);
+        fireEvent.click(stop, { detail: 1 });
+        expect(onStop).toHaveBeenCalledOnce();
+      } finally {
+        restoreMatchMedia();
+      }
+    },
+  );
+
+  it.each(["mouse", "touch", "keyboard"])(
+    "stops a run for deliberate %s activation",
+    (input) => {
+      const onStop = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            submission: { isRunning: true, onStop },
+          })}
+        />,
+      );
+      const stop = screen.getByRole("button", { name: "Stop run" });
+      if (input !== "keyboard") {
+        fireEvent.pointerDown(stop, { button: 0, pointerType: input });
+        fireEvent.pointerUp(stop, { button: 0, pointerType: input });
+      }
+      fireEvent.click(stop, { detail: input === "keyboard" ? 0 : 1 });
+      expect(onStop).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("starts voice input once for a deliberate touch tap on the voice action", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      const start = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            compact: { isCompact: true, placeholder: "Ask a follow-up" },
+            voice: {
+              state: "idle",
+              microphoneWarning: null,
+              isSupported: true,
+              stream: null,
+              start,
+              stop: vi.fn(),
+              send: vi.fn(),
+              cancel: vi.fn(),
+            },
+          })}
+        />,
+      );
+
+      const voiceButton = screen.getByRole("button", {
+        name: "Start voice input",
+      });
+      const touch = {
+        button: 0,
+        pointerType: "touch",
+        pointerId: 1,
+        isPrimary: true,
+      };
+      fireEvent.pointerDown(voiceButton, touch);
+      fireEvent.pointerUp(voiceButton, touch);
+      fireEvent.click(voiceButton, { detail: 1 });
+
+      expect(start).toHaveBeenCalledOnce();
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it("starts voice input for keyboard activation without a pointer gesture", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      const start = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            compact: { isCompact: true, placeholder: "Ask a follow-up" },
+            voice: {
+              state: "idle",
+              microphoneWarning: null,
+              isSupported: true,
+              stream: null,
+              start,
+              stop: vi.fn(),
+              send: vi.fn(),
+              cancel: vi.fn(),
+            },
+          })}
+        />,
+      );
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Start voice input" }),
+        {
+          detail: 0,
+        },
+      );
+
+      expect(start).toHaveBeenCalledOnce();
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it("keeps an unfocused compact submit stable on coarse pointers", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      const onSubmit = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "Transcript ready to send",
+            onSubmit,
+            compact: {
+              isCompact: true,
+              placeholder: "Ask a follow-up",
+            },
+          })}
+        />,
+      );
+
+      expect(document.activeElement).not.toBe(getPromptEditorElement());
+      const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+      expect(
+        fireEvent.pointerDown(submit, {
+          button: 0,
+          pointerType: "touch",
+        }),
+      ).toBe(false);
+      fireEvent.click(submit, { detail: 1 });
+      expect(onSubmit).toHaveBeenCalledOnce();
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it("sends before dismissing the keyboard when a touch synthesizes mousedown", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    try {
+      const onSubmit = vi.fn(() => {
+        expect(document.activeElement).toBe(getPromptEditorElement());
+      });
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "Send with the keyboard open",
+            onSubmit,
+            blurOnPointerSubmit: true,
+          })}
+        />,
+      );
+
+      const editor = getPromptEditorElement();
+      act(() => editor.focus());
+      const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+      fireEvent.pointerDown(submit, { button: 0, pointerType: "touch" });
+      fireEvent.pointerUp(submit, { button: 0, pointerType: "touch" });
+
+      const allowsFocusChange = fireEvent.mouseDown(submit, { button: 0 });
+      if (allowsFocusChange) act(() => editor.blur());
+      expect(allowsFocusChange).toBe(false);
+      fireEvent.mouseUp(submit, { button: 0 });
+      fireEvent.click(submit, { detail: 1 });
+
+      expect(onSubmit).toHaveBeenCalledOnce();
+      expect(document.activeElement).not.toBe(editor);
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it("submits on touch release without waiting for or duplicating the click", () => {
+    const onSubmit = vi.fn();
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({
+          value: "Send immediately",
+          onSubmit,
+          blurOnPointerSubmit: true,
+        })}
+      />,
+    );
+    const editor = getPromptEditorElement();
+    act(() => editor.focus());
+    const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+    vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 40, 40),
+    );
+    const touch = {
+      button: 0,
+      pointerType: "touch",
+      pointerId: 1,
+      isPrimary: true,
+      clientX: 20,
+      clientY: 20,
+    };
+
+    fireEvent.pointerDown(submit, touch);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(editor);
+    fireEvent.pointerUp(submit, touch);
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(document.activeElement).not.toBe(editor);
+    fireEvent.click(submit, { detail: 1 });
+    expect(onSubmit).toHaveBeenCalledOnce();
+
+    fireEvent.click(submit, { detail: 0 });
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    fireEvent.pointerDown(submit, touch);
+    fireEvent.pointerUp(submit, touch);
+    expect(onSubmit).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not open context usage when a submit touch's click lands on the donut", () => {
+    const restoreMatchMedia = mockPointerCoarse(true);
+    const onSubmit = vi.fn();
+    function Harness() {
+      const [value, setValue] = useState("Send this follow-up");
+      return (
+        <CompactViewportOverrideProvider isCompactViewport>
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value,
+              blurOnPointerSubmit: true,
+              onSubmit: () => {
+                onSubmit();
+                setValue("");
+              },
+            })}
+          />
+          <ThreadContextWindowIndicator
+            usage={{
+              usedTokens: 1000,
+              modelContextWindow: 10000,
+              estimated: false,
+            }}
+          />
+        </CompactViewportOverrideProvider>
+      );
+    }
+    try {
+      render(<Harness />);
+      act(() => getPromptEditorElement().focus());
+      const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+      vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+        new DOMRect(0, 0, 40, 40),
+      );
+      const touch = {
+        button: 0,
+        pointerType: "touch",
+        pointerId: 1,
+        isPrimary: true,
+        clientX: 20,
+        clientY: 20,
+      };
+      fireEvent.pointerDown(submit, touch);
+      fireEvent.pointerUp(submit, touch);
+      expect(onSubmit).toHaveBeenCalledOnce();
+      expect(document.activeElement).not.toBe(getPromptEditorElement());
+
+      const donut = screen.getByRole("button", {
+        name: "Context window 10% used",
+      });
+      fireEvent.click(donut, { detail: 1 });
+      expect(
+        screen.queryByRole("dialog", { name: "Context window" }),
+      ).toBeNull();
+      expect(donut.getAttribute("aria-expanded")).toBe("false");
+
+      fireEvent.pointerDown(donut, touch);
+      fireEvent.pointerUp(donut, touch);
+      fireEvent.click(donut, { detail: 1 });
+      expect(donut.getAttribute("aria-expanded")).toBe("true");
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it.each(["cancel", "drag", "outside"])(
+    "does not send after a touch %s",
+    (gesture) => {
+      const onSubmit = vi.fn();
+      render(
+        <PromptBoxInternal
+          {...createPromptBoxProps({ value: "Keep this draft", onSubmit })}
+        />,
+      );
+      const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+      vi.spyOn(submit, "getBoundingClientRect").mockReturnValue(
+        new DOMRect(0, 0, 40, 40),
+      );
+      const touch = {
+        button: 0,
+        pointerType: "touch",
+        pointerId: 1,
+        isPrimary: true,
+        clientX: 38,
+        clientY: 20,
+      };
+      fireEvent.pointerDown(submit, touch);
+      if (gesture === "cancel") fireEvent.pointerCancel(submit, touch);
+      if (gesture === "drag") {
+        fireEvent.pointerMove(submit, { ...touch, clientX: 60 });
+      }
+      fireEvent.pointerUp(submit, {
+        ...touch,
+        clientX: gesture === "outside" ? 42 : touch.clientX,
+      });
+      fireEvent.click(submit, { detail: 1 });
+      expect(onSubmit).not.toHaveBeenCalled();
+    },
+  );
+
   it("keeps the editor focused through a pointer submit", async () => {
     const onSubmit = vi.fn();
     render(
@@ -2171,6 +3607,26 @@ describe("PromptBoxInternal compact layout", () => {
 
     fireEvent.click(submit, { detail: 1 });
     expect(onSubmit).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(editor);
+  });
+
+  it("keeps DOM focus through submit when TipTap focus state is stale", async () => {
+    render(
+      <PromptBoxInternal
+        {...createPromptBoxProps({ value: "Send this follow-up" })}
+      />,
+    );
+
+    await waitForPromptFocus();
+    const editor = getPromptEditorElement();
+    const submit = screen.getByRole("button", { name: "Submit (Enter)" });
+
+    editor.dispatchEvent(new FocusEvent("blur"));
+    expect(document.activeElement).toBe(editor);
+
+    expect(
+      fireEvent.pointerDown(submit, { button: 0, pointerType: "touch" }),
+    ).toBe(false);
     expect(document.activeElement).toBe(editor);
   });
 
@@ -2260,10 +3716,12 @@ describe("PromptBoxInternal compact layout", () => {
         {...createPromptBoxProps({
           voice: {
             state: "idle",
+            microphoneWarning: null,
             isSupported: true,
             stream: null,
             start: vi.fn(),
             stop: vi.fn(),
+            send: vi.fn(),
             cancel: vi.fn(),
           },
         })}
@@ -2282,10 +3740,12 @@ describe("PromptBoxInternal compact layout", () => {
     const onChange = vi.fn();
     const voice = {
       state: "idle" as const,
+      microphoneWarning: null,
       isSupported: true,
       stream: null,
       start: vi.fn(),
       stop: vi.fn(),
+      send: vi.fn(),
       cancel: vi.fn(),
     };
     const view = render(
@@ -2332,10 +3792,12 @@ describe("PromptBoxInternal compact layout", () => {
             onChange,
             voice: {
               state,
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start: vi.fn(),
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -2373,8 +3835,152 @@ describe("PromptBoxInternal compact layout", () => {
     },
   );
 
+  it("sends the complete updated draft through the primary submit action once after voice completion", async () => {
+    const promptBoxRef = createRef<PromptBoxHandle>();
+    const onSubmit = vi.fn();
+    function Harness() {
+      const [value, setValue] = useState("Existing prompt");
+      const [state, setState] = useState<"transcribing" | "idle">(
+        "transcribing",
+      );
+      return (
+        <>
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value,
+              onChange: (next) => setValue(next),
+              onSubmit: () => onSubmit(value),
+              voice: {
+                state,
+                microphoneWarning: null,
+                isSupported: true,
+                stream: null,
+                start: vi.fn(),
+                stop: vi.fn(),
+                send: vi.fn(),
+                cancel: vi.fn(),
+              },
+            })}
+            promptBoxRef={promptBoxRef}
+          />
+          <button type="button" onClick={() => setState("idle")}>
+            Finish transcription
+          </button>
+        </>
+      );
+    }
+    render(<Harness />);
+    act(() => promptBoxRef.current?.sendVoiceTranscript("more words"));
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Finish transcription" }),
+    );
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(
+        "Existing prompt more words",
+      ),
+    );
+  });
+
+  it("keeps the transcribed draft without submitting when primary submission is unavailable", async () => {
+    const promptBoxRef = createRef<PromptBoxHandle>();
+    const onSubmit = vi.fn();
+    function Harness() {
+      const [value, setValue] = useState("Existing prompt");
+      const [state, setState] = useState<"transcribing" | "idle">(
+        "transcribing",
+      );
+      return (
+        <>
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value,
+              onChange: (next) => setValue(next),
+              onSubmit,
+              submission: { disabled: true },
+              voice: {
+                state,
+                microphoneWarning: null,
+                isSupported: true,
+                stream: null,
+                start: vi.fn(),
+                stop: vi.fn(),
+                send: vi.fn(),
+                cancel: vi.fn(),
+              },
+            })}
+            promptBoxRef={promptBoxRef}
+          />
+          <button type="button" onClick={() => setState("idle")}>
+            Finish transcription
+          </button>
+        </>
+      );
+    }
+    render(<Harness />);
+    act(() => promptBoxRef.current?.sendVoiceTranscript("more words"));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Finish transcription" }),
+    );
+    await waitFor(() =>
+      expect(getPromptEditorElement().textContent).toBe(
+        "Existing prompt more words",
+      ),
+    );
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it.each(["recording", "transcribing"] as const)(
+    "keeps empty compact drafts compact while %s and reveals existing draft content",
+    (state) => {
+      const props = createPromptBoxProps({
+        compact: { isCompact: true, placeholder: "Ask a follow-up" },
+        voice: {
+          state,
+          microphoneWarning: null,
+          isSupported: true,
+          stream: null,
+          start: vi.fn(),
+          stop: vi.fn(),
+          send: vi.fn(),
+          cancel: vi.fn(),
+        },
+      });
+      const view = render(<PromptBoxInternal {...props} />);
+      const form = document.querySelector("[data-promptbox]");
+      expect(form?.hasAttribute("data-promptbox-compact")).toBe(true);
+      expect(
+        screen.getByRole("button", { name: "Send voice input" }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("textbox")).toBeNull();
+
+      view.rerender(<PromptBoxInternal {...props} value="Existing draft" />);
+      expect(form?.hasAttribute("data-promptbox-compact")).toBe(false);
+      expect(screen.getByRole("textbox").textContent).toBe("Existing draft");
+
+      view.rerender(
+        <PromptBoxInternal
+          {...props}
+          attachments={{
+            items: [
+              {
+                type: "localFile",
+                name: "notes.txt",
+                path: "notes.txt",
+                sizeBytes: 1,
+              },
+            ],
+          }}
+        />,
+      );
+      expect(form?.hasAttribute("data-promptbox-compact")).toBe(false);
+      expect(screen.getByText("notes.txt")).toBeTruthy();
+    },
+  );
+
   it("keeps the prompt editor visible while the waveform occupies the action row", () => {
     const stop = vi.fn();
+    const send = vi.fn();
     const cancel = vi.fn();
     render(
       <PromptBoxInternal
@@ -2382,10 +3988,12 @@ describe("PromptBoxInternal compact layout", () => {
           value: "Keep this prompt visible while I dictate",
           voice: {
             state: "recording",
+            microphoneWarning: null,
             isSupported: true,
             stream: null,
             start: vi.fn(),
             stop,
+            send,
             cancel,
           },
         })}
@@ -2408,20 +4016,24 @@ describe("PromptBoxInternal compact layout", () => {
     expect(waveform).toBeTruthy();
     expect(actionRow?.contains(waveform)).toBe(true);
     const confirm = screen.getByRole("button", {
-      name: "Stop and transcribe recording",
+      name: "Stop and add to draft",
     });
     const cancelButton = screen.getByRole("button", {
       name: "Cancel recording",
     });
+    const sendButton = screen.getByRole("button", { name: "Send voice input" });
     const voiceControls = document.querySelector(
       "[data-promptbox-voice-controls]",
     );
     expect(voiceControls?.classList.contains("pointer-events-auto")).toBe(true);
     expect(voiceControls?.contains(confirm)).toBe(true);
     expect(voiceControls?.contains(cancelButton)).toBe(true);
+    expect(voiceControls?.contains(sendButton)).toBe(true);
     fireEvent.click(confirm);
+    fireEvent.click(sendButton);
     fireEvent.click(cancelButton);
     expect(stop).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
   });
 
@@ -2443,10 +4055,12 @@ describe("PromptBoxInternal compact layout", () => {
     try {
       const idleVoice: PromptVoiceConfig = {
         state: "idle",
+        microphoneWarning: null,
         isSupported: true,
         stream: null,
         start: vi.fn(),
         stop: vi.fn(),
+        send: vi.fn(),
         cancel: vi.fn(),
       };
       const view = render(
@@ -2492,10 +4106,12 @@ describe("PromptBoxInternal compact layout", () => {
             value: "Existing draft",
             voice: {
               state: "transcribing",
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start: vi.fn(),
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -2550,10 +4166,12 @@ describe("PromptBoxInternal compact layout", () => {
       const cancel = vi.fn();
       const recordingVoice: PromptVoiceConfig = {
         state: "recording",
+        microphoneWarning: null,
         isSupported: true,
         stream: null,
         start: vi.fn(),
         stop: vi.fn(),
+        send: vi.fn(),
         cancel,
       };
       const view = render(
@@ -2620,10 +4238,12 @@ describe("PromptBoxInternal compact layout", () => {
             promptBoxRef,
             voice: {
               state: "transcribing",
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start: vi.fn(),
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -2666,10 +4286,12 @@ describe("PromptBoxInternal compact layout", () => {
             promptBoxRef,
             voice: {
               state: "transcribing",
+              microphoneWarning: null,
               isSupported: true,
               stream: null,
               start: vi.fn(),
               stop: vi.fn(),
+              send: vi.fn(),
               cancel: vi.fn(),
             },
           })}
@@ -2684,70 +4306,7 @@ describe("PromptBoxInternal compact layout", () => {
     }
   });
 
-  it.each(["recording", "transcribing"] as const)(
-    "keeps zen sizing coherent while voice is %s",
-    async (state) => {
-      const storageKey = `bb.test.promptbox.voice-zen-${state}`;
-      window.localStorage.removeItem(storageKey);
-      const voice = {
-        state: "idle" as const,
-        isSupported: true,
-        stream: null,
-        start: vi.fn(),
-        stop: vi.fn(),
-        cancel: vi.fn(),
-      };
-      const view = render(
-        <PromptBoxInternal
-          {...createPromptBoxProps({
-            value: "Keep this zen prompt visible",
-            voice,
-            zenMode: { storageKey },
-          })}
-        />,
-      );
-
-      fireEvent.click(
-        screen.getByRole("button", { name: "Make prompt box larger" }),
-      );
-      await waitFor(() =>
-        expect(
-          document
-            .querySelector("[data-promptbox]")
-            ?.hasAttribute("data-promptbox-zen"),
-        ).toBe(true),
-      );
-
-      view.rerender(
-        <PromptBoxInternal
-          {...createPromptBoxProps({
-            value: "Keep this zen prompt visible",
-            voice: { ...voice, state },
-            zenMode: { storageKey },
-          })}
-        />,
-      );
-
-      const form = document.querySelector("[data-promptbox]");
-      const editorScroll = document.querySelector<HTMLElement>(
-        "[data-promptbox-editor-scroll]",
-      );
-      const actionRow = document.querySelector("[data-promptbox-action-row]");
-      const waveform = document.querySelector("canvas[aria-hidden]");
-      expect(form?.hasAttribute("data-promptbox-zen")).toBe(true);
-      expect(form?.classList.contains("h-[50dvh]")).toBe(true);
-      expect(editorScroll?.style.height).toBe("100%");
-      expect(editorScroll?.style.maxHeight).toBe("none");
-      expect(getPromptEditorElement().textContent).toBe(
-        "Keep this zen prompt visible",
-      );
-      expect(actionRow?.contains(waveform)).toBe(true);
-
-      window.localStorage.removeItem(storageKey);
-    },
-  );
-
-  it("does not expose zen controls in the full mobile layout", () => {
+  it("keeps prompt actions in the full mobile layout", () => {
     render(
       <PromptBoxInternal
         {...createPromptBoxProps({
@@ -2758,9 +4317,6 @@ describe("PromptBoxInternal compact layout", () => {
       />,
     );
 
-    expect(
-      screen.queryByRole("button", { name: /Make prompt box/u }),
-    ).toBeNull();
     expect(screen.getByRole("button", { name: "Prompt actions" })).toBeTruthy();
   });
 });
@@ -2778,7 +4334,303 @@ describe("PromptBoxInternal mention triggers", () => {
     replacement: "#42 Fix login bug",
   };
 
-  it("renders a plugin mention's named icon hint", async () => {
+  it("applies the first result with Enter for a multiword mention query", async () => {
+    const { changes, onMentionQueryChange, onSubmit, promptBoxRef } =
+      renderPromptBox("Ask @fix login", {
+        mentionSuggestions: [githubIssueSuggestion],
+      });
+
+    await focusPromptEnd(promptBoxRef);
+    await waitFor(() =>
+      expect(onMentionQueryChange).toHaveBeenCalledWith("fix login", "@"),
+    );
+    await screen.findByRole("button", { name: /Fix login bug/u });
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(latestValue(changes)).toBe("Ask @#42 Fix login bug "),
+    );
+    expect(latestChange(changes)?.mentions).toHaveLength(1);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("offers the draft's file attachments on a bare @ and mentions the picked one", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("Read @", {
+      upload: async (files) => uploadedAs(files),
+      initialAttachments: [
+        {
+          type: "localFile",
+          path: "uploads/Pasted text.txt",
+          name: "Pasted text.txt",
+        },
+        {
+          type: "localImage",
+          path: "uploads/photo.png",
+          name: "photo.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+
+    await focusPromptEnd(promptBoxRef);
+    await screen.findByTitle("Attachment: Pasted text.txt");
+    expect(screen.queryByTitle("Attachment: photo.png")).toBeNull();
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(latestValue(changes)).toBe("Read @Pasted text.txt "),
+    );
+    expect(latestChange(changes)?.mentions).toEqual([
+      {
+        start: 5,
+        end: 21,
+        resource: {
+          kind: "attachment",
+          path: "uploads/Pasted text.txt",
+          label: "Pasted text.txt",
+        },
+      },
+    ]);
+  });
+
+  it("opens an attachment mention from the attachment's source project", async () => {
+    const openAttachment = vi.fn();
+    renderPromptBox("Read @spec.txt", {
+      upload: async (files) => uploadedAs(files),
+      initialAttachments: [
+        {
+          type: "localFile",
+          path: "uploads/spec.txt",
+          name: "spec.txt",
+          sourceProjectId: "proj_source",
+        },
+      ],
+      initialMentionRanges: [
+        {
+          start: 5,
+          end: 14,
+          resource: {
+            kind: "attachment",
+            path: "uploads/spec.txt",
+            label: "spec.txt",
+          },
+        },
+      ],
+      openAttachment,
+    });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Open .*spec\.txt/u }),
+    );
+
+    expect(openAttachment).toHaveBeenCalledWith({
+      name: "spec.txt",
+      path: "uploads/spec.txt",
+      projectId: "proj_source",
+    });
+  });
+
+  it("keeps a dismissed multiword occurrence closed as its query extends", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("@asdf qwe", {
+      mentionSuggestions: [githubIssueSuggestion],
+    });
+    await focusPromptEnd(promptBoxRef);
+    await screen.findByRole("button", { name: /Fix login bug/u });
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Escape" });
+    await act(async () => promptBoxRef.current?.insertTextAtCursor("rt"));
+
+    await waitFor(() => expect(latestValue(changes)).toBe("@asdf qwe rt"));
+    expect(screen.queryByRole("button", { name: /Fix login bug/u })).toBeNull();
+  });
+
+  it("dismisses a coarse-pointer occurrence from a 44px close target", async () => {
+    const restorePointer = mockPointerCoarse(true);
+    try {
+      const { onMentionQueryChange } = renderPromptBox("@fix", {
+        mentionSuggestions: [githubIssueSuggestion],
+      });
+
+      const closeButton = await screen.findByRole("button", {
+        name: "Close suggestions",
+      });
+      expect(closeButton.classList).toContain("size-11");
+      expect(closeButton.parentElement?.classList).toContain("h-11");
+      expect(closeButton.parentElement?.classList).not.toContain("absolute");
+
+      fireEvent.click(closeButton);
+
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: /Fix login bug/u }),
+        ).toBeNull(),
+      );
+      expect(getPromptEditorElement().textContent).toBe("@fix");
+      expect(onMentionQueryChange).toHaveBeenLastCalledWith(null, null);
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("reopens after a touch-dismissed occurrence is removed and retyped", async () => {
+    const restorePointer = mockPointerCoarse(true);
+    const promptBoxRef = createRef<PromptBoxHandle>();
+
+    function RetriggerHarness() {
+      const [value, setValue] = useState("@fix");
+      return (
+        <>
+          <button type="button" onClick={() => setValue("")}>
+            Remove occurrence
+          </button>
+          <button type="button" onClick={() => setValue("@fix")}>
+            Retype occurrence
+          </button>
+          <PromptBoxInternal
+            {...createPromptBoxProps({
+              value,
+              onChange: (nextValue) => setValue(nextValue),
+              typeahead: buildTypeaheadConfig({
+                mentionSuggestions: [githubIssueSuggestion],
+              }),
+            })}
+            promptBoxRef={promptBoxRef}
+          />
+        </>
+      );
+    }
+
+    try {
+      render(<RetriggerHarness />);
+      await screen.findByRole("button", { name: /Fix login bug/u });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Close suggestions" }),
+      );
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Remove occurrence" }),
+      );
+      await waitFor(() =>
+        expect(getPromptEditorElement().textContent).toBe(""),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Retype occurrence" }),
+      );
+
+      await screen.findByRole("button", { name: /Fix login bug/u });
+    } finally {
+      restorePointer();
+    }
+  });
+
+  it("reports the queued editor typeahead's open state and measured height", async () => {
+    const layouts: Array<{ height: number; isOpen: boolean }> = [];
+    const nativeGetBoundingClientRect =
+      HTMLElement.prototype.getBoundingClientRect;
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.hasAttribute("data-promptbox-typeahead-menu")) {
+          return new DOMRect(0, 0, 600, 144);
+        }
+        return nativeGetBoundingClientRect.call(this);
+      });
+    const promptBoxRef = createRef<PromptBoxHandle>();
+
+    render(
+      <QueuedEditorTypeaheadLayoutContext.Provider
+        value={(layout) => layouts.push(layout)}
+      >
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value: "@fix",
+            typeahead: buildTypeaheadConfig({
+              mentionSuggestions: [githubIssueSuggestion],
+            }),
+          })}
+          promptBoxRef={promptBoxRef}
+        />
+      </QueuedEditorTypeaheadLayoutContext.Provider>,
+    );
+
+    await focusPromptEnd(promptBoxRef);
+    await waitFor(() =>
+      expect(layouts).toContainEqual({ height: 144, isOpen: true }),
+    );
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Escape" });
+    await waitFor(() =>
+      expect(layouts.at(-1)).toEqual({ height: 0, isOpen: false }),
+    );
+    rectSpy.mockRestore();
+  });
+
+  it("resolves title mentions inside an existing thread chip without changing its target", async () => {
+    const value = "Continue from @thread:thr_handoff";
+    render(
+      <ThreadTitleMentionResourcesProvider
+        sectionNamesById={new Map()}
+        projectNamesById={new Map()}
+        threadById={
+          new Map([
+            [
+              "thr_source",
+              {
+                id: "thr_source",
+                projectId: "proj_test",
+                title: "test",
+                titleFallback: null,
+              },
+            ],
+          ])
+        }
+      >
+        <PromptBoxInternal
+          {...createPromptBoxProps({
+            value,
+            mentionRanges: [
+              {
+                start: "Continue from ".length,
+                end: value.length,
+                resource: {
+                  kind: "thread",
+                  projectId: "proj_test",
+                  threadId: "thr_handoff",
+                  label: "Continue from @thread:thr_source",
+                },
+              },
+            ],
+          })}
+        />
+      </ThreadTitleMentionResourcesProvider>,
+    );
+
+    await waitFor(() => {
+      const chip = getPromptEditorElement().querySelector(
+        '[data-prompt-mention-serialized-text="@thread:thr_handoff"]',
+      );
+      expect(chip?.textContent).toBe("Continue from test");
+    });
+  });
+
+  it("keeps a plugin mention's named icon ahead of branding in the menu row and the inserted pill", async () => {
+    setPluginLogoUrls(
+      new Map([
+        [
+          "github",
+          {
+            displayName: "GitHub",
+            icon: "Check",
+            compactIconUrl: "/github.svg",
+            logoUrl: null,
+            logoDarkUrl: null,
+            icons: new Map(),
+          },
+        ],
+      ]),
+    );
     const suggestion = { ...githubIssueSuggestion, icon: "FileText" };
     const { promptBoxRef } = renderPromptBox("@fix", {
       mentionSuggestions: [suggestion],
@@ -2787,20 +4639,7 @@ describe("PromptBoxInternal mention triggers", () => {
     await focusPromptEnd(promptBoxRef);
     const row = await screen.findByRole("button", { name: /Fix login bug/u });
     expect(row.querySelector('[data-icon="FileText"]')).not.toBeNull();
-  });
-
-  it("keeps a plugin mention's named icon hint in the inserted pill", async () => {
-    setPluginLogoUrls(new Map());
-    const suggestion = { ...githubIssueSuggestion, icon: "FileText" };
-    const { promptBoxRef } = renderPromptBox("@fix", {
-      mentionSuggestions: [suggestion],
-    });
-
-    await focusPromptEnd(promptBoxRef);
-    fireEvent.mouseDown(
-      await screen.findByRole("button", { name: /Fix login bug/u }),
-      { button: 0 },
-    );
+    fireEvent.mouseDown(row, { button: 0 });
 
     await waitFor(() =>
       expect(
@@ -2846,6 +4685,7 @@ describe("PromptBoxInternal mention triggers", () => {
             compactIconUrl: null,
             logoUrl: "/api/v1/plugins/github/assets/logo?h=abc",
             logoDarkUrl: null,
+            icons: new Map(),
           },
         ],
       ]),
@@ -2882,6 +4722,60 @@ describe("PromptBoxInternal mention triggers", () => {
     expect(promptEditor.querySelector("img")).toBeNull();
   });
 
+  it("labels thread mention rows with their relation to the current thread", async () => {
+    const suggestions: PromptMentionSuggestion[] = [
+      {
+        kind: "thread",
+        path: "thread:thr_parent",
+        replacement: "thread:thr_parent",
+        projectId: "proj_app",
+        threadId: "thr_parent",
+        title: "Shared context",
+        relation: "parent",
+      },
+      {
+        kind: "thread",
+        path: "thread:thr_roommate",
+        replacement: "thread:thr_roommate",
+        projectId: "proj_app",
+        threadId: "thr_roommate",
+        title: "Shared context",
+        relation: "same-environment",
+      },
+      {
+        kind: "thread",
+        path: "thread:thr_unrelated",
+        replacement: "thread:thr_unrelated",
+        projectId: "proj_app",
+        threadId: "thr_unrelated",
+        title: "Shared context",
+        relation: null,
+      },
+    ];
+    const { promptBoxRef } = renderPromptBox("@shared", {
+      mentionSuggestions: suggestions,
+    });
+
+    await focusPromptEnd(promptBoxRef);
+    const threadsLabel = await screen.findByText("Threads");
+    const menu = threadsLabel.closest(".overflow-hidden");
+    if (!(menu instanceof HTMLElement)) {
+      throw new Error("Expected mention menu");
+    }
+
+    expect(
+      within(menu)
+        .getAllByRole("button")
+        .map((button) => button.getAttribute("title")),
+    ).toEqual([
+      "Shared context · parent",
+      "Shared context · same environment",
+      "Shared context",
+    ]);
+    expect(within(menu).getByText("same environment")).toBeTruthy();
+    expect(within(menu).getByText("same env").className).toContain("hidden");
+  });
+
   it("keeps path-first mention results in keyboard navigation order", async () => {
     const pathSuggestion: PromptMentionSuggestion = {
       kind: "path",
@@ -2899,6 +4793,7 @@ describe("PromptBoxInternal mention triggers", () => {
       projectName: "App",
       threadId: "thr_app",
       title: "App thread",
+      relation: null,
     };
     const { promptBoxRef } = renderPromptBox("@src/", {
       mentionSuggestions: [pathSuggestion, threadSuggestion],
@@ -2921,20 +4816,687 @@ describe("PromptBoxInternal mention triggers", () => {
       expect(threadButton.className).toContain("bg-state-active"),
     );
   });
+
+  it("keeps the keyboard-selected mention when a stronger delayed result arrives", async () => {
+    const threadSuggestion: PromptMentionSuggestion = {
+      kind: "thread",
+      path: "thread:thr_atlas",
+      replacement: "Atlas launch notes",
+      projectId: "proj_atlas",
+      projectName: "Atlas",
+      threadId: "thr_atlas",
+      title: "Atlas launch notes",
+      relation: null,
+    };
+    const sectionSuggestion: PromptMentionSuggestion = {
+      kind: "section",
+      path: "section:sec_atlas_planning",
+      replacement: "Atlas planning",
+      sectionId: "sec_atlas_planning",
+      name: "Atlas planning",
+    };
+    const delayedExactSuggestion: PromptMentionSuggestion = {
+      kind: "plugin",
+      pluginId: "installed",
+      providerId: "plugins",
+      itemId: "plugins:atlas",
+      providerLabel: "Installed",
+      title: "Atlas",
+      subtitle: null,
+      icon: null,
+      replacement: "Atlas",
+    };
+    const changes: PromptChange[] = [];
+    const promptBoxRef = createRef<PromptBoxHandle>();
+
+    function Harness({
+      mentionSuggestions,
+    }: {
+      mentionSuggestions: readonly PromptMentionSuggestion[];
+    }) {
+      const [value, setValue] = useState("@atlas");
+      const [mentionRanges, setMentionRanges] = useState<PromptTextMention[]>(
+        [],
+      );
+      return (
+        <PromptBoxInternal
+          value={value}
+          mentionRanges={mentionRanges}
+          onChange={(nextValue, nextMentions) => {
+            changes.push({ mentions: nextMentions, value: nextValue });
+            setValue(nextValue);
+            setMentionRanges(nextMentions);
+          }}
+          onSubmit={vi.fn()}
+          typeahead={{
+            mention: {
+              results: orderPromptMentionSuggestions({
+                query: "atlas",
+                suggestions: mentionSuggestions,
+              }),
+              isLoading: false,
+              isError: false,
+              onQueryChange: vi.fn(),
+            },
+            command: INERT_TYPEAHEAD_COMMAND_CONFIG,
+          }}
+          mentionMenuPlacement="bottom"
+          promptBoxRef={promptBoxRef}
+        />
+      );
+    }
+
+    const initialSuggestions = [threadSuggestion, sectionSuggestion];
+    const view = render(<Harness mentionSuggestions={initialSuggestions} />);
+    await focusPromptEnd(promptBoxRef);
+
+    const sectionButton = await screen.findByRole("button", {
+      name: "Atlas planning",
+    });
+    fireEvent.keyDown(getPromptEditorElement(), { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(sectionButton.className).toContain("bg-state-active"),
+    );
+
+    view.rerender(
+      <Harness
+        mentionSuggestions={[...initialSuggestions, delayedExactSuggestion]}
+      />,
+    );
+    await screen.findByRole("button", { name: "Atlas" });
+    await waitFor(() =>
+      expect(sectionButton.className).toContain("bg-state-active"),
+    );
+
+    fireEvent.keyDown(getPromptEditorElement(), { key: "Enter" });
+
+    await waitFor(() => expect(latestValue(changes)).toBe("@Atlas planning "));
+    expect(latestChange(changes)?.mentions[0]?.resource).toMatchObject({
+      kind: "section",
+      sectionId: "sec_atlas_planning",
+    });
+  });
+});
+
+describe("PromptBoxInternal selection reveal", () => {
+  async function nextAnimationFrame() {
+    await act(
+      () =>
+        new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    );
+  }
+
+  it("reveals the moving selection head, not the anchor, when a selection extends upward", async () => {
+    const lines = Array.from({ length: 40 }, (_, index) => `line ${index}`);
+    const { promptBoxRef } = renderPromptBox(lines.join("\n"));
+
+    const scrollContainer = document.querySelector(
+      "[data-promptbox-editor-scroll]",
+    );
+    if (!(scrollContainer instanceof HTMLElement)) {
+      throw new Error("Prompt editor scroll container was not rendered");
+    }
+    let scrollTop = 500;
+    Object.defineProperty(scrollContainer, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (next: number) => {
+        scrollTop = next;
+      },
+    });
+    const scrollRectSpy = vi
+      .spyOn(scrollContainer, "getBoundingClientRect")
+      .mockReturnValue(new DOMRect(0, 0, 320, 100));
+    let view: EditorView | null = null;
+    const coordsAtPosSpy = vi
+      .spyOn(EditorView.prototype, "coordsAtPos")
+      .mockImplementation(function (this: EditorView, pos: number) {
+        view = this;
+        const { selection } = this.state;
+        if (pos === selection.head && selection.head !== selection.anchor) {
+          return { left: 0, right: 0, top: -30, bottom: -14 };
+        }
+        return { left: 0, right: 0, top: 160, bottom: 176 };
+      });
+
+    try {
+      await focusPromptEnd(promptBoxRef);
+      await nextAnimationFrame();
+
+      expect(view).not.toBeNull();
+      if (view === null) {
+        throw new Error("Expected focus reveal to capture the editor view");
+      }
+      const liveView: EditorView = view;
+      const { doc } = liveView.state;
+      scrollTop = 500;
+      await act(async () => {
+        liveView.dispatch(
+          liveView.state.tr.setSelection(
+            TextSelection.create(doc, doc.content.size - 1, 1),
+          ),
+        );
+      });
+      await nextAnimationFrame();
+
+      expect(scrollTop).toBeLessThan(500);
+    } finally {
+      coordsAtPosSpy.mockRestore();
+      scrollRectSpy.mockRestore();
+    }
+  });
 });
 
 describe("PromptBoxInternal prompt actions", () => {
-  it("preserves blockquote structure when pasting copied blockquote html", async () => {
+  it("keeps the action row out of text selection while the editor stays selectable", () => {
+    renderPromptBox("");
+
+    const actionRow = document.querySelector("[data-promptbox-action-row]");
+    expect(actionRow?.classList.contains("select-none")).toBe(true);
+    expect(getPromptEditorElement().closest(".select-none")).toBeNull();
+  });
+
+  it("keeps the custom caret reveal for composer-handled text pastes", async () => {
     const { changes, promptBoxRef } = renderPromptBox("");
 
     await focusPromptEnd(promptBoxRef);
-    pasteClipboard({
-      html: "<blockquote><p>quoted</p></blockquote>",
-      plainText: "> quoted",
+    await act(
+      () =>
+        new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    );
+
+    const scrollContainer = document.querySelector(
+      "[data-promptbox-editor-scroll]",
+    );
+    if (!(scrollContainer instanceof HTMLElement)) {
+      throw new Error("Prompt editor scroll container was not rendered");
+    }
+    const scrollRectSpy = vi
+      .spyOn(scrollContainer, "getBoundingClientRect")
+      .mockReturnValue(new DOMRect(0, 0, 320, 100));
+    const coordsAtPosSpy = vi
+      .spyOn(EditorView.prototype, "coordsAtPos")
+      .mockReturnValue({
+        left: 0,
+        right: 0,
+        top: 120,
+        bottom: 136,
+      });
+
+    try {
+      pastePlainText("first line\nsecond line");
+
+      await waitFor(() =>
+        expect(latestValue(changes)).toBe("first line\nsecond line"),
+      );
+      await act(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => resolve()),
+          ),
+      );
+
+      expect(coordsAtPosSpy).toHaveBeenCalled();
+    } finally {
+      coordsAtPosSpy.mockRestore();
+      scrollRectSpy.mockRestore();
+    }
+  });
+
+  it("pastes clipboard text and attaches the clipboard image", async () => {
+    const onAttachFiles = vi.fn().mockResolvedValue([]);
+    const { changes, promptBoxRef } = renderPromptBox("Before ", {
+      onAttachFiles,
+    });
+    const image = new File(["image"], "photo.png", { type: "image/png" });
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({ files: [image], plainText: "A photo" });
+
+    await waitFor(() => expect(latestValue(changes)).toBe("Before A photo"));
+    expect(onAttachFiles).toHaveBeenCalledWith([image]);
+  });
+
+  it("attaches pasted text of 5,000 characters as a file and keeps the draft", async () => {
+    const onAttachFiles = vi.fn().mockResolvedValue([]);
+    const { changes, promptBoxRef } = renderPromptBox("Before ", {
+      onAttachFiles,
+    });
+    const text = `${"log line\r\n".repeat(499)}\t    tail\n`;
+    expect(text).toHaveLength(5_000);
+
+    await focusPromptEnd(promptBoxRef);
+    pastePlainText(text);
+
+    await waitFor(() => expect(onAttachFiles).toHaveBeenCalledTimes(1));
+    const [file] = onAttachFiles.mock.calls[0]![0] as File[];
+    expect(file!.name).toBe("Pasted text.txt");
+    expect(await file!.text()).toBe(text);
+    expect(latestValue(changes) ?? "Before ").toBe("Before ");
+  });
+
+  it("undoes and redoes a pasted file without uploading it again", async () => {
+    const upload = vi.fn(async (files: File[]) => uploadedAs(files));
+    const { attachmentPaths, promptBoxRef } = renderPromptBox("", { upload });
+    const image = new File(["image"], "photo.png", { type: "image/png" });
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({ files: [image] });
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual(["uploads/photo.png"]),
+    );
+
+    pressUndo();
+    await waitFor(() => expect(attachmentPaths()).toEqual([]));
+    pressUndo({ redo: true });
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual(["uploads/photo.png"]),
+    );
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("undoes a large paste into its text, then to before the paste", async () => {
+    const upload = vi.fn(async (files: File[]) => uploadedAs(files));
+    const { attachmentPaths, changes, promptBoxRef } = renderPromptBox(
+      "Before ",
+      { upload },
+    );
+    const text = "log line\n".repeat(600).trimEnd();
+
+    await focusPromptEnd(promptBoxRef);
+    pastePlainText(text);
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual(["uploads/Pasted text.txt"]),
+    );
+    expect(latestValue(changes) ?? "Before ").toBe("Before ");
+
+    pressUndo();
+    await waitFor(() => expect(latestValue(changes)).toBe(`Before ${text}`));
+    expect(attachmentPaths()).toEqual([]);
+
+    pressUndo();
+    await waitFor(() => expect(latestValue(changes)).toBe("Before "));
+    expect(attachmentPaths()).toEqual([]);
+
+    pressUndo({ redo: true });
+    await waitFor(() => expect(latestValue(changes)).toBe(`Before ${text}`));
+    pressUndo({ redo: true });
+    await waitFor(() => expect(latestValue(changes)).toBe("Before "));
+    expect(attachmentPaths()).toEqual(["uploads/Pasted text.txt"]);
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores a removed attachment to its original position", async () => {
+    const { attachmentPaths, promptBoxRef } = renderPromptBox("", {
+      upload: async (files) => uploadedAs(files),
+      initialAttachments: uploadedAs([
+        new File(["a"], "a.txt"),
+        new File(["b"], "b.txt"),
+        new File(["c"], "c.txt"),
+      ]),
     });
 
-    await waitFor(() => expect(latestValue(changes)).toBe("> quoted"));
-    expect(getPromptEditorElement().querySelector("blockquote")).not.toBeNull();
+    await focusPromptEnd(promptBoxRef);
+    fireEvent.click(screen.getByRole("button", { name: "Remove b.txt" }));
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual(["uploads/a.txt", "uploads/c.txt"]),
+    );
+
+    pressUndo();
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual([
+        "uploads/a.txt",
+        "uploads/b.txt",
+        "uploads/c.txt",
+      ]),
+    );
+  });
+
+  it("keeps a file undone during its upload out of the draft until redo", async () => {
+    const pending = createDeferredPromise<PromptDraftAttachment[]>();
+    const { attachmentPaths, promptBoxRef } = renderPromptBox("", {
+      upload: () => pending.promise,
+    });
+    const file = new File(["log"], "server.log");
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({ files: [file] });
+    pressUndo();
+    await act(async () => pending.resolve(uploadedAs([file])));
+    await waitFor(() => expect(attachmentPaths()).toEqual([]));
+
+    pressUndo({ redo: true });
+    await waitFor(() =>
+      expect(attachmentPaths()).toEqual(["uploads/server.log"]),
+    );
+  });
+
+  it("names pasted text after the attached and uploading pastes", async () => {
+    const onAttachFiles = vi.fn().mockResolvedValue([]);
+    const { promptBoxRef } = renderPromptBox("", {
+      props: {
+        attachments: {
+          onAttachFiles,
+          items: [
+            {
+              type: "localFile",
+              path: "Pasted-text-1.txt",
+              name: "Pasted text.txt",
+            },
+          ],
+          pendingUploads: [
+            { id: "upload", file: new File(["x"], "Pasted text 2.txt") },
+          ],
+        },
+      },
+    });
+
+    await focusPromptEnd(promptBoxRef);
+    pastePlainText("x".repeat(5_000));
+
+    await waitFor(() => expect(onAttachFiles).toHaveBeenCalledTimes(1));
+    const [file] = onAttachFiles.mock.calls[0]![0] as File[];
+    expect(file!.name).toBe("Pasted text 3.txt");
+  });
+
+  it("gives every attached file a name unique within the draft", async () => {
+    const onAttachFiles = vi.fn().mockResolvedValue([]);
+    const { promptBoxRef } = renderPromptBox("", {
+      props: {
+        attachments: {
+          onAttachFiles,
+          items: [
+            { type: "localFile", path: "notes-1.txt", name: "notes.txt" },
+          ],
+        },
+      },
+    });
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({
+      files: [
+        new File(["a"], "notes.txt", { type: "text/plain" }),
+        new File(["b"], "notes.txt", { type: "text/plain" }),
+        new File(["c"], "README", { type: "text/plain" }),
+      ],
+    });
+
+    await waitFor(() => expect(onAttachFiles).toHaveBeenCalledTimes(1));
+    const files = onAttachFiles.mock.calls[0]![0] as File[];
+    expect(files.map((file) => file.name)).toEqual([
+      "notes 2.txt",
+      "notes 3.txt",
+      "README",
+    ]);
+    expect(await files[1]!.text()).toBe("b");
+  });
+
+  it.each([
+    ["shorter pasted text", "x".repeat(4_999), []],
+    [
+      "large pasted text beside a clipboard image",
+      "x".repeat(5_000),
+      [new File(["image"], "sheet.png", { type: "image/png" })],
+    ],
+  ])("keeps %s inline", async (_label, text, files) => {
+    const onAttachFiles = vi.fn().mockResolvedValue([]);
+    const { changes, promptBoxRef } = renderPromptBox("Before ", {
+      onAttachFiles,
+    });
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({ files, plainText: text });
+
+    await waitFor(() => expect(latestValue(changes)).toBe(`Before ${text}`));
+    expect(onAttachFiles.mock.calls).toEqual(files.length ? [[files]] : []);
+  });
+
+  it.each(["available", "unavailable", "removed editor"])(
+    "preserves marked HTML text while the image is %s",
+    async (state) => {
+      const onAttachFiles = vi.fn().mockResolvedValue([]);
+      let resolveImage: (response: Response) => void = () => {};
+      const fetchImage = vi.fn().mockImplementation(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveImage = resolve;
+          }),
+      );
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = fetchImage;
+      try {
+        const { changes, promptBoxRef, view } = renderPromptBox("Before ", {
+          onAttachFiles,
+        });
+        await focusPromptEnd(promptBoxRef);
+        const imageUrl = new URL("/attachments/photo.png", window.location.href)
+          .href;
+        pasteClipboard({
+          plainText: 'A <photo> & "caption"\nNext',
+          html: buildMessageClipboardHtml(
+            'A <photo> & "caption"\nNext',
+            imageUrl,
+          ),
+        });
+        await waitFor(() =>
+          expect(latestValue(changes)).toBe(
+            'Before A <photo> & "caption"\nNext',
+          ),
+        );
+        expect(fetchImage).toHaveBeenCalledOnce();
+        if (state === "removed editor") view.unmount();
+        await act(async () => {
+          resolveImage(
+            new Response(
+              state === "unavailable"
+                ? "Not found"
+                : new Uint8Array([137, 80, 78, 71]),
+              {
+                status: state === "unavailable" ? 404 : 200,
+                headers: {
+                  "content-type":
+                    state === "unavailable" ? "text/plain" : "image/png",
+                },
+              },
+            ),
+          );
+        });
+        if (state === "available") {
+          await waitFor(() =>
+            expect(onAttachFiles).toHaveBeenCalledWith([
+              expect.objectContaining({
+                name: "photo.png",
+                type: "image/png",
+                size: 4,
+              }),
+            ]),
+          );
+        } else {
+          expect(onAttachFiles).not.toHaveBeenCalled();
+        }
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    },
+  );
+
+  it.each([
+    {
+      label: "drops the quote from part of a quoted line",
+      selection: { from: 1, to: 6 },
+      copiedText: "ello ",
+      value: "> hello world\n\nafterello ",
+      blockquotes: 1,
+    },
+    {
+      label: "keeps the quote on a whole quoted line",
+      selection: { from: 0, to: 11 },
+      copiedText: "> hello world",
+      value: "> hello world\n\nafter\n> hello world",
+      blockquotes: 2,
+    },
+  ])(
+    "$label when copying and pasting",
+    async ({ selection, copiedText, value, blockquotes }) => {
+      const { changes, promptBoxRef } = renderPromptBox(
+        "> hello world\n\nafter",
+      );
+
+      await focusPromptEnd(promptBoxRef);
+      const editor = (getPromptEditorElement() as TiptapEditorHTMLElement)
+        .editor;
+      if (!editor) {
+        throw new Error("Prompt editor was not mounted");
+      }
+      const quoteTextStart = 2;
+      act(() => {
+        editor.view.dispatch(
+          editor.state.tr.setSelection(
+            TextSelection.create(
+              editor.state.doc,
+              quoteTextStart + selection.from,
+              quoteTextStart + selection.to,
+            ),
+          ),
+        );
+      });
+      const copied = new Map<string, string>();
+      fireEvent.copy(getPromptEditorElement(), {
+        clipboardData: {
+          clearData: () => copied.clear(),
+          setData: (type: string, data: string) => copied.set(type, data),
+        },
+      });
+      expect(copied.get("text/plain")).toBe(copiedText);
+
+      await focusPromptEnd(promptBoxRef);
+      pasteClipboard({
+        html: copied.get("text/html") ?? "",
+        plainText: copied.get("text/plain") ?? "",
+      });
+
+      await waitFor(() => expect(latestValue(changes)).toBe(value));
+      expect(
+        getPromptEditorElement().querySelectorAll("blockquote"),
+      ).toHaveLength(blockquotes);
+    },
+  );
+
+  it("inserts a dropped sidebar thread as a serialized mention pill", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("Review ");
+    await focusPromptEnd(promptBoxRef);
+    const editorElement = getPromptEditorElement();
+    const previous = document.elementsFromPoint;
+    document.elementsFromPoint = () => [editorElement];
+    const position = vi
+      .spyOn(EditorView.prototype, "posAtCoords")
+      .mockReturnValue(null);
+    try {
+      const target = resolveThreadMentionDropTarget(100, 100, {
+        threadId: "thr_dropped",
+        label: "Dropped thread",
+      });
+      expect(target).not.toBeNull();
+      act(() => target?.drop());
+      await waitFor(() =>
+        expect(latestValue(changes)).toBe("Review @thread:thr_dropped "),
+      );
+      expect(latestChange(changes)?.mentions[0]?.resource).toEqual({
+        kind: "thread",
+        threadId: "thr_dropped",
+        label: "Dropped thread",
+      });
+      expect(editorElement.textContent).toContain("Dropped thread");
+    } finally {
+      document.elementsFromPoint = previous;
+      position.mockRestore();
+    }
+  });
+
+  it("keeps list markers attached to their item text when pasting mentioned list html", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("");
+    const resource = {
+      kind: "thread" as const,
+      threadId: "thr_office",
+      label: "Agent office visualization",
+    };
+    const serializedText = serializedTextForPromptMentionResource(resource);
+    const pill = document.createElement("span");
+    for (const [name, value] of Object.entries(
+      promptMentionClipboardDataAttributes({ resource, serializedText }),
+    )) {
+      pill.setAttribute(name, value);
+    }
+    pill.textContent = resource.label;
+
+    await focusPromptEnd(promptBoxRef);
+    pasteClipboard({
+      html: `<p>Findings:</p><ul><li><p>Reproduced on ${pill.outerHTML} today</p></li><li><p>Second finding</p></li></ul>`,
+      plainText:
+        "Findings:\n\nReproduced on Agent office visualization today\nSecond finding",
+    });
+
+    await waitFor(() =>
+      expect(latestValue(changes)).toBe(
+        `Findings:\n- Reproduced on ${serializedText} today\n- Second finding`,
+      ),
+    );
+    const mention = latestChange(changes)?.mentions.at(0);
+    expect(latestValue(changes)?.slice(mention?.start, mention?.end)).toBe(
+      serializedText,
+    );
+  });
+
+  it("keeps multiple pasted plugin references as distinct pills", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("");
+    const reference = (id: string, label: string) => {
+      const resource = {
+        kind: "plugin" as const,
+        pluginId: "plugin-api-docs",
+        icon: null,
+        itemId: `surface:${id}`,
+        label,
+      };
+      const serializedText = serializedTextForPromptMentionResource(resource);
+      const pill = document.createElement("span");
+      for (const [name, value] of Object.entries(
+        promptMentionClipboardDataAttributes({ resource, serializedText }),
+      )) {
+        pill.setAttribute(name, value);
+      }
+      pill.textContent = serializedText;
+      return {
+        text: `Build a plugin capability like ${serializedText} using bb's Plugin Guide. `,
+        html: `Build a plugin capability like ${pill.outerHTML} using bb's Plugin Guide. `,
+      };
+    };
+
+    await focusPromptEnd(promptBoxRef);
+    const actions = reference("composer-actions", "Inline actions");
+    pasteClipboard({ html: actions.html, plainText: actions.text });
+    await waitFor(() =>
+      expect(latestChange(changes)?.mentions).toHaveLength(1),
+    );
+
+    const panels = reference("thread-panel", "Thread side-panel tabs");
+    pasteClipboard({ html: panels.html, plainText: panels.text });
+
+    await waitFor(() =>
+      expect(latestChange(changes)?.mentions).toHaveLength(2),
+    );
+    expect(
+      latestChange(changes)?.mentions.map((mention) => mention.resource),
+    ).toEqual([
+      expect.objectContaining({ itemId: "surface:composer-actions" }),
+      expect.objectContaining({ itemId: "surface:thread-panel" }),
+    ]);
+    expect(
+      getPromptEditorElement().querySelectorAll(".prompt-mention-pill"),
+    ).toHaveLength(2);
+    expect(latestValue(changes)).toBe(
+      "Build a plugin capability like @Inline actions using bb's Plugin Guide. " +
+        "Build a plugin capability like @Thread side-panel tabs using bb's Plugin Guide. ",
+    );
   });
 
   it("opens the file picker from the prompt actions menu", async () => {
@@ -2973,7 +5535,7 @@ describe("PromptBoxInternal prompt actions", () => {
     await waitFor(() =>
       expect(document.activeElement).toBe(getPromptEditorElement()),
     );
-    expect(onCommandQueryChange).toHaveBeenCalledWith("");
+    expect(onCommandQueryChange).toHaveBeenCalledWith("", "/");
   });
 
   it("does not duplicate the skills trigger when it is already active", async () => {
@@ -2983,70 +5545,6 @@ describe("PromptBoxInternal prompt actions", () => {
 
     expect(changes).toHaveLength(0);
   });
-
-  it("replaces an active skills command token with plan mode", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("Start /");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Plan");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("Start /plan "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: "Start ".length,
-        end: "Start /plan".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "plan",
-          source: "command",
-          origin: "user",
-          label: "plan",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it("replaces an active partial skills command token with plan mode", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("Start /pl");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Plan");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("Start /plan "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: "Start ".length,
-        end: "Start /plan".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "plan",
-          source: "command",
-          origin: "user",
-          label: "plan",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it.each([
-    ["Start /", "Plan", "Start /plan "],
-    ["Start /p", "Plan", "Start /plan "],
-    ["Start /g", "Goal", "Start /goal "],
-  ])(
-    "replaces an active partial slash token %s with %s",
-    async (initialValue, actionLabel, expectedValue) => {
-      const { changes, promptBoxRef } = renderPromptBox(initialValue);
-
-      await focusPromptEnd(promptBoxRef);
-      await selectPromptAction(actionLabel);
-
-      await waitFor(() => expect(latestValue(changes)).toBe(expectedValue));
-    },
-  );
 
   it("inserts goal mode as a command pill", async () => {
     const { changes, promptBoxRef } = renderPromptBox("");
@@ -3075,91 +5573,32 @@ describe("PromptBoxInternal prompt actions", () => {
     ]);
   });
 
-  it("inserts automation mode as a command pill", async () => {
+  it("starts the draft with the automation prompt", async () => {
     const { changes, promptBoxRef } = renderPromptBox("");
 
     await focusPromptEnd(promptBoxRef);
     await selectPromptAction("Automation");
 
-    await waitFor(() => expect(latestValue(changes)).toBe("/automation "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: 0,
-        end: "/automation".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "automation",
-          source: "command",
-          origin: "user",
-          label: "automation",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it("seeds the plugin prompt as plain text and returns focus", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Plugin");
-
     await waitFor(() =>
-      expect(latestValue(changes)).toBe(CREATE_PLUGIN_PROMPT_ACTION.text),
+      expect(latestValue(changes)).toBe("Create a new bb automation to "),
     );
-    // The seed is a sentence opener, not a command, so it carries no pill.
     expect(latestChange(changes)?.mentions).toEqual([]);
   });
 
-  it("does not duplicate command text immediately before the cursor", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("Start /goal ");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Goal");
-
-    expect(changes).toHaveLength(0);
-  });
-
-  it("replaces a just-selected plan action with goal at the cursor", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("");
+  it("puts plan before existing text and keeps later pills on their text", async () => {
+    const project = {
+      kind: "project",
+      projectId: "proj_1",
+      label: "bb",
+    } as const;
+    const { changes, promptBoxRef } = renderPromptBox("fix @bb", {
+      initialMentionRanges: [{ start: 4, end: 7, resource: project }],
+    });
 
     await focusPromptEnd(promptBoxRef);
     await selectPromptAction("Plan");
-    await waitFor(() => expect(latestValue(changes)).toBe("/plan "));
-    await waitForPromptFocus();
 
-    await selectPromptAction("Goal");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("/goal "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: 0,
-        end: "/goal".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "goal",
-          source: "command",
-          origin: "user",
-          label: "goal",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it("replaces a just-selected skills trigger with plan at the cursor", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Skills");
-    await waitFor(() => expect(latestValue(changes)).toBe("/"));
-    await waitForPromptFocus();
-
-    await selectPromptAction("Plan");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("/plan "));
+    await waitFor(() => expect(latestValue(changes)).toBe("/plan fix @bb"));
     expect(latestChange(changes)?.mentions).toEqual([
       {
         start: 0,
@@ -3174,13 +5613,40 @@ describe("PromptBoxInternal prompt actions", () => {
           argumentHint: null,
         },
       },
+      {
+        start: "/plan fix ".length,
+        end: "/plan fix @bb".length,
+        resource: project,
+      },
     ]);
   });
 
-  it("pastes prompt action command tokens as goal, plan, and automation pills", async () => {
+  it("replaces a leading command with the plugin prompt once", async () => {
     const { changes, promptBoxRef } = renderPromptBox("");
-    const text =
-      "/plan inspect first\n/goal finish the change\n/automation keep checking";
+
+    await focusPromptEnd(promptBoxRef);
+    await selectPromptAction("Plan");
+    await waitFor(() => expect(latestValue(changes)).toBe("/plan "));
+    await waitForPromptFocus();
+    await act(async () => {
+      promptBoxRef.current?.insertTextAtCursor("wraps CI");
+    });
+    await waitFor(() => expect(latestValue(changes)).toBe("/plan wraps CI"));
+
+    await selectPromptAction("Plugin");
+    await waitFor(() =>
+      expect(latestValue(changes)).toBe("Create a new bb plugin that wraps CI"),
+    );
+    expect(latestChange(changes)?.mentions).toEqual([]);
+
+    await selectPromptAction("Plugin");
+
+    expect(latestValue(changes)).toBe("Create a new bb plugin that wraps CI");
+  });
+
+  it("pastes prompt action command tokens as plan and goal pills", async () => {
+    const { changes, promptBoxRef } = renderPromptBox("");
+    const text = "/plan inspect first\n/goal finish the change";
 
     await focusPromptEnd(promptBoxRef);
     pastePlainText(text);
@@ -3210,96 +5676,6 @@ describe("PromptBoxInternal prompt actions", () => {
           source: "command",
           origin: "user",
           label: "goal",
-          argumentHint: null,
-        },
-      },
-      {
-        start: "/plan inspect first\n/goal finish the change\n".length,
-        end: "/plan inspect first\n/goal finish the change\n/automation".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "automation",
-          source: "command",
-          origin: "user",
-          label: "automation",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it("replaces a just-selected goal action with skills at the cursor", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Goal");
-    await waitFor(() => expect(latestValue(changes)).toBe("/goal "));
-    await waitForPromptFocus();
-
-    await selectPromptAction("Skills");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("/"));
-    expect(latestChange(changes)?.mentions).toEqual([]);
-  });
-
-  it("replaces a just-selected goal action with automation at the cursor", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("");
-
-    await focusPromptEnd(promptBoxRef);
-    await selectPromptAction("Goal");
-    await waitFor(() => expect(latestValue(changes)).toBe("/goal "));
-    await waitForPromptFocus();
-
-    await selectPromptAction("Automation");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("/automation "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: 0,
-        end: "/automation".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "automation",
-          source: "command",
-          origin: "user",
-          label: "automation",
-          argumentHint: null,
-        },
-      },
-    ]);
-  });
-
-  it("selects automation from slash typeahead as a command pill", async () => {
-    const { changes, promptBoxRef } = renderPromptBox("/auto", {
-      commandSuggestions: [
-        {
-          kind: "command",
-          name: "automation",
-          source: "command",
-          origin: "user",
-          description: null,
-          argumentHint: null,
-        },
-      ],
-    });
-
-    await focusPromptEnd(promptBoxRef);
-    await selectCommandSuggestion("automation");
-
-    await waitFor(() => expect(latestValue(changes)).toBe("/automation "));
-    expect(latestChange(changes)?.mentions).toEqual([
-      {
-        start: 0,
-        end: "/automation".length,
-        resource: {
-          kind: "command",
-          trigger: "/",
-          name: "automation",
-          source: "command",
-          origin: "user",
-          label: "automation",
           argumentHint: null,
         },
       },
@@ -3341,7 +5717,7 @@ describe("PromptBoxInternal prompt actions", () => {
     ]);
   });
 
-  it("keeps typed content after a prompt action when selecting another action", async () => {
+  it("keeps typed content when another command replaces the leading one", async () => {
     const { changes, promptBoxRef } = renderPromptBox("");
 
     await focusPromptEnd(promptBoxRef);
@@ -3356,8 +5732,22 @@ describe("PromptBoxInternal prompt actions", () => {
 
     await selectPromptAction("Goal");
 
-    await waitFor(() => expect(latestValue(changes)).toContain("clean up"));
-    expect(latestValue(changes)).not.toBe("/goal ");
+    await waitFor(() => expect(latestValue(changes)).toBe("/goal clean up"));
+    expect(latestChange(changes)?.mentions).toEqual([
+      {
+        start: 0,
+        end: "/goal".length,
+        resource: {
+          kind: "command",
+          trigger: "/",
+          name: "goal",
+          source: "command",
+          origin: "user",
+          label: "goal",
+          argumentHint: null,
+        },
+      },
+    ]);
   });
 });
 
@@ -3401,13 +5791,13 @@ describe("PromptBoxInternal command typeahead submit", () => {
           onSubmit={onSubmit}
           typeahead={{
             mention: {
-              suggestions: [],
+              results: EMPTY_ORDERED_MENTION_SUGGESTIONS,
               isLoading: false,
               isError: false,
               onQueryChange: () => {},
             },
             command: {
-              trigger: "/",
+              triggers: ["/"],
               suggestions: [suggestion],
               isLoading: false,
               isError: false,
@@ -3451,9 +5841,6 @@ describe("PromptBoxInternal command typeahead submit", () => {
     await act(async () => {});
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
-    // The command mention is applied (and therefore submitted), not left as
-    // bare text — Codex reads the mention to trigger compaction and Claude
-    // sends the `/compact` text as-is.
     expect(latestChange(changes)?.mentions).toEqual([
       {
         start: 0,
@@ -3482,7 +5869,6 @@ describe("PromptBoxInternal command typeahead submit", () => {
     await act(async () => {});
 
     expect(onSubmit).not.toHaveBeenCalled();
-    // The pill is still inserted so the user can add arguments before sending.
     expect(latestChange(changes)?.mentions?.[0]?.resource).toMatchObject({
       name: "review",
       origin: "user",
@@ -3504,41 +5890,6 @@ describe("PromptBoxInternal command typeahead submit", () => {
 });
 
 describe("PromptBoxInternal command typeahead navigation", () => {
-  it("applies typeahead before submit for Magic Keyboard Enter on coarse-pointer iPadOS WebKit", async () => {
-    const restoreMatchMedia = mockPointerCoarse(true);
-    const restoreNavigator = mockIPadOSWebKit();
-    try {
-      const { changes, onSubmit } = renderPromptBox("/", {
-        commandSuggestions: [
-          {
-            kind: "command",
-            name: "review",
-            source: "skill",
-            origin: "user",
-            description: null,
-            argumentHint: null,
-          },
-        ],
-      });
-      const editor = getPromptEditorElement();
-      editor.focus();
-      await screen.findByRole("button", { name: "review" });
-      expect(onSubmit).not.toHaveBeenCalled();
-
-      fireEvent.keyDown(editor, { key: "Enter", code: "Enter" });
-
-      await waitFor(() => expect(latestValue(changes)).toBe("/review "));
-      expect(onSubmit).not.toHaveBeenCalled();
-      expect(latestChange(changes)?.mentions[0]?.resource).toMatchObject({
-        kind: "command",
-        name: "review",
-      });
-    } finally {
-      restoreNavigator();
-      restoreMatchMedia();
-    }
-  });
-
   it("uses the rendered section order for Arrow keys and Enter", async () => {
     const { changes, promptBoxRef } = renderPromptBox("/", {
       commandSuggestions: [
@@ -3620,9 +5971,6 @@ describe("PromptBoxInternal command typeahead navigation", () => {
   });
 
   it("hoists an exactly-named user command above the skills section", async () => {
-    // Suggestions arrive in section order (skills first), the way the server
-    // hands them back — the exact-match hoist is PromptBoxInternal's job, so
-    // every composer that renders through it gets the same order.
     const { changes, promptBoxRef } = renderPromptBox("/plan", {
       commandSuggestions: [
         {
@@ -3674,9 +6022,6 @@ describe("PromptBoxInternal command typeahead navigation", () => {
     if (!(menu instanceof HTMLElement)) {
       throw new Error("Expected command menu");
     }
-    // The exact match leads, and its section stays whole rather than splitting
-    // around the skills — one header per section keeps rendered order equal to
-    // the array Arrow/Enter walk.
     expect(
       within(menu)
         .getAllByRole("button")
@@ -3711,10 +6056,12 @@ describe("voice recording escape", () => {
   ): PromptVoiceConfig {
     return {
       state: "recording",
+      microphoneWarning: null,
       isSupported: true,
       stream: null,
       start: vi.fn(),
       stop: vi.fn(),
+      send: vi.fn(),
       cancel: vi.fn(),
       ...overrides,
     };
@@ -3740,7 +6087,6 @@ describe("voice recording escape", () => {
       />,
     );
 
-    // Stand in for the composer's own bubble-phase Escape-to-dismiss listener.
     const dismiss = vi.fn();
     const onWindowEscape = (event: Event) => {
       if ((event as KeyboardEvent).key === "Escape") dismiss();
@@ -3781,4 +6127,150 @@ describe("voice recording escape", () => {
     expect(pressEscape().defaultPrevented).toBe(false);
     expect(cancel).not.toHaveBeenCalled();
   });
+});
+
+describe("thread URL clipboard paste", () => {
+  const threadId = "thr_86mb5jjzi9";
+  const projectId = "proj_khiw2za95v";
+  const url = `${window.location.origin}/projects/${projectId}/threads/${threadId}`;
+  const resolved = {
+    threadId,
+    projectId,
+    label: "Composer paste improvements",
+  };
+
+  it("keeps HTML code and authored links literal while converting repeated URLs in prose", async () => {
+    const lookup = vi
+      .spyOn(sdk.threads, "resolveMentions")
+      .mockResolvedValue([resolved]);
+    try {
+      const { changes, promptBoxRef } = renderPromptBox("");
+      await focusPromptEnd(promptBoxRef);
+      pasteClipboard({
+        plainText: `${url}\n${url}\n${url}\n${url}`,
+        html: `<p>${url}</p><pre><code>${url}</code></pre><p><a href="https://example.com">${url}</a></p><p><a href="${url}">${url}</a></p>`,
+      });
+      await waitFor(() =>
+        expect(latestChange(changes)?.mentions).toHaveLength(2),
+      );
+      expect(latestValue(changes)).toBe(
+        `@thread:${threadId}\n${url}\n${url}\n@thread:${threadId}`,
+      );
+    } finally {
+      lookup.mockRestore();
+    }
+  });
+
+  it.each(["ctrlKey", "metaKey"])(
+    "keeps %s+Shift+V literal and converts the next normal clipboard paste through the SDK",
+    async (modifier) => {
+      const lookup = vi
+        .spyOn(sdk.threads, "resolveMentions")
+        .mockResolvedValue([resolved]);
+      try {
+        const { changes, promptBoxRef } = renderPromptBox("");
+        await focusPromptEnd(promptBoxRef);
+        fireEvent.keyDown(getPromptEditorElement(), {
+          key: "V",
+          code: "KeyV",
+          shiftKey: true,
+          [modifier]: true,
+        });
+        pastePlainText(url);
+        fireEvent.keyUp(getPromptEditorElement(), {
+          key: "V",
+          code: "KeyV",
+        });
+        await act(async () => {
+          await Promise.resolve();
+        });
+        expect(latestChange(changes)).toEqual({ value: url, mentions: [] });
+        expect(lookup).not.toHaveBeenCalled();
+
+        pastePlainText(` ${url}`);
+        await waitFor(() =>
+          expect(latestValue(changes)).toBe(`${url} @thread:${threadId}`),
+        );
+        expect(latestChange(changes)?.mentions).toEqual([
+          {
+            start: url.length + 1,
+            end: url.length + 1 + `@thread:${threadId}`.length,
+            resource: { kind: "thread", ...resolved },
+          },
+        ]);
+        expect(
+          getPromptEditorElement().querySelector(
+            `[data-prompt-mention-serialized-text="@thread:${threadId}"]`,
+          )?.textContent,
+        ).toBe(resolved.label);
+        expect(lookup).toHaveBeenCalledTimes(1);
+        expect(lookup.mock.calls[0]?.[0].threadIds).toEqual([threadId]);
+      } finally {
+        lookup.mockRestore();
+      }
+    },
+  );
+
+  it.each(["submit", "replace draft"])(
+    "does not apply a delayed resolution after the real %s handler",
+    async (action) => {
+      let finishLookup!: (
+        result: Awaited<ReturnType<typeof sdk.threads.resolveMentions>>,
+      ) => void;
+      const lookup = vi
+        .spyOn(sdk.threads, "resolveMentions")
+        .mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              finishLookup = resolve;
+            }),
+        );
+      const changes: PromptChange[] = [];
+      const submitted = vi.fn();
+      const promptBoxRef = createRef<PromptBoxHandle>();
+      const props = createPromptBoxProps({
+        onChange: (value, mentions) => changes.push({ value, mentions }),
+        onSubmit: submitted,
+      });
+      const content = (value: string) => (
+        <MemoryRouter>
+          <PromptBoxInternal
+            {...props}
+            value={value}
+            promptBoxRef={promptBoxRef}
+          />
+        </MemoryRouter>
+      );
+      try {
+        const view = render(content(""));
+        await focusPromptEnd(promptBoxRef);
+        pastePlainText(url);
+        await waitFor(() => expect(lookup).toHaveBeenCalledTimes(1));
+        expect(latestChange(changes)).toEqual({ value: url, mentions: [] });
+        view.rerender(content(url));
+        if (action === "submit")
+          fireEvent.click(
+            screen.getByRole("button", { name: "Submit (Enter)" }),
+          );
+        else view.rerender(content("Replacement draft"));
+        const expected = action === "submit" ? url : "Replacement draft";
+        expect(lookup.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+        if (action === "submit") {
+          expect(submitted).toHaveBeenCalledOnce();
+        }
+        const countBeforeResolution = changes.length;
+        await act(async () => {
+          finishLookup([resolved]);
+          await Promise.resolve();
+        });
+        expect(getPromptEditorElement().textContent).toBe(expected);
+        expect(changes).toHaveLength(countBeforeResolution);
+        expect(
+          getPromptEditorElement().querySelector("[data-prompt-mention]"),
+        ).toBeNull();
+      } finally {
+        lookup.mockRestore();
+      }
+    },
+  );
 });

@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   setupCommandOutputTestEnvironment,
   collectLogPayloads,
-  getHelpOutput,
   runCommand,
   stubServerApi,
 } from "../helpers/command-output-harness.js";
@@ -28,13 +27,6 @@ describe("bb provider command output", () => {
     ]);
   });
 
-  it("discovers provider routing selectors in command help", async () => {
-    const help = await getHelpOutput(["provider", "list"], register);
-    expect(help).toContain("--machine <id-or-name>");
-    expect(help).toContain("--host <id-or-name>");
-    expect(help).toContain("--environment <id>");
-  });
-
   it("bb provider list resolves a machine and preserves portable JSON output", async () => {
     const getProviders = vi.fn(async () => [
       { id: "acp-remote", displayName: "Remote ACP" },
@@ -44,7 +36,6 @@ describe("bb provider command output", () => {
         {
           id: "host-remote",
           name: "builder",
-          type: "persistent",
           status: "connected",
           lastSeenAt: 1,
           lastRejectedProtocolVersion: null,
@@ -72,28 +63,6 @@ describe("bb provider command output", () => {
     ]);
   });
 
-  it("bb provider models renders the shared borderless table", async () => {
-    const get = vi.fn(async () => [
-      { model: "gpt-5", displayName: "GPT-5", isDefault: true },
-    ]);
-    stubServerApi({
-      "v1.system.execution-options.$get": vi.fn(async () => ({
-        providers: [],
-        models: await get(),
-        selectedOnlyModels: [],
-      })),
-    });
-
-    await runCommand(["provider", "models", "openai"], register);
-
-    expect(collectLogPayloads(vi.mocked(console.log))).toEqual([
-      "Models for openai:",
-      "",
-      "Model  Name   Default\n-----  -----  -------\ngpt-5  GPT-5  *",
-      "",
-    ]);
-  });
-
   it("bb provider models includes a matching selected-only model", async () => {
     const get = vi.fn(async () => ({
       providers: [],
@@ -111,6 +80,7 @@ describe("bb provider command output", () => {
           isDefault: false,
         },
       ],
+      modelLoadError: null,
     }));
     stubServerApi({ "v1.system.execution-options.$get": get });
 
@@ -156,6 +126,30 @@ describe("bb provider command output", () => {
       query: { environmentId: "env-remote", providerId: "codex" },
     });
     expect(collectLogPayloads(vi.mocked(console.log))).toEqual(["[]"]);
+  });
+
+  it("bb provider models reports a model-load failure and its detail on stderr", async () => {
+    const get = vi.fn(async () => ({
+      providers: [],
+      models: [],
+      selectedOnlyModels: [],
+      modelLoadError: {
+        providerId: "codex",
+        code: "failed",
+        detail: "bb could not find the Codex CLI on this machine.",
+      },
+    }));
+    stubServerApi({ "v1.system.execution-options.$get": get });
+
+    await runCommand(["provider", "models", "codex"], register);
+
+    expect(vi.mocked(console.error).mock.calls).toEqual([
+      ["Could not load models for codex (failed)"],
+      ["  bb could not find the Codex CLI on this machine."],
+    ]);
+    expect(collectLogPayloads(vi.mocked(console.log))).toEqual([
+      "No models available",
+    ]);
   });
 
   it("rejects simultaneous machine and environment selectors", async () => {

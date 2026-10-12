@@ -2,79 +2,103 @@ import { useEffect, useState } from "react";
 import {
   assertNever,
   fileNameFromPath,
-  type TimelineImageViewViewWorkRow,
   type TimelineViewWorkRow,
 } from "@bb/thread-view";
+import { Button } from "@bb/shared-ui/button";
+import { Icon } from "@bb/shared-ui/icon";
 import { EventCodeBlock } from "../../ui/event-code-block.js";
 import { ImageLightbox } from "../../ui/image-lightbox.js";
 import { EmptyStatePanel } from "@bb/shared-ui/empty-state";
-import { TerminalOutputBlock } from "./TerminalOutputBlock.js";
+import { LazyTerminalOutputBlock } from "./LazyTerminalOutputBlock.js";
 import { TimelineDetailScroll } from "./TimelineDetailScroll.js";
-import { TimelineFileDiffBlock } from "./TimelineFileDiffBlock.js";
+import { LazyTimelineFileDiffBlock } from "./LazyTimelineFileDiffBlock.js";
 import { ToolCallDetailBlock } from "./ToolCallDetailBlock.js";
 import { QuestionWorkRowBody } from "./QuestionWorkRowBody.js";
 import { WorkflowWorkRowBody } from "./WorkflowWorkRowBody.js";
+import {
+  PlanStepsWorkRowBody,
+  PresentationDetail,
+} from "./PresentationWorkRowBodies.js";
+import {
+  useTimelineWorkRowFullOutput,
+  type TimelinePreviewableWorkRow,
+  type TimelineWorkRowFullOutput,
+  type TimelineWorkRowFullOutputState,
+} from "./useTimelineWorkRowFullOutput.js";
 import { buildThreadHostFileContentUrl } from "@/lib/file-content-urls";
-import type { ThreadTimelineTheme } from "./types.js";
 import type { ThreadTimelineImageViewSrcResolver } from "./types.js";
 
-export interface WorkRowBodyProps {
+interface WorkRowBodyProps {
   resolveImageViewSrc?: ThreadTimelineImageViewSrcResolver;
   row: TimelineViewWorkRow;
-  themeType: ThreadTimelineTheme;
   workspaceRootPath: string | undefined;
 }
 
-type DetailLine = string | null;
+type ImageWorkRow = Extract<
+  TimelineViewWorkRow,
+  { workKind: "image-view" | "image-generation" }
+>;
 
-interface ImageViewWorkRowBodyProps {
+interface ImageWorkRowBodyProps {
   resolveImageViewSrc?: ThreadTimelineImageViewSrcResolver;
-  row: TimelineImageViewViewWorkRow;
+  row: ImageWorkRow;
+}
+
+interface CommandWorkRowBodyProps {
+  row: Extract<TimelineViewWorkRow, { workKind: "command" }>;
+}
+
+interface ToolWorkRowBodyProps {
+  row: Extract<TimelineViewWorkRow, { workKind: "tool" }>;
+}
+
+interface OutputPreviewNoteProps {
+  fullOutput: TimelineWorkRowFullOutput;
+  row: TimelinePreviewableWorkRow;
+}
+
+interface OutputPreviewNoteArgs {
+  state: TimelineWorkRowFullOutputState;
+  totalChars: number;
 }
 
 interface ResolveImageViewSourceArgs {
   resolveImageViewSrc: ThreadTimelineImageViewSrcResolver | undefined;
-  row: TimelineImageViewViewWorkRow;
-}
-
-function compactDetailLines(lines: readonly DetailLine[]): string[] {
-  const compactedLines: string[] = [];
-  for (const line of lines) {
-    if (line !== null) {
-      compactedLines.push(line);
-    }
-  }
-  return compactedLines;
+  row: ImageWorkRow;
 }
 
 function resolveImageViewSource({
   resolveImageViewSrc,
   row,
-}: ResolveImageViewSourceArgs): string {
+}: ResolveImageViewSourceArgs): string | null {
+  if (!row.path || (row.workKind === "image-generation" && row.error)) {
+    return null;
+  }
   return resolveImageViewSrc
     ? resolveImageViewSrc({ path: row.path, threadId: row.threadId })
     : buildThreadHostFileContentUrl(row.threadId, row.path);
 }
 
-function ImageViewWorkRowBody({
-  resolveImageViewSrc,
-  row,
-}: ImageViewWorkRowBodyProps) {
+function ImageWorkRowBody({ resolveImageViewSrc, row }: ImageWorkRowBodyProps) {
   const [loadError, setLoadError] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const imageSrc = resolveImageViewSource({ resolveImageViewSrc, row });
-  const imageName = fileNameFromPath(row.path);
-  const imageAlt = `Viewed image: ${imageName}`;
+  const imageName = row.path ? fileNameFromPath(row.path) : "";
+  const imageAlt = `${row.workKind === "image-generation" ? "Generated" : "Viewed"} image: ${imageName}`;
 
   useEffect(() => {
     setLoadError(false);
     setLightboxOpen(false);
   }, [imageSrc, row.completedAt, row.status]);
 
-  if (loadError) {
+  if (loadError || !imageSrc) {
     return (
       <EmptyStatePanel className="rounded-lg">
-        <div>Image preview unavailable.</div>
+        <div className="whitespace-pre-wrap break-words">
+          {row.workKind === "image-generation" && row.error
+            ? row.error
+            : "Image preview unavailable."}
+        </div>
         <div className="mt-1 break-all font-mono text-xs">{row.path}</div>
       </EmptyStatePanel>
     );
@@ -107,40 +131,110 @@ function ImageViewWorkRowBody({
   );
 }
 
+function outputPreviewNoteText({
+  state,
+  totalChars,
+}: OutputPreviewNoteArgs): string | null {
+  const total = `${totalChars.toLocaleString()} characters`;
+  switch (state) {
+    case "streaming-preview":
+      return `Preview of ${total}. The full output loads when this finishes.`;
+    case "limited-preview":
+      return `Preview of ${total}. The full output exceeds the detail response limit.`;
+    case "expired-preview":
+      return `Preview of ${total}. The full output is no longer available because its retention period ended.`;
+    case "loading":
+      return `Loading the full output (${total})…`;
+    case "error":
+      return `Failed to load the full output (${total}).`;
+    case "complete":
+    case "loaded":
+      return null;
+    default:
+      return assertNever(state);
+  }
+}
+
+function OutputPreviewNote({ fullOutput, row }: OutputPreviewNoteProps) {
+  if (row.outputPreview === undefined) {
+    return null;
+  }
+  const text = outputPreviewNoteText({
+    state: fullOutput.state,
+    totalChars: row.outputPreview.totalChars,
+  });
+  if (text === null) {
+    return null;
+  }
+  return (
+    <div
+      className="flex items-center gap-2 text-xs text-muted-foreground"
+      data-testid="timeline-output-preview-note"
+    >
+      <span>{text}</span>
+      {fullOutput.state === "error" ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={fullOutput.retry}
+          className="h-6 cursor-pointer px-2"
+        >
+          <Icon name="RotateCcw" />
+          Retry
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function CommandWorkRowBody({ row }: CommandWorkRowBodyProps) {
+  const fullOutput = useTimelineWorkRowFullOutput(row);
+  return (
+    <div className="space-y-1">
+      <LazyTerminalOutputBlock
+        commandLine={`$ ${row.command}`}
+        metadataLines={row.source ? [`source: ${row.source}`] : []}
+        output={fullOutput.output}
+        exitCode={row.exitCode}
+        streaming={row.status === "pending"}
+      />
+      <OutputPreviewNote fullOutput={fullOutput} row={row} />
+    </div>
+  );
+}
+
+function ToolWorkRowBody({ row }: ToolWorkRowBodyProps) {
+  const fullOutput = useTimelineWorkRowFullOutput(row);
+  return (
+    <div className="space-y-1">
+      <PresentationDetail presentation={row.presentation} />
+      <ToolCallDetailBlock
+        toolName={row.toolName}
+        args={row.toolArgs}
+        output={fullOutput.output}
+        streaming={row.status === "pending"}
+      />
+      <OutputPreviewNote fullOutput={fullOutput} row={row} />
+    </div>
+  );
+}
+
 export function WorkRowBody({
   resolveImageViewSrc,
   row,
-  themeType,
   workspaceRootPath,
 }: WorkRowBodyProps) {
   switch (row.workKind) {
     case "command":
-      return (
-        <TerminalOutputBlock
-          commandLine={`$ ${row.command}`}
-          metadataLines={compactDetailLines([
-            row.source ? `source: ${row.source}` : null,
-          ])}
-          output={row.output}
-          exitCode={row.exitCode}
-          streaming={row.status === "pending"}
-        />
-      );
+      return <CommandWorkRowBody row={row} />;
     case "tool":
-      return (
-        <ToolCallDetailBlock
-          toolName={row.toolName}
-          args={row.toolArgs}
-          output={row.output}
-          streaming={row.status === "pending"}
-        />
-      );
+      return <ToolWorkRowBody row={row} />;
     case "file-change":
       return (
         <div className="space-y-2">
-          <TimelineFileDiffBlock
+          <LazyTimelineFileDiffBlock
             change={row.change}
-            themeType={themeType}
             workspaceRootPath={workspaceRootPath}
           />
           {row.stderr ? (
@@ -160,25 +254,32 @@ export function WorkRowBody({
         </div>
       );
     case "delegation":
-      // Delegation expanded bodies are dispatched by `TimelineExpandableBody`
-      // (in `ThreadTimelineRows.tsx`), which wraps childRows + output text in
-      // a delegation-tier scroll container. This branch is unreachable for
-      // the App renderer; kept exhaustive for the type.
       return null;
     case "question":
       return <QuestionWorkRowBody row={row} />;
+    case "form":
+      return <PresentationDetail presentation={row.presentation} />;
     case "workflow":
-      return <WorkflowWorkRowBody row={row} />;
+      return (
+        <div className="space-y-2">
+          <PresentationDetail presentation={row.presentation} />
+          <WorkflowWorkRowBody row={row} />
+        </div>
+      );
+    case "plan-steps":
+      return <PlanStepsWorkRowBody row={row} />;
+    case "extension":
+      return <PresentationDetail presentation={row.presentation} />;
+    case "image-generation":
     case "image-view":
       return (
-        <ImageViewWorkRowBody
-          row={row}
-          resolveImageViewSrc={resolveImageViewSrc}
-        />
+        <ImageWorkRowBody row={row} resolveImageViewSrc={resolveImageViewSrc} />
       );
     case "approval":
     case "web-search":
     case "web-fetch":
+    case "file-read":
+    case "search":
       return null;
     default:
       return assertNever(row);

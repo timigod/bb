@@ -6,8 +6,6 @@ export default {
   title: "right-panel/File preview",
 };
 
-// Mirror the right panel's surface: bg-background and the same horizontal
-// padding the panel uses for file-preview content (px-4 pb-3 pt-1).
 function PreviewStage({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-[360px] w-full max-w-[640px] min-w-0 flex-col overflow-hidden bg-background px-4 pb-3 pt-1">
@@ -114,6 +112,7 @@ Katherine Johnson,Active,9600,"Needs ""Executive Summary"" column added"
 `;
 
 const README_PATH = "docs/right-panel/README.md";
+const ARCHIVE_PATH = "keyboard-reset-qa/report-with-images.zip";
 const DIAGRAM_PATH = "docs/right-panel/preview-flow.md";
 const BUTTON_PATH = "apps/app/src/components/ui/button.tsx";
 const DELETED_BUTTON_PATH = "apps/app/src/components/ui/legacy-button.tsx";
@@ -142,9 +141,17 @@ const SAMPLE_IMAGE_URL =
     </svg>`,
   );
 
+const LARGE_FILE_LINE_COUNT = 8_000;
+const LARGE_FILE_TARGET_LINE = 6_500;
+const SAMPLE_LARGE_TS = Array.from({ length: LARGE_FILE_LINE_COUNT }, (_, i) =>
+  i % 40 === 0
+    ? `export function block${i / 40}(input: number): number {`
+    : i % 40 === 39
+      ? "}"
+      : `  const step${i % 40} = input * ${i} + ${(i * 7) % 13}; // line ${i + 1}`,
+).join("\n");
+
 function noopOpenInEditor(path: string) {
-  // Stories don't actually open anything; the prop is wired so the
-  // open-in-editor affordance renders in the header.
   console.log("open in editor:", path);
 }
 
@@ -221,11 +228,82 @@ export function Overview() {
               file: {
                 name: "Button.tsx",
                 contents: SAMPLE_BUTTON_TSX,
-                lang: "tsx",
               },
             }}
           />
         </PreviewStage>
+      </StoryRow>
+      <StoryRow
+        label="large file (capped)"
+        hint={`${LARGE_FILE_LINE_COUNT.toLocaleString()} lines: only the leading prefix renders until "Load full file"; rows are virtualized inside the code viewport`}
+      >
+        <PreviewStage>
+          <FilePreview
+            path="src/generated/large.ts"
+            copyPath={copyPathFor("src/generated/large.ts")}
+            onOpenInEditor={noopOpenInEditor}
+            state={{
+              kind: "ready",
+              lineRange: null,
+              textPreviewKind: null,
+              file: {
+                cacheKey: "story:large.ts",
+                name: "large.ts",
+                contents: SAMPLE_LARGE_TS,
+              },
+            }}
+          />
+        </PreviewStage>
+      </StoryRow>
+      <StoryRow
+        label="large file (line link past the cap)"
+        hint={`Opened at line ${LARGE_FILE_TARGET_LINE.toLocaleString()}: the whole file renders and the virtualized viewport scrolls the target into view`}
+      >
+        <PreviewStage>
+          <FilePreview
+            path="src/generated/large.ts"
+            copyPath={copyPathFor("src/generated/large.ts")}
+            onOpenInEditor={noopOpenInEditor}
+            state={{
+              kind: "ready",
+              lineRange: {
+                startLineNumber: LARGE_FILE_TARGET_LINE,
+                endLineNumber: LARGE_FILE_TARGET_LINE,
+              },
+              textPreviewKind: null,
+              file: {
+                cacheKey: "story:large.ts",
+                name: "large.ts",
+                contents: SAMPLE_LARGE_TS,
+              },
+            }}
+          />
+        </PreviewStage>
+      </StoryRow>
+      <StoryRow
+        label="code in a content-sized scroller"
+        hint="Skill detail embeds headerless code previews in a max-height scroller with no fixed height; the code viewport grows with its content and the outer box scrolls"
+      >
+        <div className="w-full max-w-[640px] bg-background px-4 py-2">
+          <div className="max-h-[300px] overflow-y-auto overscroll-contain rounded-md border border-border">
+            <FilePreview
+              path="skills/writing-voice/scripts/lint.ts"
+              headerMode="none"
+              state={{
+                kind: "ready",
+                lineRange: null,
+                textPreviewKind: null,
+                file: {
+                  cacheKey: "story:skill-script",
+                  name: "lint.ts",
+                  contents: SAMPLE_LARGE_TS.split("\n")
+                    .slice(0, 400)
+                    .join("\n"),
+                },
+              }}
+            />
+          </div>
+        </div>
       </StoryRow>
       <StoryRow
         label="deleted file"
@@ -244,7 +322,6 @@ export function Overview() {
               file: {
                 name: "legacy-button.tsx",
                 contents: SAMPLE_BUTTON_TSX,
-                lang: "tsx",
               },
             }}
           />
@@ -299,6 +376,41 @@ export function Overview() {
             copyPath={copyPathFor(README_PATH)}
             onOpenInEditor={noopOpenInEditor}
             state={{ kind: "error" }}
+          />
+        </PreviewStage>
+      </StoryRow>
+      <StoryRow
+        label="failed to load with a reason"
+        hint="Preview fetch failed and the response explained why"
+      >
+        <PreviewStage>
+          <FilePreview
+            path={README_PATH}
+            copyPath={copyPathFor(README_PATH)}
+            onOpenInEditor={noopOpenInEditor}
+            state={{ kind: "error", message: "Host is not connected" }}
+          />
+        </PreviewStage>
+      </StoryRow>
+      <StoryRow
+        label="preview not available"
+        hint="The file loaded but its media type has no preview renderer"
+      >
+        <PreviewStage>
+          <FilePreview
+            path={ARCHIVE_PATH}
+            copyPath={copyPathFor(ARCHIVE_PATH)}
+            onOpenInEditor={noopOpenInEditor}
+            state={{
+              kind: "unsupported",
+              file: {
+                mimeType: "application/zip",
+                name: "report-with-images.zip",
+                reason: "binary",
+                sizeBytes: 2_457_600,
+                url: "/fixtures/report-with-images.zip",
+              },
+            }}
           />
         </PreviewStage>
       </StoryRow>

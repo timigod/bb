@@ -1,9 +1,10 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { PromptInput, ThreadQueuedMessage } from "@bb/domain";
+import type { SendQueuedMessageMode } from "@bb/server-contract";
 import type {
   QueuedMessageGroupBoundaryRequest,
   QueuedMessageProcessingAction,
-} from "@/components/promptbox/banner/QueuedMessagesList";
+} from "@/components/promptbox/banner/LazyQueuedMessagesList";
 import {
   useDeleteThreadQueuedMessage,
   useReorderThreadQueuedMessage,
@@ -11,42 +12,31 @@ import {
   useSetThreadQueuedMessageGroupBoundary,
   useUpdateThreadQueuedMessage,
 } from "@/hooks/mutations/thread-runtime-mutations";
-import { getMutationErrorMessage } from "@/lib/mutation-errors";
+import { showMutationErrorToast } from "@/lib/mutation-errors";
 import type { QueuedMessageReorderRequest } from "@/lib/queued-message-reorder";
-import { appToast } from "@/components/ui/app-toast";
 import { BbHttpError } from "@/lib/sdk";
 import type { InlineQueuedMessageEditState } from "./useInlineQueuedMessageEditing";
 
-export type QueuedMessageSendGuard = "current-head" | "exists" | "none";
+type QueuedMessageSendGuard = "current-head" | "exists" | "none";
 
 interface SendQueuedMessageByIdArgs {
   guard: QueuedMessageSendGuard;
   messageId: string;
+  mode: SendQueuedMessageMode;
 }
 
 interface UseQueuedMessageActionsArgs {
-  /** The thread owning the queue. Null disables every action. */
-  threadId: string | null;
+  threadId: string;
   queuedMessages: readonly ThreadQueuedMessage[];
-  /**
-   * How long a steered ("send now") message keeps its "Sending..." label:
-   * `until-left-queue` holds it until the message leaves the queue (the steer
-   * surfaced in the timeline) so the row never flashes back to normal;
-   * `clear-on-settle` clears when the send request settles.
-   */
   sendProcessingPersistence: "clear-on-settle" | "until-left-queue";
-  /** Extra guard evaluated before a send-now besides thread existence. */
-  canSendNow?: () => boolean;
   onSendSuccess?: () => void;
   onSaveSuccess?: () => void;
   inlineEditingQueuedMessage: InlineQueuedMessageEditState | null;
   dismissInlineQueuedMessageEditor: () => void;
-  /** The inline edit draft's current prompt input (for saving the edit). */
   activeComposerDraftInput: PromptInput[];
 }
 
-export interface UseQueuedMessageActionsResult {
-  /** The processing state QueuedMessagesList should display. */
+interface UseQueuedMessageActionsResult {
   processingQueuedMessage: {
     action: QueuedMessageProcessingAction;
     id: string;
@@ -54,7 +44,6 @@ export interface UseQueuedMessageActionsResult {
   queuedMessageActionPending: boolean;
   isUpdateQueuedMessagePending: boolean;
   sendQueuedMessageById: (args: SendQueuedMessageByIdArgs) => Promise<void>;
-  handleSendQueuedImmediately: (queuedMessageId: string) => void;
   handleSaveInlineQueuedMessage: () => Promise<void>;
   handleDeleteQueuedMessage: (queuedMessageId: string) => void;
   handleReorderQueuedMessage: (request: QueuedMessageReorderRequest) => void;
@@ -63,16 +52,10 @@ export interface UseQueuedMessageActionsResult {
   ) => void;
 }
 
-/**
- * The queued-message row actions shared by every thread-chat composer: send
- * now, inline-edit save, delete, reorder, and group boundaries, with a single
- * per-message processing state driving the row spinners.
- */
 export function useQueuedMessageActions({
   threadId,
   queuedMessages,
   sendProcessingPersistence,
-  canSendNow,
   onSendSuccess,
   onSaveSuccess,
   inlineEditingQueuedMessage,
@@ -106,10 +89,7 @@ export function useQueuedMessageActions({
   );
 
   const sendQueuedMessageById = useCallback(
-    async ({ guard, messageId }: SendQueuedMessageByIdArgs) => {
-      if (threadId === null || (canSendNow !== undefined && !canSendNow())) {
-        return;
-      }
+    async ({ guard, messageId, mode }: SendQueuedMessageByIdArgs) => {
       if (
         guard !== "none" &&
         !queuedMessagesRef.current.some((message) => message.id === messageId)
@@ -127,49 +107,34 @@ export function useQueuedMessageActions({
       try {
         await sendQueuedMessage.mutateAsync({
           id: threadId,
-          mode: "auto",
+          mode,
           queuedMessageId: messageId,
         });
         onSendSuccess?.();
-        if (sendProcessingPersistence === "clear-on-settle") {
+        if (
+          mode === "steer" ||
+          sendProcessingPersistence === "clear-on-settle"
+        ) {
           setProcessingQueuedMessage((current) =>
             current?.id === messageId ? null : current,
           );
         }
-        // With `until-left-queue`, the displayed processing state clears via
-        // derivation once the message leaves the queue.
       } catch (error) {
-        appToast.error(
-          getMutationErrorMessage({
-            error,
-            fallbackMessage: "Failed to send queued message",
-            lifecycleOperation: "send_queued_message",
-          }),
-        );
+        showMutationErrorToast({
+          error,
+          fallbackMessage: "Failed to send queued message",
+          lifecycleOperation: "send_queued_message",
+        });
         setProcessingQueuedMessage((current) =>
           current?.id === messageId ? null : current,
         );
       }
     },
-    [
-      canSendNow,
-      onSendSuccess,
-      sendProcessingPersistence,
-      sendQueuedMessage,
-      threadId,
-    ],
-  );
-
-  const handleSendQueuedImmediately = useCallback(
-    (queuedMessageId: string) => {
-      void sendQueuedMessageById({ guard: "none", messageId: queuedMessageId });
-    },
-    [sendQueuedMessageById],
+    [onSendSuccess, sendProcessingPersistence, sendQueuedMessage, threadId],
   );
 
   const handleSaveInlineQueuedMessage = useCallback(async () => {
     if (
-      threadId === null ||
       !inlineEditingQueuedMessage ||
       activeComposerDraftInput.length === 0 ||
       updateQueuedMessage.isPending
@@ -201,13 +166,11 @@ export function useQueuedMessageActions({
       if (error instanceof BbHttpError && error.status === 404) {
         dismissInlineQueuedMessageEditor();
       }
-      appToast.error(
-        getMutationErrorMessage({
-          error,
-          fallbackMessage: "Failed to update queued message",
-          lifecycleOperation: "update_queued_message",
-        }),
-      );
+      showMutationErrorToast({
+        error,
+        fallbackMessage: "Failed to update queued message",
+        lifecycleOperation: "update_queued_message",
+      });
     } finally {
       setProcessingQueuedMessage((current) =>
         current?.id === queuedMessageId ? null : current,
@@ -224,9 +187,6 @@ export function useQueuedMessageActions({
 
   const handleDeleteQueuedMessage = useCallback(
     (queuedMessageId: string) => {
-      if (threadId === null) {
-        return;
-      }
       setProcessingQueuedMessage({ id: queuedMessageId, action: "delete" });
       void deleteQueuedMessage
         .mutateAsync({
@@ -234,13 +194,11 @@ export function useQueuedMessageActions({
           queuedMessageId,
         })
         .catch((error) => {
-          appToast.error(
-            getMutationErrorMessage({
-              error,
-              fallbackMessage: "Failed to delete queued message",
-              lifecycleOperation: "queue_message",
-            }),
-          );
+          showMutationErrorToast({
+            error,
+            fallbackMessage: "Failed to delete queued message",
+            lifecycleOperation: "queue_message",
+          });
         })
         .finally(() => {
           setProcessingQueuedMessage((current) =>
@@ -253,22 +211,17 @@ export function useQueuedMessageActions({
 
   const handleReorderQueuedMessage = useCallback(
     (request: QueuedMessageReorderRequest) => {
-      if (threadId === null) {
-        return;
-      }
       void reorderQueuedMessage
         .mutateAsync({
           ...request,
           id: threadId,
         })
         .catch((error) => {
-          appToast.error(
-            getMutationErrorMessage({
-              error,
-              fallbackMessage: "Failed to reorder queued message",
-              lifecycleOperation: "reorder_queued_message",
-            }),
-          );
+          showMutationErrorToast({
+            error,
+            fallbackMessage: "Failed to reorder queued message",
+            lifecycleOperation: "reorder_queued_message",
+          });
         });
     },
     [reorderQueuedMessage, threadId],
@@ -276,22 +229,17 @@ export function useQueuedMessageActions({
 
   const handleSetQueuedMessageGroupBoundary = useCallback(
     (request: QueuedMessageGroupBoundaryRequest) => {
-      if (threadId === null) {
-        return;
-      }
       void setQueuedMessageGroupBoundary
         .mutateAsync({
           id: threadId,
           ...request,
         })
         .catch((error) => {
-          appToast.error(
-            getMutationErrorMessage({
-              error,
-              fallbackMessage: "Failed to group queued messages",
-              lifecycleOperation: "set_queued_message_group_boundary",
-            }),
-          );
+          showMutationErrorToast({
+            error,
+            fallbackMessage: "Failed to group queued messages",
+            lifecycleOperation: "set_queued_message_group_boundary",
+          });
         });
     },
     [setQueuedMessageGroupBoundary, threadId],
@@ -309,7 +257,6 @@ export function useQueuedMessageActions({
     queuedMessageActionPending,
     isUpdateQueuedMessagePending: updateQueuedMessage.isPending,
     sendQueuedMessageById,
-    handleSendQueuedImmediately,
     handleSaveInlineQueuedMessage,
     handleDeleteQueuedMessage,
     handleReorderQueuedMessage,

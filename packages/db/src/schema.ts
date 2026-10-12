@@ -1,4 +1,5 @@
 import {
+  blob,
   check,
   index,
   integer,
@@ -10,16 +11,21 @@ import {
 import { sql } from "drizzle-orm";
 import type { AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 import { threadStatusValues } from "@bb/domain/thread-status";
+import { startedOnBehalfOfInitiatorValues } from "@bb/domain/started-on-behalf-of";
+import { threadCreateOriginValues } from "@bb/domain/thread-create-origin";
 import { threadOriginKindValues } from "@bb/domain/thread-origin-kind";
 import { threadVisibilityValues } from "@bb/domain/thread-visibility";
 import type {
+  EnvironmentProviderSelection,
+  JsonValue,
   EnvironmentStatus,
   FaviconColorPreference,
-  HostType,
   PendingInteractionStatus,
   PermissionMode,
   PromptHistoryScope,
   ProjectSourceType,
+  QueuedMessagePayloadKind,
+  QueuedMessageWaitHolder,
   ReasoningLevel,
   ServiceTier,
   TerminalSessionCloseReason,
@@ -29,9 +35,9 @@ import type {
   ThreadEventItemType,
   ThreadEventScopeKind,
   ThreadEventType,
-  WorkspaceProvisionType,
   ProjectKind,
 } from "@bb/domain";
+import type { RetainedEventOutputPath } from "./retained-event-output.js";
 
 export const authUsers = sqliteTable(
   "user",
@@ -89,8 +95,37 @@ export const hosts = sqliteTable(
   {
     id: text("id").primaryKey(),
     name: text("name").notNull(),
-    type: text("type").$type<HostType>().notNull(),
+    type: text("type").$type<"persistent" | "ephemeral">().notNull(),
     connectMachineId: text("connect_machine_id"),
+    machineProviderId: text("machine_provider_id"),
+    launchKey: text("launch_key"),
+    inputs: text("machine_inputs", { mode: "json" }).$type<JsonValue>(),
+    attempt: integer("machine_attempt").notNull().default(0),
+    pendingLog: text("pending_log").notNull().default(""),
+    machineOperationId: text("machine_operation_id"),
+    serverAccessProviderId: text("server_access_provider_id"),
+    serverAccessGrantId: text("server_access_grant_id"),
+    resource: text("resource", { mode: "json" }).$type<JsonValue>(),
+    phase: text("phase")
+      .$type<
+        | "creating"
+        | "active"
+        | "suspending"
+        | "suspended"
+        | "resuming"
+        | "removing"
+        | "destroyed"
+      >()
+      .notNull()
+      .default("active"),
+    suspendedAt: integer("suspended_at"),
+    statusMessage: text("status_message"),
+    suspendRetryAt: integer("suspend_retry_at"),
+    removeRetryAt: integer("remove_retry_at"),
+    teardownAttempt: integer("teardown_attempt").notNull().default(0),
+    teardownStatus: text("teardown_status").$type<
+      "running" | "failed" | "removed"
+    >(),
     maxPermissionMode: text("max_permission_mode")
       .$type<PermissionMode>()
       .notNull()
@@ -101,7 +136,17 @@ export const hosts = sqliteTable(
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
   },
-  (table) => [index("hosts_last_seen_idx").on(table.lastSeenAt)],
+  (table) => [
+    index("hosts_last_seen_idx").on(table.lastSeenAt),
+    index("hosts_pending_provider_idx")
+      .on(table.machineProviderId)
+      .where(
+        sql`${table.destroyedAt} IS NULL AND ${table.phase} <> 'destroyed'`,
+      ),
+    uniqueIndex("hosts_live_launch_key_idx")
+      .on(table.launchKey)
+      .where(sql`${table.destroyedAt} is null`),
+  ],
 );
 
 export const projects = sqliteTable(
@@ -150,6 +195,47 @@ export const systemExperiments = sqliteTable("system_experiments", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+export const environmentVariables = sqliteTable(
+  "environment_variables",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: text("project_id").references(() => projects.id, {
+      onDelete: "cascade",
+    }),
+    name: text("name").notNull(),
+    ciphertext: text("ciphertext").notNull(),
+    encryptionVersion: integer("encryption_version").notNull(),
+    note: text("note"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("environment_variables_global_name")
+      .on(table.name)
+      .where(sql`${table.projectId} IS NULL`),
+    uniqueIndex("environment_variables_project_name")
+      .on(table.projectId, table.name)
+      .where(sql`${table.projectId} IS NOT NULL`),
+  ],
+);
+
+export const appSettingsValues = sqliteTable("app_settings_values", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const uiPreferenceDefaults = sqliteTable("ui_preference_defaults", {
+  key: text("key").primaryKey(),
+  valueJson: text("value_json").notNull(),
+});
+
+export const uiPreferences = sqliteTable("ui_preferences", {
+  key: text("key").primaryKey(),
+  valueJson: text("value_json").notNull(),
+  revision: integer("revision").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
 export const appSettings = sqliteTable("app_settings", {
   id: text("id").primaryKey(),
   caffeinate: integer("caffeinate", { mode: "boolean" })
@@ -192,17 +278,12 @@ export const appSettings = sqliteTable("app_settings", {
     .notNull()
     .default(false),
   keybindingOverrides: text("keybinding_overrides").notNull().default("[]"),
-  /** ISO timestamp of the last onboarding completion/dismissal; null = never. */
   onboardingCompletedAt: text("onboarding_completed_at"),
   updatedAt: integer("updated_at").notNull(),
 });
 
-// Installed plugins registered by `bb plugin install`. Rows hold durable
-// registration facts only; live status (running/error/…) is plugin-loader
-// memory served via GET /api/v1/plugins.
 export const installedPlugins = sqliteTable("plugins", {
   id: text("id").primaryKey(),
-  /** Legacy display/diagnostic spec. Normalized columns below are authoritative. */
   source: text("source").notNull(),
   provenance: text("provenance", {
     enum: ["builtin", "direct", "catalog"],
@@ -210,6 +291,7 @@ export const installedPlugins = sqliteTable("plugins", {
     .notNull()
     .default("direct"),
   catalogEntryId: text("catalog_entry_id"),
+  catalogMarketplaceName: text("catalog_marketplace_name"),
   sourceKind: text("source_kind", {
     enum: ["path", "builtin", "npm", "git"],
   })
@@ -229,6 +311,9 @@ export const installedPlugins = sqliteTable("plugins", {
   sourceGitRefKind: text("source_git_ref_kind", {
     enum: ["branch", "tag", "commit"],
   }),
+  sourceGitRange: text("source_git_range"),
+  sourceGitTagPrefix: text("source_git_tag_prefix"),
+  sourceGitResolvedTag: text("source_git_resolved_tag"),
   npmResolvedVersion: text("npm_resolved_version"),
   npmIntegrity: text("npm_integrity"),
   gitResolvedCommit: text("git_resolved_commit"),
@@ -239,20 +324,16 @@ export const installedPlugins = sqliteTable("plugins", {
   lastFailureVersion: text("last_failure_version"),
   lastFailureAt: integer("last_failure_at"),
   lastFailureDetail: text("last_failure_detail"),
-  // deletePluginArtifact clears this before deleting in the same transaction.
-  // NO ACTION is intentional: drizzle-kit cannot faithfully emit SET NULL
-  // when adding this circular FK to the pre-existing plugins table.
   activeArtifactId: text("active_artifact_id").references(
     (): AnySQLiteColumn => pluginArtifacts.id,
   ),
-  /** 0 marks rows created before normalized persistence; startup upgrades to 1. */
   normalizationVersion: integer("normalization_version").notNull().default(0),
-  /** Absolute directory containing the plugin's package.json. */
   rootDir: text("root_dir").notNull(),
-  /** package.json version recorded at install/update time. */
   version: text("version").notNull(),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
-  /** Builtin remove tombstone; non-null rows are hidden and not auto-reconciled. */
+  enabledFollowsDefault: integer("enabled_follows_default", { mode: "boolean" })
+    .notNull()
+    .default(false),
   removedAt: integer("removed_at"),
   installedAt: integer("installed_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
@@ -262,12 +343,11 @@ export const pluginArtifacts = sqliteTable(
   "plugin_artifacts",
   {
     id: text("id").primaryKey(),
-    // Deliberately not an FK: removing a registration retains immutable
-    // artifact history for later retention/GC policy.
     pluginId: text("plugin_id").notNull(),
     sourceKind: text("source_kind", { enum: ["npm", "git"] }).notNull(),
     npmResolvedVersion: text("npm_resolved_version"),
     gitResolvedCommit: text("git_resolved_commit"),
+    gitCheckoutRoot: text("git_checkout_root"),
     path: text("path").notNull(),
     integrity: text("integrity"),
     contentHash: text("content_hash"),
@@ -281,6 +361,40 @@ export const pluginArtifacts = sqliteTable(
   (table) => [index("plugin_artifacts_plugin_idx").on(table.pluginId)],
 );
 
+export const pluginMarketplaces = sqliteTable("plugin_marketplaces", {
+  name: text("name").primaryKey(),
+  sourceKind: text("source_kind", { enum: ["https", "git", "path"] })
+    .notNull()
+    .default("https"),
+  manifestUrl: text("manifest_url").notNull(),
+  sourceGitRef: text("source_git_ref"),
+  sourceGitCommit: text("source_git_commit"),
+  manifestJson: text("manifest_json").notNull(),
+  statsJson: text("stats_json"),
+  etag: text("etag"),
+  lastModified: text("last_modified"),
+  lastSuccessfulRefreshAt: integer("last_successful_refresh_at"),
+  lastAttemptedRefreshAt: integer("last_attempted_refresh_at"),
+  lastError: text("last_error"),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const pluginMarketplaceIcons = sqliteTable(
+  "plugin_marketplace_icons",
+  {
+    marketplaceName: text("marketplace_name").notNull(),
+    entryId: text("entry_id").notNull(),
+    sourceUrl: text("source_url").notNull(),
+    contentType: text("content_type").notNull(),
+    etag: text("etag"),
+    contentHash: text("content_hash").notNull(),
+    bytes: blob("bytes", { mode: "buffer" }).notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.marketplaceName, table.entryId] })],
+);
+
 export const pluginStateSnapshots = sqliteTable(
   "plugin_state_snapshots",
   {
@@ -292,7 +406,6 @@ export const pluginStateSnapshots = sqliteTable(
     databasePath: text("database_path"),
     statePath: text("state_path").notNull(),
     secretsPath: text("secrets_path"),
-    // Null only for snapshots created by the initial Phase 3b implementation.
     registrationPath: text("registration_path"),
     status: text("status", {
       enum: [
@@ -319,8 +432,6 @@ export const pluginStateSnapshots = sqliteTable(
   ],
 );
 
-// Namespaced plugin key/value storage (`bb.storage.kv`). Values are JSON text;
-// the plugin API caps them at 256KB before they reach this table.
 export const pluginKv = sqliteTable(
   "plugin_kv",
   {
@@ -332,9 +443,6 @@ export const pluginKv = sqliteTable(
   (table) => [primaryKey({ columns: [table.pluginId, table.key] })],
 );
 
-// Non-secret plugin settings values (`bb.settings`). Values are JSON text;
-// `secret: true` values live in files under <dataDir>/plugins/<id>/secrets/
-// instead, never in the database.
 export const pluginSettings = sqliteTable(
   "plugin_settings",
   {
@@ -346,10 +454,6 @@ export const pluginSettings = sqliteTable(
   (table) => [primaryKey({ columns: [table.pluginId, table.key] })],
 );
 
-// Durable rows for `bb.background.schedule`. Registration (plugin load)
-// upserts the row and computes next_run_at; the periodic sweep claims a due
-// row with a compare-and-swap on next_run_at, but only while its plugin is
-// loaded. Dispose keeps rows; removing the plugin deletes them.
 export const pluginSchedules = sqliteTable(
   "plugin_schedules",
   {
@@ -365,9 +469,6 @@ export const pluginSchedules = sqliteTable(
   (table) => [primaryKey({ columns: [table.pluginId, table.name] })],
 );
 
-// Single-row table (id = "current") holding the app-wide appearance: the active
-// palette id (a built-in theme id, or a custom theme name whose CSS lives on
-// disk under `<data-dir>/theme/<name>/theme.css`) and the browser tab icon tint.
 export const appTheme = sqliteTable("app_theme", {
   id: text("id").primaryKey(),
   themeId: text("theme_id").notNull(),
@@ -388,6 +489,9 @@ export const projectSources = sqliteTable(
     type: text("type").$type<ProjectSourceType>().notNull(),
     hostId: text("host_id").references(() => hosts.id, { onDelete: "cascade" }),
     path: text("path"),
+    ownsPath: integer("owns_path", { mode: "boolean" })
+      .notNull()
+      .default(false),
     isDefault: integer("is_default", { mode: "boolean" })
       .notNull()
       .default(false),
@@ -407,9 +511,6 @@ export const projectSources = sqliteTable(
         ${table.type} = 'local_path' AND ${table.hostId} IS NOT NULL AND ${table.path} IS NOT NULL
       )`,
     ),
-    // NOTE: Drizzle does not support partial/filtered unique indexes.
-    // The baseline migration adds the database constraint for at most one
-    // default source per project.
   ],
 );
 
@@ -425,7 +526,6 @@ export const environments = sqliteTable(
       .notNull()
       .references(() => hosts.id, { onDelete: "cascade" }),
     path: text("path"),
-    managed: integer("managed", { mode: "boolean" }).notNull().default(false),
     isGitRepo: integer("is_git_repo", { mode: "boolean" })
       .notNull()
       .default(false),
@@ -436,13 +536,27 @@ export const environments = sqliteTable(
     baseBranch: text("base_branch"),
     defaultBranch: text("default_branch"),
     mergeBaseBranch: text("merge_base_branch"),
-    destroyAttemptId: text("destroy_attempt_id"),
-    // Durable product-policy clock. Unlike updatedAt, metadata polling cannot
-    // move the start of an accidental-archive recovery window.
-    retireRequestedAt: integer("retire_requested_at"),
-    workspaceProvisionType: text("workspace_provision_type")
-      .$type<WorkspaceProvisionType>()
-      .notNull(),
+    environmentProviderId: text("environment_provider_id"),
+    environmentProviderPluginId: text("environment_provider_plugin_id"),
+    providerOwnsPath: integer("provider_owns_path", { mode: "boolean" })
+      .notNull()
+      .default(false),
+    environmentProviderSelection: text("environment_provider_selection", {
+      mode: "json",
+    }).$type<EnvironmentProviderSelection>(),
+    environmentProviderInstanceKey: text("environment_provider_instance_key"),
+    retireAt: integer("retire_at"),
+    teardownAttempt: integer("teardown_attempt").notNull().default(0),
+    teardownStatus: text("teardown_status").$type<
+      "running" | "failed" | "removed"
+    >(),
+    teardownMessage: text("teardown_message"),
+    resource: text("resource", { mode: "json" }).$type<JsonValue>(),
+    ownerThreadId: text("owner_thread_id"),
+    attempt: integer("attempt").notNull().default(0),
+    statusMessage: text("status_message"),
+    pendingLog: text("pending_log").notNull().default(""),
+    claimPath: text("claim_path"),
     status: text("status")
       .$type<EnvironmentStatus>()
       .notNull()
@@ -451,18 +565,27 @@ export const environments = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
   },
   (table) => [
-    // A workspace path is claimed per project, not globally. Two projects may
-    // point at the same folder; each gets its own environment for it.
     uniqueIndex("environments_project_host_path_idx").on(
       table.projectId,
       table.hostId,
       table.path,
     ),
-    // Host-leading lookups: every environment on a host, and every project's
-    // environment for one physical directory.
     index("environments_host_path_lookup_idx").on(table.hostId, table.path),
+    uniqueIndex("environments_owner_thread_idx")
+      .on(table.ownerThreadId)
+      .where(sql`${table.ownerThreadId} IS NOT NULL`),
+    index("environments_claim_idx").on(table.hostId, table.claimPath),
     index("environments_project_idx").on(table.projectId),
     index("environments_status_idx").on(table.status),
+    index("environments_provider_instance_idx").on(
+      table.environmentProviderId,
+      table.environmentProviderInstanceKey,
+    ),
+    index("environments_provider_lifecycle_idx")
+      .on(table.environmentProviderId)
+      .where(
+        sql`${table.status} <> 'destroyed' OR ${table.teardownStatus} IS NOT 'removed'`,
+      ),
   ],
 );
 
@@ -477,10 +600,6 @@ export const threads = sqliteTable(
       onDelete: "set null",
     }),
     providerId: text("provider_id").notNull(),
-    // Sticky, thread-level execution overrides. NULL = no override (fall back to
-    // the per-turn request, then the last turn, then project defaults). Consulted
-    // by resolveExecutionOptions so a change applies on the next turn without
-    // sending a message. Execution config, not lifecycle state.
     modelOverride: text("model_override"),
     reasoningLevelOverride: text(
       "reasoning_level_override",
@@ -493,9 +612,14 @@ export const threads = sqliteTable(
     status: text("status", { enum: threadStatusValues })
       .notNull()
       .default("starting"),
+    startupContext: text("startup_context"),
     parentThreadId: text("parent_thread_id").references(
       (): AnySQLiteColumn => threads.id,
       { onDelete: "set null" },
+    ),
+    lifecycleOwnerThreadId: text("lifecycle_owner_thread_id").references(
+      (): AnySQLiteColumn => threads.id,
+      { onDelete: "restrict" },
     ),
     sourceThreadId: text("source_thread_id").references(
       (): AnySQLiteColumn => threads.id,
@@ -504,8 +628,6 @@ export const threads = sqliteTable(
     originKind: text("origin_kind", {
       enum: threadOriginKindValues,
     }),
-    // Id of the plugin that spawned this thread (create origin "plugin").
-    // NULL for every other origin.
     originPluginId: text("origin_plugin_id"),
     visibility: text("visibility", { enum: threadVisibilityValues })
       .notNull()
@@ -514,12 +636,14 @@ export const threads = sqliteTable(
     pinnedAt: integer("pinned_at"),
     pinSortKey: text("pin_sort_key"),
     deletedAt: integer("deleted_at"),
+    storageDeletedAt: integer("storage_deleted_at"),
     lastReadAt: integer("last_read_at"),
     latestAttentionAt: integer("latest_attention_at").notNull(),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
   },
   (table) => [
+    index("threads_project_id_idx").on(table.projectId, table.id),
     index("threads_project_updated_idx").on(table.projectId, table.updatedAt),
     index("threads_project_archived_deleted_idx").on(
       table.projectId,
@@ -531,12 +655,12 @@ export const threads = sqliteTable(
       .on(table.archivedAt, table.deletedAt, table.pinSortKey, table.id)
       .where(sql`${table.pinnedAt} IS NOT NULL`),
     index("threads_environment_idx").on(table.environmentId),
+    index("threads_lifecycle_owner_idx").on(table.lifecycleOwnerThreadId),
     index("threads_parent_idx").on(table.parentThreadId),
     index("threads_source_origin_idx").on(
       table.sourceThreadId,
       table.originKind,
     ),
-    // The side-chat plugin's hourly sweep pages through its own live forks.
     index("threads_origin_plugin_archived_idx").on(
       table.originPluginId,
       table.archivedAt,
@@ -548,6 +672,9 @@ export const threads = sqliteTable(
       table.id,
     ),
     index("threads_archived_status_idx").on(table.archivedAt, table.status),
+    index("threads_deleted_cleanup_idx")
+      .on(table.deletedAt)
+      .where(sql`${table.deletedAt} IS NOT NULL`),
     index("threads_environment_archived_deleted_idx").on(
       table.environmentId,
       table.archivedAt,
@@ -559,9 +686,18 @@ export const threads = sqliteTable(
   ],
 );
 
-// Server-owned tab descriptors for a thread's shared secondary-panel workspace.
-// Presentation state such as active tab, panel visibility, and width remains
-// client-local; this row stores only the ordered durable tab list.
+export const threadPluginMetadata = sqliteTable(
+  "thread_plugin_metadata",
+  {
+    threadId: text("thread_id")
+      .notNull()
+      .references(() => threads.id, { onDelete: "cascade" }),
+    pluginId: text("plugin_id").notNull(),
+    metadataJson: text("metadata_json").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.threadId, table.pluginId] })],
+);
+
 export const threadTabs = sqliteTable("thread_tabs", {
   threadId: text("thread_id")
     .primaryKey()
@@ -609,6 +745,17 @@ export const threadSearchSegments = sqliteTable(
   ],
 );
 
+export const threadConversationOutlines = sqliteTable(
+  "thread_conversation_outlines",
+  {
+    threadId: text("thread_id")
+      .primaryKey()
+      .references(() => threads.id, { onDelete: "cascade" }),
+    projectionKey: text("projection_key").notNull(),
+    itemsJson: text("items_json").notNull(),
+  },
+);
+
 export const threadDynamicContextFileStates = sqliteTable(
   "thread_dynamic_context_file_states",
   {
@@ -649,6 +796,7 @@ export const events = sqliteTable(
     type: text("type").$type<ThreadEventType>().notNull(),
     itemId: text("item_id"),
     itemKind: text("item_kind").$type<ThreadEventItemType>(),
+    parentToolCallId: text("parent_tool_call_id"),
     data: text("data").notNull().default("{}"),
     createdAt: integer("created_at").notNull(),
   },
@@ -657,14 +805,23 @@ export const events = sqliteTable(
       table.threadId,
       table.sequence,
     ),
+    index("events_delegating_item_lookup_idx")
+      .on(table.threadId, table.itemId, table.sequence, table.itemKind)
+      .where(sql`${table.itemKind} IN ('toolCall', 'delegation')`),
+    index("events_plan_steps_thread_sequence_idx")
+      .on(table.threadId, table.sequence)
+      .where(
+        sql`(${table.itemKind} = 'planSteps' AND ${table.type} = 'item/completed') OR ${table.type} = 'turn/plan/updated'`,
+      ),
+    index("events_parent_tool_call_thread_parent_sequence_idx")
+      .on(table.threadId, table.parentToolCallId, table.sequence)
+      .where(sql`${table.parentToolCallId} IS NOT NULL`),
     index("events_thread_type_item_kind_sequence_idx").on(
       table.threadId,
       table.type,
       table.itemKind,
       table.sequence,
     ),
-    // The thread list checks all visible threads. Background-task events are
-    // rare, so this partial index keeps the cold read set small.
     index("events_background_task_thread_type_item_sequence_idx")
       .on(table.threadId, table.type, table.itemId, table.sequence)
       .where(sql`${table.itemKind} = 'backgroundTask'`),
@@ -680,18 +837,22 @@ export const events = sqliteTable(
       table.itemId,
       table.sequence,
     ),
+    index("events_item_lifecycle_thread_item_sequence_idx")
+      .on(table.threadId, table.itemId, table.sequence)
+      .where(
+        sql`${table.type} IN ('item/started', 'item/completed', 'item/backgroundTask/completed')`,
+      ),
     index("events_environment_idx").on(table.environmentId),
+    index("events_provider_identity_idx")
+      .on(table.providerThreadId, table.createdAt)
+      .where(sql`${table.type} = 'thread/identity'`),
     index("events_completed_item_truncation_idx")
       .on(table.itemKind, table.createdAt, table.id)
       .where(sql`${table.type} = 'item/completed'`),
-    // Latest-goal lookup (listLatestGoalEventRowsByThreadIds) runs over every
-    // listed thread on each sidebar bootstrap. Goal events are rare, so this
-    // partial index stays tiny; the query must spell the same type list as
-    // literals for SQLite to accept the partial index.
-    index("events_goal_thread_sequence_idx")
+    index("events_thread_state_thread_sequence_idx")
       .on(table.threadId, table.sequence)
       .where(
-        sql`${table.type} IN ('thread/goal/updated', 'thread/goal/cleared')`,
+        sql`${table.type} IN ('thread/goal/updated', 'thread/goal/cleared', 'thread/extensionState/updated')`,
       ),
     check(
       "events_scope_shape_check",
@@ -700,6 +861,60 @@ export const events = sqliteTable(
         OR
         (${table.scopeKind} = 'thread' AND ${table.turnId} IS NULL)
       )`,
+    ),
+  ],
+);
+
+export const retainedEventOutputs = sqliteTable(
+  "retained_event_outputs",
+  {
+    eventId: text("event_id")
+      .primaryKey()
+      .references(() => events.id, { onDelete: "cascade" }),
+    outputPath: text("output_path").$type<RetainedEventOutputPath>().notNull(),
+    value: text("value").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("retained_event_outputs_expiry_idx").on(
+      table.expiresAt,
+      table.eventId,
+    ),
+  ],
+);
+
+export const threadPruningCursors = sqliteTable(
+  "thread_pruning_cursors",
+  {
+    policy: text("policy").notNull(),
+    scope: text("scope").notNull().default(""),
+    threadId: text("thread_id").references(() => threads.id, {
+      onDelete: "cascade",
+    }),
+    version: integer("version").notNull(),
+    lastThreadId: text("last_thread_id").notNull().default(""),
+    currentThreadId: text("current_thread_id"),
+    step: integer("step").notNull().default(0),
+    sequence: integer("sequence").notNull().default(0),
+    upperSequence: integer("upper_sequence").notNull().default(0),
+    workRevision: integer("work_revision").notNull().default(0),
+    cycle: integer("cycle").notNull().default(0),
+    latestRootSequence: integer("latest_root_sequence").notNull().default(0),
+    latestContextSequence: integer("latest_context_sequence")
+      .notNull()
+      .default(0),
+    probeEventId: text("probe_event_id"),
+    probePhase: integer("probe_phase").notNull().default(0),
+    probeSequence: integer("probe_sequence").notNull().default(0),
+    probeWitnessId: text("probe_witness_id"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.policy, table.scope] }),
+    index("thread_pruning_cursors_thread_idx").on(table.threadId),
+    check(
+      "thread_pruning_cursors_scope_check",
+      sql`${table.scope} = coalesce(${table.threadId}, '')`,
     ),
   ],
 );
@@ -753,6 +968,11 @@ export const promptHistoryEntries = sqliteTable(
       table.requestSequence,
       table.id,
     ),
+    index("prompt_history_entries_created_idx").on(
+      table.createdAt,
+      table.requestSequence,
+      table.id,
+    ),
     index("prompt_history_entries_thread_scope_created_idx").on(
       table.threadId,
       table.scope,
@@ -767,11 +987,31 @@ export const queuedThreadMessages = sqliteTable(
   "queued_thread_messages",
   {
     id: text("id").primaryKey(),
+    // JSON `{ kind, subject }` when this row is one of core's own system
+    // notices rather than somebody's message; NULL for every ordinary row.
+    // Owned by the server, which is the only thing that writes or reads it.
+    systemNotice: text("system_notice"),
     threadId: text("thread_id")
       .notNull()
       .references(() => threads.id, { onDelete: "cascade" }),
     content: text("content").notNull(),
     senderThreadId: text("sender_thread_id"),
+    // How the dispatch this row was queued from was requested, and the plugin
+    // that requested it. On the row rather than read from the request, so a
+    // drained re-attempt decides on the same provenance its first attempt saw.
+    // Both NULL for a send, a retry, a system notice and every row written
+    // before these columns existed: only a thread's first dispatch has one.
+    origin: text("origin", { enum: threadCreateOriginValues }),
+    originPluginId: text("origin_plugin_id"),
+    // Set together: the thread that asked for the dispatch this row was queued
+    // from, and what it counts as. Distinct from `sender_thread_id`, which is
+    // the sender of a message to an existing thread and drives the agent
+    // message prefix — a thread-start has a requester and no message sender,
+    // so without these a drained first message reads as one the user typed.
+    requestedByInitiator: text("requested_by_initiator", {
+      enum: startedOnBehalfOfInitiatorValues,
+    }),
+    requestedByThreadId: text("requested_by_thread_id"),
     model: text("model").notNull(),
     reasoningLevel: text("reasoning_level").notNull(),
     permissionMode: text("permission_mode").$type<PermissionMode>().notNull(),
@@ -779,8 +1019,62 @@ export const queuedThreadMessages = sqliteTable(
     groupWithNext: integer("group_with_next", { mode: "boolean" })
       .notNull()
       .default(false),
+    // Epoch ms this row is scheduled to attempt dispatch. NULL means "as soon
+    // as the other waits clear", which is what an ordinary queued row is.
+    sendAt: integer("send_at"),
+    // JSON `QueuedMessageWaitingOn`: the typed reason this row is queued.
+    // NULL for a plain queued row that is simply next in line behind the
+    // running turn — including every row written before waits were typed, for
+    // which inventing a reason would be a lie.
+    //
+    // A plugin wait's authored reason lives HERE and nowhere else. There is
+    // deliberately no `wait_reason` column: nothing queries on the reason, and
+    // every read that renders it already has the whole row in hand.
+    waitingOn: text("waiting_on"),
+    // Denormalized `plugin:<id>` owner of a plugin wait, NULL otherwise.
+    // Unlike the reason, this IS queried — the orphan sweep and the
+    // per-plugin release both need "every row this plugin holds" as an
+    // indexed equality lookup, which JSON cannot serve. Written only by the
+    // same statement that writes `waiting_on`, derived from it, so the two
+    // cannot drift.
+    waitHolder: text("wait_holder").$type<QueuedMessageWaitHolder>(),
+    // Why this row's last DRAIN attempt failed outright, NULL when it has not
+    // failed one. Its own column rather than a shape inside `waiting_on`
+    // because writing a wait rewrites that column wholesale on every attempt, which
+    // would erase a failure recorded there before anybody could read it. The
+    // row stays waiting on whatever it was waiting on; this only says what went
+    // wrong the last time the drain tried to send it.
+    failureReason: text("failure_reason"),
+    // How many drain attempts in a row have failed, and when the next
+    // automatic one may run. Together they make a failure a bounded retry
+    // instead of a terminal state: the condition that failed a dispatch is
+    // usually the one a restart just created, so the row goes again on a
+    // widening delay and only stops when the budget is spent. `next_attempt_at`
+    // NULL beside a non-NULL `failure_reason` IS that spent budget — the row
+    // now waits for a person. A fresh, successful statement of the row's wait
+    // resets both, because the attempt that wrote it learned something newer
+    // than the failure did.
+    failureCount: integer("failure_count").notNull().default(0),
+    nextAttemptAt: integer("next_attempt_at"),
+    payloadKind: text("payload_kind")
+      .$type<QueuedMessagePayloadKind>()
+      .notNull()
+      .default("inline"),
+    // Set together, and only on a `retry` row: the ORIGINAL request this row
+    // re-submits, which attempt it is (2 is the first retry), and why it is
+    // being retried in the retrier's words ("Rate limited").
+    //
+    // The reason is a column of the retry rather than part of `waiting_on`
+    // because a retry can wait on the clock, on a plugin, or on nothing, and
+    // the reason outlives all three: it is a fact about the retry, not about
+    // what is currently holding it, so a re-queue that rewrites the wait must
+    // not erase it.
+    retryOfTurnRequestId: text("retry_of_turn_request_id"),
+    retryAttempt: integer("retry_attempt"),
+    retryReason: text("retry_reason"),
     claimedAt: integer("claimed_at"),
     claimToken: text("claim_token"),
+    editHeldUntil: integer("edit_held_until"),
     sortKey: text("sort_key").notNull(),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
@@ -796,9 +1090,20 @@ export const queuedThreadMessages = sqliteTable(
       table.sortKey,
       table.id,
     ),
+    // The due-scheduled sweep: "every unclaimed row whose send_at has
+    // arrived", ordered by when it came due. Partial on the two liveness
+    // predicates so the index holds only rows the sweep can actually act on.
+    index("queued_thread_messages_due_idx")
+      .on(table.sendAt, table.id)
+      .where(
+        sql`${table.sendAt} IS NOT NULL AND ${table.claimedAt} IS NULL AND ${table.claimToken} IS NULL`,
+      ),
+    // Plugin-holder lookup for the orphan sweep and per-plugin release.
+    index("queued_thread_messages_wait_holder_idx")
+      .on(table.waitHolder, table.id)
+      .where(sql`${table.waitHolder} IS NOT NULL`),
   ],
 );
-
 export const hostDaemonSessions = sqliteTable(
   "host_daemon_sessions",
   {
@@ -808,7 +1113,6 @@ export const hostDaemonSessions = sqliteTable(
       .references(() => hosts.id, { onDelete: "cascade" }),
     instanceId: text("instance_id").notNull(),
     hostName: text("host_name").notNull(),
-    hostType: text("host_type").$type<HostType>().notNull(),
     dataDir: text("data_dir").notNull(),
     protocolVersion: integer("protocol_version").notNull(),
     heartbeatIntervalMs: integer("heartbeat_interval_ms").notNull(),
@@ -836,6 +1140,26 @@ export const hostDaemonSessions = sqliteTable(
       table.closedAt,
       table.id,
     ),
+  ],
+);
+
+export const providerModelCatalogs = sqliteTable(
+  "provider_model_catalogs",
+  {
+    hostId: text("host_id")
+      .notNull()
+      .references(() => hosts.id, { onDelete: "cascade" }),
+    providerId: text("provider_id").notNull(),
+    scopeKey: text("scope_key").notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    modelsJson: text("models_json").notNull(),
+    selectedOnlyModelsJson: text("selected_only_models_json").notNull(),
+    fetchedAt: integer("fetched_at").notNull(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.hostId, table.providerId, table.scopeKey],
+    }),
   ],
 );
 
@@ -933,4 +1257,105 @@ export const pendingInteractions = sqliteTable(
       table.createdAt,
     ),
   ],
+);
+
+export const environmentHookOperations = sqliteTable(
+  "environment_hook_operations",
+  {
+    id: text("id").primaryKey(),
+    operationId: text("operation_id").notNull(),
+    hostId: text("host_id").notNull(),
+    path: text("path").notNull(),
+    kind: text("kind").$type<"setup" | "teardown">().notNull(),
+    startedAt: integer("started_at").notNull(),
+    finishedAt: integer("finished_at"),
+    error: text("error"),
+  },
+);
+
+export const projectAttachments = sqliteTable(
+  "project_attachments",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    storedPath: text("stored_path").notNull(),
+    originalName: text("original_name").notNull(),
+    mimeType: text("mime_type"),
+    sizeBytes: integer("size_bytes").notNull(),
+    createdAt: integer("created_at").notNull(),
+    readyAt: integer("ready_at"),
+    deletionClaimedAt: integer("deletion_claimed_at"),
+  },
+  (table) => [
+    uniqueIndex("project_attachments_project_path_idx").on(
+      table.projectId,
+      table.storedPath,
+    ),
+    index("project_attachments_project_created_idx").on(
+      table.projectId,
+      table.createdAt,
+    ),
+    index("project_attachments_deletion_idx")
+      .on(table.projectId, table.deletionClaimedAt, table.id)
+      .where(sql`${table.deletionClaimedAt} IS NOT NULL`),
+    check("project_attachments_size_check", sql`${table.sizeBytes} >= 0`),
+  ],
+);
+
+export const projectAttachmentThreads = sqliteTable(
+  "project_attachment_threads",
+  {
+    attachmentId: text("attachment_id")
+      .notNull()
+      .references(() => projectAttachments.id, { onDelete: "cascade" }),
+    threadId: text("thread_id")
+      .notNull()
+      .references(() => threads.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.attachmentId, table.threadId] }),
+    index("project_attachment_threads_thread_idx").on(table.threadId),
+  ],
+);
+
+export const threadPruningWork = sqliteTable(
+  "thread_pruning_work",
+  {
+    policy: text("policy").notNull(),
+    threadId: text("thread_id")
+      .notNull()
+      .references(() => threads.id, { onDelete: "cascade" }),
+    revision: integer("revision").notNull().default(1),
+  },
+  (table) => [
+    primaryKey({ columns: [table.policy, table.threadId] }),
+    index("thread_pruning_work_thread_idx").on(table.threadId),
+  ],
+);
+
+export const projectAttachmentBackfills = sqliteTable(
+  "project_attachment_backfills",
+  {
+    projectId: text("project_id")
+      .primaryKey()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    phase: text("phase")
+      .$type<
+        | "files"
+        | "events"
+        | "queue"
+        | "history-thread"
+        | "history-project"
+        | "done"
+      >()
+      .notNull(),
+    threadCursor: text("thread_cursor").notNull(),
+    inputCursor: integer("input_cursor").notNull(),
+    inputId: text("input_id").notNull(),
+    inputSequence: integer("input_sequence").notNull(),
+    attemptedAt: integer("attempted_at").notNull(),
+    error: text("error"),
+  },
 );

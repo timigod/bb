@@ -17,6 +17,7 @@ export function useWebSocket(): void {
     const unsubscribeConnected = wsManager.onConnected(
       cacheEffects.handleConnected,
     );
+    const unsubscribeResumed = wsManager.onResumed(cacheEffects.handleResumed);
     const unsubscribe = wsManager.onChanged((message) => {
       cacheEffects.handleChanged(message);
       deletedResourceRouteChangeRef.current(message);
@@ -27,9 +28,8 @@ export function useWebSocket(): void {
     return () => {
       cacheEffects.dispose();
       unsubscribeConnected();
+      unsubscribeResumed();
       unsubscribe();
     };
-    // Route deletion handling is route-derived. Keep it behind a ref so
-    // navigation cannot dispose cache effects and drop debounced invalidations.
   }, [queryClient]);
 }

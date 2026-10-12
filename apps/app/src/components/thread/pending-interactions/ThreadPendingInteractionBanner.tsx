@@ -1,63 +1,78 @@
-import { useMemo, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import {
+  PendingInteractionShell,
+  type PendingInteractionSourceThread,
+} from "./PendingInteractionShell";
+import { useMemo, useState, type ReactNode } from "react";
 import {
   assertNever,
   buildPendingInteractionApprovalResolution,
+  describePendingInteractionToolUse,
   formatPendingInteractionSubjectDetailLines,
+  type PendingInteractionToolUseAsk,
 } from "@bb/core-ui";
 import { extractShellCommandFromString } from "@bb/thread-view";
 import {
-  isApprovalPendingInteractionPayload,
-  isUserQuestionPendingInteractionPayload,
+  isPluginPendingInteraction,
   type ApprovalPendingInteractionPayload,
   type PendingInteraction,
   type PendingInteractionApprovalDecision,
   type PendingInteractionApprovalSubject,
   type PendingInteractionResolution,
-  type UserQuestionPendingInteractionPayload,
+  type PendingInteractionUserQuestionQuestion,
 } from "@bb/domain";
 import { Button } from "@bb/shared-ui/button";
-import { ExpandableLine } from "@/components/ui/expandable-line.js";
 import { Icon } from "@bb/shared-ui/icon";
 import { MarkdownPreview } from "@/components/ui/markdown-preview.js";
 import { getDetailScrollMaxHeightClass } from "@/components/ui/detail-scroll-size.js";
 import { UserQuestionAnswerForm } from "@/components/thread/user-questions/UserQuestionInteractionContent.js";
 import { useResolveThreadPendingInteraction } from "@/hooks/mutations/thread-interaction-mutations";
+import { PluginPendingInteractionComposer } from "@/components/plugin/PluginPendingInteractionComposer";
+import {
+  classifyInteractionRequest,
+  type InteractionRequestView,
+} from "./interaction-request";
 import { getMutationErrorMessage } from "@/lib/mutation-errors";
+import {
+  presentationIconName,
+  presentationTintStyle,
+} from "@/components/thread/timeline/presentation-display";
+import { PluginCompactIconMask } from "@/components/plugin/PluginIcon";
+import { usePluginIconUrl } from "@/lib/plugin-logos";
 import { cn } from "@bb/shared-ui/lib/utils";
 
-interface ThreadPendingInteractionSourceThread {
-  href: string;
-  title: string;
-}
-
-interface ThreadPendingInteractionBannerProps {
-  interaction: PendingInteraction;
-  sourceThread?: ThreadPendingInteractionSourceThread;
+interface ThreadPendingInteractionBannersProps {
+  interactions: readonly PendingInteraction[];
+  sourceThread?: PendingInteractionSourceThread;
   threadId: string;
 }
+
+interface PendingInteractionBannerProps {
+  interaction: PendingInteraction;
+  sourceThread?: PendingInteractionSourceThread;
+  threadId: string;
+  collapsedByDefault: boolean;
+}
+
+type ApprovalBannerSubject = Extract<
+  InteractionRequestView,
+  { family: "approval" }
+>["subject"];
 
 interface ApprovalPendingInteractionBannerProps {
   interaction: PendingInteraction;
   payload: ApprovalPendingInteractionPayload;
-  sourceThread?: ThreadPendingInteractionSourceThread;
+  subject: ApprovalBannerSubject;
+  sourceThread?: PendingInteractionSourceThread;
   threadId: string;
+  collapsedByDefault: boolean;
 }
 
 interface UserQuestionPendingInteractionBannerProps {
   interaction: PendingInteraction;
-  payload: UserQuestionPendingInteractionPayload;
-  sourceThread?: ThreadPendingInteractionSourceThread;
+  questions: readonly PendingInteractionUserQuestionQuestion[];
+  sourceThread?: PendingInteractionSourceThread;
   threadId: string;
-}
-
-interface BannerShellProps {
-  /** Heading line. Omitted when the body supplies its own (e.g. the question form). */
-  title?: string;
-  errorMessage?: string | null;
-  footer?: ReactNode;
-  children?: ReactNode;
-  sourceThread?: ThreadPendingInteractionSourceThread;
+  collapsedByDefault: boolean;
 }
 
 interface ApprovalSubject {
@@ -65,107 +80,135 @@ interface ApprovalSubject {
   body: ReactNode;
 }
 
+const COMMAND_PREVIEW_LINE_COUNT = 4;
+const APPROVAL_DECISION_ORDER: Record<
+  PendingInteractionApprovalDecision,
+  number
+> = { deny: 0, allow_for_session: 1, allow_once: 2 };
+
 interface BuildApprovalSubjectInput {
   interaction: PendingInteraction;
   payload: ApprovalPendingInteractionPayload;
+  subject: ApprovalBannerSubject;
 }
 
-export function ThreadPendingInteractionBanner({
+interface UseApprovalDecisionSubmissionArgs {
+  fallbackMessage: string;
+  interaction: PendingInteraction;
+  threadId: string;
+}
+
+interface ApprovalDecisionSubmission {
+  errorMessage: string | null;
+  loadingDecision: PendingInteractionApprovalDecision | null;
+  submitDecision: (decision: PendingInteractionApprovalDecision) => void;
+  submitDisabled: boolean;
+}
+
+export function ThreadPendingInteractionBanners({
+  interactions,
+  sourceThread,
+  threadId,
+}: ThreadPendingInteractionBannersProps) {
+  return interactions.map((interaction, index) => (
+    <PendingInteractionBanner
+      key={interaction.id}
+      interaction={interaction}
+      sourceThread={sourceThread}
+      threadId={threadId}
+      collapsedByDefault={index > 0}
+    />
+  ));
+}
+
+function PendingInteractionBanner({
   interaction,
   sourceThread,
   threadId,
-}: ThreadPendingInteractionBannerProps) {
-  if (interaction.payload.kind === "plugin") {
-    return null;
-  }
-  if (isUserQuestionPendingInteractionPayload(interaction.payload)) {
+  collapsedByDefault,
+}: PendingInteractionBannerProps) {
+  const request = classifyInteractionRequest(interaction);
+  if (request.family === "approval") {
     return (
-      <ThreadUserQuestionPendingInteractionBanner
+      <ApprovalPendingInteractionBanner
         interaction={interaction}
-        payload={interaction.payload}
+        payload={request.payload}
+        subject={request.subject}
         sourceThread={sourceThread}
         threadId={threadId}
+        collapsedByDefault={collapsedByDefault}
       />
     );
   }
-
-  if (!isApprovalPendingInteractionPayload(interaction.payload)) {
-    return assertNever(interaction.payload);
-  }
-
-  return (
-    <ApprovalPendingInteractionBanner
-      interaction={interaction}
-      payload={interaction.payload}
-      sourceThread={sourceThread}
-      threadId={threadId}
-    />
-  );
-}
-
-function BannerShell({
-  title,
-  errorMessage,
-  footer,
-  children,
-  sourceThread,
-}: BannerShellProps) {
-  return (
-    <div className="mb-2 rounded-lg border border-border bg-surface-recessed px-4 py-3 text-xs text-muted-foreground">
-      {sourceThread ? (
-        <NavLink
-          to={sourceThread.href}
-          className="mb-1 block text-xs text-muted-foreground no-underline hover:underline"
+  switch (request.kind) {
+    case "user_question":
+      return (
+        <ThreadUserQuestionPendingInteractionBanner
+          interaction={interaction}
+          questions={request.questions}
+          sourceThread={sourceThread}
+          threadId={threadId}
+          collapsedByDefault={collapsedByDefault}
+        />
+      );
+    case "plan_review":
+      return (
+        <PlanReviewRequestBanner
+          interaction={interaction}
+          request={request}
+          sourceThread={sourceThread}
+          threadId={threadId}
+          collapsedByDefault={collapsedByDefault}
+        />
+      );
+    default:
+      return (
+        <div
+          data-testid="plugin-request-banner"
+          data-request-kind={request.kind}
         >
-          From child thread: {sourceThread.title}
-        </NavLink>
-      ) : null}
-      {title ? (
-        <h3 className="min-w-0 text-sm font-semibold text-foreground">
-          <ExpandableLine fullText={title} collapsedClassName="line-clamp-2">
-            {title}
-          </ExpandableLine>
-        </h3>
-      ) : null}
-      {children ? (
-        <div className={title ? "mt-3" : undefined}>{children}</div>
-      ) : null}
-      {footer ? (
-        <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-          {footer}
+          <PluginPendingInteractionComposer
+            sourceThread={sourceThread}
+            collapsedByDefault={collapsedByDefault}
+            interaction={interaction}
+            request={{
+              pluginId: request.pluginId,
+              rendererId: request.name,
+              title: request.title,
+              data: request.data,
+            }}
+            origin={
+              isPluginPendingInteraction(interaction) ? "plugin" : "provider"
+            }
+          />
         </div>
-      ) : null}
-      {errorMessage ? (
-        <div className="mt-2 rounded-md border border-surface-destructive-border bg-surface-destructive px-2 py-1 text-xs text-destructive-text">
-          {errorMessage}
-        </div>
-      ) : null}
-    </div>
-  );
+      );
+  }
 }
 
-function ApprovalPendingInteractionBanner({
+interface PlanReviewRequestBannerProps {
+  interaction: PendingInteraction;
+  request: Extract<InteractionRequestView, { kind: "plan_review" }>;
+  sourceThread?: PendingInteractionSourceThread;
+  threadId: string;
+  collapsedByDefault: boolean;
+}
+
+function useApprovalDecisionSubmission({
+  fallbackMessage,
   interaction,
-  payload,
-  sourceThread,
   threadId,
-}: ApprovalPendingInteractionBannerProps) {
-  const resolvePendingInteraction = useResolveThreadPendingInteraction();
+}: UseApprovalDecisionSubmissionArgs): ApprovalDecisionSubmission {
+  const resolvePendingInteraction =
+    useResolveThreadPendingInteraction(threadId);
   const isResolving = interaction.status === "resolving";
-  const submittedDecision = approvalResolutionDecision(interaction.resolution);
-  const subject = useMemo(
-    () => buildApprovalSubject({ interaction, payload }),
-    [interaction, payload],
-  );
-  const mutationErrorMessage = resolvePendingInteraction.error
+  const errorMessage = resolvePendingInteraction.error
     ? getMutationErrorMessage({
         error: resolvePendingInteraction.error,
-        fallbackMessage: "Failed to resolve pending interaction",
+        fallbackMessage,
         lifecycleOperation: "resolve_interaction",
       })
     : null;
-  const submitDisabled = resolvePendingInteraction.isPending || isResolving;
-
   const submitDecision = (
     decision: PendingInteractionApprovalDecision,
   ): void => {
@@ -174,58 +217,192 @@ function ApprovalPendingInteractionBanner({
       decision,
     );
     void resolvePendingInteraction
-      .mutateAsync({
-        threadId,
-        interactionId: interaction.id,
-        resolution,
-      })
+      .mutateAsync({ threadId, interactionId: interaction.id, resolution })
       .catch(() => {});
   };
+  return {
+    errorMessage,
+    loadingDecision: isResolving
+      ? approvalResolutionDecision(interaction.resolution)
+      : null,
+    submitDecision,
+    submitDisabled: resolvePendingInteraction.isPending || isResolving,
+  };
+}
+
+function PlanReviewRequestBanner({
+  interaction,
+  request,
+  sourceThread,
+  threadId,
+  collapsedByDefault,
+}: PlanReviewRequestBannerProps) {
+  const { errorMessage, loadingDecision, submitDecision, submitDisabled } =
+    useApprovalDecisionSubmission({
+      fallbackMessage: "Failed to resolve plan review",
+      interaction,
+      threadId,
+    });
+  const { approval } = request;
+  const { plan, planFilePath } = request.review;
+  return (
+    <PendingInteractionShell
+      label="Plan review"
+      title={approval.reason ?? "Ready to code?"}
+      expandedByDefault={!collapsedByDefault}
+      errorMessage={errorMessage}
+      sourceThread={sourceThread}
+      testId="plan-review-banner"
+      footer={
+        <ApprovalDecisionButtons
+          decisions={approval.availableDecisions}
+          disabled={submitDisabled}
+          loadingDecision={loadingDecision}
+          onDecide={submitDecision}
+          subjectKind="plan"
+        />
+      }
+    >
+      {() => (
+        <div
+          className="overflow-hidden rounded-lg border border-border bg-card"
+          data-testid="plan-review-request"
+        >
+          <div
+            className={cn(
+              getDetailScrollMaxHeightClass("base"),
+              "overflow-auto px-3 py-2",
+            )}
+          >
+            <MarkdownPreview content={plan} className="text-xs" />
+          </div>
+          {planFilePath ? (
+            <p className="truncate border-t border-border px-3 py-2 font-mono text-xs text-muted-foreground">
+              {planFilePath}
+            </p>
+          ) : null}
+        </div>
+      )}
+    </PendingInteractionShell>
+  );
+}
+
+function unwrapBacktickedCommand(command: string): string {
+  const trimmed = command.trim();
+  return trimmed.length > 2 &&
+    trimmed.startsWith("`") &&
+    trimmed.endsWith("`") &&
+    !trimmed.slice(1, -1).includes("`")
+    ? trimmed.slice(1, -1)
+    : command;
+}
+
+function ApprovalPendingInteractionBanner({
+  interaction,
+  payload,
+  subject,
+  sourceThread,
+  threadId,
+  collapsedByDefault,
+}: ApprovalPendingInteractionBannerProps) {
+  const { errorMessage, loadingDecision, submitDecision, submitDisabled } =
+    useApprovalDecisionSubmission({
+      fallbackMessage: "Failed to resolve pending interaction",
+      interaction,
+      threadId,
+    });
+  const view = useMemo(
+    () => buildApprovalSubject({ interaction, payload, subject }),
+    [interaction, payload, subject],
+  );
 
   return (
-    <BannerShell
-      title={subject.title}
-      errorMessage={mutationErrorMessage}
+    <PendingInteractionShell
+      label="Approval needed"
+      title={view.title}
+      expandedByDefault={!collapsedByDefault}
+      errorMessage={errorMessage}
       sourceThread={sourceThread}
-      footer={payload.availableDecisions.map((decision) => (
-        <ApprovalDecisionButton
-          key={decision}
-          decision={decision}
+      testId="approval-banner"
+      footer={
+        <ApprovalDecisionButtons
+          decisions={payload.availableDecisions}
           disabled={submitDisabled}
-          isLoading={isResolving && submittedDecision === decision}
-          onClick={() => submitDecision(decision)}
-          subjectKind={payload.subject.kind}
+          loadingDecision={loadingDecision}
+          onDecide={submitDecision}
+          subjectKind={subject.kind}
         />
-      ))}
+      }
     >
-      {subject.body}
-    </BannerShell>
+      {() => view.body}
+    </PendingInteractionShell>
   );
 }
 
 function ThreadUserQuestionPendingInteractionBanner({
   interaction,
-  payload,
+  questions,
   sourceThread,
   threadId,
+  collapsedByDefault,
 }: UserQuestionPendingInteractionBannerProps) {
   const isResolving = interaction.status === "resolving";
 
-  // No shell title: the form supplies its own heading (the current question
-  // prompt) plus the question tab strip.
   return (
-    <BannerShell sourceThread={sourceThread}>
-      <UserQuestionAnswerForm
-        interactionId={interaction.id}
-        isResolving={isResolving}
-        questions={payload.questions}
-        threadId={threadId}
-      />
-    </BannerShell>
+    <PendingInteractionShell
+      label={
+        questions.length === 1 ? "Question" : `${questions.length} questions`
+      }
+      expandedByDefault={!collapsedByDefault}
+      sourceThread={sourceThread}
+      testId="user-question-banner"
+    >
+      {() => (
+        <UserQuestionAnswerForm
+          interactionId={interaction.id}
+          isResolving={isResolving}
+          questions={questions}
+          threadId={threadId}
+        />
+      )}
+    </PendingInteractionShell>
   );
 }
 
+interface ApprovalDecisionButtonsProps {
+  decisions: readonly PendingInteractionApprovalDecision[];
+  disabled: boolean;
+  loadingDecision: PendingInteractionApprovalDecision | null;
+  onDecide: (decision: PendingInteractionApprovalDecision) => void;
+  subjectKind: PendingInteractionApprovalSubject["kind"];
+}
+
+function ApprovalDecisionButtons({
+  decisions,
+  disabled,
+  loadingDecision,
+  onDecide,
+  subjectKind,
+}: ApprovalDecisionButtonsProps) {
+  const denyFirst = [...decisions].sort(
+    (left, right) =>
+      APPROVAL_DECISION_ORDER[left] - APPROVAL_DECISION_ORDER[right],
+  );
+  return denyFirst.map((decision, index) => (
+    <ApprovalDecisionButton
+      key={decision}
+      decision={decision}
+      disabled={disabled}
+      isLoading={loadingDecision === decision}
+      onClick={() => onDecide(decision)}
+      subjectKind={subjectKind}
+      className={index === 0 && decision === "deny" ? "mr-auto" : undefined}
+    />
+  ));
+}
+
 interface ApprovalDecisionButtonProps {
+  className?: string;
   decision: PendingInteractionApprovalDecision;
   disabled: boolean;
   isLoading: boolean;
@@ -234,12 +411,17 @@ interface ApprovalDecisionButtonProps {
 }
 
 function ApprovalDecisionButton({
+  className,
   decision,
   disabled,
   isLoading,
   onClick,
   subjectKind,
 }: ApprovalDecisionButtonProps) {
+  const label = labelForApprovalDecision(decision, subjectKind);
+  const spinner = isLoading ? (
+    <Icon name="Spinner" className="size-3 animate-spin" />
+  ) : null;
   return (
     <Button
       type="button"
@@ -247,11 +429,10 @@ function ApprovalDecisionButton({
       variant={approvalDecisionButtonVariant(decision)}
       disabled={disabled}
       onClick={onClick}
+      className={className}
     >
-      {isLoading ? (
-        <Icon name="Spinner" className="size-3 animate-spin" />
-      ) : null}
-      {labelForApprovalDecision(decision, subjectKind)}
+      {spinner}
+      {label}
     </Button>
   );
 }
@@ -259,9 +440,6 @@ function ApprovalDecisionButton({
 function approvalDecisionButtonVariant(
   decision: PendingInteractionApprovalDecision,
 ): "default" | "outline" | "ghost" {
-  // Three-level hierarchy: filled primary for the safest yes, outline for the
-  // longer-lived yes, ghost for the dismissive no. Keeps Deny visible without
-  // letting it compete with the affirmative actions.
   switch (decision) {
     case "allow_once":
       return "default";
@@ -281,105 +459,180 @@ function approvalResolutionDecision(
   return resolution.decision;
 }
 
+function ApprovalDetailList({
+  className,
+  lines,
+}: {
+  className: string;
+  lines: readonly string[];
+}) {
+  return (
+    <ul
+      className={cn(
+        "min-w-0 max-w-full text-xs text-muted-foreground [overflow-wrap:anywhere]",
+        className,
+      )}
+    >
+      {lines.map((line) => (
+        <li key={line}>{line}</li>
+      ))}
+    </ul>
+  );
+}
+
+function ToolUseAskCard({ ask }: { ask: PendingInteractionToolUseAsk }) {
+  const iconUrl = usePluginIconUrl(ask.icon.glyph);
+  return (
+    <div
+      className="min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card px-3 py-2"
+      data-testid="tool-use-ask"
+    >
+      <div className="flex min-w-0 items-center gap-2 text-xs text-foreground">
+        {iconUrl !== undefined ? (
+          <PluginCompactIconMask
+            url={iconUrl}
+            className="size-3.5"
+            style={presentationTintStyle(ask)}
+          />
+        ) : (
+          <Icon
+            name={presentationIconName(ask) ?? "Terminal"}
+            fallback="Terminal"
+            className="size-3.5 shrink-0"
+            style={presentationTintStyle(ask)}
+          />
+        )}
+        <span className="min-w-0 truncate font-mono">
+          {ask.headline ?? ask.tool}
+        </span>
+      </div>
+      {ask.headline !== null ? (
+        <p className="mt-1 text-xs text-muted-foreground">Tool: {ask.tool}</p>
+      ) : null}
+      {ask.detail !== null ? (
+        <MarkdownPreview
+          content={ask.detail}
+          className="mt-1 text-xs text-muted-foreground"
+          imagePolicy="alt-text"
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function CommandPreview({
+  command,
+  detailLines,
+}: {
+  command: string;
+  detailLines: readonly string[];
+}) {
+  const [showsAllLines, setShowsAllLines] = useState(false);
+  const lines = command.split("\n");
+  const hiddenLineCount = Math.max(
+    0,
+    lines.length - COMMAND_PREVIEW_LINE_COUNT,
+  );
+  const visibleCommand =
+    showsAllLines || hiddenLineCount === 0
+      ? command
+      : lines.slice(0, COMMAND_PREVIEW_LINE_COUNT).join("\n");
+  return (
+    <div
+      className="min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card"
+      data-testid="command-preview"
+    >
+      <pre
+        className={cn(
+          getDetailScrollMaxHeightClass("base"),
+          "max-w-full overflow-auto whitespace-pre px-3 py-2 font-mono text-xs leading-relaxed text-foreground",
+        )}
+      >
+        $ {visibleCommand}
+      </pre>
+      {hiddenLineCount > 0 ? (
+        <button
+          type="button"
+          onClick={() => setShowsAllLines((value) => !value)}
+          className="block w-full border-t border-border px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-state-hover hover:text-foreground"
+        >
+          {showsAllLines
+            ? "Show less"
+            : hiddenLineCount === 1
+              ? "Show 1 more line"
+              : `Show ${hiddenLineCount} more lines`}
+        </button>
+      ) : null}
+      {detailLines.length > 0 ? (
+        <ApprovalDetailList
+          className="border-t border-border px-3 py-2"
+          lines={detailLines}
+        />
+      ) : null}
+    </div>
+  );
+}
+
 function buildApprovalSubject({
   interaction,
   payload,
+  subject,
 }: BuildApprovalSubjectInput): ApprovalSubject {
-  switch (payload.subject.kind) {
+  switch (subject.kind) {
     case "command": {
-      const rawCommand = payload.subject.command;
+      const rawCommand = subject.command;
       const command = rawCommand
-        ? (extractShellCommandFromString(rawCommand) ?? rawCommand)
+        ? unwrapBacktickedCommand(
+            extractShellCommandFromString(rawCommand) ?? rawCommand,
+          )
         : null;
-      // The cwd value is a self-describing absolute path, so the "Cwd: "
-      // prefix from the shared formatter reads as redundant in the banner.
-      // Strip the label here; other prefixed lines (Action:, Session grant:)
-      // need their labels to be readable.
       const detailLines = formatPendingInteractionSubjectDetailLines(
         interaction,
       )
-        .filter((line) => !line.startsWith("Command: "))
+        .filter(
+          (line) =>
+            !line.startsWith("Command: ") &&
+            line !== `Action: ${rawCommand}` &&
+            line !== `Action: ${command}`,
+        )
         .map((line) =>
           line.startsWith("Cwd: ") ? line.slice("Cwd: ".length) : line,
         );
       return {
         title: payload.reason ?? "Do you want to run this command?",
         body: command ? (
-          <div className="overflow-hidden rounded-lg border border-border bg-card">
-            <pre
-              className={cn(
-                getDetailScrollMaxHeightClass("base"),
-                "overflow-auto whitespace-pre px-3 py-2 font-mono text-xs leading-relaxed text-foreground",
-              )}
-            >
-              $ {command}
-            </pre>
-            {detailLines.length > 0 ? (
-              <ul className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
-                {detailLines.map((line) => (
-                  <li key={line}>{line}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
+          <CommandPreview command={command} detailLines={detailLines} />
         ) : null,
       };
     }
-    case "file_change": {
-      const detailLines =
-        formatPendingInteractionSubjectDetailLines(interaction);
-      return {
-        title: payload.reason ?? "Do you want to make these changes?",
-        body:
-          detailLines.length > 0 ? (
-            <ul className="rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground">
-              {detailLines.map((line) => (
-                <li key={line}>{line}</li>
-              ))}
-            </ul>
-          ) : null,
-      };
-    }
+    case "file_change":
     case "permission_grant": {
       const detailLines =
         formatPendingInteractionSubjectDetailLines(interaction);
       return {
-        title: payload.reason ?? "Do you want to grant this permission?",
+        title:
+          payload.reason ??
+          (subject.kind === "file_change"
+            ? "Do you want to make these changes?"
+            : "Do you want to grant this permission?"),
         body:
           detailLines.length > 0 ? (
-            <ul className="rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground">
-              {detailLines.map((line) => (
-                <li key={line}>{line}</li>
-              ))}
-            </ul>
+            <ApprovalDetailList
+              className="rounded-lg border border-border bg-card px-3 py-2"
+              lines={detailLines}
+            />
           ) : null,
       };
     }
-    case "plan": {
-      const { plan, planFilePath } = payload.subject;
+    case "tool_use": {
+      const ask = describePendingInteractionToolUse({ ...payload, subject });
       return {
-        title: payload.reason ?? "Ready to code?",
-        body: (
-          <div className="overflow-hidden rounded-lg border border-border bg-card">
-            <div
-              className={cn(
-                getDetailScrollMaxHeightClass("base"),
-                "overflow-auto px-3 py-2",
-              )}
-            >
-              <MarkdownPreview content={plan} className="text-xs" />
-            </div>
-            {planFilePath ? (
-              <p className="truncate border-t border-border px-3 py-2 font-mono text-xs text-muted-foreground">
-                {planFilePath}
-              </p>
-            ) : null}
-          </div>
-        ),
+        title: ask.title,
+        body: <ToolUseAskCard ask={ask} />,
       };
     }
     default:
-      return assertNever(payload.subject);
+      return assertNever(subject);
   }
 }
 
@@ -387,8 +640,6 @@ function labelForApprovalDecision(
   decision: PendingInteractionApprovalDecision,
   subjectKind: PendingInteractionApprovalSubject["kind"],
 ): string {
-  // A plan verdict decides whether the work starts, not what the agent may
-  // touch, so the permission vocabulary would misdescribe both buttons.
   if (subjectKind === "plan") {
     return decision === "deny" ? "Keep planning" : "Approve plan";
   }

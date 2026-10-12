@@ -117,27 +117,33 @@ export function getThreadTimelineInvalidationQueryKeys({
       ];
 }
 
-/**
- * Timeline-window-only invalidation for realtime `events-appended` /
- * `thread-created` / `thread-deleted`. Deliberately excludes the
- * turn-summary-details prefix: a completed turn's expanded detail is a fixed
- * `sourceSeqStart..sourceSeqEnd` range and never changes once the turn is done,
- * so re-fetching every open detail panel on every appended-event batch is pure
- * waste during streaming. Mutations that can rewrite history (fork/retry/edit)
- * still use {@link getThreadTimelineInvalidationQueryKeys}, which invalidates
- * both prefixes.
- */
+export function getThreadConversationOutlineInvalidationQueryKeys({
+  threadId,
+}: ThreadScopedInvalidationArgs): QueryKey[] {
+  return threadId
+    ? [threadConversationOutlineQueryKeyPrefix(threadId)]
+    : [allThreadConversationOutlineQueryKeyPrefix()];
+}
+
 export function getThreadTimelineWindowInvalidationQueryKeys({
+  threadId,
+}: ThreadScopedInvalidationArgs): QueryKey[] {
+  return threadId
+    ? [threadTimelineQueryKeyPrefix(threadId)]
+    : [allThreadTimelineQueryKeyPrefix()];
+}
+
+export function getThreadCompactedHistoryInvalidationQueryKeys({
   threadId,
 }: ThreadScopedInvalidationArgs): QueryKey[] {
   return threadId
     ? [
         threadTimelineQueryKeyPrefix(threadId),
-        threadConversationOutlineQueryKeyPrefix(threadId),
+        threadTimelineTurnSummaryDetailsQueryKeyPrefix(threadId),
       ]
     : [
         allThreadTimelineQueryKeyPrefix(),
-        allThreadConversationOutlineQueryKeyPrefix(),
+        allThreadTimelineTurnSummaryDetailsQueryKeyPrefix(),
       ];
 }
 

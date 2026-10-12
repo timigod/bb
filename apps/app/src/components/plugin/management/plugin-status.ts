@@ -5,25 +5,21 @@ import type { PluginListItem } from "@/hooks/queries/plugin-settings-queries";
 export interface PluginRuntimeStatusPresentation {
   icon: IconName;
   label: string;
-  tone: "error" | "warning";
+  tone: "error" | "warning" | "muted";
   condition: string;
   recovery: string;
 }
 
-export type PluginRuntimeStatusDefinition = Omit<
+type PluginRuntimeStatusDefinition = Omit<
   PluginRuntimeStatusPresentation,
   "condition" | "recovery"
 >;
 
-/**
- * Canonical user-facing projection of plugin runtime health. Enabled/disabled
- * remains lifecycle state, while updates remain release state; neither is
- * folded into this health vocabulary.
- */
-export const PLUGIN_RUNTIME_STATUS_DEFINITIONS: Record<
+const PLUGIN_RUNTIME_STATUS_DEFINITIONS: Record<
   PluginRuntimeStatus,
   PluginRuntimeStatusDefinition | null
 > = {
+  starting: { icon: "Clock", label: "Starting", tone: "muted" },
   running: null,
   error: { icon: "CircleX", label: "Failed", tone: "error" },
   incompatible: {
@@ -41,36 +37,34 @@ export const PLUGIN_RUNTIME_STATUS_DEFINITIONS: Record<
   degraded: { icon: "AlertTriangle", label: "Degraded", tone: "warning" },
 };
 
-export function pluginRuntimeStatusDefinition(
-  status: PluginRuntimeStatus,
-): PluginRuntimeStatusDefinition | null {
-  return PLUGIN_RUNTIME_STATUS_DEFINITIONS[status];
+function configuredPathUnavailable(plugin: PluginListItem): boolean {
+  return /\bconfigured\b.*\b(directory|folder|path)\b/iu.test(
+    plugin.statusDetail ?? "",
+  );
 }
 
 function pluginRuntimeRecovery(plugin: PluginListItem): string {
   switch (plugin.status) {
     case "error":
-      if (plugin.source.startsWith("path:")) {
-        return "Fix the plugin, then reload it.";
-      }
-      if (plugin.provenance === "builtin") {
-        return "Reload the plugin. If it still fails, restart bb.";
-      }
-      return "Reload the plugin. If it still fails, remove it and install it again.";
+      if (configuredPathUnavailable(plugin))
+        return "Check the path, then reload.";
+      return plugin.source.startsWith("path:")
+        ? "Fix the plugin, then reload."
+        : "Try reloading it.";
     case "incompatible":
       return plugin.provenance === "builtin"
-        ? "Update bb to load a compatible bundled plugin."
-        : "Install a version compatible with this bb.";
+        ? "Update bb."
+        : "Install a compatible version.";
     case "missing":
+      if (plugin.source.startsWith("path:"))
+        return "Restore the folder, then reload.";
       return plugin.provenance === "builtin"
-        ? "Restart bb. If the files are still missing, reinstall bb."
-        : "Remove the plugin, then install it again from its source.";
+        ? "Update or reinstall bb."
+        : "Reinstall from its source.";
     case "needs-configuration":
-      return plugin.hasSettings
-        ? "Complete the Configuration section; bb reloads the plugin after you save."
-        : "Add the required configuration, then reload the plugin.";
+      return plugin.hasSettings ? "" : "Then reload.";
     case "degraded":
-      return "Wait a moment, then reload the plugin.";
+      return "Wait, then reload.";
     default:
       return "";
   }
@@ -78,16 +72,24 @@ function pluginRuntimeRecovery(plugin: PluginListItem): string {
 
 function pluginRuntimeCondition(plugin: PluginListItem): string {
   switch (plugin.status) {
+    case "starting":
+      return "The plugin is starting.";
     case "error":
-      return "The plugin couldn't start.";
+      return configuredPathUnavailable(plugin)
+        ? "Configured folder unavailable."
+        : "The plugin couldn't start.";
     case "incompatible":
-      return "This plugin version isn't compatible with your version of bb.";
+      return "This version is incompatible with bb.";
     case "missing":
-      return "The plugin's files are missing.";
-    case "needs-configuration":
-      return "Required settings are incomplete.";
+      return "Plugin files are missing.";
+    case "needs-configuration": {
+      const detail = plugin.statusDetail?.trim();
+      return detail && detail.length <= 60
+        ? detail
+        : "Complete the required settings.";
+    }
     case "degraded":
-      return "A background service is still stopping.";
+      return "A service is still stopping.";
     default:
       return "";
   }
@@ -96,7 +98,7 @@ function pluginRuntimeCondition(plugin: PluginListItem): string {
 export function pluginRuntimeStatusPresentation(
   plugin: PluginListItem,
 ): PluginRuntimeStatusPresentation | null {
-  const definition = pluginRuntimeStatusDefinition(plugin.status);
+  const definition = PLUGIN_RUNTIME_STATUS_DEFINITIONS[plugin.status];
   if (definition === null) return null;
   return {
     ...definition,
@@ -105,21 +107,13 @@ export function pluginRuntimeStatusPresentation(
   };
 }
 
-/**
- * A plugin row earns at most one signal. Updates use a pill; abnormal runtime
- * health uses a specific icon action that opens plugin details. A failed update
- * that rolled back outranks an available update — the user should know a
- * rollback happened before applying anything else. Newer-but-incompatible
- * releases and pinned sources never signal the list; they surface on the detail
- * page.
- */
 export type PluginRowSignal =
   | { kind: "update"; version: string }
   | {
       kind: "status";
       icon: IconName;
       label: string;
-      tone: "error" | "warning";
+      tone: PluginRuntimeStatusPresentation["tone"];
       detail: string | null;
     };
 
@@ -127,8 +121,6 @@ export function pluginRowSignal(
   plugin: PluginListItem,
 ): PluginRowSignal | null {
   const state = plugin.updateState;
-  // A rollback wins the row's single signal slot even when the same plugin
-  // still has an available candidate.
   if (state.lastFailure !== null) {
     return {
       kind: "status",
@@ -151,16 +143,17 @@ export function pluginRowSignal(
       detail: plugin.statusDetail,
     };
   }
+  if (state.outcome === "unavailable") {
+    return {
+      kind: "status",
+      icon: "AlertTriangle",
+      label: "Needs attention",
+      tone: "warning",
+      detail: state.detail,
+    };
+  }
   if (state.availableVersion !== null) {
     return { kind: "update", version: state.availableVersion };
   }
   return null;
-}
-
-/** The detail-page banner mirrors the row pill's update case. */
-export function pluginUpdateAvailableVersion(
-  plugin: PluginListItem,
-): string | null {
-  const signal = pluginRowSignal(plugin);
-  return signal?.kind === "update" ? signal.version : null;
 }

@@ -1,41 +1,17 @@
-import { PERSONAL_PROJECT_ID } from "@bb/domain";
-import type { BaseBranchSpec, CreateThreadRequest } from "@bb/server-contract";
+import type { EnvironmentMachineSelection, JsonValue } from "@bb/domain";
+import type {
+  CreateThreadRequest,
+  SystemEnvironmentProvider,
+} from "@bb/server-contract";
 import { parseEnvironmentValue } from "@/components/pickers/environment-picker-value";
 
-export interface RootComposeSelectedBranch {
-  name: string;
-  isNew: boolean;
-}
-
-export interface ResolveRootComposeThreadEnvironmentArgs {
-  defaultBranch: string | null | undefined;
-  defaultWorktreeBaseBranch: string | null | undefined;
+interface ResolveRootComposeThreadEnvironmentArgs {
   environmentValue: string;
   projectId: string | undefined;
-  selectedBranch: RootComposeSelectedBranch | null;
-}
-
-interface ResolveManagedBaseBranchArgs {
-  defaultBranch: string | null | undefined;
-  defaultWorktreeBaseBranch: string | null | undefined;
-  selectedBranch: RootComposeSelectedBranch | null;
-}
-
-function resolveManagedBaseBranch(
-  args: ResolveManagedBaseBranchArgs,
-): BaseBranchSpec {
-  if (!args.selectedBranch) {
-    if (
-      args.defaultWorktreeBaseBranch &&
-      args.defaultWorktreeBaseBranch !== args.defaultBranch
-    ) {
-      return { kind: "named", name: args.defaultWorktreeBaseBranch };
-    }
-
-    return { kind: "default" };
-  }
-
-  return { kind: "named", name: args.selectedBranch.name };
+  environmentProviders?: readonly SystemEnvironmentProvider[];
+  providerHostId?: string | null;
+  providerMachine?: EnvironmentMachineSelection | null;
+  providerInputs?: JsonValue | null;
 }
 
 export function resolveRootComposeThreadEnvironment(
@@ -45,69 +21,28 @@ export function resolveRootComposeThreadEnvironment(
   const parsed = parseEnvironmentValue(args.environmentValue);
   if (!parsed) return null;
 
-  if (parsed.type === "reuse") {
-    // Bare reuse value (mode picked but no worktree chosen yet) is an
-    // incomplete state — submit is disabled by returning null.
-    if (parsed.environmentId === null) return null;
-    return { type: "reuse", environmentId: parsed.environmentId };
-  }
-
-  if (parsed.type === "host") {
-    if (args.projectId === PERSONAL_PROJECT_ID) {
-      return {
-        type: "host",
-        hostId: parsed.hostId,
-        workspace: { type: "personal" },
-      };
-    }
-
-    if (parsed.mode === "worktree") {
-      return {
-        type: "host",
-        hostId: parsed.hostId,
-        workspace: {
-          type: "managed-worktree",
-          baseBranch: resolveManagedBaseBranch({
-            defaultBranch: args.defaultBranch,
-            defaultWorktreeBaseBranch: args.defaultWorktreeBaseBranch,
-            selectedBranch: args.selectedBranch,
-          }),
-        },
-      };
-    }
-
-    if (args.selectedBranch?.isNew) {
-      return {
-        type: "host",
-        hostId: parsed.hostId,
-        workspace: {
-          type: "unmanaged",
-          path: null,
-          branch: {
-            kind: "new",
-            baseBranch: args.selectedBranch.name,
-          },
-        },
-      };
-    }
-
+  if (parsed.type === "provider") {
+    const provider = args.environmentProviders?.find(
+      (candidate) => candidate.id === parsed.environmentProviderId,
+    );
+    if (provider === undefined) return null;
+    const machine =
+      args.providerMachine ??
+      (args.providerHostId === undefined || args.providerHostId === null
+        ? null
+        : { type: "existing" as const, hostId: args.providerHostId });
+    if (machine === null && !provider.machineProviderId) return null;
+    const inputs =
+      provider.inputs === null ? null : (args.providerInputs ?? null);
+    if (provider.inputs !== null && inputs === null) return null;
     return {
-      type: "host",
-      hostId: parsed.hostId,
-      workspace: {
-        type: "unmanaged",
-        path: null,
-        ...(args.selectedBranch
-          ? {
-              branch: {
-                kind: "existing",
-                name: args.selectedBranch.name,
-              },
-            }
-          : {}),
-      },
+      type: "provider",
+      environmentProviderId: provider.id,
+      ...(machine === null ? {} : { machine }),
+      inputs,
     };
   }
 
-  return null;
+  if (parsed.environmentId === null) return null;
+  return { type: "reuse", environmentId: parsed.environmentId };
 }

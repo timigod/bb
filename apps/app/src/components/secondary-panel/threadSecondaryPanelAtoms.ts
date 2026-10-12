@@ -1,7 +1,11 @@
 import { atom } from "jotai";
 import { atomWithStorage } from "jotai/utils";
 import { atomFamily } from "jotai-family";
-import { createLocalStorageSyncStorage } from "@/lib/browser-storage";
+import {
+  booleanLocalStorage,
+  createLocalStorageSyncStorage,
+} from "@/lib/browser-storage";
+import { hasThreadId } from "@/lib/thread-id";
 
 export const threadSecondaryPanelResizingAtom = atom(false);
 
@@ -11,24 +15,7 @@ type ThreadSecondaryPanelThreadId =
   | null
   | undefined;
 
-interface ThreadSecondaryPanelStorageKeyArgs {
-  prefix: string;
-  threadId: ResolvedThreadSecondaryPanelThreadId;
-}
-
-function getThreadSecondaryPanelStorageKey({
-  prefix,
-  threadId,
-}: ThreadSecondaryPanelStorageKeyArgs): string {
-  return `${prefix}-${encodeURIComponent(threadId)}`;
-}
-
-/**
- * User's preferred secondary panel width as a percentage of the surrounding
- * PanelGroup. Persisted across reloads. The default (50) is used when the
- * panel opens for the first time.
- */
-export const DEFAULT_SECONDARY_PANEL_WIDTH_PERCENT = 50;
+const DEFAULT_SECONDARY_PANEL_WIDTH_PERCENT = 50;
 const secondaryPanelWidthStorage = createLocalStorageSyncStorage<number>({
   parse: (storedValue, initialValue) => {
     if (storedValue === null) return initialValue;
@@ -46,69 +33,21 @@ export const secondaryPanelWidthPercentAtom = atomWithStorage<number>(
   { getOnInit: true },
 );
 
-const threadSecondaryPanelBooleanStorage =
-  createLocalStorageSyncStorage<boolean>({
-    parse: (storedValue, initialValue) => {
-      if (storedValue === "true") return true;
-      if (storedValue === "false") return false;
-      return initialValue;
-    },
-    serialize: (value) => String(value),
-  });
-
-function hasThreadId(
-  threadId: ThreadSecondaryPanelThreadId,
-): threadId is ResolvedThreadSecondaryPanelThreadId {
-  return threadId !== null && threadId !== undefined && threadId.length > 0;
-}
-
 const THREAD_CONVERSATION_COLLAPSED_STORAGE_PREFIX =
   "bb.thread.conversation.collapsed";
-
-/**
- * Whether a given thread's conversation/timeline pane is collapsed so the
- * secondary panel fills the whole content area. Keyed per thread (like the
- * terminal panel and recent-items state) so collapsing one thread's
- * conversation — e.g. opening an app full-screen from the sidebar — never
- * leaks into another thread or gets cleared by selecting an unrelated row.
- * Persisted per thread; only takes effect while the secondary panel is open on
- * a wide viewport — see ThreadDetailSecondaryContent for the gating.
- */
-interface ThreadConversationCollapsedStorageKeyArgs {
-  threadId: ResolvedThreadSecondaryPanelThreadId;
-}
-
-export function getThreadConversationCollapsedStorageKey({
-  threadId,
-}: ThreadConversationCollapsedStorageKeyArgs): string {
-  return getThreadSecondaryPanelStorageKey({
-    prefix: THREAD_CONVERSATION_COLLAPSED_STORAGE_PREFIX,
-    threadId,
-  });
-}
-
-const conversationCollapsedStorage = threadSecondaryPanelBooleanStorage;
 
 const threadConversationCollapsedAtomFamily = atomFamily(
   (threadId: ResolvedThreadSecondaryPanelThreadId) =>
     atomWithStorage<boolean>(
-      getThreadConversationCollapsedStorageKey({ threadId }),
+      `${THREAD_CONVERSATION_COLLAPSED_STORAGE_PREFIX}-${encodeURIComponent(threadId)}`,
       false,
-      conversationCollapsedStorage,
+      booleanLocalStorage,
       { getOnInit: true },
     ),
 );
 
-// Fallback for callers without a resolved thread id (e.g. before routing
-// settles). It stays false and any write lands on this throwaway atom, so no
-// real thread's collapse state is affected.
 const disabledThreadConversationCollapsedAtom = atom(false);
 
-/**
- * The conversation-collapsed atom for a specific thread. `atomFamily` memoizes
- * by threadId, so repeated calls with the same id return a stable atom
- * reference safe to pass straight to `useAtom`/`useSetAtom`/`useAtomValue`.
- */
 export function getThreadConversationCollapsedAtom(
   threadId: ThreadSecondaryPanelThreadId,
 ) {

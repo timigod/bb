@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ThreadConversationOutlineItem,
+  ThreadConversationOutlineResponse,
   TimelineConversationAttachments,
+  TimelineConversationRow,
   TimelineRow,
 } from "@bb/server-contract";
 import { useScrollOverflowState } from "@/components/thread/timeline/useScrollOverflowState";
 import { useBottomAnchoredScroll } from "@/components/ui/bottom-anchored-scroll-body.js";
+import { revealTimelineRow } from "@/components/thread/timeline/reveal-timeline-row.js";
 import { useThreadConversationOutline } from "@/hooks/queries/thread-queries";
 import { useSenderThreadMetadataById } from "@/hooks/useSenderThreadMetadataById";
 import { PromptMentionIcon } from "@/components/promptbox/mentions/PromptMentionIcon";
@@ -28,42 +31,30 @@ interface ActiveItemIds {
 }
 
 interface ThreadTableOfContentsProps {
+  contextBoundarySeq: number | null;
   threadId: string;
-  /**
-   * The currently-loaded timeline window. Used for scroll-spy (which loaded row
-   * is in view) and as a fallback item source until the full outline loads — the
-   * minimap itself renders the full thread via {@link useThreadConversationOutline}.
-   */
   timelineRows: readonly TimelineRow[];
   hasOlderTimelineRows: boolean;
-  /** Loads the next older timeline page; awaited while jumping to an unloaded row. */
   loadOlderTimelineRows: () => void | Promise<void>;
+  onNavigateToRow?: (rowId: string) => void;
 }
 
-// Matches `@container scroll-overlay (min-width: 56rem)` in app.css.
 const TOC_MIN_VISIBLE_WIDTH_PX = 56 * 16;
 const TOC_BOTTOM_ACTIVE_THRESHOLD_PX = 4;
-// Only worth showing once the conversation has enough user turns to navigate.
 const TOC_MIN_USER_MESSAGES = 3;
 const TOC_MAX_RAIL_TICKS = 20;
-// Updating the active rail tick changes overlay DOM and invalidates layout.
-// Wait for a scroll burst to settle instead of doing that work in the same
-// animation frames the timeline is trying to paint.
 const TOC_ACTIVE_UPDATE_IDLE_MS = 120;
-// Hard stop so a pagination bug can never spin the jump loop forever.
 const TOC_JUMP_MAX_PAGE_LOADS = 1000;
-// Frames to wait for prepended rows to commit before paginating again.
 const TOC_JUMP_RENDER_FRAMES = 6;
 function toPreviewLabel(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function toAttachmentPreviewLabel(
-  attachments: TimelineConversationAttachments | null,
+function formatAttachmentCountLabel(
+  imageCount: number,
+  fileCount: number,
 ): string {
-  if (!attachments) return "Message";
-  const imageCount = attachments.webImages + attachments.localImages;
-  const totalCount = imageCount + attachments.localFiles;
+  const totalCount = imageCount + fileCount;
   if (totalCount === 0) return "Message";
   if (totalCount === 1) {
     return imageCount === 1 ? "Image attachment" : "File attachment";
@@ -79,27 +70,69 @@ function toTocLabel({
   text: string;
 }): string {
   const textLabel = toPreviewLabel(text);
-  return textLabel || toAttachmentPreviewLabel(attachments);
+  if (textLabel) return textLabel;
+  if (!attachments) return "Message";
+  return formatAttachmentCountLabel(
+    attachments.webImages + attachments.localImages,
+    attachments.localFiles,
+  );
 }
 
-function toAttachmentSummaryLabel(
-  summary: ThreadConversationOutlineItem["attachmentSummary"],
-): string {
-  if (!summary) return "Message";
-  const totalCount = summary.imageCount + summary.fileCount;
-  if (totalCount === 0) return "Message";
-  if (totalCount === 1) {
-    return summary.imageCount === 1 ? "Image attachment" : "File attachment";
-  }
-  return `${totalCount} attachments`;
+const timelineTocItemsByRow = new WeakMap<TimelineConversationRow, TocItem>();
+
+function getTimelineTocItem(row: TimelineConversationRow): TocItem {
+  const cachedItem = timelineTocItemsByRow.get(row);
+  if (cachedItem !== undefined) return cachedItem;
+  const item: TocItem = {
+    id: row.id,
+    label: toTocLabel({ attachments: row.attachments, text: row.text }),
+    role: row.role,
+  };
+  timelineTocItemsByRow.set(row, item);
+  return item;
 }
 
 function outlineItemToTocItem(item: ThreadConversationOutlineItem): TocItem {
+  const summary = item.attachmentSummary;
   return {
     id: item.id,
-    label: item.preview || toAttachmentSummaryLabel(item.attachmentSummary),
+    label:
+      item.preview ||
+      (summary
+        ? formatAttachmentCountLabel(summary.imageCount, summary.fileCount)
+        : "Message"),
     role: item.role,
   };
+}
+
+function partitionTocItems(items: Iterable<TocItem>): {
+  agentItems: TocItem[];
+  userItems: TocItem[];
+} {
+  const userItems: TocItem[] = [];
+  const agentItems: TocItem[] = [];
+  for (const item of items) {
+    if (item.role === "user") {
+      userItems.push(item);
+    } else {
+      agentItems.push(item);
+    }
+  }
+  return { agentItems, userItems };
+}
+
+function mergeLiveTocItems(
+  outlineItems: readonly TocItem[],
+  timelineItems: readonly TocItem[],
+): TocItem[] {
+  const timelineItemsById = new Map(
+    timelineItems.map((item) => [item.id, item]),
+  );
+  const outlineItemIds = new Set(outlineItems.map((item) => item.id));
+  return [
+    ...outlineItems.map((item) => timelineItemsById.get(item.id) ?? item),
+    ...timelineItems.filter((item) => !outlineItemIds.has(item.id)),
+  ];
 }
 
 export function selectTocRailItems({
@@ -222,70 +255,54 @@ function TocItemPreview({
   );
 }
 
-/**
- * Builds the user/agent item lists for the minimap. Prefers the full
- * conversation outline (the whole thread, independent of pagination); falls
- * back to the loaded timeline window so the minimap still renders on first
- * paint and in environments without the outline endpoint (e.g. stories).
- */
-function useConversationTocItems({
-  outlineItems,
-  timelineRows,
-}: {
-  outlineItems: readonly ThreadConversationOutlineItem[] | undefined;
-  timelineRows: readonly TimelineRow[];
-}) {
-  const outlineTocItems = useMemo(() => {
-    if (!outlineItems || outlineItems.length === 0) return null;
-    const userItems: TocItem[] = [];
-    const agentItems: TocItem[] = [];
-    for (const item of outlineItems) {
-      const tocItem = outlineItemToTocItem(item);
-      if (tocItem.role === "user") {
-        userItems.push(tocItem);
-      } else {
-        agentItems.push(tocItem);
-      }
-    }
-    return { agentItems, userItems };
-  }, [outlineItems]);
-
-  const timelineTocItems = useMemo(() => {
-    const userItems: TocItem[] = [];
-    const agentItems: TocItem[] = [];
-    for (const row of timelineRows) {
-      if (row.kind !== "conversation") continue;
-      const item: TocItem = {
-        id: row.id,
-        label: toTocLabel({ attachments: row.attachments, text: row.text }),
-        role: row.role,
-      };
-      if (row.role === "user") {
-        userItems.push(item);
-      } else {
-        agentItems.push(item);
-      }
-    }
-
-    return { agentItems, userItems };
-  }, [timelineRows]);
-
-  return outlineTocItems ?? timelineTocItems;
+function mergeOutlineTocItems(
+  outlineItems: readonly ThreadConversationOutlineItem[] | undefined,
+  timelineItems: readonly TocItem[],
+): TocItem[] {
+  if (!outlineItems || outlineItems.length === 0) return [...timelineItems];
+  return mergeLiveTocItems(
+    outlineItems.map(outlineItemToTocItem),
+    timelineItems,
+  );
 }
 
-/**
- * Returns the width a container query sees for `host`.
- *
- * An inline-size container query resolves against the content box, but
- * `clientWidth` also counts horizontal padding. The scroll overlay pads itself,
- * so the raw `clientWidth` would report the TOC as visible for a padding-wide
- * band below the CSS breakpoint.
- */
-function containerInlineSize(host: HTMLElement): number {
-  const style = window.getComputedStyle(host);
-  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
-  const paddingRight = Number.parseFloat(style.paddingRight) || 0;
-  return host.clientWidth - paddingLeft - paddingRight;
+function useConversationTocItems({
+  agentOutlineItems,
+  timelineRows,
+  userOutlineItems,
+}: {
+  agentOutlineItems: readonly ThreadConversationOutlineItem[] | undefined;
+  timelineRows: readonly TimelineRow[];
+  userOutlineItems: readonly ThreadConversationOutlineItem[] | undefined;
+}) {
+  const timelineTocItems = useMemo(
+    () =>
+      partitionTocItems(
+        timelineRows
+          .filter((row) => row.kind === "conversation")
+          .map((row) => getTimelineTocItem(row)),
+      ),
+    [timelineRows],
+  );
+  const userItems = useMemo(
+    () => mergeOutlineTocItems(userOutlineItems, timelineTocItems.userItems),
+    [timelineTocItems.userItems, userOutlineItems],
+  );
+  const agentItems = useMemo(
+    () => mergeOutlineTocItems(agentOutlineItems, timelineTocItems.agentItems),
+    [agentOutlineItems, timelineTocItems.agentItems],
+  );
+  return { agentItems, userItems };
+}
+
+function currentOutlineItems(
+  data: ThreadConversationOutlineResponse | undefined,
+  contextBoundarySeq: number | null,
+): readonly ThreadConversationOutlineItem[] | undefined {
+  return contextBoundarySeq !== null &&
+    (data?.maxSeq ?? -1) < contextBoundarySeq
+    ? undefined
+    : data?.items;
 }
 
 function useThreadTocVisible(rootElement: HTMLElement | null): boolean {
@@ -305,23 +322,14 @@ function useThreadTocVisible(rootElement: HTMLElement | null): boolean {
       return;
     }
 
-    let frame: number | null = null;
-    const measure = () => {
-      frame = null;
-      setVisible(containerInlineSize(host) >= TOC_MIN_VISIBLE_WIDTH_PX);
-    };
-    const scheduleMeasure = () => {
-      if (frame !== null) return;
-      frame = window.requestAnimationFrame(measure);
-    };
-
-    scheduleMeasure();
-    const resizeObserver = new ResizeObserver(scheduleMeasure);
-    resizeObserver.observe(host);
-    return () => {
-      if (frame !== null) window.cancelAnimationFrame(frame);
-      resizeObserver.disconnect();
-    };
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      const inlineSize =
+        entry.contentBoxSize[0]?.inlineSize ?? entry.contentRect.width;
+      setVisible(inlineSize >= TOC_MIN_VISIBLE_WIDTH_PX);
+    });
+    resizeObserver.observe(host, { box: "content-box" });
+    return () => resizeObserver.disconnect();
   }, [rootElement]);
 
   return visible;
@@ -468,11 +476,6 @@ export function findActiveItemIds({
     }
   }
 
-  // Conversation rows are non-overlapping and retain document order, so their
-  // top/bottom edges are monotonic within each role. The former full scan
-  // measured every loaded conversation row on every animation-frame scroll
-  // update; binary search keeps the same nearest/last-visible semantics with
-  // logarithmic layout reads.
   if (isNearBottom) {
     return {
       agent: findLastVisibleItemId({
@@ -503,27 +506,39 @@ export function findActiveItemIds({
 }
 
 export function ThreadTableOfContents({
+  contextBoundarySeq,
   threadId,
   timelineRows,
   hasOlderTimelineRows,
   loadOlderTimelineRows,
+  onNavigateToRow,
 }: ThreadTableOfContentsProps) {
   const bottomAnchor = useBottomAnchoredScroll();
   const [rootElement, setRootElement] = useState<HTMLElement | null>(null);
   const tocVisible = useThreadTocVisible(rootElement);
-  // The full-thread outline exists only for the wide-layout TOC. Waiting for
-  // both its visible container and the first timeline window keeps compact
-  // clients from rebuilding an invisible outline on every appended-event batch.
-  const outlineQuery = useThreadConversationOutline(threadId, {
-    enabled: tocVisible && timelineRows.length > 0,
-  });
-  const senderThreadMetadataById = useSenderThreadMetadataById();
-  const { agentItems, userItems } = useConversationTocItems({
-    outlineItems: outlineQuery.data?.items,
-    timelineRows,
-  });
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<TocTab>("user");
+  const outlineEnabled = tocVisible && timelineRows.length > 0;
+  const userOutlineQuery = useThreadConversationOutline(threadId, "user", {
+    enabled: outlineEnabled,
+  });
+  const agentOutlineQuery = useThreadConversationOutline(
+    threadId,
+    "assistant",
+    { enabled: outlineEnabled && open && tab === "agent" },
+  );
+  const senderThreadMetadataById = useSenderThreadMetadataById();
+  const { agentItems, userItems } = useConversationTocItems({
+    agentOutlineItems: currentOutlineItems(
+      agentOutlineQuery.data,
+      contextBoundarySeq,
+    ),
+    timelineRows,
+    userOutlineItems: currentOutlineItems(
+      userOutlineQuery.data,
+      contextBoundarySeq,
+    ),
+  });
   const [activeUserId, setActiveUserId] = useState<string | null>(null);
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
   const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
@@ -548,16 +563,11 @@ export function ThreadTableOfContents({
     [activeUserId, userItems],
   );
 
-  // Mirror the latest pagination props into refs so the async jump loop always
-  // reads current values rather than the ones captured when the click fired.
   const hasOlderRef = useRef(hasOlderTimelineRows);
   hasOlderRef.current = hasOlderTimelineRows;
   const loadOlderRef = useRef(loadOlderTimelineRows);
   loadOlderRef.current = loadOlderTimelineRows;
   const jumpInProgressRef = useRef(false);
-  // Switching threads remounts this component (PageShell is keyed by threadId).
-  // The jump loop checks this after each await so it stops paginating a thread
-  // the user has already left instead of firing requests against a stale closure.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -632,56 +642,50 @@ export function ThreadTableOfContents({
           container.scrollTop + (elRect.bottom - (containerRect.bottom - pad)),
       });
     }
-  }, [activeId, open, scrollRef, tocVisible]);
+  }, [activeId, items, open, scrollRef, tocVisible]);
 
   const handleSelect = useCallback(
     async (id: string) => {
       const getScrollElement = () => bottomAnchor?.getScrollElement() ?? null;
       const scrollToRow = (element: HTMLElement) => {
-        bottomAnchor?.scrollElementIntoView({
-          element,
-          options: { block: "start", inline: "nearest" },
-        });
+        revealTimelineRow(element, bottomAnchor);
       };
+      onNavigateToRow?.(id);
 
       let row = findTimelineRowElement(getScrollElement(), id);
       if (row) {
         scrollToRow(row);
         return;
       }
-      // The target message hasn't been paginated into the loaded window yet.
-      // Page older windows in until it appears (or history is exhausted), then
-      // scroll to it.
       if (jumpInProgressRef.current) return;
       jumpInProgressRef.current = true;
       setPendingJumpId(id);
+      const waitForRenderedRow = async () => {
+        for (let frame = 0; frame < TOC_JUMP_RENDER_FRAMES; frame++) {
+          await waitForAnimationFrame();
+          if (!mountedRef.current) return null;
+          const renderedRow = findTimelineRowElement(getScrollElement(), id);
+          if (renderedRow) return renderedRow;
+        }
+        return null;
+      };
       try {
+        if (timelineRows.some((timelineRow) => timelineRow.id === id)) {
+          row = await waitForRenderedRow();
+          if (!mountedRef.current) return;
+        }
         let loads = 0;
         while (!row && hasOlderRef.current && loads < TOC_JUMP_MAX_PAGE_LOADS) {
           loads += 1;
           try {
             await Promise.resolve(loadOlderRef.current());
           } catch {
-            // Pagination failed (offline / server error). History can't
-            // advance, so stop looping; the post-loop lookup below still
-            // scrolls if enough was already loaded. Catching here keeps the
-            // rejection from escaping the fire-and-forget `void handleSelect`
-            // call as an unhandled rejection.
             break;
           }
           if (!mountedRef.current) return;
-          // Wait for the prepended rows to commit, retrying across a few frames
-          // before deciding the row is in an even older page.
-          for (let frame = 0; frame < TOC_JUMP_RENDER_FRAMES && !row; frame++) {
-            await waitForAnimationFrame();
-            if (!mountedRef.current) return;
-            row = findTimelineRowElement(getScrollElement(), id);
-          }
+          row = await waitForRenderedRow();
+          if (!mountedRef.current) return;
         }
-        // If the row still isn't loaded after exhausting older pages the jump is
-        // a no-op. Outline ids are projected by the same builder as timeline
-        // rows, so a visible-but-unreachable entry is effectively impossible; we
-        // fail silently rather than surface an error for a row the user sees.
         if (!row) row = findTimelineRowElement(getScrollElement(), id);
         if (row) scrollToRow(row);
       } finally {
@@ -689,7 +693,7 @@ export function ThreadTableOfContents({
         setPendingJumpId(null);
       }
     },
-    [bottomAnchor],
+    [bottomAnchor, onNavigateToRow, timelineRows],
   );
 
   if (userItems.length < TOC_MIN_USER_MESSAGES) {

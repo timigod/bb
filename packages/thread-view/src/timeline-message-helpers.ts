@@ -1,4 +1,5 @@
 import type { EventProjectionMessage } from "./event-projection-types.js";
+import { parseSentThreadMessage } from "./tool-call-parsing.js";
 
 export function isTimelineTerminalMessage(
   message: EventProjectionMessage,
@@ -6,7 +7,7 @@ export function isTimelineTerminalMessage(
   return message.kind === "assistant-text" || message.kind === "error";
 }
 
-export function isTimelineSummaryGroupableSteerMessage(
+function isTimelineSummaryGroupableSteerMessage(
   message: EventProjectionMessage,
 ): boolean {
   return (
@@ -25,13 +26,10 @@ export function isTimelineUngroupableMessage(
   if (message.kind === "assistant-text") {
     return message.isLegacyUserMessage === true;
   }
-  return message.kind === "debug/raw-event";
-}
-
-export function isTimelineSummaryCountedMessage(
-  message: EventProjectionMessage,
-): boolean {
-  return !isTimelineUngroupableMessage(message);
+  if (message.kind === "command") {
+    return parseSentThreadMessage(message) !== null;
+  }
+  return false;
 }
 
 export function isSingletonContextManagementOperation(

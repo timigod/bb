@@ -8,7 +8,7 @@ import type {
 import { formatDiffStatsText } from "@bb/thread-view";
 import { DiffStatsTally } from "@/components/ui/diff-stats-tally.js";
 
-export interface ChangeTally {
+interface ChangeTally {
   filesCount: number;
   insertions: number;
   deletions: number;
@@ -24,11 +24,13 @@ export function toChangeTally(stats: WorkspaceChangeStats): ChangeTally {
   };
 }
 
-export function formatWorkspaceChangedFilesLabel(changedFiles: number): string {
+function formatWorkspaceChangedFilesLabel(changedFiles: number): string {
   return `${changedFiles} file${changedFiles === 1 ? "" : "s"}`;
 }
 
-export function formatChangeSummary(tally: ChangeTally): string {
+function formatChangeSummaryWithoutLineStats(
+  tally: ChangeTally,
+): string | null {
   if (
     tally.filesCount === 0 &&
     tally.insertions === 0 &&
@@ -36,47 +38,42 @@ export function formatChangeSummary(tally: ChangeTally): string {
   ) {
     return "No changes";
   }
-  const filesLabel = formatWorkspaceChangedFilesLabel(tally.filesCount);
   if (
     !tally.lineStatsComplete ||
     (tally.insertions === 0 && tally.deletions === 0)
   ) {
-    return filesLabel;
+    return formatWorkspaceChangedFilesLabel(tally.filesCount);
   }
-  const diffText = formatDiffStatsText({
-    added: tally.insertions,
-    removed: tally.deletions,
-  });
-  return `${filesLabel}, ${diffText}`;
+  return null;
 }
 
-export function renderChangeSummary(tally: ChangeTally): ReactNode {
-  if (
-    tally.filesCount === 0 &&
-    tally.insertions === 0 &&
-    tally.deletions === 0
-  ) {
-    return "No changes";
-  }
-  const filesLabel = formatWorkspaceChangedFilesLabel(tally.filesCount);
-  if (
-    !tally.lineStatsComplete ||
-    (tally.insertions === 0 && tally.deletions === 0)
-  ) {
-    return filesLabel;
-  }
+export function formatChangeSummary(tally: ChangeTally): string {
   return (
-    <>
-      {filesLabel},{" "}
-      <DiffStatsTally
-        insertions={tally.insertions}
-        deletions={tally.deletions}
-      />
-    </>
+    formatChangeSummaryWithoutLineStats(tally) ??
+    `${formatWorkspaceChangedFilesLabel(tally.filesCount)}, ${formatDiffStatsText(
+      {
+        added: tally.insertions,
+        removed: tally.deletions,
+      },
+    )}`
   );
 }
 
-export type WorkspaceChangedFilesSectionKind =
+export function renderChangeSummary(tally: ChangeTally): ReactNode {
+  return (
+    formatChangeSummaryWithoutLineStats(tally) ?? (
+      <>
+        {formatWorkspaceChangedFilesLabel(tally.filesCount)},{" "}
+        <DiffStatsTally
+          insertions={tally.insertions}
+          deletions={tally.deletions}
+        />
+      </>
+    )
+  );
+}
+
+type WorkspaceChangedFilesSectionKind =
   | "uncommitted"
   | "untracked"
   | "committed";
@@ -86,7 +83,6 @@ export interface WorkspaceChangedFilesSection {
   label: string;
   files: WorkspaceFileStatus[];
   mergeBaseRef: string | null;
-  /** Line-level stats for the files in this section. */
   stats: WorkspaceChangeStats;
 }
 
@@ -95,17 +91,6 @@ export interface WorkspaceChangedFileSelection {
   section: WorkspaceChangedFilesSection;
 }
 
-/**
- * Returns every changed-files group worth surfacing, in display order:
- * working-tree changes first (modified/staged or untracked), then
- * committed-unmerged commits if present. The two coexist only in the
- * `dirty_and_committed_unmerged` working-tree state; in every other state
- * the result has at most one entry.
- *
- * Each section carries its own stats so callers don't have to re-derive
- * which bucket the numbers came from. Untracked-only state surfaces the
- * working-tree stats synthesized by the workspace status command.
- */
 export function selectWorkspaceChangedFilesSections(
   workspaceStatus: WorkspaceStatus | undefined,
 ): WorkspaceChangedFilesSection[] {
@@ -135,12 +120,6 @@ export function selectWorkspaceChangedFilesSections(
   return sections;
 }
 
-/**
- * Commits on the thread's branch that are ahead of the selected merge base,
- * newest first. Empty when there is no merge base (e.g. on the default branch)
- * or nothing is ahead. These are the same patch-unique commits the git diff
- * panel lets you inspect individually.
- */
 export function selectWorkspaceAheadCommits(
   workspaceStatus: WorkspaceStatus | undefined,
 ): WorkspaceCommitSummary[] {
@@ -149,11 +128,6 @@ export function selectWorkspaceAheadCommits(
   return commits.slice().reverse();
 }
 
-/**
- * Single-bucket convenience for surfaces (context banner, follow-up prompt)
- * that only show one list. Returns the primary section per
- * `selectWorkspaceChangedFilesSections` ordering.
- */
 export function selectWorkspaceChangedFilesSection(
   workspaceStatus: WorkspaceStatus | undefined,
 ): WorkspaceChangedFilesSection | null {
@@ -165,6 +139,5 @@ export function formatWorkspaceFileStatus(status: string): string {
     return "A?";
   }
 
-  // Git porcelain status is open_external; preserve unknown values intentionally.
   return status;
 }

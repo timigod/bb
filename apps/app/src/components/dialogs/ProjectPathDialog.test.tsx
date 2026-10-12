@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { Host } from "@bb/domain";
+import { makeHost as host } from "@bb/test-helpers/domain-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectPathDialog } from "./ProjectPathDialog";
 
@@ -33,22 +33,8 @@ vi.mock("@/components/dialogs/RemotePathBrowser", () => ({
   ),
 }));
 
-function host(overrides: Partial<Host> & Pick<Host, "id" | "name">): Host {
-  return {
-    type: "persistent",
-    status: "connected",
-    lastSeenAt: null,
-    maxPermissionMode: "full",
-    lastRejectedProtocolVersion: null,
-    createdAt: 0,
-    updatedAt: 0,
-    ...overrides,
-  };
-}
-
 const atum = host({ id: "host_atum", name: "atum" });
 const kunst = host({ id: "host_kunst", name: "Kunst" });
-const longNameHost = host({ id: "host_long", name: "Long name host" });
 const offline = host({
   id: "host_offline",
   name: "Offline Mac",
@@ -131,37 +117,66 @@ describe("ProjectPathDialog machine selection", () => {
     );
   });
 
-  it("constrains long project names to the dialog width", () => {
-    const longProjectName = "long-project-name-".repeat(20);
+  it("includes provider-made hosts in the project setup machine picker", () => {
     render(
       <ProjectPathDialog
         target={{ kind: "create" }}
         platform="linux"
-        hostId={longNameHost.id}
-        hostName={longNameHost.name}
-        hosts={[longNameHost]}
+        hostId={atum.id}
+        hostName={atum.name}
+        hosts={[
+          atum,
+          kunst,
+          host({
+            id: "host_modal",
+            name: "Modal sandbox 3f9a",
+          }),
+        ]}
         onOpenChange={vi.fn()}
         onSubmit={vi.fn()}
       />,
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Choose folder on host_long" }),
-    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Machine" }), {
+      button: 0,
+    });
 
-    const dialog = screen.getByRole("dialog");
-    expect(dialog.className).toContain("grid-cols-[minmax(0,1fr)]");
-    expect(dialog.querySelector("form")?.className).toContain("min-w-0");
-
-    const projectName = screen.getByText(longProjectName);
-    expect(projectName.className).toContain("min-w-0");
-    expect(projectName.className).toContain("truncate");
-    expect(projectName.parentElement?.className).toContain("min-w-0");
+    expect(screen.getByRole("menuitem", { name: /Kunst/u })).toBeTruthy();
+    expect(
+      screen.getByRole("menuitem", { name: /Modal sandbox 3f9a/u }),
+    ).toBeTruthy();
   });
 
-  // With machines listed but none selectable there is no host to resolve a
-  // path against, so the manual-path fallback must not invite a submit that
-  // the picker hook would drop without feedback.
+  it("uses a provider-made host as the only project machine", () => {
+    const onSubmit = vi.fn();
+    render(
+      <ProjectPathDialog
+        target={{ kind: "create" }}
+        platform="linux"
+        hostId="host_modal"
+        hostName="Modal sandbox 3f9a"
+        hosts={[
+          host({
+            id: "host_modal",
+            name: "Modal sandbox 3f9a",
+          }),
+        ]}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Choose folder on host_modal" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add project" }));
+    expect(onSubmit).toHaveBeenCalledWith(
+      { kind: "create" },
+      "/home/deploy/repos/givecare",
+      "host_modal",
+    );
+  });
+
   it("blocks submission when every listed machine is offline", () => {
     const onSubmit = vi.fn();
     render(

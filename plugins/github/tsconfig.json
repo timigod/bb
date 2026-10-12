@@ -10,14 +10,19 @@
     "skipLibCheck": true,
     "types": ["node"],
     "paths": {
-      "@/*": ["./*"]
+      "@/components/ui/icon": [
+        "../../packages/plugin-registry/flavors/components/ui/icon.tsx"
+      ],
+      "@/*": ["../../packages/shared-ui/src/*"]
     }
   },
   "include": [
     "server.ts",
-    "server.test.ts",
+    "*.test.ts",
+    "*.test.tsx",
     "app.tsx",
     "vitest.config.ts",
-    "components"
+    "components",
+    "testing"
   ]
 }

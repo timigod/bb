@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRealtime, useRealtimeConnectionState } from "@bb/plugin-sdk/app";
+import {
+  useRealtime,
+  useRealtimeConnectionState,
+} from "@get-bb/plugin-sdk/app";
 import { useTasksRpc } from "./data.js";
 
-/** Live count of non-terminal tasks for the host sidebar row. */
 export function TasksSidebarAccessory() {
   const rpc = useTasksRpc();
   const rpcRef = useRef(rpc);
@@ -31,10 +33,7 @@ export function TasksSidebarAccessory() {
               "sidebarOpenTaskCount",
             );
             if (request.isMounted) setCount(openTaskCount);
-          } catch {
-            // Keep the last durable value during transient RPC failures. A
-            // queued event or reconnect reconciles it without noisy chrome.
-          }
+          } catch {}
         }
       } finally {
         request.isRunning = false;

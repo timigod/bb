@@ -5,7 +5,11 @@ import type {
   WorkspaceWatchError,
 } from "@bb/host-watcher";
 import type { HostWorkspace } from "@bb/host-workspace";
-import { makeWorkspaceMergeBase, makeWorkspaceStatus } from "@bb/test-helpers";
+import {
+  createDeferredPromise,
+  makeWorkspaceMergeBase,
+  makeWorkspaceStatus,
+} from "@bb/test-helpers";
 import { describe, expect, it, vi } from "vitest";
 import { WatchManager, type WatchManagerOptions } from "./watch-manager.js";
 
@@ -21,22 +25,6 @@ type WatchThreadStorageRootImplementation = (
   args: WatchThreadStorageRootArgs,
 ) => StopWatching;
 
-interface Deferred<TValue> {
-  promise: Promise<TValue>;
-  resolve: (value: TValue | PromiseLike<TValue>) => void;
-  reject: (reason?: Error) => void;
-}
-
-function createDeferred<TValue>(): Deferred<TValue> {
-  let resolve!: (value: TValue | PromiseLike<TValue>) => void;
-  let reject!: (reason?: Error) => void;
-  const promise = new Promise<TValue>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 function createFakeWorkspace(path: string, isGitRepo = true) {
   let localStateFingerprint: GetLocalStateFingerprintResult = `local:${path}:initial`;
   let localStateFingerprintError: Error | null = null;
@@ -44,7 +32,6 @@ function createFakeWorkspace(path: string, isGitRepo = true) {
   let sharedGitRefsFingerprintError: Error | null = null;
   const workspace = {
     path,
-    managed: false,
     isGitRepo,
     isWorktree: false,
     getDefaultBranch: vi.fn(async () => "main"),
@@ -79,23 +66,14 @@ function createFakeWorkspace(path: string, isGitRepo = true) {
       files: [],
       shortstat: "",
       mergeBaseRef: null,
+      truncated: false,
     })),
     diffPatch: vi.fn(async () => []),
     getPullRequest: vi.fn(async () => ({ outcome: "none" as const })),
     runPullRequestAction: vi.fn(async () => undefined),
-    listBranches: vi.fn(async () => ["main"]),
-    listFiles: vi.fn(async () => []),
     commit: vi.fn(async () => ({
       commitSha: "commit-1",
       commitSubject: "commit",
-    })),
-    reset: vi.fn(async () => undefined),
-    fetch: vi.fn(async () => undefined),
-    squashMerge: vi.fn(async () => ({
-      merged: true,
-      commitSha: "commit-1",
-      commitSubject: "commit",
-      targetBranch: "main",
     })),
     setLocalStateFingerprint(value: GetLocalStateFingerprintResult) {
       localStateFingerprint = value;
@@ -109,7 +87,6 @@ function createFakeWorkspace(path: string, isGitRepo = true) {
     setSharedGitRefsFingerprintError(error: Error | null) {
       sharedGitRefsFingerprintError = error;
     },
-    destroy: vi.fn(async () => undefined),
   } satisfies HostWorkspace & {
     setLocalStateFingerprint: (value: GetLocalStateFingerprintResult) => void;
     setLocalStateFingerprintError: (error: Error | null) => void;
@@ -149,7 +126,8 @@ function createFakeHostWatcher(
 describe("WatchManager", () => {
   it("starts watching before initial workspace fingerprints finish", async () => {
     const workspace = createFakeWorkspace("/tmp/env-watch");
-    const localFingerprint = createDeferred<GetLocalStateFingerprintResult>();
+    const localFingerprint =
+      createDeferredPromise<GetLocalStateFingerprintResult>();
     workspace.getLocalStateFingerprint.mockImplementationOnce(
       () => localFingerprint.promise,
     );
@@ -166,7 +144,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -205,7 +182,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -244,7 +220,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -257,7 +232,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -312,7 +286,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -373,7 +346,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -449,7 +421,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -488,7 +459,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -517,7 +487,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -536,7 +505,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -551,7 +519,7 @@ describe("WatchManager", () => {
   it("serializes watch-set replacement while workspace watch startup is pending", async () => {
     const stopWatchingStatus = vi.fn(() => undefined);
     const workspace = createFakeWorkspace("/tmp/env-watch");
-    const pendingWorkspace = createDeferred<HostWorkspace>();
+    const pendingWorkspace = createDeferredPromise<HostWorkspace>();
     const provisionWorkspace = vi.fn(() => {
       return pendingWorkspace.promise;
     });
@@ -570,7 +538,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -593,90 +560,6 @@ describe("WatchManager", () => {
     expect(watchWorkspace).toHaveBeenCalledTimes(1);
     expect(stopWatchingStatus).toHaveBeenCalledTimes(1);
     expect(manager.workspaceWatchCount()).toBe(0);
-  });
-
-  it("waits for pending watch startup before removing an environment watch", async () => {
-    const stopWatchingStatus = vi.fn(() => undefined);
-    const workspace = createFakeWorkspace("/tmp/env-watch");
-    const pendingWorkspace = createDeferred<HostWorkspace>();
-    const { hostWatcher, watchWorkspace } = createFakeHostWatcher({
-      watchWorkspaceImplementation: () => stopWatchingStatus,
-    });
-    const manager = new WatchManager({
-      hostWatcher,
-      provisionWorkspace: vi.fn(() => pendingWorkspace.promise),
-    });
-
-    const start = manager.replaceWatchSet({
-      generation: 1,
-      workspaceTargets: [
-        {
-          environmentId: "env-watch",
-          workspaceContext: {
-            workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
-          },
-        },
-      ],
-      threadStorageTargets: [],
-    });
-    const remove = manager.removeEnvironmentWorkspaceWatch("env-watch");
-
-    await Promise.resolve();
-    expect(stopWatchingStatus).not.toHaveBeenCalled();
-
-    pendingWorkspace.resolve(workspace);
-    await Promise.all([start, remove]);
-
-    expect(watchWorkspace).toHaveBeenCalledTimes(1);
-    expect(stopWatchingStatus).toHaveBeenCalledTimes(1);
-    expect(manager.workspaceWatchCount()).toBe(0);
-  });
-
-  it("reports shared git ref changes separately from local workspace changes", async () => {
-    let watchWorkspaceArgs: WatchWorkspaceArgs | undefined;
-    const workspace = createFakeWorkspace("/tmp/env-watch");
-    const { hostWatcher } = createFakeHostWatcher({
-      watchWorkspaceImplementation: (args) => {
-        watchWorkspaceArgs = args;
-        return () => undefined;
-      },
-    });
-    const onWorkspaceStatusChanged = vi.fn();
-    const manager = new WatchManager({
-      hostWatcher,
-      provisionWorkspace: vi.fn(async () => workspace),
-      onWorkspaceStatusChanged,
-    });
-
-    await manager.replaceWatchSet({
-      generation: 1,
-      workspaceTargets: [
-        {
-          environmentId: "env-watch",
-          workspaceContext: {
-            workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
-          },
-        },
-      ],
-      threadStorageTargets: [],
-    });
-    workspace.setSharedGitRefsFingerprint("refs:/tmp/env-watch:changed");
-
-    watchWorkspaceArgs?.onChange({
-      changedPaths: ["/tmp/shared/.git/refs/heads/main"],
-      changeKinds: ["shared-git-refs-changed"],
-      kind: "workspace-status-changed",
-      environmentId: "env-watch",
-    });
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(onWorkspaceStatusChanged).toHaveBeenCalledWith({
-      changeKinds: ["git-refs-changed"],
-      environmentId: "env-watch",
-    });
   });
 
   it("reports shared git ref changes from single-dir git watcher events", async () => {
@@ -702,7 +585,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -750,7 +632,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -823,7 +704,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -890,7 +770,6 @@ describe("WatchManager", () => {
           environmentId: "env-watch",
           workspaceContext: {
             workspacePath: "/tmp/env-watch",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],

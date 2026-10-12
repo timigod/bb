@@ -1,10 +1,39 @@
-import type { QueryClient } from "@tanstack/react-query";
+import type { Query, QueryClient } from "@tanstack/react-query";
 
-export function cancelActiveQueryFetchesForBrowserSuspend(
+interface BrowserLifecycleFetchController {
+  suspend: () => void;
+  resume: () => void;
+}
+
+export function createBrowserLifecycleFetchController(
   queryClient: QueryClient,
-): void {
-  void queryClient.cancelQueries({
-    fetchStatus: "fetching",
-    type: "active",
-  });
+): BrowserLifecycleFetchController {
+  let cancelledOnSuspend = new Set<Query>();
+  return {
+    suspend: () => {
+      for (const query of queryClient
+        .getQueryCache()
+        .findAll({ fetchStatus: "fetching", type: "active" })) {
+        cancelledOnSuspend.add(query);
+      }
+      void queryClient.cancelQueries({
+        fetchStatus: "fetching",
+        type: "active",
+      });
+    },
+    resume: () => {
+      if (cancelledOnSuspend.size === 0) {
+        return;
+      }
+      const cancelled = cancelledOnSuspend;
+      cancelledOnSuspend = new Set<Query>();
+      void queryClient.refetchQueries(
+        {
+          predicate: (query) => cancelled.has(query),
+          type: "active",
+        },
+        { cancelRefetch: false },
+      );
+    },
+  };
 }

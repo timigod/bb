@@ -1,9 +1,6 @@
 import { z } from "zod";
 import type { ConnectCredential } from "./credential.js";
 
-// `handle` also rides on this response, but it names the account's primary
-// handle, not the server the code targeted. Only `serverUrl` names that server,
-// so the routing label comes from there.
 const redeemMachineResponseSchema = z.object({
   credential: z.string().min(1),
   machineId: z.string().min(1),
@@ -12,7 +9,7 @@ const redeemMachineResponseSchema = z.object({
 
 const redeemMachineErrorSchema = z.object({ error: z.string() });
 
-export type ConnectMachineRedeemErrorCode =
+type ConnectMachineRedeemErrorCode =
   | "already_used"
   | "expired"
   | "invalid_code"
@@ -41,11 +38,6 @@ function codeForStatus(
   return "invalid_code";
 }
 
-/**
- * `https://<label>.getbb.app` → `<label>`, but only for a URL the apex we
- * asked actually owns. The gate names the server it enrolled us on; a host
- * outside that apex would point later gate calls at a stranger.
- */
 function handleForApex(serverUrl: string, apexUrl: string): string | null {
   let parsed: URL;
   let apex: URL;
@@ -65,16 +57,8 @@ function handleForApex(serverUrl: string, apexUrl: string): string | null {
   return rest.join(".") === apex.hostname ? label : null;
 }
 
-/**
- * Redeem a one-time machine code at the connect apex for this client's own
- * durable machine credential (`POST /api/connect/redeem-machine`).
- *
- * A machine credential is a separate, individually revocable identity on the
- * account. Clients that need to reach the gate without a bb server enroll this
- * way instead of copying a server's pairing secret.
- */
 export async function redeemMachineCredential(
-  args: { apexUrl: string; code: string },
+  args: { apexUrl: string; code: string; deviceName?: string },
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<ConnectCredential> {
   const url = `${args.apexUrl.replace(/\/$/u, "")}/api/connect/redeem-machine`;
@@ -83,7 +67,7 @@ export async function redeemMachineCredential(
     response = await fetchImpl(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code: args.code }),
+      body: JSON.stringify({ code: args.code, deviceName: args.deviceName }),
     });
   } catch (error) {
     throw new ConnectMachineRedeemError(
@@ -119,8 +103,6 @@ export async function redeemMachineCredential(
     );
   }
   const { credential, serverUrl } = parsed.data;
-  // The gate echoes the server the code targeted. Without it there is nothing
-  // to point a session at, so treat the row as unusable.
   if (serverUrl === null) {
     throw new ConnectMachineRedeemError(
       "invalid_response",

@@ -1,5 +1,7 @@
 import { and, eq, gt, isNull } from "drizzle-orm";
 import {
+  CONNECT_SESSION_EXPIRES_IN_SECONDS,
+  CONNECT_SESSION_UPDATE_AGE_SECONDS,
   type ConnectDb,
   labelClaim,
   machine,
@@ -7,55 +9,74 @@ import {
   profile,
   server,
   session,
+  sha256Hex,
 } from "@bb/connect-db";
 
-// Per-isolate caches. The gate authenticates every request (including each
-// static asset), so a single page load fires dozens of requests through the
-// same warm isolate. Without caching, that's 3 sequential D1 round-trips per
-// request (~150ms each); with it, only the first request in a burst touches
-// D1. TTLs are short so sign-out / disconnect take effect quickly (and the DO
-// already severs a live tunnel on revoke, so a stale-cached label still can't
-// reach a disconnected server).
 const LABEL_TTL_MS = 15_000;
 const SESSION_TTL_MS = 20_000;
+const MACHINE_CREDENTIAL_TTL_MS = 20_000;
+const SESSION_REFRESH_BEFORE_EXPIRY_MS =
+  (CONNECT_SESSION_EXPIRES_IN_SECONDS - CONNECT_SESSION_UPDATE_AGE_SECONDS) *
+  1000;
 
-interface CacheEntry<T> {
-  value: T;
-  expires: number;
+export class SettledLookupCache<T> {
+  private readonly entries = new Map<string, { value: T; expires: number }>();
+  private generation = 0;
+
+  async read(
+    key: string,
+    options: {
+      now: number;
+      fresh?: boolean;
+      expires: (value: T) => number;
+      load: () => Promise<T>;
+    },
+  ): Promise<T> {
+    if (!options.fresh) {
+      const hit = this.entries.get(key);
+      if (hit && hit.expires > options.now) return hit.value;
+      if (hit) this.entries.delete(key);
+    }
+    const generation = this.generation;
+    const value = await options.load();
+    if (generation === this.generation) {
+      this.entries.set(key, { value, expires: options.expires(value) });
+    }
+    return value;
+  }
+
+  delete(key: string): void {
+    this.entries.delete(key);
+    this.generation += 1;
+  }
 }
-const labelCache = new Map<string, CacheEntry<ResolvedLabel | null>>();
-const sessionCache = new Map<string, CacheEntry<string | null>>();
 
-function cacheGet<T>(
-  map: Map<string, CacheEntry<T>>,
-  key: string,
-  now: number,
-): T | undefined {
-  const hit = map.get(key);
-  if (hit && hit.expires > now) return hit.value;
-  if (hit) map.delete(key);
-  return undefined;
+const labelCache = new SettledLookupCache<ResolvedLabel | null>();
+
+interface CachedSession {
+  sessionId: string;
+  userId: string;
+  expiresAt: number;
 }
 
-export interface ResolvedServer {
+const sessionCache = new SettledLookupCache<CachedSession | null>();
+
+export function invalidateSessionCookie(cookieValue: string): void {
+  sessionCache.delete(safeDecode(cookieValue));
+}
+
+interface ResolvedServer {
   kind: "server";
-  /**
-   * The account that owns this server (`server.userId`). Session and machine
-   * auth scope to this: only this account may visit the server, and only this
-   * account's machines may traverse `/internal/*`. With multi-server, an
-   * account owns several servers, each with its own `userId === this account`.
-   */
   userId: string;
   server: {
     id: string;
     credentialHash: string | null;
     revokedAt: Date | null;
-    /** Last tunnel heartbeat; null = never connected. Drives the offline page. */
     lastSeenAt: Date | null;
   };
 }
 
-export interface ResolvedMachine {
+interface ResolvedMachine {
   kind: "machine";
   routingKey: string;
   userId: string;
@@ -64,35 +85,30 @@ export interface ResolvedMachine {
     id: string;
     credentialHash: string;
     revokedAt: Date | null;
-    /** Last tunnel heartbeat; null = never connected. */
     lastSeenAt: Date | null;
   };
 }
 
-export type ResolvedLabel = ResolvedServer | ResolvedMachine;
+type ResolvedLabel = ResolvedServer | ResolvedMachine;
 
-/**
- * Preserve the existing server-label resolution path and precedence: first
- * resolve `server.subdomain` exactly as main does, then fall through to a
- * machine label. Machine claims supply the ownership generation used to keep a
- * stale cached resolution pinned to the previous machine TunnelDO after reuse.
- *
- * Pass `{ fresh: true }` to bypass the read cache for credential-sensitive
- * paths (tunnel (re)connect): the ~15s cache TTL would otherwise let a
- * just-revoked credential re-establish a tunnel from a warm isolate. The
- * fresh read still refreshes the cache for subsequent visitor lookups.
- */
 export async function resolveLabel(
   label: string,
   db: ConnectDb,
   options?: { fresh?: boolean },
 ): Promise<ResolvedLabel | null> {
   const now = Date.now();
-  if (!options?.fresh) {
-    const cached = cacheGet(labelCache, label, now);
-    if (cached !== undefined) return cached;
-  }
+  return labelCache.read(label, {
+    now,
+    fresh: options?.fresh,
+    expires: () => now + LABEL_TTL_MS,
+    load: () => lookupLabel(label, db),
+  });
+}
 
+async function lookupLabel(
+  label: string,
+  db: ConnectDb,
+): Promise<ResolvedLabel | null> {
   const serverRow = await db
     .select({
       userId: server.userId,
@@ -105,7 +121,7 @@ export async function resolveLabel(
     .where(eq(server.subdomain, label))
     .get();
   if (serverRow) {
-    const resolvedServer: ResolvedServer = {
+    return {
       kind: "server",
       userId: serverRow.userId,
       server: {
@@ -115,11 +131,6 @@ export async function resolveLabel(
         lastSeenAt: serverRow.lastSeenAt,
       },
     };
-    labelCache.set(label, {
-      value: resolvedServer,
-      expires: now + LABEL_TTL_MS,
-    });
-    return resolvedServer;
   }
 
   const machineRow = await db
@@ -144,56 +155,73 @@ export async function resolveLabel(
     )
     .where(eq(machine.subdomain, label))
     .get();
-  const resolvedMachine: ResolvedMachine | null = machineRow
-    ? {
-        kind: "machine",
-        routingKey: machineRoutingKey(label, machineRow.generation),
-        userId: machineRow.userId,
-        accountHandle: machineRow.accountHandle,
-        machine: {
-          id: machineRow.machineId,
-          credentialHash: machineRow.credentialHash,
-          revokedAt: machineRow.revokedAt,
-          lastSeenAt: machineRow.lastSeenAt,
-        },
-      }
-    : null;
-  labelCache.set(label, {
-    value: resolvedMachine,
-    expires: now + LABEL_TTL_MS,
-  });
-  return resolvedMachine;
+  if (!machineRow) return null;
+  return {
+    kind: "machine",
+    routingKey: machineRoutingKey(label, machineRow.generation),
+    userId: machineRow.userId,
+    accountHandle: machineRow.accountHandle,
+    machine: {
+      id: machineRow.machineId,
+      credentialHash: machineRow.credentialHash,
+      revokedAt: machineRow.revokedAt,
+      lastSeenAt: machineRow.lastSeenAt,
+    },
+  };
 }
 
-/**
- * Verify a better-auth session cookie directly against D1 (no cross-worker
- * call), cached per-isolate. Mirrors better-auth's
- * `${token}.${base64(hmac-sha256(token,secret))}` scheme. Returns the userId
- * when the signature is valid and the session row exists and is unexpired.
- */
-export async function verifySessionCookie(
+export interface VerifiedSessionCookie {
+  sessionId: string;
+  userId: string;
+  needsRefresh: boolean;
+}
+
+function verifiedSession(
+  session: CachedSession,
+  now: number,
+): VerifiedSessionCookie {
+  return {
+    sessionId: session.sessionId,
+    userId: session.userId,
+    needsRefresh: session.expiresAt <= now + SESSION_REFRESH_BEFORE_EXPIRY_MS,
+  };
+}
+
+export async function verifySessionCookieDetails(
   cookieValue: string,
   secret: string,
   db: ConnectDb,
-): Promise<string | null> {
-  // better-auth URL-encodes the cookie value, so the base64 signature arrives
-  // with %2F/%2B/%3D. Decode before splitting/comparing (the hex token is
-  // unaffected by decoding).
+): Promise<VerifiedSessionCookie | null> {
   const decoded = safeDecode(cookieValue);
   const dot = decoded.lastIndexOf(".");
   if (dot <= 0) return null;
-  const token = decoded.slice(0, dot);
-  const providedSig = decoded.slice(dot + 1);
 
   const now = Date.now();
-  // Cache on the full `token.sig` value, not the token alone: keying on the
-  // token would return a cached userId before the signature is checked, so a
-  // valid `token` with a forged signature would authenticate (and a forged
-  // one would negative-poison the real token). The full-cookie key makes the
-  // cache reflect exactly what passed verification.
-  const cached = cacheGet(sessionCache, decoded, now);
-  if (cached !== undefined) return cached;
+  const cachedSession = await sessionCache.read(decoded, {
+    now,
+    expires: (looked) =>
+      looked === null
+        ? now + SESSION_TTL_MS
+        : Math.min(now + SESSION_TTL_MS, looked.expiresAt),
+    load: () =>
+      lookupCachedSession(
+        decoded.slice(0, dot),
+        decoded.slice(dot + 1),
+        secret,
+        db,
+        now,
+      ),
+  });
+  return cachedSession === null ? null : verifiedSession(cachedSession, now);
+}
 
+async function lookupCachedSession(
+  token: string,
+  providedSig: string,
+  secret: string,
+  db: ConnectDb,
+  now: number,
+): Promise<CachedSession | null> {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -207,41 +235,29 @@ export async function verifySessionCookie(
     new TextEncoder().encode(token),
   );
   const expectedSig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
-  if (!constantTimeEqual(providedSig, expectedSig)) {
-    sessionCache.set(decoded, { value: null, expires: now + SESSION_TTL_MS });
-    return null;
-  }
+  if (!constantTimeEqual(providedSig, expectedSig)) return null;
 
   const row = await db
-    .select({ userId: session.userId })
+    .select({
+      expiresAt: session.expiresAt,
+      sessionId: session.id,
+      userId: session.userId,
+    })
     .from(session)
-    .where(and(eq(session.token, token), gt(session.expiresAt, new Date())))
+    .where(and(eq(session.token, token), gt(session.expiresAt, new Date(now))))
     .get();
-  const userId = row?.userId ?? null;
-  sessionCache.set(decoded, { value: userId, expires: now + SESSION_TTL_MS });
-  return userId;
+  return row
+    ? {
+        sessionId: row.sessionId,
+        userId: row.userId,
+        expiresAt: row.expiresAt.getTime(),
+      }
+    : null;
 }
 
 const machineLastSeenWrites = new Map<string, number>();
 export const MACHINE_LAST_SEEN_WRITE_INTERVAL_MS = 60_000;
 
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
-  return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-/**
- * Verify a bb-connect machine credential (presented by a daemon on the
- * `x-bb-connect-machine` header) against D1. Returns the owning userId when the
- * credential matches a non-revoked machine. Successful verification is not
- * cached: dashboard revocation is the lost-machine recovery hatch and must
- * take effect on the next request.
- */
 export async function verifyMachineCredential(
   credential: string,
   db: ConnectDb,
@@ -249,12 +265,31 @@ export async function verifyMachineCredential(
   return (await verifyMachineCredentialDetails(credential, db))?.userId ?? null;
 }
 
+interface VerifiedMachine {
+  machineId: string;
+  userId: string;
+}
+
+const machineCredentialCache = new SettledLookupCache<VerifiedMachine | null>();
+
 export async function verifyMachineCredentialDetails(
   credential: string,
   db: ConnectDb,
-): Promise<{ machineId: string; userId: string } | null> {
+): Promise<VerifiedMachine | null> {
   if (!credential) return null;
   const hash = await sha256Hex(credential);
+  const now = Date.now();
+  return machineCredentialCache.read(hash, {
+    now,
+    expires: () => now + MACHINE_CREDENTIAL_TTL_MS,
+    load: () => lookupMachineCredential(hash, db),
+  });
+}
+
+async function lookupMachineCredential(
+  hash: string,
+  db: ConnectDb,
+): Promise<VerifiedMachine | null> {
   const row = await db
     .select({ machineId: machine.id, userId: machine.userId })
     .from(machine)
@@ -263,7 +298,6 @@ export async function verifyMachineCredentialDetails(
   return row ?? null;
 }
 
-/** Best-effort liveness write, capped to one D1 update per machine per minute/isolate. */
 export async function markMachineSeen(
   machineId: string,
   db: ConnectDb,

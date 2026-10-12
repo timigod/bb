@@ -1,6 +1,12 @@
 import { z } from "zod";
+import { threadCreateOriginSchema } from "./thread-create-origin.js";
 import { environmentWorkspaceDisplayKindSchema } from "./environment.js";
 import { gitCheckoutRefSchema } from "./git-checkout.js";
+import {
+  queuedMessageFailureReasonSchema,
+  queuedMessagePayloadSchema,
+  queuedMessageWaitingOnSchema,
+} from "./queued-message.js";
 import {
   promptInputSchema,
   permissionModeSchema,
@@ -12,24 +18,25 @@ import { threadOriginKindSchema } from "./thread-origin-kind.js";
 import { threadVisibilitySchema } from "./thread-visibility.js";
 export { threadStatusSchema, threadStatusValues } from "./thread-status.js";
 export type { ThreadStatus } from "./thread-status.js";
-export {
-  threadOriginKindSchema,
-  threadOriginKindValues,
-} from "./thread-origin-kind.js";
+export { threadOriginKindSchema } from "./thread-origin-kind.js";
 export type { ThreadOriginKind } from "./thread-origin-kind.js";
-export {
-  threadVisibilitySchema,
-  threadVisibilityValues,
-} from "./thread-visibility.js";
-export type { ThreadVisibility } from "./thread-visibility.js";
 
-export const threadRuntimeDisplayStatusValues = [
+/**
+ * The three additions to {@link threadStatusValues} are display-only: they
+ * refine `active`/`idle` with host and workspace facts the durable status does
+ * not record.
+ *
+ * A never-started thread needs no such refinement — `pending` is a real thread
+ * status now, so it travels to the client as itself. It used to arrive as a
+ * separate `held` display status, derived from an `idle` thread holding a live
+ * dispatch hold; that derivation and the holds behind it are both gone.
+ */
+const threadRuntimeDisplayStatusValues = [
   ...threadStatusValues,
   "provisioning",
-  "host-reconnecting",
   "waiting-for-host",
 ] as const;
-export const threadRuntimeDisplayStatusSchema = z.enum(
+const threadRuntimeDisplayStatusSchema = z.enum(
   threadRuntimeDisplayStatusValues,
 );
 export type ThreadRuntimeDisplayStatus = z.infer<
@@ -38,7 +45,6 @@ export type ThreadRuntimeDisplayStatus = z.infer<
 
 export const threadRuntimeStateSchema = z.object({
   displayStatus: threadRuntimeDisplayStatusSchema,
-  hostReconnectGraceExpiresAt: z.number().nullable(),
 });
 export type ThreadRuntimeState = z.infer<typeof threadRuntimeStateSchema>;
 
@@ -51,16 +57,16 @@ export const threadActivityStateSchema = z.object({
 });
 export type ThreadActivityState = z.infer<typeof threadActivityStateSchema>;
 
-export const workspaceStateValues = [
+const workspaceStateValues = [
   "clean",
   "untracked",
   "dirty_uncommitted",
   "committed_unmerged",
   "dirty_and_committed_unmerged",
 ] as const;
-export const workspaceStateSchema = z.enum(workspaceStateValues);
+const workspaceStateSchema = z.enum(workspaceStateValues);
 
-export const workspaceFileStatusKindSchema = z.enum([
+const workspaceFileStatusKindSchema = z.enum([
   "M",
   "A",
   "D",
@@ -68,31 +74,21 @@ export const workspaceFileStatusKindSchema = z.enum([
   "C",
   "U",
   "??",
-  /**
-   * Fallback for git status letters we don't recognize. Kept distinct from
-   * "M" so UI and consumers can surface the ambiguity rather than silently
-   * mislabeling the change.
-   */
   "?",
 ]);
 export type WorkspaceFileStatusKind = z.infer<
   typeof workspaceFileStatusKindSchema
 >;
 
-export const workspaceFileStatusSchema = z.object({
+const workspaceFileStatusSchema = z.object({
   path: z.string(),
   status: workspaceFileStatusKindSchema,
-  /**
-   * Per-file line counts from `git diff --numstat`. Null when the count is
-   * unknown — binary files (numstat reports `-`) and untracked files (numstat
-   * does not include them).
-   */
   insertions: z.number().nullable(),
   deletions: z.number().nullable(),
 });
 export type WorkspaceFileStatus = z.infer<typeof workspaceFileStatusSchema>;
 
-export const workspaceCommitSummarySchema = z.object({
+const workspaceCommitSummarySchema = z.object({
   sha: z.string(),
   shortSha: z.string(),
   subject: z.string(),
@@ -103,36 +99,26 @@ export type WorkspaceCommitSummary = z.infer<
   typeof workspaceCommitSummarySchema
 >;
 
-/**
- * Fields shared by any surface that reports changed files plus the line totals
- * Git computed for them. `lineStatsComplete` distinguishes exact totals from
- * tracked-only totals that intentionally omit untracked file contents.
- */
-export const workspaceChangeStatsSchema = z.object({
+const workspaceChangeStatsSchema = z.object({
   insertions: z.number(),
   deletions: z.number(),
-  /** False when line totals omit files whose contents were intentionally not read. */
   lineStatsComplete: z.boolean(),
   files: z.array(workspaceFileStatusSchema),
 });
 export type WorkspaceChangeStats = z.infer<typeof workspaceChangeStatsSchema>;
 
-export const workspaceWorkingTreeSchema = workspaceChangeStatsSchema.extend({
+const workspaceWorkingTreeSchema = workspaceChangeStatsSchema.extend({
   hasUncommittedChanges: z.boolean(),
   state: workspaceStateSchema,
 });
 export type WorkspaceWorkingTree = z.infer<typeof workspaceWorkingTreeSchema>;
 
-export const workspaceBranchSchema = z.object({
+const workspaceBranchSchema = z.object({
   currentBranch: z.string().nullable(),
   defaultBranch: z.string(),
 });
 
-/**
- * Stats and file list are relative to the merge-base-to-HEAD range
- * (committed, unmerged) via `workspaceChangeStatsSchema`.
- */
-export const workspaceMergeBaseSchema = workspaceChangeStatsSchema.extend({
+const workspaceMergeBaseSchema = workspaceChangeStatsSchema.extend({
   mergeBaseBranch: z.string(),
   baseRef: z.string().nullable(),
   aheadCount: z.number(),
@@ -150,7 +136,7 @@ export const workspaceStatusSchema = z.object({
 });
 export type WorkspaceStatus = z.infer<typeof workspaceStatusSchema>;
 
-export const gitHostPullRequestCheckStatusSchema = z.enum([
+const gitHostPullRequestCheckStatusSchema = z.enum([
   "queued",
   "in_progress",
   "completed",
@@ -160,7 +146,7 @@ export type GitHostPullRequestCheckStatus = z.infer<
   typeof gitHostPullRequestCheckStatusSchema
 >;
 
-export const gitHostPullRequestCheckConclusionSchema = z.enum([
+const gitHostPullRequestCheckConclusionSchema = z.enum([
   "success",
   "failure",
   "cancelled",
@@ -176,7 +162,7 @@ export type GitHostPullRequestCheckConclusion = z.infer<
   typeof gitHostPullRequestCheckConclusionSchema
 >;
 
-export const gitHostPullRequestCheckSchema = z
+const gitHostPullRequestCheckSchema = z
   .object({
     name: z.string().min(1),
     status: gitHostPullRequestCheckStatusSchema,
@@ -189,7 +175,7 @@ export type GitHostPullRequestCheck = z.infer<
   typeof gitHostPullRequestCheckSchema
 >;
 
-export const gitHostPullRequestReviewDecisionSchema = z.enum([
+const gitHostPullRequestReviewDecisionSchema = z.enum([
   "APPROVED",
   "CHANGES_REQUESTED",
   "REVIEW_REQUIRED",
@@ -198,7 +184,7 @@ export type GitHostPullRequestReviewDecision = z.infer<
   typeof gitHostPullRequestReviewDecisionSchema
 >;
 
-export const gitHostPullRequestMergeStateStatusSchema = z.enum([
+const gitHostPullRequestMergeStateStatusSchema = z.enum([
   "BEHIND",
   "BLOCKED",
   "CLEAN",
@@ -212,7 +198,7 @@ export type GitHostPullRequestMergeStateStatus = z.infer<
   typeof gitHostPullRequestMergeStateStatusSchema
 >;
 
-export const gitHostPullRequestMergeableSchema = z.enum([
+const gitHostPullRequestMergeableSchema = z.enum([
   "CONFLICTING",
   "MERGEABLE",
   "UNKNOWN",
@@ -221,11 +207,6 @@ export type GitHostPullRequestMergeable = z.infer<
   typeof gitHostPullRequestMergeableSchema
 >;
 
-/**
- * Pull request data normalized from the host git-host CLI (`gh pr view`).
- * The host daemon returns this verbatim; the server maps it onto the
- * product-facing `ThreadPullRequest`.
- */
 export const gitHostPullRequestSchema = z
   .object({
     number: z.number().int().positive(),
@@ -233,6 +214,8 @@ export const gitHostPullRequestSchema = z
     state: z.enum(["OPEN", "CLOSED", "MERGED"]),
     url: z.string().url(),
     isDraft: z.boolean(),
+    autoMerge: z.boolean(),
+    inMergeQueue: z.boolean().nullable(),
     baseRefName: z.string(),
     headRefName: z.string(),
     updatedAt: z.string().datetime(),
@@ -245,15 +228,10 @@ export const gitHostPullRequestSchema = z
   .strict();
 export type GitHostPullRequest = z.infer<typeof gitHostPullRequestSchema>;
 
-export const pullRequestStateSchema = z.enum([
-  "draft",
-  "open",
-  "merged",
-  "closed",
-]);
+const pullRequestStateSchema = z.enum(["draft", "open", "merged", "closed"]);
 export type PullRequestState = z.infer<typeof pullRequestStateSchema>;
 
-export const threadPullRequestChecksStateSchema = z.enum([
+const threadPullRequestChecksStateSchema = z.enum([
   "passing",
   "failing",
   "pending",
@@ -264,7 +242,7 @@ export type ThreadPullRequestChecksState = z.infer<
   typeof threadPullRequestChecksStateSchema
 >;
 
-export const threadPullRequestChecksSchema = z
+const threadPullRequestChecksSchema = z
   .object({
     state: threadPullRequestChecksStateSchema,
     totalCount: z.number().int().nonnegative(),
@@ -277,7 +255,7 @@ export type ThreadPullRequestChecks = z.infer<
   typeof threadPullRequestChecksSchema
 >;
 
-export const threadPullRequestReviewStateSchema = z.enum([
+const threadPullRequestReviewStateSchema = z.enum([
   "approved",
   "changes_requested",
   "review_required",
@@ -288,7 +266,7 @@ export type ThreadPullRequestReviewState = z.infer<
   typeof threadPullRequestReviewStateSchema
 >;
 
-export const threadPullRequestReviewSchema = z
+const threadPullRequestReviewSchema = z
   .object({
     state: threadPullRequestReviewStateSchema,
     reviewRequestCount: z.number().int().nonnegative(),
@@ -298,7 +276,7 @@ export type ThreadPullRequestReview = z.infer<
   typeof threadPullRequestReviewSchema
 >;
 
-export const threadPullRequestMergeabilityStateSchema = z.enum([
+const threadPullRequestMergeabilityStateSchema = z.enum([
   "mergeable",
   "conflicts",
   "blocked",
@@ -309,7 +287,7 @@ export type ThreadPullRequestMergeabilityState = z.infer<
   typeof threadPullRequestMergeabilityStateSchema
 >;
 
-export const threadPullRequestMergeabilitySchema = z
+const threadPullRequestMergeabilitySchema = z
   .object({
     state: threadPullRequestMergeabilityStateSchema,
     mergeStateStatus: gitHostPullRequestMergeStateStatusSchema.nullable(),
@@ -320,7 +298,7 @@ export type ThreadPullRequestMergeability = z.infer<
   typeof threadPullRequestMergeabilitySchema
 >;
 
-export const threadPullRequestAttentionStateSchema = z.enum([
+const threadPullRequestAttentionStateSchema = z.enum([
   "checks_failed",
   "checks_pending",
   "changes_requested",
@@ -328,6 +306,7 @@ export const threadPullRequestAttentionStateSchema = z.enum([
   "conflicts",
   "blocked",
   "draft",
+  "queued",
   "ready_to_merge",
   "merged",
   "closed",
@@ -337,11 +316,6 @@ export type ThreadPullRequestAttentionState = z.infer<
   typeof threadPullRequestAttentionStateSchema
 >;
 
-/**
- * A pull request associated with a thread's branch, assembled by the server
- * from {@link gitHostPullRequestSchema} (the server folds `isDraft` into the
- * product-facing {@link pullRequestStateSchema}).
- */
 export const threadPullRequestSchema = z
   .object({
     number: z.number().int().positive(),
@@ -351,6 +325,8 @@ export const threadPullRequestSchema = z
     baseRefName: z.string(),
     headRefName: z.string(),
     updatedAt: z.string().datetime(),
+    autoMerge: z.boolean(),
+    inMergeQueue: z.boolean().nullable(),
     checks: threadPullRequestChecksSchema,
     review: threadPullRequestReviewSchema,
     mergeability: threadPullRequestMergeabilitySchema,
@@ -361,12 +337,57 @@ export type ThreadPullRequest = z.infer<typeof threadPullRequestSchema>;
 
 export const threadQueuedMessageSchema = z.object({
   id: z.string(),
+  origin: threadCreateOriginSchema.nullable(),
+  originPluginId: z.string().nullable(),
+  initiator: z.enum(["user", "agent", "system"]),
+  senderThreadId: z.string().nullable(),
+  /**
+   * The thread this row is waiting on. Redundant on the thread-scoped list
+   * route that first served this DTO, and load-bearing everywhere else it is
+   * now served: a `queue.*` plugin event and a cross-thread wait-holder query
+   * both hand out rows with no surrounding thread to read it from.
+   */
+  threadId: z.string(),
   content: z.array(promptInputSchema).min(1),
   model: z.string().min(1),
   reasoningLevel: reasoningLevelSchema,
   permissionMode: permissionModeSchema,
   serviceTier: serviceTierSchema,
   groupWithNext: z.boolean(),
+  /**
+   * Epoch ms this row is scheduled to attempt dispatch, or null when it is
+   * eligible as soon as its other waits clear.
+   */
+  sendAt: z.number().int().nonnegative().nullable(),
+  /**
+   * Why this row is queued, or null for a plain queued row that is simply
+   * next in line behind the running turn. Null rather than a
+   * `{ kind: "thread-busy" }` default because rows written before waits were
+   * typed carry no reason at all, and inventing one for them would be a lie.
+   */
+  waitingOn: queuedMessageWaitingOnSchema.nullable(),
+  /**
+   * Why this row's last DRAIN attempt failed outright, or null when it has not
+   * failed one — which is every row that has never been re-attempted, and
+   * every row whose latest attempt merely queued again. An inline attempt
+   * reports its failure to the sender that is still listening and never lands
+   * here.
+   *
+   * Independent of `waitingOn`, not folded into it: the row is still waiting on
+   * whatever it was waiting on, and writing a wait rewrites it wholesale, so a
+   * failure stored there would not survive the next attempt.
+   */
+  failureReason: queuedMessageFailureReasonSchema.nullable(),
+  payload: queuedMessagePayloadSchema,
+  /**
+   * Whether the sender may still rewrite this row's input. Not derivable from
+   * `payload` alone: a `retry` row is never editable, and an `inline` row
+   * stops being editable once the drain has claimed it — and the claim is
+   * deliberately not part of this response, since it is drain bookkeeping and
+   * not something a client should reason about. The server folds both into
+   * this one answer.
+   */
+  editable: z.boolean(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
@@ -382,9 +403,9 @@ export const threadSchema = z.object({
   sectionId: z.string().nullable(),
   status: threadStatusSchema,
   parentThreadId: z.string().nullable(),
+  lifecycleOwnerThreadId: z.string().nullable(),
   sourceThreadId: z.string().nullable(),
   originKind: threadOriginKindSchema.nullable(),
-  /** Id of the plugin that spawned this thread; null for non-plugin origins. */
   originPluginId: z.string().nullable(),
   visibility: threadVisibilitySchema,
   archivedAt: z.number().nullable(),
@@ -402,13 +423,31 @@ export const threadWithRuntimeSchema = threadSchema.extend({
 });
 export type ThreadWithRuntime = z.infer<typeof threadWithRuntimeSchema>;
 
+/**
+ * Whether a thread has work waiting on its queue, as a list row needs to know
+ * it: not how many rows, but whether any are waiting and whether any of them
+ * failed to go out.
+ *
+ * `failed` outranks `waiting` because a failure is the only one of the two a
+ * reader has to act on — a waiting row will clear itself. Deliberately a
+ * queue fact only: whether the thread is also running is the list row's
+ * question, not the queue's, and the row's glyph precedence answers it.
+ */
+export const threadQueuedWorkValues = ["none", "waiting", "failed"] as const;
+export const threadQueuedWorkSchema = z.enum(threadQueuedWorkValues);
+export type ThreadQueuedWork = z.infer<typeof threadQueuedWorkSchema>;
+
 export const threadListEntrySchema = threadWithRuntimeSchema.extend({
   activity: threadActivityStateSchema,
+  queuedWork: threadQueuedWorkSchema,
   pinSortKey: z.string().nullable(),
   hasPendingInteraction: z.boolean(),
   environmentHostId: z.string().nullable(),
   environmentName: z.string().nullable(),
   environmentBranchName: z.string().nullable(),
+  environmentPath: z.string().nullable(),
+  environmentProviderId: z.string().nullable(),
+  environmentIsWorktree: z.boolean().nullable(),
   environmentWorkspaceDisplayKind: environmentWorkspaceDisplayKindSchema,
 });
 export type ThreadListEntry = z.infer<typeof threadListEntrySchema>;

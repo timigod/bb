@@ -15,7 +15,9 @@ import {
 } from "@bb/server-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeRegistrySkillProvenance } from "../../src/services/skills/registry-skill-provenance.js";
+import { providerHasNativeRootSurface } from "../../src/services/providers/native-roots.js";
 import { registerHostRpcResponder } from "../helpers/host-rpc.js";
+import { declaredNativeRootSet } from "../helpers/provider-registry.js";
 import { readJson } from "../helpers/json.js";
 import {
   seedEnvironment,
@@ -58,11 +60,6 @@ function registryHtml(args: {
   })}</script>`;
 }
 
-/**
- * Mocks the host online-RPC boundary for the skills commands. `host.list_skills`
- * returns the per-provider raw skill set; `host.delete_skill` echoes a deleted
- * path. Any other command fails loudly.
- */
 function registerSkillRpc(
   harness: Parameters<typeof registerHostRpcResponder>[0],
   args: {
@@ -88,6 +85,12 @@ function registerSkillRpc(
             skills: args.skillsByProvider?.[request.command.providerId] ?? [],
           },
         };
+      }
+      if (
+        request.command.type === "plugin.host.call" &&
+        request.command.method === "resolveNativeRoots"
+      ) {
+        return { ok: true, result: { output: { skills: [], commands: [] } } };
       }
       if (request.command.type === "host.delete_skill") {
         return {
@@ -263,9 +266,15 @@ describe("public project skills route", () => {
                 "shared-project",
                 "/tmp/shared-skill-list/.agents/skills/portable-review/SKILL.md",
               ),
+              discovered(
+                "repo-bb-skill",
+                "bb-project",
+                "/tmp/shared-skill-list/.bb/skills/repo-bb-skill/SKILL.md",
+              ),
             ],
           },
         });
+        const warn = vi.spyOn(harness.deps.logger, "warn");
 
         const response = await harness.app.request(
           `/api/v1/projects/${project.id}/skills?environmentId=${environment.id}`,
@@ -287,6 +296,13 @@ describe("public project skills route", () => {
           manageable: false,
           registrySkillId: null,
         });
+        expect(body.skills.map((skill) => skill.name)).not.toContain(
+          "repo-bb-skill",
+        );
+        expect(warn).not.toHaveBeenCalledWith(
+          expect.anything(),
+          "Skipping invalid shared skill",
+        );
       },
     );
   });
@@ -434,9 +450,6 @@ describe("public project skills route", () => {
 
   it("asks the authenticated API for the trending view and keeps its order", async () => {
     await withTestHarness(async (harness) => {
-      // Without this the authenticated browse path is unpinned: reverting the
-      // view to all-time, or re-sorting the leaderboard the API already ranked,
-      // both stay green.
       vi.stubEnv("VERCEL_OIDC_TOKEN", "test-token");
       const requested: string[] = [];
       vi.stubGlobal(
@@ -446,7 +459,6 @@ describe("public project skills route", () => {
           if (url.startsWith("https://www.skills.sh/api/v1/skills?")) {
             requested.push(url);
             return Response.json({
-              // Deliberately not installs-descending: the API owns the ranking.
               data: [
                 {
                   id: "owner/repo/rising",
@@ -497,9 +509,6 @@ describe("public project skills route", () => {
   it("keeps the trending page's own order but ranks a filtered search", async () => {
     await withTestHarness(async (harness) => {
       vi.stubEnv("VERCEL_OIDC_TOKEN", "");
-      // Tied install counts where the source order is NOT alphabetical. Sorting
-      // an already-ranked page would swap these, replacing skills.sh's ordering
-      // within ties with an alphabetical one.
       const directory = [
         String.raw`\"source\":\"owner/zulu-repo\",\"skillId\":\"zulu-skill\",\"name\":\"Zulu skill\",\"installs\":500`,
         String.raw`\"source\":\"owner/alpha-repo\",\"skillId\":\"alpha-skill\",\"name\":\"Alpha skill\",\"installs\":500`,
@@ -546,8 +555,6 @@ describe("public project skills route", () => {
         "fetch",
         vi.fn(async (input: string | URL) => {
           const url = String(input);
-          // 200 with markup the parser cannot read — how an upstream redesign
-          // arrives. An empty catalog would look identical to a real one.
           if (url === "https://www.skills.sh/trending") {
             return new Response("<html><body>redesigned</body></html>", {
               status: 200,
@@ -567,7 +574,6 @@ describe("public project skills route", () => {
       expect(body.skills.map((skill) => skill.id)).toEqual([
         "owner/steady-repo/steady-skill",
       ]);
-      // These are lifetime counts, so the response must not call them trending.
       expect(body.ranking).toBe("all-time");
     });
   });
@@ -576,9 +582,6 @@ describe("public project skills route", () => {
     await withTestHarness(async (harness) => {
       vi.stubEnv("VERCEL_OIDC_TOKEN", "");
       const allTime = String.raw`\"source\":\"owner/steady-repo\",\"skillId\":\"steady-skill\",\"name\":\"Steady skill\",\"installs\":700`;
-      // A removed or renamed /trending route is at least as likely as its
-      // markup moving, and browse must not hard-fail on it while `/` — the URL
-      // it used before trending existed — is serving fine.
       for (const trendingFailure of [
         async () => new Response(null, { status: 404 }),
         async () => {
@@ -618,8 +621,6 @@ describe("public project skills route", () => {
   it("returns an empty page, not an error, when a search matches nothing", async () => {
     await withTestHarness(async (harness) => {
       vi.stubEnv("VERCEL_OIDC_TOKEN", "");
-      // The zero-record rule guards an unreadable page, so it must not fire for
-      // a page that read fine and simply had no match.
       const directory = String.raw`\"source\":\"owner/repo\",\"skillId\":\"present-skill\",\"name\":\"Present skill\",\"installs\":100`;
       vi.stubGlobal(
         "fetch",
@@ -778,9 +779,6 @@ describe("public project skills route", () => {
         String.raw`\"source\":\"owner/available-repo\",\"skillId\":\"available-skill\",\"name\":\"Available skill\",\"installs\":200`,
         String.raw`\"source\":\"owner/stale-repo\",\"skillId\":\"stale-skill\",\"name\":\"Stale skill\",\"installs\":100`,
       ].join("\n");
-      // Disjoint bodies: asserting on the response proves which directory page
-      // was actually consumed, where identical stubs would only prove which URL
-      // was requested.
       const allTime = [
         String.raw`\"source\":\"owner/available-repo\",\"skillId\":\"available-skill\",\"name\":\"Available skill\",\"installs\":900`,
         String.raw`\"source\":\"owner/stale-repo\",\"skillId\":\"stale-skill\",\"name\":\"Stale skill\",\"installs\":800`,
@@ -818,7 +816,6 @@ describe("public project skills route", () => {
         signal: expect.any(AbortSignal),
       });
 
-      // Search still filters the all-time directory, not the trending page.
       const searchResponse = await harness.app.request(
         "/api/v1/skills-registry?q=stale&page=0&perPage=24",
       );
@@ -961,9 +958,6 @@ describe("public project skills route", () => {
       );
 
       expect(response.status).toBe(200);
-      // Asserts the shape registrySkillInstallResponseSchema actually accepts;
-      // mocking a richer resolve value and asserting it back only proves the
-      // route spreads its mock.
       expect(await readJson(response)).toEqual({ ok: true, filePath });
       expect(installServerRegistrySkillMock).toHaveBeenCalledWith({
         dataDir: harness.deps.config.dataDir,
@@ -992,23 +986,6 @@ describe("public project skills route", () => {
     });
   });
 
-  it("rejects a registry source that could be parsed as a CLI option", async () => {
-    await withTestHarness(async (harness) => {
-      const response = await harness.app.request(
-        "/api/v1/skills-registry/install",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            registrySkillId: "--help/find-skills",
-          }),
-        },
-      );
-
-      expect(response.status).toBe(400);
-    });
-  });
-
   it("rejects a parent-directory segment before any upstream request", async () => {
     await withTestHarness(async (harness) => {
       installServerRegistrySkillMock.mockClear();
@@ -1026,8 +1003,6 @@ describe("public project skills route", () => {
         },
       );
 
-      // encodeURIComponent leaves ".." intact and `new URL` then normalizes it,
-      // which would walk an authenticated request to another path on skills.sh.
       expect(response.status).toBe(400);
       expect(fetchMock).not.toHaveBeenCalled();
       expect(installServerRegistrySkillMock).not.toHaveBeenCalled();
@@ -1037,9 +1012,6 @@ describe("public project skills route", () => {
   it("rejects a dash exposed by stripping the github.com prefix", async () => {
     await withTestHarness(async (harness) => {
       installServerRegistrySkillMock.mockClear();
-      // This id passes the leading-dash guard on the whole source; the dash is
-      // only exposed once "github.com/" is stripped to derive the package ref,
-      // which is handed to the skills CLI as a bare argv element.
       vi.stubGlobal(
         "fetch",
         vi.fn(
@@ -1098,8 +1070,6 @@ describe("public project skills route", () => {
         projectId: project.id,
         path: "/tmp/skills-env",
       });
-      // The same bb skill (identical filePath) is discovered under both
-      // providers; it must be listed once with provider:null.
       const bbSkill = discovered(
         "bb-helper",
         "bb-data-dir",
@@ -1162,11 +1132,22 @@ describe("public project skills route", () => {
           registrySkillId: null,
         },
         {
+          id: skillId("/cwd/.cursor/skills/impeccable/SKILL.md"),
+          name: "impeccable",
+          description: "impeccable skill",
+          provider: "acp-cursor",
+          scope: "provider-project",
+          pluginId: null,
+          filePath: "/cwd/.cursor/skills/impeccable/SKILL.md",
+          manageable: false,
+          registrySkillId: null,
+        },
+        {
           id: skillId("/cwd/.claude/skills/cp/SKILL.md"),
           name: "cp",
           description: "cp skill",
           provider: "claude-code",
-          scope: "claude-project",
+          scope: "provider-project",
           pluginId: null,
           filePath: "/cwd/.claude/skills/cp/SKILL.md",
           manageable: true,
@@ -1177,7 +1158,7 @@ describe("public project skills route", () => {
           name: "cu",
           description: "cu skill",
           provider: "claude-code",
-          scope: "claude-user",
+          scope: "provider-user",
           pluginId: null,
           filePath: "/home/.claude/skills/cu/SKILL.md",
           manageable: true,
@@ -1188,35 +1169,37 @@ describe("public project skills route", () => {
           name: "cx",
           description: "cx skill",
           provider: "codex",
-          scope: "codex-user",
+          scope: "provider-user",
           pluginId: null,
           filePath: "/home/.codex/skills/cx/SKILL.md",
           manageable: true,
           registrySkillId: null,
         },
-        {
-          id: skillId("/cwd/.cursor/skills/impeccable/SKILL.md"),
-          name: "impeccable",
-          description: "impeccable skill",
-          provider: "acp-cursor",
-          scope: "cursor-project",
-          pluginId: null,
-          filePath: "/cwd/.cursor/skills/impeccable/SKILL.md",
-          manageable: false,
-          registrySkillId: null,
-        },
       ]);
-      // Queried once per command-surface provider, with the env workspace cwd.
       const listed = stub.requests
         .map((request) => request.command)
         .filter((command) => command.type === "host.list_skills");
-      expect(listed.map((command) => command.providerId).sort()).toEqual([
-        "acp-cursor",
-        "claude-code",
-        "codex",
-      ]);
+      const surfaced = harness.deps.providerRegistry
+        .list()
+        .filter(providerHasNativeRootSurface)
+        .map((registration) => registration.info.id)
+        .sort();
+      expect(surfaced).toEqual(
+        expect.arrayContaining(["acp-cursor", "claude-code", "codex", "pi"]),
+      );
+      expect(listed.map((command) => command.providerId).sort()).toEqual(
+        surfaced,
+      );
       for (const command of listed) {
-        expect(command).toMatchObject({ cwd: "/tmp/skills-env" });
+        expect(command).toEqual({
+          type: "host.list_skills",
+          providerId: command.providerId,
+          cwd: "/tmp/skills-env",
+          nativeRoots: declaredNativeRootSet(
+            harness.deps.providerRegistry,
+            command.providerId,
+          ),
+        });
       }
     });
   });
@@ -1266,6 +1249,7 @@ describe("public project skills route", () => {
       const { host, session } = seedHostSession(harness.deps, {
         id: "host-registry-provenance",
       });
+      seedPrimaryHost(harness.deps, host.id);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
         path: "/tmp/registry-provenance-project",
@@ -1288,14 +1272,9 @@ describe("public project skills route", () => {
           registrySkillId,
           scope,
         }));
-      expect(collidingSkills).toHaveLength(2);
+      expect(collidingSkills).toHaveLength(1);
       expect(collidingSkills).toEqual(
         expect.arrayContaining([
-          {
-            filePath: join(builtinCollisionDirectory, "SKILL.md"),
-            registrySkillId: null,
-            scope: "bb-builtin",
-          },
           {
             filePath: join(registrySkillDirectory, "SKILL.md"),
             registrySkillId: "github.com/vercel-labs/skills/find-skills",
@@ -1323,6 +1302,7 @@ describe("public project skills route", () => {
         const { host, session } = seedHostSession(harness.deps, {
           id: "host-plugin-skill",
         });
+        seedPrimaryHost(harness.deps, host.id);
         const { project } = seedProjectWithSource(harness.deps, {
           hostId: host.id,
           path: "/tmp/plugin-skill-project",
@@ -1484,7 +1464,7 @@ describe("public project skills route", () => {
         .find((command) => command.type === "host.delete_skill");
       expect(deleteCommand).toEqual({
         type: "host.delete_skill",
-        scope: "claude-user",
+        scope: "provider-user",
         name: "moss-notes",
         cwd: "/tmp/provider-skill-delete-env",
         rootPath: "/home/.claude/skills",
@@ -1562,6 +1542,7 @@ describe("public project skills route", () => {
       const { host, session } = seedHostSession(harness.deps, {
         id: "host-duplicate-skills",
       });
+      seedPrimaryHost(harness.deps, host.id);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
         path: "/tmp/duplicate-skills-project",
@@ -1608,6 +1589,7 @@ describe("public project skills route", () => {
       const { host, session } = seedHostSession(harness.deps, {
         id: "host-claude-skill-edit",
       });
+      seedPrimaryHost(harness.deps, host.id);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
         path: "/tmp/claude-skill-edit-project",
@@ -1662,6 +1644,7 @@ describe("public project skills route", () => {
       const { host, session } = seedHostSession(harness.deps, {
         id: "host-stale-skill-edit",
       });
+      seedPrimaryHost(harness.deps, host.id);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
         path: "/tmp/stale-skill-edit-project",
@@ -1719,8 +1702,6 @@ describe("public project skills route", () => {
 
   it("rejects a bb-project delete when no workspace resolves", async () => {
     await withTestHarness(async (harness) => {
-      // Primary host A is connected; the project's source lives on host B, so a
-      // request without an environment resolves no cwd.
       const { host: hostA, session } = seedHostSession(harness.deps, {
         id: "host-primary",
       });

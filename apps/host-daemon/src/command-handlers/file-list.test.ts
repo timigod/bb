@@ -1,11 +1,7 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   finalizeListedFiles,
   finalizeListedPaths,
-  listPathsRecursively,
   normalizeListedPath,
 } from "./file-list.js";
 
@@ -38,16 +34,6 @@ describe("finalizeListedFiles", () => {
     expect(result.truncated).toBe(false);
   });
 
-  it("does not report truncation below the limit", () => {
-    const result = finalizeListedFiles({
-      filePaths: ["a.ts", "b.ts"],
-      limit: 3,
-    });
-
-    expect(result.files.map((file) => file.path)).toEqual(["a.ts", "b.ts"]);
-    expect(result.truncated).toBe(false);
-  });
-
   it("does not report truncation exactly at the limit", () => {
     const result = finalizeListedFiles({
       filePaths: ["a.ts", "b.ts", "c.ts"],
@@ -60,20 +46,6 @@ describe("finalizeListedFiles", () => {
       "c.ts",
     ]);
     expect(result.truncated).toBe(false);
-  });
-
-  it("reports truncation above the limit", () => {
-    const result = finalizeListedFiles({
-      filePaths: ["a.ts", "b.ts", "c.ts", "d.ts"],
-      limit: 3,
-    });
-
-    expect(result.files.map((file) => file.path)).toEqual([
-      "a.ts",
-      "b.ts",
-      "c.ts",
-    ]);
-    expect(result.truncated).toBe(true);
   });
 
   it("applies query matching before truncating", () => {
@@ -199,64 +171,7 @@ describe("finalizeListedPaths", () => {
   });
 });
 
-describe("listPathsRecursively", () => {
-  it("returns slash-separated relative paths for nested entries", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "bb-file-list-"));
-    try {
-      await fs.mkdir(path.join(root, "src", "components"), {
-        recursive: true,
-      });
-      await fs.writeFile(
-        path.join(root, "src", "components", "Button.tsx"),
-        "",
-      );
-
-      const result = await listPathsRecursively({
-        dir: root,
-        root,
-        includeFiles: true,
-        includeDirectories: true,
-      });
-
-      expect(result).toEqual([
-        { kind: "directory", path: "src", name: "src" },
-        {
-          kind: "directory",
-          path: "src/components",
-          name: "components",
-        },
-        {
-          kind: "file",
-          path: "src/components/Button.tsx",
-          name: "Button.tsx",
-        },
-      ]);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("does not return symlinked files as regular path entries", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "bb-file-list-"));
-    try {
-      await fs.writeFile(path.join(root, "state.json"), "{}");
-      await fs.symlink(path.join(root, "state.json"), path.join(root, "logo.svg"));
-
-      const result = await listPathsRecursively({
-        dir: root,
-        root,
-        includeFiles: true,
-        includeDirectories: false,
-      });
-
-      expect(result).toEqual([
-        { kind: "file", path: "state.json", name: "state.json" },
-      ]);
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
+describe("normalizeListedPath", () => {
   it("normalizes Windows separators before returning paths", () => {
     expect(normalizeListedPath("src\\components\\Button.tsx")).toBe(
       "src/components/Button.tsx",

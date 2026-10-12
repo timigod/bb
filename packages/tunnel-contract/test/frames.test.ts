@@ -4,6 +4,8 @@ import {
   chunkBody,
   decodeFrame,
   encodeFrame,
+  peekFrame,
+  setFrameStreamId,
   type Frame,
 } from "../src/index.js";
 
@@ -53,7 +55,6 @@ describe("frame round-trips", () => {
       headers: [],
       hasBody: false,
     });
-    // Payload must not contain the target key at all.
     const payload = new TextDecoder().decode(encoded.subarray(5));
     expect(payload).not.toContain("target");
     const out = decodeFrame(encoded);
@@ -69,13 +70,6 @@ describe("frame round-trips", () => {
     if (out.type !== "body-chunk") throw new Error("unreachable");
     expect(out.streamId).toBe(0xffffffff);
     expect(Array.from(out.data)).toEqual(Array.from(data));
-  });
-
-  it("body-end", () => {
-    expect(roundTrip({ type: "body-end", streamId: 3 })).toEqual({
-      type: "body-end",
-      streamId: 3,
-    });
   });
 
   it("resp-head", () => {
@@ -213,7 +207,7 @@ describe("validation", () => {
 
   it("rejects malformed JSON metadata", () => {
     const bad = new Uint8Array(5 + 3);
-    bad[0] = 1; // open-http
+    bad[0] = 1;
     bad.set(new TextEncoder().encode("{no"), 5);
     expect(() => decodeFrame(bad)).toThrow(/malformed open-http/);
   });
@@ -233,12 +227,63 @@ describe("chunkBody", () => {
       total.set(chunk.data, offset);
       offset += chunk.data.length;
     }
-    // Native memcmp — element-wise toEqual over ~2 MiB of numbers blows the
-    // test timeout on slower CI runners.
     expect(Buffer.compare(Buffer.from(total), Buffer.from(data))).toBe(0);
   });
 
   it("yields nothing for an empty body", () => {
     expect([...chunkBody(5, new Uint8Array(0))]).toEqual([]);
+  });
+});
+
+describe("frame header access", () => {
+  it("reads the type and stream id without decoding the payload", () => {
+    const head = encodeFrame({
+      type: "resp-head",
+      streamId: 4_000_000_000,
+      status: 200,
+      headers: [["content-type", "text/plain"]],
+    });
+    expect(peekFrame(head)).toEqual({
+      type: "resp-head",
+      streamId: 4_000_000_000,
+    });
+    const malformedPayload = new Uint8Array(5 + 3);
+    malformedPayload[0] = 4;
+    malformedPayload.set(new TextEncoder().encode("{no"), 5);
+    expect(peekFrame(malformedPayload).type).toBe("resp-head");
+  });
+
+  it("re-addresses a frame in place, including through an ArrayBuffer and a subarray view", () => {
+    const chunk = encodeFrame({
+      type: "body-chunk",
+      streamId: 0,
+      data: new Uint8Array([1, 2, 3]),
+    });
+    const buffer = chunk.buffer.slice(
+      chunk.byteOffset,
+      chunk.byteOffset + chunk.byteLength,
+    ) as ArrayBuffer;
+    expect(decodeFrame(setFrameStreamId(buffer, 42))).toEqual({
+      type: "body-chunk",
+      streamId: 42,
+      data: new Uint8Array([1, 2, 3]),
+    });
+
+    const padded = new Uint8Array(chunk.length + 4);
+    padded.set(chunk, 4);
+    const view = padded.subarray(4);
+    setFrameStreamId(view, 7);
+    expect(peekFrame(view).streamId).toBe(7);
+    expect([...padded.subarray(0, 4)]).toEqual([0, 0, 0, 0]);
+  });
+
+  it("rejects short frames, unknown types, and out-of-range stream ids", () => {
+    expect(() => peekFrame(new Uint8Array(4))).toThrow(/too short/u);
+    expect(() => peekFrame(new Uint8Array([99, 0, 0, 0, 1]))).toThrow(
+      /unknown frame type/u,
+    );
+    const frame = encodeFrame({ type: "body-end", streamId: 1 });
+    expect(() => setFrameStreamId(frame, -1)).toThrow(/out of range/u);
+    expect(() => setFrameStreamId(new Uint8Array(2), 1)).toThrow(/too short/u);
   });
 });

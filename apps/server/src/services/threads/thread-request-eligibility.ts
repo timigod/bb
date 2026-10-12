@@ -1,17 +1,15 @@
-import { getProjectSourceByHost } from "@bb/db";
-import {
-  type Environment,
-  type LocalPathProjectSource,
-  PERSONAL_PROJECT_ID,
-} from "@bb/domain";
+import { type LocalPathProjectSource, PERSONAL_PROJECT_ID } from "@bb/domain";
+import type { EnvironmentRow } from "@bb/db";
 import type { EnvironmentArgs } from "@bb/server-contract";
 import { ApiError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
+import { assertEnvironmentPathAvailable } from "../environments/path-admission.js";
 import { requireEnvironment } from "../lib/entity-lookup.js";
 import {
   assertUsableHostId,
   requireConnectedPrimaryHostId,
 } from "../hosts/primary-host.js";
+import { requireSourceForHost } from "./thread-create-helpers.js";
 
 type ThreadRequestEnvironment = EnvironmentArgs;
 type ThreadRequestEnvironmentDeps = Pick<AppDeps, "config" | "db" | "hub">;
@@ -27,18 +25,13 @@ type ReuseThreadRequestEnvironment = Extract<
   ThreadRequestEnvironment,
   { type: "reuse" }
 >;
-export interface ResolveStableThreadRequestEnvironmentArgs {
-  /**
-   * A directory switch can leave a personal-project source thread attached to
-   * an unmanaged environment. Source-derived forks may reuse that exact
-   * environment, but a new root thread must still use a personal workspace.
-   */
+interface ResolveStableThreadRequestEnvironmentArgs {
   allowUnmanagedPersonalProjectReuseEnvironmentId?: string;
   environment: ThreadRequestEnvironment;
   projectId: string;
 }
 
-export interface ResolvedHostThreadRequestEnvironment {
+interface ResolvedHostThreadRequestEnvironment {
   hostId: string;
   localSource: LocalPathProjectSource | null;
   type: "host";
@@ -46,13 +39,13 @@ export interface ResolvedHostThreadRequestEnvironment {
   workspace: WorkspaceBackedHostWorkspace;
 }
 
-export interface ResolvedReuseThreadRequestEnvironment {
-  environment: Environment;
+interface ResolvedReuseThreadRequestEnvironment {
+  environment: EnvironmentRow;
   type: "reuse";
 }
 
-export interface ResolvedPersonalThreadRequestEnvironment {
-  hostId: string | null;
+interface ResolvedPersonalThreadRequestEnvironment {
+  hostId: string;
   type: "personal";
 }
 
@@ -84,23 +77,24 @@ function assertPersonalWorkspaceProjectCompatibility(projectId: string): void {
   }
 }
 
+function isPersonalWorkspaceEnvironment(environment: EnvironmentRow): boolean {
+  return (
+    environment.projectId === PERSONAL_PROJECT_ID &&
+    environment.environmentProviderId !== null
+  );
+}
+
 function assertReuseWorkspaceProjectCompatibility(
   projectId: string,
-  environment: Environment,
+  environment: EnvironmentRow,
   allowUnmanagedPersonalProjectReuseEnvironmentId: string | undefined,
 ): void {
   const projectIsPersonal = projectId === PERSONAL_PROJECT_ID;
-  const environmentIsPersonal =
-    environment.workspaceProvisionType === "personal";
-  const environmentIsUnmanaged =
-    environment.workspaceProvisionType === "unmanaged";
+  const environmentIsPersonal = isPersonalWorkspaceEnvironment(environment);
   if (
     projectIsPersonal &&
     !environmentIsPersonal &&
-    !(
-      environmentIsUnmanaged &&
-      allowUnmanagedPersonalProjectReuseEnvironmentId === environment.id
-    )
+    allowUnmanagedPersonalProjectReuseEnvironmentId !== environment.id
   ) {
     throw new ApiError(
       409,
@@ -150,14 +144,7 @@ function resolveHostThreadRequestEnvironment(
     };
   }
 
-  const localSource = getProjectSourceByHost(deps.db, projectId, hostId);
-  if (!localSource || localSource.type !== "local_path") {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      "No project source configured for this host",
-    );
-  }
+  const localSource = requireSourceForHost(deps, projectId, hostId);
 
   return {
     hostId,
@@ -169,13 +156,13 @@ function resolveHostThreadRequestEnvironment(
   };
 }
 
-function resolveReuseThreadRequestEnvironment(
+export function resolveReuseThreadRequestEnvironment(
   deps: ThreadRequestEnvironmentDeps,
   environment: ReuseThreadRequestEnvironment,
   projectId: string,
   allowUnmanagedPersonalProjectReuseEnvironmentId: string | undefined,
 ): ResolvedReuseThreadRequestEnvironment {
-  const reusedEnvironment = requireEnvironment(
+  let reusedEnvironment = requireEnvironment(
     deps.db,
     environment.environmentId,
   );
@@ -192,6 +179,21 @@ function resolveReuseThreadRequestEnvironment(
     allowUnmanagedPersonalProjectReuseEnvironmentId,
   );
   assertUsableHostId(deps, { hostId: reusedEnvironment.hostId });
+  assertEnvironmentPathAvailable(deps, {
+    hostId: reusedEnvironment.hostId,
+    path: reusedEnvironment.path ?? reusedEnvironment.claimPath,
+    threadId: null,
+  });
+  reusedEnvironment = requireEnvironment(deps.db, environment.environmentId);
+  if (reusedEnvironment.ownerThreadId !== null) {
+    throw new ApiError(
+      409,
+      "workspace_busy",
+      reusedEnvironment.path === null
+        ? "Environment is still being prepared"
+        : "Cannot checkout branch while another thread is using this workspace",
+    );
+  }
   return {
     environment: reusedEnvironment,
     type: "reuse",

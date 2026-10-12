@@ -8,6 +8,7 @@ import type {
   TimelineRowBase,
   TimelineRowStatus,
   TimelineToolWorkRow,
+  TimelineSystemRow,
 } from "@bb/server-contract";
 import {
   buildTimelineWorkSummaryLabel,
@@ -28,7 +29,10 @@ interface WorkRowOverrides {
   turnId?: string | null;
 }
 
-function baseRow(id: string, overrides: WorkRowOverrides = {}): TimelineRowBase {
+function baseRow(
+  id: string,
+  overrides: WorkRowOverrides = {},
+): TimelineRowBase {
   return {
     id,
     threadId: "thread-1",
@@ -48,6 +52,7 @@ function assistantRow({
   return {
     ...baseRow(id, overrides),
     kind: "conversation",
+    messageSeq: overrides.sourceSeqEnd ?? 1,
     role: "assistant",
     text,
     attachments: null,
@@ -84,9 +89,8 @@ function commandRow({
     source: null,
     output: "",
     exitCode: 0,
-    completedAt: durationMs === null
-      ? null
-      : (baseOverrides.startedAt ?? 1) + durationMs,
+    completedAt:
+      durationMs === null ? null : (baseOverrides.startedAt ?? 1) + durationMs,
     approvalStatus: null,
     activityIntents,
   };
@@ -131,9 +135,10 @@ function commandRowReadingPaths(paths: readonly string[], seq: number) {
   });
 }
 
-function explorationIntents(row: ThreadTimelineViewRow): TimelineActivityIntent[] {
-  if (row.kind !== "work") return [];
-  if (row.workKind !== "command" && row.workKind !== "tool") return [];
+function explorationIntents(
+  row: ThreadTimelineViewRow,
+): TimelineActivityIntent[] {
+  if (row.kind !== "work" || row.workKind !== "command") return [];
   return [...row.activityIntents];
 }
 
@@ -172,7 +177,6 @@ function fileChangeRow({
 }
 
 interface ToolRowOverrides extends WorkRowOverrides {
-  activityIntents?: TimelineActivityIntent[];
   callId?: string;
   durationMs?: number | null;
   output?: string;
@@ -181,7 +185,6 @@ interface ToolRowOverrides extends WorkRowOverrides {
 }
 
 function toolRow({
-  activityIntents = [],
   callId = "tool-call-1",
   durationMs = 200,
   id = "tool-1",
@@ -200,11 +203,9 @@ function toolRow({
     toolName,
     toolArgs,
     output,
-    completedAt: durationMs === null
-      ? null
-      : (baseOverrides.startedAt ?? 1) + durationMs,
+    completedAt:
+      durationMs === null ? null : (baseOverrides.startedAt ?? 1) + durationMs,
     approvalStatus: null,
-    activityIntents,
   };
 }
 
@@ -227,21 +228,13 @@ function delegationRow({
     status,
     callId,
     toolName: "spawnAgent",
+    childRef: null,
+    background: false,
     subagentType: "reviewer",
     description: "Review timeline grouping",
     output: "",
     completedAt: (baseOverrides.startedAt ?? 1) + 500,
     childRows,
-  };
-}
-
-function deniedCommandRow(): TimelineCommandWorkRow {
-  return {
-    ...commandRow(),
-    id: "command-denied-1",
-    callId: "call-denied-1",
-    command: "git push",
-    approvalStatus: "denied",
   };
 }
 
@@ -294,8 +287,6 @@ describe("buildTimelineViewRows", () => {
   });
 
   it("keeps single terminal work rows as direct leaves regardless of status", () => {
-    // Per Q1: single terminal rows are always muted leaves; the old behavior
-    // of wrapping single denied/error/interrupted in a 1-child summary is gone.
     const cases = [
       commandRow({ id: "command-error", status: "error" }),
       commandRow({ id: "command-interrupted", status: "interrupted" }),
@@ -318,23 +309,8 @@ describe("buildTimelineViewRows", () => {
     ] as const;
 
     for (const inputRow of cases) {
-      const rows = buildTimelineViewRows([inputRow]);
-
-      expect(rows).toHaveLength(1);
-      expect(rows[0]?.kind).toBe("work");
-      expect(rows[0]?.id).toBe(inputRow.id);
+      expect(buildTimelineViewRows([inputRow])).toEqual([inputRow]);
     }
-  });
-
-  it("keeps a single denied command as a leaf row", () => {
-    const rows = buildTimelineViewRows([deniedCommandRow()]);
-
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.kind).toBe("work");
-    expect(rows[0]).toMatchObject({
-      id: "command-denied-1",
-      approvalStatus: "denied",
-    });
   });
 
   it("keeps activity summary identity stable as a run grows", () => {
@@ -364,9 +340,7 @@ describe("buildTimelineViewRows", () => {
       workKind: "command",
       id: "command-1",
     });
-    expect(nextSummary.id).toBe(
-      "thread-1:turn-1:work-summary:command-1",
-    );
+    expect(nextSummary.id).toBe("thread-1:turn-1:work-summary:command-1");
     expect(nextSummary.status).toBe("completed");
     expect(nextSummary.sourceSeqStart).toBe(1);
     expect(nextSummary.sourceSeqEnd).toBe(2);
@@ -374,9 +348,7 @@ describe("buildTimelineViewRows", () => {
       "command-1",
       "command-2",
     ]);
-    expect(buildTimelineWorkSummaryLabel(nextSummary)).toBe(
-      "Ran 2 commands",
-    );
+    expect(buildTimelineWorkSummaryLabel(nextSummary)).toBe("Ran 2 commands");
   });
 
   it("keeps bundle row identity stable across activity transitions", () => {
@@ -410,11 +382,9 @@ describe("buildTimelineViewRows", () => {
 
     expect(pendingSummary.id).toBe("thread-1:turn-1:work-summary:command-1");
     expect(completedSummary.id).toBe(pendingSummary.id);
-    // Active-latest treatment is decided by list-level renderers, not by the
-    // grouper. The label generator opts in to active wording only when asked.
-    expect(buildTimelineWorkSummaryLabel(pendingSummary, { active: true })).toBe(
-      "Running 2 commands",
-    );
+    expect(
+      buildTimelineWorkSummaryLabel(pendingSummary, { active: true }),
+    ).toBe("Running 2 commands");
     expect(buildTimelineWorkSummaryLabel(completedSummary)).toBe(
       "Ran 2 commands",
     );
@@ -448,8 +418,6 @@ describe("buildTimelineViewRows", () => {
   });
 
   it("groups same-concept consecutive work into a bundle regardless of status mix", () => {
-    // The new grouping is concept-based; mixing completed and pending of the
-    // same concept stays in one bundle (active-latest decided by the renderer).
     const rows = buildTimelineViewRows([
       commandRow({ id: "command-completed", sourceSeqStart: 1 }),
       commandRow({
@@ -537,9 +505,6 @@ describe("buildTimelineViewRows", () => {
   });
 
   it("emits multi-concept step-summary phrasing once an assistant boundary closes the step", () => {
-    // Before the assistant boundary the step is open and concepts render as
-    // separate leaves/bundles. After the assistant arrives, the step closes
-    // into a single multi-concept step-summary.
     const rows = buildTimelineViewRows([
       commandRow({
         activityIntents: [readIntent("src/app.ts")],
@@ -563,13 +528,11 @@ describe("buildTimelineViewRows", () => {
   it("uses active labels for tool-only bundle summaries", () => {
     const rows = buildTimelineViewRows([
       toolRow({
-        activityIntents: [],
         id: "tool-pending-1",
         sourceSeqStart: 1,
         status: "pending",
       }),
       toolRow({
-        activityIntents: [],
         id: "tool-pending-2",
         sourceSeqStart: 2,
         status: "pending",
@@ -577,9 +540,9 @@ describe("buildTimelineViewRows", () => {
     ]);
     const summary = expectBundleSummaryRow(rows[0]);
 
-    expect(
-      buildTimelineWorkSummaryLabel(summary, { active: true }),
-    ).toBe("Running 2 tools");
+    expect(buildTimelineWorkSummaryLabel(summary, { active: true })).toBe(
+      "Running 2 tools",
+    );
   });
 
   it("collapses completed delegation children into a step-summary", () => {
@@ -607,13 +570,11 @@ describe("buildTimelineViewRows", () => {
     ]);
 
     const delegation = expectDelegationWorkRow(rows[0]);
-    const childSummary = expectStepSummaryRow(delegation.childRows[0]);
+    const childSummary = expectStepSummaryRow(delegation.childRows?.[0]);
 
     expect(rows).toHaveLength(1);
     expect(delegation.childRows).toHaveLength(1);
-    expect(buildTimelineWorkSummaryLabel(childSummary)).toBe(
-      "Ran 2 commands",
-    );
+    expect(buildTimelineWorkSummaryLabel(childSummary)).toBe("Ran 2 commands");
     expect(childSummary).toMatchObject({
       status: "completed",
       sourceSeqStart: 10,
@@ -625,8 +586,14 @@ describe("buildTimelineViewRows", () => {
     expect(
       childSummary.children.map((child) => ({
         id: child.id,
-        callId: child.workKind === "command" ? child.callId : null,
-        command: child.workKind === "command" ? child.command : null,
+        callId:
+          child.kind === "work" && child.workKind === "command"
+            ? child.callId
+            : null,
+        command:
+          child.kind === "work" && child.workKind === "command"
+            ? child.command
+            : null,
       })),
     ).toEqual([
       {
@@ -723,10 +690,6 @@ describe("bundle activity intent dedupe", () => {
   });
 
   it("non-exploration siblings break the dedupe chain inside step-summary children", () => {
-    // closeOpenStepAtBoundary places the read, file-edit, read sequence into a
-    // single step-summary with mixed concepts. A file-edit between two same-
-    // path reads must reset the running dedupe key so the trailing read isn't
-    // suppressed against the leading one.
     const rows = buildTimelineViewRows([
       commandRowReadingPaths(["a"], 1),
       fileChangeRow({ id: "edit-1", sourceSeqStart: 2, sourceSeqEnd: 2 }),
@@ -742,9 +705,6 @@ describe("bundle activity intent dedupe", () => {
   });
 
   it("does not modify activityIntents on standalone (non-bundled) rows", () => {
-    // A single same-concept row never bundles, so its activityIntents must
-    // pass through unchanged — within-row dedupe is a render-time concern for
-    // standalone rows, not a property of the row data.
     const rows = buildTimelineViewRows([
       commandRow({
         activityIntents: [readIntent("a"), readIntent("a")],
@@ -765,5 +725,112 @@ describe("bundle activity intent dedupe", () => {
         intent.type === "read" ? intent.path : null,
       ),
     ).toEqual(["a", "a"]);
+  });
+});
+
+describe("reasoning within activity groups", () => {
+  function thought(
+    id: string,
+    seq: number,
+  ): Extract<TimelineSystemRow, { systemKind: "operation" }> & {
+    operationKind: "reasoning";
+  } {
+    return {
+      ...baseRow(id, {
+        sourceSeqStart: seq,
+        sourceSeqEnd: seq,
+        startedAt: seq,
+        createdAt: seq + 1,
+      }),
+      kind: "system",
+      systemKind: "operation",
+      operationKind: "reasoning",
+      status: "completed",
+      title: "Thought",
+      detail: "Consider the next change.",
+      completedAt: seq + 1,
+    };
+  }
+
+  it("keeps interleaved thoughts inside a closed exploration and edit step", () => {
+    const input = [
+      thought("before", 1),
+      commandRowReadingPaths(["src/app.ts"], 2),
+      thought("between", 3),
+      fileChangeRow({ id: "edit", sourceSeqStart: 4 }),
+      thought("after", 5),
+    ];
+    const liveRows = buildTimelineViewRows(input);
+    expect(liveRows.map((row) => row.kind)).toEqual([
+      "bundle-summary",
+      "bundle-summary",
+    ]);
+    expect(
+      buildTimelineWorkSummaryLabel(expectBundleSummaryRow(liveRows[0])),
+    ).toBe("Explored 1 file");
+    expect(
+      buildTimelineWorkSummaryLabel(expectBundleSummaryRow(liveRows[1])),
+    ).toBe("Edited 1 file");
+    const rows = buildTimelineViewRows([
+      ...input,
+      assistantRow({ id: "response", sourceSeqStart: 6 }),
+    ]);
+    const summary = expectStepSummaryRow(rows[0]);
+    expect(summary.children.map((row) => row.id)).toEqual(
+      input.map((row) => row.id),
+    );
+    expect(buildTimelineWorkSummaryLabel(summary)).toBe(
+      "Explored 1 file, edited 1 file",
+    );
+    expect(rows[1]?.id).toBe("response");
+  });
+
+  it("bundles live exploration across thoughts without counting them as work", () => {
+    const input = [
+      thought("before", 1),
+      commandRowReadingPaths(["a.ts"], 2),
+      thought("between", 3),
+      commandRowReadingPaths(["b.ts"], 4),
+      thought("after", 5),
+    ];
+    const rows = buildTimelineViewRows(input);
+    expect(rows).toHaveLength(1);
+    const summary = expectBundleSummaryRow(rows[0]);
+    expect(summary.children.map((row) => row.id)).toEqual(
+      input.map((row) => row.id),
+    );
+    expect(buildTimelineWorkSummaryLabel(summary)).toBe("Explored 2 files");
+  });
+
+  it("leaves thought-only sequences visible and does not cross warnings or messages", () => {
+    const first = thought("first", 1);
+    const second = thought("second", 2);
+    expect(
+      buildTimelineViewRows([first, second], { closedScope: true }),
+    ).toEqual([first, second]);
+    expect(buildTimelineViewRows([first, second])).toEqual([first, second]);
+    const warning: TimelineSystemRow = {
+      ...first,
+      id: "warning",
+      systemKind: "operation",
+      operationKind: "warning",
+    };
+    const rows = buildTimelineViewRows([
+      commandRowReadingPaths(["a.ts"], 0),
+      first,
+      warning,
+      commandRowReadingPaths(["b.ts"], 3),
+      second,
+      assistantRow({ id: "response", sourceSeqStart: 4 }),
+      commandRowReadingPaths(["c.ts"], 5),
+    ]);
+    expect(rows.map((row) => row.kind)).toEqual([
+      "bundle-summary",
+      "system",
+      "step-summary",
+      "conversation",
+      "work",
+    ]);
+    expect(rows[1]?.id).toBe("warning");
   });
 });

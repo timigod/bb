@@ -1,17 +1,63 @@
+import {
+  environmentCompositionSchema,
+  validateServerAccessProviderDeclaration,
+  type NormalizedPluginEnvironmentComposition,
+} from "../internal/host-policy.js";
+import type { MachineBootstrapApi } from "../machine-bootstrap.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { CronExpressionParser } from "cron-parser";
 import { Hono } from "hono";
-import { z } from "zod";
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "../backend-contract.js";
+import { deepFreezePluginMetadata, validatePluginMetadata } from "@bb/domain";
+import {
+  adoptHttpRouteResponse,
+  aiServiceAlreadyRegisteredMessage,
+  pluginHookAlreadyRegisteredMessage,
+  coerceStoredPluginSettingValue,
+  enforcePluginCliOutputLimit,
+  isStandardSchema,
+  storePluginHook,
+  validatePluginEnvironmentProviderDeclaration,
+  validatePluginMachineProviderDeclaration,
+  type NormalizedPluginEnvironmentProvider,
+  type NormalizedPluginMachineProvider,
+  KV_VALUE_MAX_BYTES,
+  normalizeAgentToolRegistration,
+  normalizeCliRegistration,
+  normalizeHttpRouteRegistration,
+  normalizeInteractionRequest,
+  normalizeMentionProviderRegistration,
+  normalizePluginAgentConfiguration,
+  normalizeRealtimePayload,
+  normalizeRpcJsonResult,
+  normalizeRpcRegistration,
+  publishRpcMethod,
+  normalizeWebSocketRouteRegistration,
+  pluginCliCollisionWarning,
+  providerAlreadyRegisteredMessage,
+  providerIconRefusalMessage,
+  providerWithoutBridgeMessage,
+  registerSettingDescriptors,
+  runPluginStorageMigrations,
+  undeclaredIconProblem,
+  validateBackgroundServiceRegistration,
+  validatePluginAiServiceDeclaration,
+  validatePluginProviderDeclaration,
+  validatePluginProviderEnvEntries,
+  validateProviderEnvContribution,
+  validateRpcValue,
+  validateScheduleRegistration,
+  validateSettingsUpdate,
+  type NormalizedPluginProviderDeclaration,
+} from "../internal/host-policy.js";
 import type {
   BbPluginApi,
   PluginAgentConfiguration,
   PluginAgentConfigurationContext,
   PluginAgentToolContext,
-  PluginAgentToolExperimentalStatusLabels,
+  PluginRowPresentation,
   PluginAgentToolResult,
   PluginAgents,
   PluginBackground,
@@ -19,8 +65,12 @@ import type {
   PluginCliCommandInfo,
   PluginCliContext,
   PluginCliExecutionResult,
-  PluginCliOutputLimitError,
   PluginCliResult,
+  PluginHookHandler,
+  PluginEnvironments,
+  PluginMachines,
+  PluginHookName,
+  PluginHooks,
   PluginEvents,
   PluginHttp,
   PluginHttpAuthMode,
@@ -32,12 +82,23 @@ import type {
   PluginKvStorage,
   PluginLogger,
   PluginMentionItem,
+  PluginMentionProviderRegistration,
   PluginMentionSearchContext,
   PluginMentionTrigger,
+  PluginAiServiceDeclaration,
+  PluginAiServices,
+  PluginProviderDeclaration,
+  ExperimentalPluginProviderEnvContext,
+  ExperimentalPluginProviderEnvEntry,
+  ExperimentalPluginProviderEnvHealth,
+  ExperimentalPluginProviderEnvHealthContext,
+  ExperimentalPluginWebSocket,
+  ExperimentalPluginWebSocketHandler,
+  ExperimentalPluginWebSocketHandlers,
+  PluginProviders,
   PluginRealtime,
   PluginRpc,
   PluginServerApi,
-  PluginSettingDescriptor,
   PluginSettingDescriptors,
   PluginSettingValue,
   PluginSettings,
@@ -49,13 +110,11 @@ import type {
   PluginThreadEventPayloads,
   PluginUi,
   PluginRpcError,
-  PluginRpcMethodContract,
-  PluginRpcValidationIssue,
+  ExperimentalPluginRpcCaller,
+  ExperimentalPluginRpcHandlerContext,
   StandardSchemaV1,
-  StandardSchemaV1Issue,
-  StandardSchemaV1Result,
   JsonValue,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import {
   createFakeSdk,
   type FakeSdkHarness,
@@ -100,138 +159,6 @@ export class PluginContextStaleError extends Error {
   }
 }
 
-/** JSON values ≤256KB; larger writes are rejected with a clear error. */
-const KV_VALUE_MAX_BYTES = 256 * 1024;
-/** Mirrors the server's pending-interaction title schema. */
-const PLUGIN_INTERACTION_MAX_TITLE_LENGTH = 160;
-
-const PLUGIN_HTTP_METHODS = new Set([
-  "GET",
-  "POST",
-  "PUT",
-  "PATCH",
-  "DELETE",
-  "HEAD",
-  "OPTIONS",
-]);
-
-const RPC_METHOD_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const BACKGROUND_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const CLI_COMMAND_NAME_PATTERN = /^[a-z0-9-]+$/;
-const AGENT_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS = 4096;
-/** Status labels ride on every tool-call event and share one timeline row. */
-const PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS = 80;
-const PLUGIN_AGENT_SELECTION_MAX_IDS = 256;
-const PLUGIN_AGENT_DYNAMIC_INSTRUCTIONS_MAX_CHARS = 4096;
-
-function enforcePluginCliOutputLimit(
-  result: Omit<PluginCliExecutionResult, "error">,
-  jsonOutput: boolean,
-): PluginCliExecutionResult {
-  const stdoutBytes = Buffer.byteLength(result.stdout, "utf8");
-  const stderrBytes = Buffer.byteLength(result.stderr, "utf8");
-  const totalBytes = stdoutBytes + stderrBytes;
-  if (totalBytes <= PLUGIN_CLI_OUTPUT_MAX_BYTES) return result;
-
-  const error: PluginCliOutputLimitError = {
-    code: "plugin_cli_output_too_large",
-    message:
-      `Plugin CLI output is ${totalBytes} bytes (${stdoutBytes} stdout + ${stderrBytes} stderr), ` +
-      `exceeding the ${PLUGIN_CLI_OUTPUT_MAX_BYTES}-byte limit. Narrow the query, request a smaller page, or use a file/streaming command.`,
-    maxBytes: PLUGIN_CLI_OUTPUT_MAX_BYTES,
-    stdoutBytes,
-    stderrBytes,
-    totalBytes,
-  };
-  return jsonOutput
-    ? {
-        exitCode: 1,
-        stdout: JSON.stringify({ error }),
-        stderr: "",
-        error,
-      }
-    : { exitCode: 1, stdout: "", stderr: error.message, error };
-}
-const MENTION_PROVIDER_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
-const PLUGIN_MENTION_TRIGGER_VALUES = [
-  "@",
-  "#",
-  "$",
-  "!",
-  "~",
-] as const satisfies readonly PluginMentionTrigger[];
-const DEFAULT_PLUGIN_MENTION_TRIGGERS = [
-  "@",
-] as const satisfies readonly PluginMentionTrigger[];
-const SETTING_KEY_PATTERN = /^[a-zA-Z0-9_-]+$/;
-
-function isPluginMentionTrigger(value: unknown): value is PluginMentionTrigger {
-  return (
-    typeof value === "string" &&
-    (PLUGIN_MENTION_TRIGGER_VALUES as readonly string[]).includes(value)
-  );
-}
-
-function normalizeMentionProviderTriggers(
-  providerId: string,
-  triggers: unknown,
-): readonly PluginMentionTrigger[] {
-  if (triggers === undefined) {
-    return DEFAULT_PLUGIN_MENTION_TRIGGERS;
-  }
-  if (!Array.isArray(triggers)) {
-    throw new Error(
-      `mention provider "${providerId}" triggers must be an array`,
-    );
-  }
-  if (triggers.length === 0) {
-    throw new Error(
-      `mention provider "${providerId}" triggers must include at least one trigger`,
-    );
-  }
-  const seen = new Set<PluginMentionTrigger>();
-  const normalized: PluginMentionTrigger[] = [];
-  for (const trigger of triggers) {
-    if (!isPluginMentionTrigger(trigger)) {
-      throw new Error(
-        `mention provider "${providerId}" trigger ${JSON.stringify(trigger)} is invalid — use one of ${PLUGIN_MENTION_TRIGGER_VALUES.join(" ")}`,
-      );
-    }
-    if (seen.has(trigger)) {
-      throw new Error(
-        `mention provider "${providerId}" trigger ${JSON.stringify(trigger)} is duplicated`,
-      );
-    }
-    seen.add(trigger);
-    normalized.push(trigger);
-  }
-  return normalized;
-}
-
-/**
- * Copies of the server's hand-maintained reserved-name lists
- * (RESERVED_BB_CLI_COMMANDS / RESERVED_AGENT_TOOL_NAMES in
- * apps/server/src/services/plugins/plugin-api.ts) so registrations fail here
- * the same way they fail there. Update alongside the server lists.
- */
-const RESERVED_BB_CLI_COMMANDS: readonly string[] = [
-  "environment",
-  "guide",
-  "help",
-  "manager",
-  "plugin",
-  "project",
-  "provider",
-  "status",
-  "theme",
-  "thread",
-  "ui",
-];
-const RESERVED_AGENT_TOOL_NAMES: readonly string[] = [
-  "update_environment_directory",
-];
-
 export type FakeLogLevel = "debug" | "info" | "warn" | "error";
 
 export interface FakeLogEntry {
@@ -244,6 +171,24 @@ export interface FakeHttpRouteRecord {
   path: string;
   auth: PluginHttpAuthMode;
   handler: PluginHttpHandler;
+}
+
+export interface ExperimentalFakeWebSocketRouteRecord {
+  path: string;
+  auth: PluginHttpAuthMode;
+  handler: ExperimentalPluginWebSocketHandler;
+}
+
+export interface ExperimentalFakeWebSocketSession {
+  readonly sent: readonly (string | Uint8Array)[];
+  readonly closeCalls: readonly {
+    code: number | null;
+    reason: string | null;
+  }[];
+  readonly readyState: number;
+  receive(data: string | Uint8Array): Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+  error(error: Error): Promise<void>;
 }
 
 export interface FakeScheduleRecord {
@@ -270,8 +215,14 @@ export interface FakeCliRecord {
 export interface FakeAgentToolRecord {
   name: string;
   description: string;
-  experimentalStatusLabels: PluginAgentToolExperimentalStatusLabels | null;
   instructions: string | null;
+  /**
+   * The plugin's declared row presentation, null when it declared none.
+   * Parsed by the shared `parsePluginRowPresentation`, so the record
+   * holds exactly what the production host stores and a presentation bb
+   * rejects is rejected here with the same message.
+   */
+  presentation: PluginRowPresentation | null;
   /** JSON-schema object the host would send providers. */
   inputSchema: unknown;
   parse(
@@ -283,7 +234,6 @@ export interface FakeAgentToolRecord {
   ): PluginAgentToolResult | Promise<PluginAgentToolResult>;
 }
 
-
 export interface FakeMentionProviderRecord {
   id: string;
   label: string;
@@ -291,9 +241,7 @@ export interface FakeMentionProviderRecord {
   search: (
     ctx: PluginMentionSearchContext,
   ) => PluginMentionItem[] | Promise<PluginMentionItem[]>;
-  resolve: (
-    itemId: string,
-  ) => { context: string } | Promise<{ context: string }>;
+  resolve: PluginMentionProviderRegistration["resolve"];
 }
 
 export interface FakeRealtimeSignal {
@@ -302,10 +250,21 @@ export interface FakeRealtimeSignal {
   payload: unknown;
 }
 
+export interface ExperimentalFakeHostRpcCall {
+  method: string;
+  input: unknown;
+  hostId: string;
+  signal?: AbortSignal;
+}
+
 /** Everything the plugin registered, exposed raw for assertions. */
 export interface FakePluginRegistrations {
   settingsDescriptors: PluginSettingDescriptors;
   httpRoutes: FakeHttpRouteRecord[];
+  websocketRoutes: ExperimentalFakeWebSocketRouteRecord[];
+  experimental_publishedRpcMethods: Array<
+    NonNullable<ReturnType<typeof publishRpcMethod>>
+  >;
   rpcMethods: string[];
   services: FakeServiceRecord[];
   schedules: FakeScheduleRecord[];
@@ -320,7 +279,47 @@ export interface FakePluginRegistrations {
     | ((ctx: { threadId: string; projectId: string }) => string | null)
     | null;
   threadEventHandlers: Record<PluginThreadEventName, number>;
+  /** The handler registered per hook by `bb.experimental_hooks.on`. */
+  hooks: {
+    [K in PluginHookName]: PluginHookHandler<K> | null;
+  };
+  environmentCompositions: ReadonlyMap<
+    string,
+    NormalizedPluginEnvironmentComposition
+  >;
+  environmentProviders: ReadonlyMap<
+    string,
+    NormalizedPluginEnvironmentProvider
+  >;
+  machineProviders: ReadonlyMap<string, NormalizedPluginMachineProvider>;
+  serverAccessProviders: ReadonlyMap<
+    string,
+    import("../backend-contract.js").ServerAccessProviderDeclaration
+  >;
   mentionProviders: FakeMentionProviderRecord[];
+  /** Live provider registrations from `bb.providers.register`
+   * (normalized declarations, registration order; dispose removes). */
+  providerRegistrations: NormalizedPluginProviderDeclaration[];
+  providerEnvResolvers: ReadonlyMap<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvContext,
+    ) =>
+      | Promise<readonly ExperimentalPluginProviderEnvEntry[]>
+      | readonly ExperimentalPluginProviderEnvEntry[]
+  >;
+  providerEnvHealthResolvers: ReadonlyMap<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvHealthContext,
+    ) =>
+      | ExperimentalPluginProviderEnvHealth
+      | null
+      | Promise<ExperimentalPluginProviderEnvHealth | null>
+  >;
+  /** Live AI-service registrations from `experimental_aiServices.register`
+   * (normalized declarations, registration order; dispose removes). */
+  aiServiceRegistrations: PluginAiServiceDeclaration[];
 }
 
 /** Read-only state for assertions after a plugin registers or handles work. */
@@ -332,6 +331,12 @@ export interface FakePluginInspectionState {
   readonly realtimeSignals: FakeRealtimeSignal[];
   /** Every `bb.status.needsConfiguration` message, in order. */
   readonly needsConfigurationMessages: string[];
+  /**
+   * How many times the plugin called
+   * `bb.experimental_hooks.recheck()` — the wake it asks core for when a
+   * condition its own waits depend on has changed.
+   */
+  readonly recheckCount: number;
   /** Recorded `bb.sdk` calls + stub control. */
   readonly sdk: FakeSdkHarness;
   readonly registrations: FakePluginRegistrations;
@@ -339,6 +344,8 @@ export interface FakePluginInspectionState {
     hostId: string;
     ports: number[];
   }>;
+  /** Calls made through bb.hosts.experimental_client, after input validation. */
+  readonly experimental_hostRpcCalls: readonly ExperimentalFakeHostRpcCall[];
   readonly pendingInteractions: readonly (PluginInteractionRequest & {
     id: string;
   })[];
@@ -346,6 +353,14 @@ export interface FakePluginInspectionState {
 
 /** Deterministic inputs that stand in for behavior normally driven by BB. */
 export interface FakePluginBehaviorDrivers {
+  /** Deliver an unexpected host-worker exit to every registered client. */
+  experimental_emitHostWorkerExit(hostId: string): Promise<void>;
+  /** Deliver a host signal through its registered payload schema. */
+  experimental_emitHostSignal(
+    hostId: string,
+    signal: string,
+    payload: unknown,
+  ): Promise<void>;
   submitInteraction(id: string, value: JsonValue): void;
   cancelInteraction(id: string): void;
   /**
@@ -358,9 +373,16 @@ export interface FakePluginBehaviorDrivers {
   /**
    * Invoke a registered rpc method with host semantics: input/output schemas,
    * strict JSON result normalization, and structured failure codes. Rejects
-   * with the same message/code/issues the frontend client surfaces.
+   * with the same message/code/issues the frontend client surfaces. The
+   * handler sees `options.experimental_caller` as its caller, `{ kind:
+   * "client" }` by default; pass `{ kind: "plugin", pluginId }` to act as
+   * another plugin calling through `bb.sdk.plugins.callRpc`.
    */
-  callRpc(method: string, input?: unknown): Promise<unknown>;
+  callRpc(
+    method: string,
+    input?: unknown,
+    options?: { experimental_caller?: ExperimentalPluginRpcCaller },
+  ): Promise<unknown>;
   /**
    * Invoke the plugin's CLI command with host semantics: the result's
    * exitCode must be a number, stdout/stderr default to "", and a throwing
@@ -381,6 +403,11 @@ export interface FakePluginBehaviorDrivers {
     path: string,
     init?: RequestInit,
   ): Promise<Response>;
+  /** Open and drive an exact-match `bb.http.experimental_websocket` route. */
+  experimental_openWebSocket(
+    path: string,
+    init?: RequestInit,
+  ): Promise<ExperimentalFakeWebSocketSession>;
   /**
    * Start a registered background service once, deterministically. `done`
    * settles when `start` returns; abort `controller` to signal shutdown.
@@ -416,12 +443,23 @@ export interface FakePluginBehaviorDrivers {
   ): Promise<PluginAgentToolResult>;
   /** Evaluate `bb.agents.configure` with production validation/fail-closed
    * semantics. With no callback, every registered tool/declared test skill is
-   * selected. Callback failures are logged and return empty selections. */
+   * selected. The callback receives a copy of `context` whose `pluginMetadata`
+   * is a validated, deep-frozen clone; invalid metadata rejects instead of
+   * reaching the callback. Callback failures are logged and return empty
+   * selections. */
   resolveAgentConfiguration(context: PluginAgentConfigurationContext): Promise<{
     tools: FakeAgentToolRecord[];
     skills: string[];
     instructions: string | null;
   }>;
+  resolveProviderEnv(
+    providerId: string,
+    context: ExperimentalPluginProviderEnvContext,
+  ): Promise<ExperimentalPluginProviderEnvEntry[]>;
+  resolveProviderEnvHealth(
+    providerId: string,
+    context: ExperimentalPluginProviderEnvHealthContext,
+  ): Promise<ExperimentalPluginProviderEnvHealth | null>;
 }
 
 /** Reload/shutdown controls, kept separate from behavior and inspection. */
@@ -441,6 +479,12 @@ export interface FakePluginLifecycleControls {
    * PluginContextStaleError). Idempotent.
    */
   dispose(): Promise<void>;
+  /**
+   * Run every handler registered with `bb.onInstall`, in
+   * registration order, as bb does right after a fresh install. A handler
+   * that throws is logged at warn level and the rest still run.
+   */
+  install(): Promise<void>;
 }
 
 /**
@@ -458,13 +502,24 @@ export interface FakePluginHarness
 }
 
 export interface CreateFakePluginHostOptions {
+  machineBootstrap?: MachineBootstrapApi;
+  machineResource?: (hostId: string) => Promise<JsonValue | null>;
   /** Defaults to "test-plugin". */
   pluginId?: string;
+  /**
+   * Value served by `bb.server.experimental_appUrl`. Defaults to `null`.
+   */
+  appUrl?: string | null;
   /**
    * Value served by `bb.server.loopbackBaseUrl` (always bound here, like
    * `bb.sdk`). Defaults to "http://127.0.0.1:38886".
    */
   loopbackBaseUrl?: string;
+  /**
+   * Value served by `bb.server.experimental_dataDir`. Defaults to
+   * "/tmp/bb-fake-data-dir".
+   */
+  dataDir?: string;
   /**
    * Pre-seeded stored settings values (as if saved before this load) —
    * including secret ones, which the fake keeps in memory instead of
@@ -478,92 +533,31 @@ export interface CreateFakePluginHostOptions {
   agentSkillIds?: readonly string[];
   /** Read-only identities returned by bb.hosts.ensureSharedPortTunnel. */
   sharedPortTunnelIdentities?: Record<string, PluginSharedPortTunnelIdentity>;
+  /**
+   * Whether the plugin's manifest declares a `bb.host` entry. Production
+   * refuses `bb.providers.register` without one (the provider would have no
+   * bridge to run on); the fake applies the same rule. Defaults to true.
+   */
+  experimental_hostEntry?: boolean;
+  /**
+   * The icon names the plugin's manifest declares under
+   * `bb.branding.experimental_icons`. Production refuses a provider `icon`
+   * or a tool `presentation.icon.glyph` that is a namespaced glyph
+   * (`"<pluginId>/<name>"`) naming another plugin or a name not declared
+   * there; the fake applies the same rule against this list. Defaults to
+   * none declared, so every namespaced glyph is refused until the test
+   * names the icons the manifest would.
+   */
+  experimental_declaredIconNames?: readonly string[];
+  /** Deterministic stand-in for the targeted daemon host entry. */
+  experimental_callHostRpc?: (
+    call: ExperimentalFakeHostRpcCall,
+  ) => unknown | Promise<unknown>;
 }
 
 export interface FakePluginHost {
   bb: BbPluginApi;
   harness: FakePluginHarness;
-}
-
-// ---------------------------------------------------------------------------
-// Settings descriptor validation — ported from the server's
-// plugin-settings.ts so plugins trip over the same errors here.
-// ---------------------------------------------------------------------------
-
-const settingsBaseFields = {
-  label: z.string().min(1),
-  description: z.string().min(1).optional(),
-};
-
-const settingDescriptorSchema = z.discriminatedUnion("type", [
-  z
-    .object({
-      type: z.literal("string"),
-      ...settingsBaseFields,
-      secret: z.literal(true).optional(),
-      default: z.string().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("boolean"),
-      ...settingsBaseFields,
-      default: z.boolean().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("select"),
-      ...settingsBaseFields,
-      options: z.array(z.string().min(1)).min(1),
-      default: z.string().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal("project"),
-      ...settingsBaseFields,
-      default: z.string().optional(),
-    })
-    .strict(),
-]);
-
-function registerSettingDescriptors(
-  target: PluginSettingDescriptors,
-  added: Record<string, unknown>,
-): PluginSettingDescriptors {
-  const validated: PluginSettingDescriptors = {};
-  for (const [key, raw] of Object.entries(added)) {
-    if (!SETTING_KEY_PATTERN.test(key)) {
-      throw new Error(
-        `invalid setting key "${key}" — use letters, digits, "-" and "_"`,
-      );
-    }
-    if (key in target) {
-      throw new Error(`setting "${key}" is already defined`);
-    }
-    const parsed = settingDescriptorSchema.safeParse(raw);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0];
-      const path = issue?.path.join(".") ?? "";
-      throw new Error(
-        `invalid descriptor for setting "${key}"${path ? ` (${path})` : ""}: ${issue?.message ?? "unknown error"}`,
-      );
-    }
-    const descriptor = parsed.data;
-    if (
-      descriptor.type === "select" &&
-      descriptor.default !== undefined &&
-      !descriptor.options.includes(descriptor.default)
-    ) {
-      throw new Error(
-        `default for setting "${key}" must be one of its options`,
-      );
-    }
-    validated[key] = descriptor;
-  }
-  Object.assign(target, validated);
-  return validated;
 }
 
 /** Effective typed values: stored value when valid, else the default, else undefined. */
@@ -573,83 +567,15 @@ function readSettingsValues(
 ): Record<string, PluginSettingValue | undefined> {
   const values: Record<string, PluginSettingValue | undefined> = {};
   for (const [key, descriptor] of Object.entries(descriptors)) {
-    let value = stored.get(key);
-    const expected = descriptor.type === "boolean" ? "boolean" : "string";
-    if (typeof value !== expected) value = undefined;
-    if (
-      descriptor.type === "select" &&
-      typeof value === "string" &&
-      !descriptor.options.includes(value)
-    ) {
-      value = undefined;
-    }
-    values[key] = value ?? descriptor.default;
+    values[key] = coerceStoredPluginSettingValue(descriptor, stored.get(key));
   }
   return values;
-}
-
-function validateSettingsUpdate(
-  descriptors: PluginSettingDescriptors,
-  values: Record<string, unknown>,
-): string[] {
-  const errors: string[] = [];
-  for (const [key, value] of Object.entries(values)) {
-    const descriptor: PluginSettingDescriptor | undefined = descriptors[key];
-    if (!descriptor) {
-      errors.push(`unknown setting "${key}"`);
-      continue;
-    }
-    if (value === null) continue; // unset
-    if (descriptor.type === "boolean") {
-      if (typeof value !== "boolean") {
-        errors.push(`setting "${key}" expects a boolean`);
-      }
-      continue;
-    }
-    if (typeof value !== "string") {
-      errors.push(`setting "${key}" expects a string`);
-      continue;
-    }
-    if (descriptor.type === "select" && !descriptor.options.includes(value)) {
-      errors.push(
-        `setting "${key}" must be one of: ${descriptor.options.join(", ")}`,
-      );
-    }
-  }
-  return errors;
 }
 
 // ---------------------------------------------------------------------------
 
 function isNeedsConfigurationError(error: unknown): error is Error {
   return error instanceof Error && error.name === "NeedsConfigurationError";
-}
-
-/** Duck-typed zod detection, same as the host (plugins may carry their own zod). */
-function isZodSchemaLike(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { safeParse?: unknown }).safeParse === "function"
-  );
-}
-
-function summarizeParseIssues(error: unknown): string {
-  const issues = (
-    error as { issues?: Array<{ path?: PropertyKey[]; message?: string }> }
-  )?.issues;
-  if (Array.isArray(issues) && issues.length > 0) {
-    return issues
-      .map((issue) => {
-        const path =
-          Array.isArray(issue.path) && issue.path.length > 0
-            ? issue.path.join(".")
-            : "(input)";
-        return `${path}: ${issue.message ?? "invalid"}`;
-      })
-      .join("; ");
-  }
-  return error instanceof Error ? error.message : String(error);
 }
 
 function errorMessage(error: unknown): string {
@@ -671,66 +597,26 @@ function jsonRoundTrip(value: unknown, what: string): unknown {
 }
 
 interface FakeRpcRecord {
+  publication: ReturnType<typeof publishRpcMethod>;
   inputSchema: StandardSchemaV1;
   outputSchema: StandardSchemaV1;
-  handler: (input: never) => unknown;
+  handler: (
+    input: never,
+    context: ExperimentalPluginRpcHandlerContext,
+  ) => unknown;
 }
 
-function isStandardSchema(value: unknown): value is StandardSchemaV1 {
-  if (typeof value !== "object" || value === null) return false;
-  const standard = Reflect.get(value, "~standard");
-  return (
-    typeof standard === "object" &&
-    standard !== null &&
-    Reflect.get(standard, "version") === 1 &&
-    typeof Reflect.get(standard, "vendor") === "string" &&
-    typeof Reflect.get(standard, "validate") === "function"
-  );
-}
+type FakeHostWorkerExitSubscription = (event: {
+  readonly hostId: string;
+}) => void | Promise<void>;
 
-function readRpcMethodContract(
-  method: string,
-  value: unknown,
-): PluginRpcMethodContract {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      `rpc method "${method}" contract must provide input and output Standard Schemas`,
-    );
-  }
-  const input = Reflect.get(value, "input");
-  const output = Reflect.get(value, "output");
-  if (!isStandardSchema(input)) {
-    throw new Error(
-      `rpc method "${method}" input must be a Standard Schema v1 validator`,
-    );
-  }
-  if (!isStandardSchema(output)) {
-    throw new Error(
-      `rpc method "${method}" output must be a Standard Schema v1 validator`,
-    );
-  }
-  return { input, output };
-}
-
-function normalizeRpcIssues(
-  issues: readonly StandardSchemaV1Issue[],
-): PluginRpcValidationIssue[] {
-  return issues.map((issue) => {
-    const rawPath = issue.path;
-    const segments =
-      rawPath === undefined ? [] : Array.isArray(rawPath) ? rawPath : [rawPath];
-    const path = segments.map((segment) => {
-      const key =
-        typeof segment === "object" && segment !== null
-          ? Reflect.get(segment, "key")
-          : segment;
-      return typeof key === "number" ? key : String(key);
-    });
-    return {
-      message: issue.message,
-      ...(path.length > 0 ? { path } : {}),
-    };
-  });
+interface FakeHostSignalSubscription {
+  signal: string;
+  payloadSchema: StandardSchemaV1;
+  handler: (event: {
+    hostId: string;
+    payload: unknown;
+  }) => void | Promise<void>;
 }
 
 function throwRpcError(error: PluginRpcError): never {
@@ -738,302 +624,6 @@ function throwRpcError(error: PluginRpcError): never {
   Reflect.set(thrown, "code", error.code);
   if (error.issues !== undefined) Reflect.set(thrown, "issues", error.issues);
   throw thrown;
-}
-
-async function validateRpcValue(
-  schema: StandardSchemaV1,
-  value: unknown,
-  phase: "input" | "output",
-): Promise<unknown> {
-  let result: StandardSchemaV1Result<unknown>;
-  try {
-    result = await schema["~standard"].validate(value);
-  } catch (error) {
-    const message = errorMessage(error);
-    return throwRpcError({
-      code: phase === "input" ? "invalid_input" : "invalid_output",
-      message: `rpc ${phase} validator failed: ${message}`,
-      issues: [{ message }],
-    });
-  }
-  if (result.issues !== undefined) {
-    return throwRpcError({
-      code: phase === "input" ? "invalid_input" : "invalid_output",
-      message: `rpc ${phase} validation failed`,
-      issues: normalizeRpcIssues(result.issues),
-    });
-  }
-  return result.value;
-}
-
-function normalizeRpcJsonResult(value: unknown): JsonValue {
-  const ancestors = new Set<object>();
-  function visit(current: unknown, path: string): JsonValue {
-    if (
-      current === null ||
-      typeof current === "string" ||
-      typeof current === "boolean"
-    ) {
-      return current;
-    }
-    if (typeof current === "number") {
-      if (!Number.isFinite(current)) {
-        return throwRpcError({
-          code: "non_json_result",
-          message: `rpc result at ${path} contains a non-finite number`,
-        });
-      }
-      return current;
-    }
-    if (typeof current !== "object") {
-      return throwRpcError({
-        code: "non_json_result",
-        message: `rpc result at ${path} is not a JSON value (${typeof current})`,
-      });
-    }
-    if (ancestors.has(current)) {
-      return throwRpcError({
-        code: "non_json_result",
-        message: `rpc result at ${path} is cyclic`,
-      });
-    }
-    ancestors.add(current);
-    try {
-      if (Array.isArray(current)) {
-        return current.map((item, index) => visit(item, `${path}[${index}]`));
-      }
-      const prototype = Object.getPrototypeOf(current) as object | null;
-      if (prototype !== Object.prototype && prototype !== null) {
-        return throwRpcError({
-          code: "non_json_result",
-          message: `rpc result at ${path} must be a plain JSON object`,
-        });
-      }
-      if (Reflect.ownKeys(current).some((key) => typeof key === "symbol")) {
-        return throwRpcError({
-          code: "non_json_result",
-          message: `rpc result at ${path} contains a symbol key`,
-        });
-      }
-      const normalized: Record<string, JsonValue> = {};
-      for (const [key, child] of Object.entries(current)) {
-        normalized[key] = visit(child, `${path}.${key}`);
-      }
-      return normalized;
-    } finally {
-      ancestors.delete(current);
-    }
-  }
-  return visit(value, "$result");
-}
-
-const AGENT_TOOL_PARAMETERS_MAX_BYTES = 128 * 1024;
-
-function normalizeAgentToolSelections(args: {
-  knownIds: ReadonlySet<string>;
-  pluginId: string;
-  value: unknown;
-}): {
-  toolIds: string[];
-  parameterOverrides: Map<string, Record<string, unknown>>;
-} {
-  if (!Array.isArray(args.value)) {
-    throw new Error("configure() output.tools must be an array");
-  }
-  if (args.value.length > PLUGIN_AGENT_SELECTION_MAX_IDS) {
-    throw new Error(
-      `configure() output.tools exceeds the ${PLUGIN_AGENT_SELECTION_MAX_IDS}-id limit`,
-    );
-  }
-  const toolIds: string[] = [];
-  const parameterOverrides = new Map<string, Record<string, unknown>>();
-  const seen = new Set<string>();
-  for (let index = 0; index < args.value.length; index += 1) {
-    const entry = args.value[index];
-    let name: unknown;
-    let parameters: Record<string, unknown> | null = null;
-    if (typeof entry === "string") {
-      name = entry;
-    } else if (
-      typeof entry === "object" &&
-      entry !== null &&
-      !Array.isArray(entry)
-    ) {
-      const typed = entry as Record<string, unknown>;
-      const unknownKeys = Object.keys(typed)
-        .filter((key) => !["name", "parameters"].includes(key))
-        .sort();
-      if (unknownKeys.length > 0) {
-        throw new Error(
-          `configure() output.tools[${index}] contains unknown field${unknownKeys.length === 1 ? "" : "s"}: ${unknownKeys.join(", ")}`,
-        );
-      }
-      name = typed.name;
-      parameters = normalizeAgentToolParameters({
-        index,
-        value: typed.parameters,
-      });
-    } else {
-      throw new Error(
-        `configure() output.tools[${index}] must be a tool name or { name, parameters }`,
-      );
-    }
-    if (typeof name !== "string" || name.length === 0) {
-      throw new Error(
-        `configure() output.tools[${index}] must ${typeof entry === "string" ? "be" : "name"} a non-empty string`,
-      );
-    }
-    if (seen.has(name)) {
-      throw new Error(
-        `configure() output.tools contains duplicate id ${JSON.stringify(name)}`,
-      );
-    }
-    if (!args.knownIds.has(name)) {
-      throw new Error(
-        `configure() selected unknown tool id ${JSON.stringify(name)} owned by plugin ${JSON.stringify(args.pluginId)}`,
-      );
-    }
-    seen.add(name);
-    toolIds.push(name);
-    if (parameters !== null) parameterOverrides.set(name, parameters);
-  }
-  return { toolIds, parameterOverrides };
-}
-
-function normalizeAgentToolParameters(args: {
-  index: number;
-  value: unknown;
-}): Record<string, unknown> {
-  const { index, value } = args;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      `configure() output.tools[${index}].parameters must be a JSON-schema object`,
-    );
-  }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(value);
-  } catch {
-    throw new Error(
-      `configure() output.tools[${index}].parameters is not JSON-serializable`,
-    );
-  }
-  if (serialized === undefined) {
-    throw new Error(
-      `configure() output.tools[${index}].parameters is not JSON-serializable`,
-    );
-  }
-  if (Buffer.byteLength(serialized, "utf8") > AGENT_TOOL_PARAMETERS_MAX_BYTES) {
-    throw new Error(
-      `configure() output.tools[${index}].parameters exceeds the ${AGENT_TOOL_PARAMETERS_MAX_BYTES}-byte limit`,
-    );
-  }
-  const parameters = JSON.parse(serialized) as Record<string, unknown>;
-  if (parameters.type !== "object") {
-    throw new Error(
-      `configure() output.tools[${index}].parameters must have root type "object"`,
-    );
-  }
-  return parameters;
-}
-
-function normalizeAgentConfigurationIds(args: {
-  field: "skills";
-  knownIds: ReadonlySet<string>;
-  pluginId: string;
-  value: unknown;
-}): string[] {
-  if (!Array.isArray(args.value)) {
-    throw new Error(`configure() output.${args.field} must be an array`);
-  }
-  if (args.value.length > PLUGIN_AGENT_SELECTION_MAX_IDS) {
-    throw new Error(
-      `configure() output.${args.field} exceeds the ${PLUGIN_AGENT_SELECTION_MAX_IDS}-id limit`,
-    );
-  }
-  const selected: string[] = [];
-  const seen = new Set<string>();
-  for (let index = 0; index < args.value.length; index += 1) {
-    const id = args.value[index];
-    if (typeof id !== "string" || id.length === 0) {
-      throw new Error(
-        `configure() output.${args.field}[${index}] must be a non-empty string`,
-      );
-    }
-    if (seen.has(id)) {
-      throw new Error(
-        `configure() output.${args.field} contains duplicate id ${JSON.stringify(id)}`,
-      );
-    }
-    if (!args.knownIds.has(id)) {
-      throw new Error(
-        `configure() selected unknown skill id ${JSON.stringify(id)} owned by plugin ${JSON.stringify(args.pluginId)}`,
-      );
-    }
-    seen.add(id);
-    selected.push(id);
-  }
-  return selected;
-}
-
-function normalizeAgentConfiguration(args: {
-  knownSkillIds: ReadonlySet<string>;
-  knownToolIds: ReadonlySet<string>;
-  pluginId: string;
-  value: unknown;
-}): {
-  toolIds: string[];
-  toolParameterOverrides: Map<string, Record<string, unknown>>;
-  skillIds: string[];
-  instructions: string | null;
-} {
-  if (
-    typeof args.value !== "object" ||
-    args.value === null ||
-    Array.isArray(args.value)
-  ) {
-    throw new Error(
-      "configure() must return { tools: string[], skills: string[], instructions?: string }",
-    );
-  }
-  const output = args.value as Record<string, unknown>;
-  const unknownKeys = Object.keys(output)
-    .filter((key) => !["tools", "skills", "instructions"].includes(key))
-    .sort();
-  if (unknownKeys.length > 0) {
-    throw new Error(
-      `configure() output contains unknown field${unknownKeys.length === 1 ? "" : "s"}: ${unknownKeys.join(", ")}`,
-    );
-  }
-  if (
-    output.instructions !== undefined &&
-    typeof output.instructions !== "string"
-  ) {
-    throw new Error("configure() output.instructions must be a string");
-  }
-  const toolSelections = normalizeAgentToolSelections({
-    knownIds: args.knownToolIds,
-    pluginId: args.pluginId,
-    value: output.tools,
-  });
-  return {
-    toolIds: toolSelections.toolIds,
-    toolParameterOverrides: toolSelections.parameterOverrides,
-    skillIds: normalizeAgentConfigurationIds({
-      field: "skills",
-      knownIds: args.knownSkillIds,
-      pluginId: args.pluginId,
-      value: output.skills,
-    }),
-    instructions:
-      typeof output.instructions === "string" &&
-      output.instructions.trim().length > 0
-        ? output.instructions.slice(
-            0,
-            PLUGIN_AGENT_DYNAMIC_INSTRUCTIONS_MAX_CHARS,
-          )
-        : null,
-  };
 }
 
 interface FakePluginPersistentState {
@@ -1067,6 +657,9 @@ function createFakePluginHostInternal(
       ),
     } satisfies FakePluginPersistentState);
   const pluginId = options.pluginId ?? "test-plugin";
+  const declaredIconNames = new Set(
+    options.experimental_declaredIconNames ?? [],
+  );
   const agentSkillIds = [...(options.agentSkillIds ?? [])];
   if (new Set(agentSkillIds).size !== agentSkillIds.length) {
     throw new Error("agentSkillIds must not contain duplicates");
@@ -1129,13 +722,14 @@ function createFakePluginHostInternal(
   const storageRoot = persistentState.storageRoot;
 
   // One shared temp-file handle: every database() call sees the same data,
-  // like the host's handles over one on-disk file.
+  // like the host's handles over one on-disk file. Like the host, a handle
+  // the plugin closed itself is replaced on the next call.
   let databaseHandle: Database.Database | undefined;
   const storage: PluginStorage = {
     kv,
     database() {
       assertLive();
-      if (!databaseHandle) {
+      if (!databaseHandle?.open) {
         databaseHandle = new Database(join(storageRoot, "data.db"));
         databaseHandle.pragma("busy_timeout = 5000");
       }
@@ -1143,26 +737,7 @@ function createFakePluginHostInternal(
     },
     migrate(database, statements) {
       assertLive();
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
-      );
-      const applied = new Set(
-        (
-          database.prepare("SELECT id FROM _bb_migrations").all() as Array<{
-            id: number;
-          }>
-        ).map((row) => row.id),
-      );
-      const record = database.prepare(
-        "INSERT INTO _bb_migrations (id, applied_at) VALUES (?, ?)",
-      );
-      database.transaction(() => {
-        statements.forEach((statement, index) => {
-          if (applied.has(index)) return;
-          database.exec(statement);
-          record.run(index, Date.now());
-        });
-      })();
+      runPluginStorageMigrations(database, statements);
     },
   };
 
@@ -1176,10 +751,44 @@ function createFakePluginHostInternal(
   > = [];
   const storedSettings = persistentState.storedSettings;
 
+  async function setSettingsValues(
+    values: Record<string, unknown>,
+  ): Promise<void> {
+    const errors = validateSettingsUpdate(settingsDescriptors, values);
+    if (errors.length > 0) {
+      throw new Error(errors.join("; "));
+    }
+    const prev = readSettingsValues(settingsDescriptors, storedSettings);
+    for (const [key, value] of Object.entries(values)) {
+      if (value === null) storedSettings.delete(key);
+      else if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        storedSettings.set(key, value);
+      } else {
+        throw new Error(`setting "${key}" has an unsupported value`);
+      }
+    }
+    const next = readSettingsValues(settingsDescriptors, storedSettings);
+    if (JSON.stringify(next) === JSON.stringify(prev)) return;
+    for (const listener of settingsListeners) {
+      try {
+        listener(next, prev);
+      } catch (error) {
+        emitLog(
+          "warn",
+          `settings onChange listener failed: ${errorMessage(error)}`,
+        );
+      }
+    }
+  }
+
   const settings: PluginSettings = {
     define(descriptors) {
       assertLive();
-      registerSettingDescriptors(
+      const validated = registerSettingDescriptors(
         settingsDescriptors,
         descriptors as Record<string, unknown>,
       );
@@ -1187,10 +796,20 @@ function createFakePluginHostInternal(
       return {
         async get() {
           assertLive();
-          return readSettingsValues(
-            settingsDescriptors,
-            storedSettings,
-          ) as Values;
+          return readSettingsValues(validated, storedSettings) as Values;
+        },
+        async experimental_set(values) {
+          assertLive();
+          const rawValues: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(values)) {
+            rawValues[key] = value;
+          }
+          const errors = validateSettingsUpdate(validated, rawValues);
+          if (errors.length > 0) {
+            throw new Error(errors.join("; "));
+          }
+          await setSettingsValues(rawValues);
+          return readSettingsValues(validated, storedSettings) as Values;
         },
         onChange(listener) {
           assertLive();
@@ -1204,99 +823,45 @@ function createFakePluginHostInternal(
 
   // --- http ---
   const httpRoutes: FakeHttpRouteRecord[] = [];
+  const websocketRoutes: ExperimentalFakeWebSocketRouteRecord[] = [];
+  const websocketSessions = new Set<{
+    closeForReload(): Promise<void>;
+  }>();
   const http: PluginHttp = {
     route(method, path, handler, opts) {
       assertLive();
-      const normalizedMethod = String(method).toUpperCase();
-      if (!PLUGIN_HTTP_METHODS.has(normalizedMethod)) {
-        throw new Error(
-          `invalid http method "${String(method)}" — use one of: ${[...PLUGIN_HTTP_METHODS].join(", ")}`,
-        );
-      }
-      if (typeof path !== "string" || !path.startsWith("/")) {
-        throw new Error(
-          `http route path must be a string starting with "/", got ${JSON.stringify(path)}`,
-        );
-      }
-      if (typeof handler !== "function") {
-        throw new Error(
-          `http route handler for ${normalizedMethod} ${path} must be a function`,
-        );
-      }
-      const auth = opts?.auth ?? "local";
-      if (auth !== "local" && auth !== "token" && auth !== "none") {
-        throw new Error(
-          `invalid auth mode "${String(auth)}" for ${normalizedMethod} ${path} — use "local", "token", or "none"`,
-        );
-      }
-      if (
-        httpRoutes.some(
-          (route) => route.method === normalizedMethod && route.path === path,
-        )
-      ) {
-        throw new Error(
-          `http route ${normalizedMethod} ${path} is already registered`,
-        );
-      }
-      httpRoutes.push({ method: normalizedMethod, path, auth, handler });
+      const route = normalizeHttpRouteRegistration(
+        method,
+        path,
+        handler,
+        opts,
+        httpRoutes,
+      );
+      httpRoutes.push({ ...route, handler });
+    },
+    experimental_websocket(path, handler, opts) {
+      assertLive();
+      const route = normalizeWebSocketRouteRegistration(
+        path,
+        handler,
+        opts,
+        websocketRoutes,
+      );
+      websocketRoutes.push({ ...route, handler });
     },
   };
 
   // --- rpc ---
   const rpcHandlers = new Map<string, FakeRpcRecord>();
   const rpc: PluginRpc = {
-    register(contract, handlers) {
+    register(contract, handlers, registrationOptions) {
       assertLive();
-      if (
-        typeof contract !== "object" ||
-        contract === null ||
-        Array.isArray(contract)
-      ) {
-        throw new Error("rpc.register contract must be an object");
-      }
-      if (
-        typeof handlers !== "object" ||
-        handlers === null ||
-        Array.isArray(handlers)
-      ) {
-        throw new Error("rpc.register handlers must be an object");
-      }
-      const pending: Array<[string, FakeRpcRecord]> = [];
-      const contractEntries = Object.entries(contract);
-      const contractNames = new Set(contractEntries.map(([name]) => name));
-      for (const extraName of Object.keys(handlers)) {
-        if (!contractNames.has(extraName)) {
-          throw new Error(
-            `rpc handler "${extraName}" has no matching contract method`,
-          );
-        }
-      }
-      for (const [name, contractValue] of contractEntries) {
-        if (!RPC_METHOD_PATTERN.test(name)) {
-          throw new Error(
-            `invalid rpc method name "${name}" — use letters, digits, "-" and "_"`,
-          );
-        }
-        const methodContract = readRpcMethodContract(name, contractValue);
-        const handler = Reflect.get(handlers, name);
-        if (typeof handler !== "function") {
-          throw new Error(
-            `rpc method "${name}" must provide a handler function`,
-          );
-        }
-        if (rpcHandlers.has(name)) {
-          throw new Error(`rpc method "${name}" is already registered`);
-        }
-        pending.push([
-          name,
-          {
-            inputSchema: methodContract.input,
-            outputSchema: methodContract.output,
-            handler: handler as (input: never) => unknown,
-          },
-        ]);
-      }
-      for (const [name, record] of pending) {
+      for (const [name, record] of normalizeRpcRegistration(
+        contract,
+        handlers,
+        rpcHandlers,
+        registrationOptions,
+      )) {
         rpcHandlers.set(name, record);
       }
     },
@@ -1307,17 +872,10 @@ function createFakePluginHostInternal(
   const realtime: PluginRealtime = {
     publish(channel, payload) {
       assertLive();
-      if (typeof channel !== "string" || channel.length === 0) {
-        throw new Error("realtime channel must be a non-empty string");
-      }
-      const normalized =
-        payload === undefined
-          ? null
-          : (jsonRoundTrip(
-              payload,
-              `realtime payload for channel "${channel}"`,
-            ) ?? null);
-      realtimeSignals.push({ channel, payload: normalized });
+      realtimeSignals.push({
+        channel,
+        payload: normalizeRealtimePayload(channel, payload),
+      });
     },
   };
 
@@ -1327,42 +885,23 @@ function createFakePluginHostInternal(
   const background: PluginBackground = {
     service(name, service) {
       assertLive();
-      if (typeof name !== "string" || !BACKGROUND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid service name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (services.some((record) => record.name === name)) {
-        throw new Error(`background service "${name}" is already registered`);
-      }
-      if (typeof service?.start !== "function") {
-        throw new Error(
-          `background service "${name}" must provide a start(signal) function`,
-        );
-      }
-      services.push({ name, start: service.start.bind(service) });
+      services.push(
+        validateBackgroundServiceRegistration(name, service, services),
+      );
     },
     schedule(name, cron, fn) {
       assertLive();
-      if (typeof name !== "string" || !BACKGROUND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid schedule name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (schedules.some((record) => record.name === name)) {
-        throw new Error(`schedule "${name}" is already registered`);
-      }
-      try {
-        CronExpressionParser.parse(String(cron));
-      } catch (error) {
-        throw new Error(
-          `invalid cron ${JSON.stringify(cron)} for schedule "${name}": ${errorMessage(error)}`,
-        );
-      }
-      if (typeof fn !== "function") {
-        throw new Error(`schedule "${name}" must provide a function`);
-      }
-      schedules.push({ name, cron: String(cron), fn });
+      schedules.push(
+        validateScheduleRegistration(
+          name,
+          cron,
+          fn,
+          schedules,
+          (expression) => {
+            CronExpressionParser.parse(expression);
+          },
+        ),
+      );
     },
   };
 
@@ -1373,69 +912,113 @@ function createFakePluginHostInternal(
   const cli: PluginCli = {
     register(registration) {
       assertLive();
-      if (cliRecord.registration !== null) {
-        throw new Error("cli command is already registered");
-      }
-      const name = registration?.name;
-      if (typeof name !== "string" || !CLI_COMMAND_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid cli command name ${JSON.stringify(name)} — use lowercase letters, digits, and "-"`,
-        );
-      }
-      if (RESERVED_BB_CLI_COMMANDS.includes(name)) {
-        throw new Error(
-          `cli command name "${name}" is reserved by the bb CLI — pick another name`,
-        );
-      }
-      if (
-        typeof registration.summary !== "string" ||
-        registration.summary.trim().length === 0
-      ) {
-        throw new Error(`cli command "${name}" must provide a summary`);
-      }
-      const commands = registration.commands ?? [];
-      if (!Array.isArray(commands)) {
-        throw new Error(`cli command "${name}" commands must be an array`);
-      }
-      const validatedCommands = commands.map((command, index) => {
-        if (
-          typeof command?.name !== "string" ||
-          !CLI_COMMAND_NAME_PATTERN.test(command.name) ||
-          typeof command.summary !== "string" ||
-          typeof command.usage !== "string"
-        ) {
-          throw new Error(
-            `cli command "${name}" commands[${index}] must be { name: [a-z0-9-]+, summary, usage }`,
-          );
-        }
-        return {
-          name: command.name,
-          summary: command.summary,
-          usage: command.usage,
-        };
-      });
-      if (typeof registration.run !== "function") {
-        throw new Error(
-          `cli command "${name}" must provide a run(argv, ctx) function`,
-        );
-      }
-      cliRecord.registration = {
-        name,
-        summary: registration.summary,
-        commands: validatedCommands,
-        run: registration.run.bind(registration),
-      };
+      const record = normalizeCliRegistration(
+        registration,
+        cliRecord.registration !== null,
+      );
+      cliRecord.registration = record;
+      const warning = pluginCliCollisionWarning(pluginId, record.name);
+      if (warning) emitLog("warn", warning);
     },
   };
 
   // --- agents ---
   const agentTools: FakeAgentToolRecord[] = [];
+  const providerRegistrations: NormalizedPluginProviderDeclaration[] = [];
+  const providerEnvResolvers = new Map<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvContext,
+    ) =>
+      | readonly ExperimentalPluginProviderEnvEntry[]
+      | Promise<readonly ExperimentalPluginProviderEnvEntry[]>
+  >();
+  const providerEnvHealthResolvers = new Map<
+    string,
+    (
+      context: ExperimentalPluginProviderEnvHealthContext,
+    ) =>
+      | ExperimentalPluginProviderEnvHealth
+      | null
+      | Promise<ExperimentalPluginProviderEnvHealth | null>
+  >();
   let agentConfigurationProvider:
     | ((context: PluginAgentConfigurationContext) => PluginAgentConfiguration)
     | null = null;
   let instructionProvider:
     | ((ctx: { threadId: string; projectId: string }) => string | null)
     | null = null;
+  function registerProviderDeclaration(
+    declaration: PluginProviderDeclaration,
+  ): { dispose(): void } {
+    assertLive();
+    // The shared validator: the fake host must accept and reject provider
+    // declarations exactly like production.
+    const normalized = validatePluginProviderDeclaration(declaration);
+    // The same refusals production makes at the register call, in its
+    // order: the icon against the manifest's declared icons, then the
+    // bridge the declaration runs on, then the id.
+    const iconProblem =
+      normalized.icon === undefined
+        ? null
+        : undeclaredIconProblem(pluginId, declaredIconNames, normalized.icon);
+    if (iconProblem !== null) {
+      throw new Error(providerIconRefusalMessage(normalized.id, iconProblem));
+    }
+    if (options.experimental_hostEntry === false) {
+      throw new Error(providerWithoutBridgeMessage(normalized.id));
+    }
+    if (
+      providerRegistrations.some((existing) => existing.id === normalized.id)
+    ) {
+      throw new Error(providerAlreadyRegisteredMessage(normalized.id));
+    }
+    providerRegistrations.push(normalized);
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      const index = providerRegistrations.indexOf(normalized);
+      if (index !== -1) providerRegistrations.splice(index, 1);
+    };
+    disposeHooks.push(dispose);
+    return { dispose };
+  }
+
+  const aiServiceRegistrations: PluginAiServiceDeclaration[] = [];
+  const experimental_aiServices: PluginAiServices = {
+    register(declaration) {
+      assertLive();
+      const normalized = validatePluginAiServiceDeclaration(declaration);
+      if (
+        aiServiceRegistrations.some((existing) => existing.id === normalized.id)
+      ) {
+        throw new Error(aiServiceAlreadyRegisteredMessage(normalized.id));
+      }
+      const registration: PluginAiServiceDeclaration = Object.freeze({
+        id: normalized.id,
+        displayName: normalized.displayName,
+        ...(normalized.complete === null
+          ? {}
+          : { complete: normalized.complete }),
+        ...(normalized.transcribe === null
+          ? {}
+          : { transcribe: normalized.transcribe }),
+        ...(normalized.status === null ? {} : { status: normalized.status }),
+      });
+      aiServiceRegistrations.push(registration);
+      let disposed = false;
+      const dispose = (): void => {
+        if (disposed) return;
+        disposed = true;
+        const index = aiServiceRegistrations.indexOf(registration);
+        if (index !== -1) aiServiceRegistrations.splice(index, 1);
+      };
+      disposeHooks.push(dispose);
+      return { dispose };
+    },
+  };
+
   const agents: PluginAgents = {
     configure(provider) {
       assertLive();
@@ -1465,7 +1048,7 @@ function createFakePluginHostInternal(
       name: string;
       description: string;
       instructions?: string;
-      experimental_statusLabels?: PluginAgentToolExperimentalStatusLabels;
+      presentation?: PluginRowPresentation;
       parameters: unknown;
       execute(
         params: never,
@@ -1473,128 +1056,13 @@ function createFakePluginHostInternal(
       ): PluginAgentToolResult | Promise<PluginAgentToolResult>;
     }) {
       assertLive();
-      const name = tool?.name;
-      if (typeof name !== "string" || !AGENT_TOOL_NAME_PATTERN.test(name)) {
-        throw new Error(
-          `invalid tool name ${JSON.stringify(name)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (RESERVED_AGENT_TOOL_NAMES.includes(name)) {
-        throw new Error(
-          `tool name "${name}" is a built-in bb tool — pick another name`,
-        );
-      }
-      if (
-        typeof tool.description !== "string" ||
-        tool.description.trim().length === 0
-      ) {
-        throw new Error(`tool "${name}" must provide a description`);
-      }
-      if (
-        tool.instructions !== undefined &&
-        typeof tool.instructions !== "string"
-      ) {
-        throw new Error(`tool "${name}" instructions must be a string`);
-      }
-      if (
-        typeof tool.instructions === "string" &&
-        tool.instructions.length > PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS
-      ) {
-        throw new Error(
-          `tool "${name}" instructions exceed the ${PLUGIN_AGENT_STATIC_INSTRUCTIONS_MAX_CHARS}-character limit`,
-        );
-      }
-      const experimentalStatusLabels = tool.experimental_statusLabels;
-      if (
-        experimentalStatusLabels !== undefined &&
-        (typeof experimentalStatusLabels !== "object" ||
-          experimentalStatusLabels === null ||
-          typeof experimentalStatusLabels.pending !== "string" ||
-          typeof experimentalStatusLabels.completed !== "string" ||
-          experimentalStatusLabels.pending.trim().length === 0 ||
-          experimentalStatusLabels.completed.trim().length === 0)
-      ) {
-        throw new Error(
-          `tool "${name}" experimental_statusLabels must provide non-empty pending and completed strings`,
-        );
-      }
-      if (
-        experimentalStatusLabels !== undefined &&
-        (experimentalStatusLabels.pending.length >
-          PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS ||
-          experimentalStatusLabels.completed.length >
-            PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS)
-      ) {
-        throw new Error(
-          `tool "${name}" experimental_statusLabels exceed the ${PLUGIN_AGENT_STATUS_LABEL_MAX_CHARS}-character limit`,
-        );
-      }
-      if (typeof tool.execute !== "function") {
-        throw new Error(
-          `tool "${name}" must provide an execute(params, ctx) function`,
-        );
-      }
-      const parameters: unknown = tool.parameters;
-      let inputSchema: unknown;
-      let parse: FakeAgentToolRecord["parse"];
-      if (isZodSchemaLike(parameters)) {
-        try {
-          inputSchema = z.toJSONSchema(parameters as z.ZodType, {
-            io: "input",
-          });
-        } catch (error) {
-          throw new Error(
-            `tool "${name}" parameters look like a zod schema but could not be converted to JSON Schema (${errorMessage(error)}) — use zod 4, or pass a plain JSON-schema object`,
-          );
-        }
-        parse = (input) => {
-          const result = (parameters as z.ZodType).safeParse(input);
-          if (result.success) return { ok: true, value: result.data };
-          return { ok: false, error: summarizeParseIssues(result.error) };
-        };
-      } else if (
-        typeof parameters === "object" &&
-        parameters !== null &&
-        !Array.isArray(parameters)
-      ) {
-        try {
-          inputSchema = JSON.parse(JSON.stringify(parameters));
-        } catch {
-          throw new Error(
-            `tool "${name}" parameters JSON schema is not JSON-serializable`,
-          );
-        }
-        parse = (input) => ({ ok: true, value: input });
-      } else {
-        throw new Error(
-          `tool "${name}" parameters must be a zod schema or a JSON-schema object`,
-        );
-      }
-      const record: FakeAgentToolRecord = {
-        name,
-        description: tool.description,
-        experimentalStatusLabels:
-          experimentalStatusLabels === undefined
-            ? null
-            : {
-                pending: experimentalStatusLabels.pending,
-                completed: experimentalStatusLabels.completed,
-              },
-        instructions:
-          tool.instructions !== undefined && tool.instructions.trim().length > 0
-            ? tool.instructions
-            : null,
-        inputSchema,
-        parse,
-        execute: (
-          tool.execute as (
-            params: unknown,
-            ctx: PluginAgentToolContext,
-          ) => PluginAgentToolResult | Promise<PluginAgentToolResult>
-        ).bind(tool),
-      };
-      if (agentTools.some((existing) => existing.name === name)) {
-        throw new Error(`tool "${name}" is already registered`);
+      const record = normalizeAgentToolRegistration({
+        pluginId,
+        declaredIconNames,
+        tool,
+      });
+      if (agentTools.some((existing) => existing.name === record.name)) {
+        throw new Error(`tool "${record.name}" is already registered`);
       }
       agentTools.push(record);
     },
@@ -1606,40 +1074,15 @@ function createFakePluginHostInternal(
     requestInput,
     registerMentionProvider(provider) {
       assertLive();
-      const id = provider?.id;
-      if (typeof id !== "string" || !MENTION_PROVIDER_ID_PATTERN.test(id)) {
-        throw new Error(
-          `invalid mention provider id ${JSON.stringify(id)} — use letters, digits, "-" and "_"`,
-        );
-      }
-      if (mentionProviders.some((record) => record.id === id)) {
-        throw new Error(`mention provider "${id}" is already registered`);
-      }
-      if (
-        typeof provider.label !== "string" ||
-        provider.label.trim().length === 0
-      ) {
-        throw new Error(`mention provider "${id}" must provide a label`);
-      }
-      if (typeof provider.search !== "function") {
-        throw new Error(
-          `mention provider "${id}" must provide a search({ query, projectId, threadId }) function`,
-        );
-      }
-      if (typeof provider.resolve !== "function") {
-        throw new Error(
-          `mention provider "${id}" must provide a resolve(itemId) function`,
-        );
-      }
-      mentionProviders.push({
-        id,
-        label: provider.label.trim(),
-        triggers: normalizeMentionProviderTriggers(id, provider.triggers),
-        search: provider.search.bind(provider),
-        resolve: provider.resolve.bind(provider),
-      });
+      mentionProviders.push(
+        normalizeMentionProviderRegistration(provider, mentionProviders),
+      );
     },
   };
+
+  // --- hooks ---
+  /** How many times `bb.experimental_hooks.recheck()` was called. */
+  let requestedDrains = 0;
 
   // --- status ---
   const needsConfigurationMessages: string[] = [];
@@ -1655,11 +1098,21 @@ function createFakePluginHostInternal(
   };
 
   // --- server ---
+  const appUrl = options.appUrl ?? null;
   const loopbackBaseUrl = options.loopbackBaseUrl ?? "http://127.0.0.1:38886";
+  const dataDir = options.dataDir ?? "/tmp/bb-fake-data-dir";
   const server: PluginServerApi = {
+    get experimental_appUrl(): string | null {
+      assertLive();
+      return appUrl;
+    },
     get loopbackBaseUrl(): string {
       assertLive();
       return loopbackBaseUrl;
+    },
+    get experimental_dataDir(): string {
+      assertLive();
+      return dataDir;
     },
   };
 
@@ -1673,14 +1126,44 @@ function createFakePluginHostInternal(
   const threadEventHandlers: {
     [E in PluginThreadEventName]: Array<PluginThreadEventHandler<E>>;
   } = {
+    "experimental_thread.events": [],
+    "experimental_thread.parentChanged": [],
+    "experimental_terminal.input": [],
+    "experimental_host.deleted": [],
+    "experimental_environment.removed": [],
     "thread.created": [],
     "thread.active": [],
     "thread.idle": [],
     "thread.failed": [],
     "thread.archived": [],
     "thread.deleted": [],
+    "interaction.pending": [],
+    "message.queued": [],
+    "message.dispatched": [],
+    "turn.failed": [],
+    "message.cancelled": [],
+    "thread.unarchived": [],
   };
+  const hooks: {
+    [K in PluginHookName]: PluginHookHandler<K> | null;
+  } = {
+    "message.dispatch": null,
+  };
+  const environmentCompositions = new Map<
+    string,
+    NormalizedPluginEnvironmentComposition
+  >();
+  const environmentProviders = new Map<
+    string,
+    NormalizedPluginEnvironmentProvider
+  >();
+  const machineProviders = new Map<string, NormalizedPluginMachineProvider>();
+  const serverAccessProviders = new Map<
+    string,
+    import("../backend-contract.js").ServerAccessProviderDeclaration
+  >();
   const disposeHooks: Array<() => void | Promise<void>> = [];
+  const installHandlers: Array<() => void | Promise<void>> = [];
   const serviceControllers: AbortController[] = [];
   let nextInteractionId = 1;
   const pendingInteractions = new Map<
@@ -1696,58 +1179,19 @@ function createFakePluginHostInternal(
     requestOptions?: Parameters<PluginUi["requestInput"]>[1],
   ) {
     assertLive();
-    if (!request || typeof request !== "object") {
-      throw new Error("ui.requestInput requires an options object");
-    }
-    if (typeof request.threadId !== "string" || request.threadId.length === 0) {
-      throw new Error("ui.requestInput threadId must be a non-empty string");
-    }
-    if (
-      typeof request.rendererId !== "string" ||
-      !/^[a-zA-Z0-9_-]+$/.test(request.rendererId)
-    ) {
-      throw new Error(
-        "ui.requestInput rendererId must use letters, digits, '-' or '_'",
-      );
-    }
-    if (
-      typeof request.title !== "string" ||
-      request.title.trim().length === 0 ||
-      request.title.trim().length > PLUGIN_INTERACTION_MAX_TITLE_LENGTH
-    ) {
-      throw new Error(
-        `ui.requestInput title must be 1-${PLUGIN_INTERACTION_MAX_TITLE_LENGTH} characters`,
-      );
-    }
-    let payload: JsonValue;
-    try {
-      const json = JSON.stringify(request.payload);
-      if (json === undefined) throw new Error();
-      if (Buffer.byteLength(json, "utf8") > 64 * 1024) {
-        throw new Error("ui.requestInput payload exceeds 64 KiB");
-      }
-      payload = JSON.parse(json) as JsonValue;
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("64 KiB")) {
-        throw error;
-      }
-      throw new Error("ui.requestInput payload must be JSON-serializable");
-    }
-    const timeoutMs = request.timeoutMs ?? 10 * 60 * 1000;
-    if (
-      !Number.isInteger(timeoutMs) ||
-      timeoutMs <= 0 ||
-      timeoutMs > 60 * 60 * 1000
-    ) {
-      throw new Error(
-        "ui.requestInput timeoutMs must be between 1 and 3600000",
-      );
-    }
+    const normalized = normalizeInteractionRequest(request);
     const normalizedRequest: PluginInteractionRequest = {
-      ...request,
-      title: request.title.trim(),
-      payload,
-      timeoutMs,
+      threadId: normalized.threadId,
+      rendererId: normalized.rendererId,
+      title: normalized.title,
+      payload: normalized.payload,
+      timeoutMs: normalized.timeoutMs,
+      ...(normalized.presentation === null
+        ? {}
+        : { presentation: normalized.presentation }),
+      ...(normalized.describeSubmission === null
+        ? {}
+        : { describeSubmission: normalized.describeSubmission }),
     };
     const id = `fake-interaction-${nextInteractionId++}`;
     return new Promise<PluginInteractionResult>((resolve) => {
@@ -1764,7 +1208,7 @@ function createFakePluginHostInternal(
       const timer = setTimeout(() => {
         pendingInteractions.delete(id);
         resolve({ outcome: "cancelled", reason: "timeout" });
-      }, timeoutMs);
+      }, normalized.timeoutMs);
       pendingInteractions.set(id, {
         request: normalizedRequest,
         resolve,
@@ -1775,7 +1219,113 @@ function createFakePluginHostInternal(
 
   const sharedPortDeclarations: FakePluginHarness["sharedPortDeclarations"] =
     [];
+  const hostRpcCalls: ExperimentalFakeHostRpcCall[] = [];
+  const hostWorkerExitSubscriptions: FakeHostWorkerExitSubscription[] = [];
+  const hostSignalSubscriptions: FakeHostSignalSubscription[] = [];
   const hosts: PluginHosts = {
+    experimental_client({ contract, experimental_signals }) {
+      return {
+        async call(method, input, callOptions) {
+          assertLive();
+          const methodContract = contract[method];
+          if (methodContract === undefined) {
+            throw new Error(`unknown host rpc method "${String(method)}"`);
+          }
+          if (
+            typeof callOptions !== "object" ||
+            callOptions === null ||
+            typeof callOptions.hostId !== "string" ||
+            callOptions.hostId.length === 0
+          ) {
+            throw new Error(
+              `host rpc method "${String(method)}" requires a host id`,
+            );
+          }
+          if (callOptions.signal?.aborted) {
+            throw Object.assign(new Error("Host plugin call was cancelled"), {
+              name: "AbortError",
+            });
+          }
+          const validatedInput = normalizeRpcJsonResult(
+            await validateRpcValue(
+              methodContract.input,
+              input,
+              "input",
+              throwRpcError,
+            ),
+            throwRpcError,
+          );
+          const call: ExperimentalFakeHostRpcCall = {
+            method: String(method),
+            input: validatedInput,
+            hostId: callOptions.hostId,
+            ...(callOptions.signal === undefined
+              ? {}
+              : { signal: callOptions.signal }),
+          };
+          hostRpcCalls.push(call);
+          if (options.experimental_callHostRpc === undefined) {
+            throw new Error(
+              `fake plugin host has no experimental_callHostRpc stub for "${String(method)}"`,
+            );
+          }
+          const rawOutput = await options.experimental_callHostRpc(call);
+          const validatedOutput = await validateRpcValue(
+            methodContract.output,
+            rawOutput,
+            "output",
+            throwRpcError,
+          );
+          return normalizeRpcJsonResult(
+            validatedOutput,
+            throwRpcError,
+          ) as never;
+        },
+        experimental_onWorkerExit(handler) {
+          assertLive();
+          if (typeof handler !== "function") {
+            throw new Error("host worker exit subscription requires a handler");
+          }
+          hostWorkerExitSubscriptions.push(handler);
+          let subscribed = true;
+          return () => {
+            if (!subscribed) return;
+            subscribed = false;
+            const index = hostWorkerExitSubscriptions.indexOf(handler);
+            if (index >= 0) hostWorkerExitSubscriptions.splice(index, 1);
+          };
+        },
+        experimental_onSignal(signal, handler) {
+          assertLive();
+          const descriptor = experimental_signals?.[signal];
+          if (
+            typeof signal !== "string" ||
+            signal.length === 0 ||
+            typeof descriptor !== "object" ||
+            descriptor === null ||
+            !isStandardSchema(descriptor.payload)
+          ) {
+            throw new Error(`unknown host signal "${String(signal)}"`);
+          }
+          if (typeof handler !== "function") {
+            throw new Error("host signal subscription requires a handler");
+          }
+          const record: FakeHostSignalSubscription = {
+            signal,
+            payloadSchema: descriptor.payload,
+            handler,
+          };
+          hostSignalSubscriptions.push(record);
+          let subscribed = true;
+          return () => {
+            if (!subscribed) return;
+            subscribed = false;
+            const index = hostSignalSubscriptions.indexOf(record);
+            if (index >= 0) hostSignalSubscriptions.splice(index, 1);
+          };
+        },
+      };
+    },
     async ensureSharedPortTunnel(hostId) {
       assertLive();
       if (hostId.trim().length === 0) {
@@ -1833,6 +1383,121 @@ function createFakePluginHostInternal(
     },
   };
 
+  const providers: PluginProviders = {
+    register(declaration) {
+      return registerProviderDeclaration(declaration);
+    },
+    experimental_contributeEnv(providerId, resolve) {
+      assertLive();
+      validateProviderEnvContribution(
+        "provider environment contribution",
+        providerId,
+        resolve,
+        providerEnvResolvers,
+      );
+      providerEnvResolvers.set(providerId, resolve);
+    },
+    experimental_contributeEnvHealth(providerId, resolve) {
+      assertLive();
+      validateProviderEnvContribution(
+        "provider environment health contribution",
+        providerId,
+        resolve,
+        providerEnvHealthResolvers,
+      );
+      providerEnvHealthResolvers.set(providerId, resolve);
+    },
+  };
+
+  const experimental_hooks: PluginHooks = {
+    on(hook, handler) {
+      if (hooks[hook] !== null) {
+        throw new Error(pluginHookAlreadyRegisteredMessage(hook));
+      }
+      storePluginHook(hooks, hook, handler);
+    },
+    async recheck(_hook) {
+      assertLive();
+      // The real host schedules a background walk and resolves; there is no
+      // queue here to walk, so the fake records the ask. Asserting on the
+      // count is how a test pins the wake path — the condition the plugin
+      // watches changed, so it told core to re-ask.
+      requestedDrains += 1;
+    },
+  };
+
+  const experimental_environments: PluginEnvironments = {
+    register(
+      declaration:
+        | import("@get-bb/plugin-sdk").PluginEnvironmentProviderDeclaration
+        | NormalizedPluginEnvironmentComposition,
+    ) {
+      assertLive();
+      if ("machineProviderId" in declaration) {
+        const composition = environmentCompositionSchema.parse(declaration);
+        const problem =
+          composition.icon === null
+            ? null
+            : undeclaredIconProblem(
+                pluginId,
+                declaredIconNames,
+                composition.icon,
+              );
+        if (problem !== null)
+          throw new Error(providerIconRefusalMessage(composition.id, problem));
+        if (environmentProviders.has(composition.id))
+          throw new Error(
+            "Environment ID is already registered as a concrete provider",
+          );
+        environmentCompositions.set(composition.id, composition);
+        return;
+      }
+      if (environmentCompositions.has(declaration.id))
+        throw new Error(
+          "Environment ID is already registered as a composition",
+        );
+      const target = validatePluginEnvironmentProviderDeclaration(declaration);
+      const problem =
+        target.icon === null
+          ? null
+          : undeclaredIconProblem(pluginId, declaredIconNames, target.icon);
+      if (problem !== null)
+        throw new Error(providerIconRefusalMessage(target.id, problem));
+      environmentProviders.set(target.id, target);
+    },
+    async recheck() {
+      assertLive();
+      requestedDrains += 1;
+    },
+  };
+
+  const unavailableMachineBootstrap = (): never => {
+    throw new Error(
+      "Configure machineBootstrap in createFakePluginHost to exercise machine bootstrap",
+    );
+  };
+  const experimental_machines: PluginMachines = {
+    async getResource(hostId) {
+      assertLive();
+      return options.machineResource ? options.machineResource(hostId) : null;
+    },
+    ...(options.machineBootstrap ?? {
+      bootstrap: unavailableMachineBootstrap,
+    }),
+    register(declaration) {
+      assertLive();
+      const target = validatePluginMachineProviderDeclaration(declaration);
+      const problem =
+        target.icon === null
+          ? null
+          : undeclaredIconProblem(pluginId, declaredIconNames, target.icon);
+      if (problem !== null) {
+        throw new Error(providerIconRefusalMessage(target.id, problem));
+      }
+      machineProviders.set(target.id, target);
+    },
+  };
+
   const bb: BbPluginApi = {
     pluginId,
     log,
@@ -1844,11 +1509,31 @@ function createFakePluginHostInternal(
     background,
     cli,
     agents,
+    providers,
     ui,
     events,
+    experimental_hooks,
+    experimental_environments,
+    experimental_machines,
+    experimental_serverAccess: {
+      register(declaration) {
+        assertLive();
+        validateServerAccessProviderDeclaration(declaration);
+        if (serverAccessProviders.has(declaration.id))
+          throw new Error(
+            `Server access provider "${declaration.id}" is already registered`,
+          );
+        serverAccessProviders.set(declaration.id, declaration);
+      },
+      recheck() {
+        assertLive();
+        requestedDrains += 1;
+      },
+    },
     status,
     server,
     hosts,
+    experimental_aiServices,
     get sdk() {
       assertLive();
       return sdk;
@@ -1856,6 +1541,13 @@ function createFakePluginHostInternal(
     onDispose(hook) {
       assertLive();
       disposeHooks.push(hook);
+    },
+    onInstall(handler) {
+      assertLive();
+      if (typeof handler !== "function") {
+        throw new Error("onInstall expects a function");
+      }
+      installHandlers.push(handler);
     },
   };
 
@@ -1866,6 +1558,9 @@ function createFakePluginHostInternal(
       clearTimeout(pending.timer);
       pendingInteractions.delete(id);
       pending.resolve({ outcome: "cancelled", reason: "plugin-disposed" });
+    }
+    for (const session of [...websocketSessions]) {
+      await session.closeForReload();
     }
     // Host order (§3): services first, then hooks LIFO (isolated), then
     // vended database handles, then handle invalidation.
@@ -1887,6 +1582,8 @@ function createFakePluginHostInternal(
     if (cleanupStorage) {
       rmSync(storageRoot, { recursive: true, force: true });
     }
+    hostWorkerExitSubscriptions.splice(0);
+    hostSignalSubscriptions.splice(0);
     invalidated = true;
   }
 
@@ -1904,11 +1601,21 @@ function createFakePluginHostInternal(
     logEntries,
     realtimeSignals,
     needsConfigurationMessages,
+    get recheckCount() {
+      return requestedDrains;
+    },
     sharedPortDeclarations,
+    experimental_hostRpcCalls: hostRpcCalls,
     sdk: sdkHarness,
     registrations: {
       settingsDescriptors,
       httpRoutes,
+      websocketRoutes,
+      get experimental_publishedRpcMethods() {
+        return [...rpcHandlers.values()].flatMap((record) =>
+          record.publication === null ? [] : [record.publication],
+        );
+      },
       get rpcMethods() {
         return [...rpcHandlers.keys()];
       },
@@ -1926,21 +1633,131 @@ function createFakePluginHostInternal(
       },
       get threadEventHandlers() {
         return {
+          "experimental_thread.events":
+            threadEventHandlers["experimental_thread.events"].length,
+          "experimental_thread.parentChanged":
+            threadEventHandlers["experimental_thread.parentChanged"].length,
+          "experimental_terminal.input":
+            threadEventHandlers["experimental_terminal.input"].length,
+          "experimental_environment.removed":
+            threadEventHandlers["experimental_environment.removed"].length,
+          "experimental_host.deleted":
+            threadEventHandlers["experimental_host.deleted"].length,
           "thread.created": threadEventHandlers["thread.created"].length,
           "thread.active": threadEventHandlers["thread.active"].length,
           "thread.idle": threadEventHandlers["thread.idle"].length,
           "thread.failed": threadEventHandlers["thread.failed"].length,
           "thread.archived": threadEventHandlers["thread.archived"].length,
           "thread.deleted": threadEventHandlers["thread.deleted"].length,
+          "interaction.pending":
+            threadEventHandlers["interaction.pending"].length,
+          "message.queued": threadEventHandlers["message.queued"].length,
+          "message.dispatched":
+            threadEventHandlers["message.dispatched"].length,
+          "turn.failed": threadEventHandlers["turn.failed"].length,
+          "message.cancelled": threadEventHandlers["message.cancelled"].length,
+          "thread.unarchived": threadEventHandlers["thread.unarchived"].length,
         };
       },
+      get hooks() {
+        return { ...hooks };
+      },
+      get environmentCompositions() {
+        return new Map(environmentCompositions);
+      },
+      get environmentProviders() {
+        return new Map(environmentProviders);
+      },
+      get serverAccessProviders() {
+        return new Map(serverAccessProviders);
+      },
+      get machineProviders() {
+        return new Map(machineProviders);
+      },
       mentionProviders,
+      providerRegistrations,
+      providerEnvResolvers,
+      providerEnvHealthResolvers,
+      aiServiceRegistrations,
     },
     get pendingInteractions() {
       return [...pendingInteractions].map(([id, pending]) => ({
         id,
         ...pending.request,
       }));
+    },
+    async experimental_emitHostWorkerExit(hostId) {
+      assertLive();
+      if (hostId.trim().length === 0) {
+        throw new Error("host worker exit hostId must be non-empty");
+      }
+      for (const handler of [...hostWorkerExitSubscriptions]) {
+        await handler({ hostId });
+      }
+    },
+    async resolveProviderEnv(providerId, context) {
+      assertLive();
+      const resolve = providerEnvResolvers.get(providerId);
+      if (resolve === undefined) return [];
+      try {
+        return validatePluginProviderEnvEntries(await resolve(context));
+      } catch (error) {
+        emitLog(
+          "warn",
+          `provider environment contribution failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return [];
+      }
+    },
+    async resolveProviderEnvHealth(providerId, context) {
+      assertLive();
+      if (!providerEnvResolvers.has(providerId)) return null;
+      const resolve = providerEnvHealthResolvers.get(providerId);
+      if (resolve === undefined) return null;
+      try {
+        const value = await resolve(context);
+        if (value === null) return null;
+        if (value.label.trim().length === 0) {
+          throw new Error("label must not be empty");
+        }
+        if (value.statusMessage.trim().length === 0) {
+          throw new Error("statusMessage must not be empty");
+        }
+        return value;
+      } catch (error) {
+        emitLog(
+          "warn",
+          `provider environment health contribution failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return null;
+      }
+    },
+    async experimental_emitHostSignal(hostId, signal, payload) {
+      assertLive();
+      if (hostId.trim().length === 0) {
+        throw new Error("host signal hostId must be non-empty");
+      }
+      const subscriptions = hostSignalSubscriptions.filter(
+        (subscription) => subscription.signal === signal,
+      );
+      for (const subscription of subscriptions) {
+        const normalized = normalizeRpcJsonResult(
+          await validateRpcValue(
+            subscription.payloadSchema,
+            payload,
+            "input",
+            throwRpcError,
+          ),
+          throwRpcError,
+        );
+        const parsed = await validateRpcValue(
+          subscription.payloadSchema,
+          normalized,
+          "input",
+          throwRpcError,
+        );
+        await subscription.handler({ hostId, payload: parsed });
+      }
     },
     submitInteraction(id, value) {
       const pending = pendingInteractions.get(id);
@@ -1958,30 +1775,10 @@ function createFakePluginHostInternal(
     },
 
     async setSettings(values) {
-      const errors = validateSettingsUpdate(settingsDescriptors, values);
-      if (errors.length > 0) {
-        throw new Error(errors.join("; "));
-      }
-      const prev = readSettingsValues(settingsDescriptors, storedSettings);
-      for (const [key, value] of Object.entries(values)) {
-        if (value === null) storedSettings.delete(key);
-        else storedSettings.set(key, value);
-      }
-      const next = readSettingsValues(settingsDescriptors, storedSettings);
-      if (JSON.stringify(next) === JSON.stringify(prev)) return;
-      for (const listener of settingsListeners) {
-        try {
-          listener(next, prev);
-        } catch (error) {
-          emitLog(
-            "warn",
-            `settings onChange listener failed: ${errorMessage(error)}`,
-          );
-        }
-      }
+      await setSettingsValues(values);
     },
 
-    async callRpc(method, input) {
+    async callRpc(method, input, options = {}) {
       const record = rpcHandlers.get(method);
       if (!record) {
         return throwRpcError({
@@ -1997,10 +1794,15 @@ function createFakePluginHostInternal(
         record.inputSchema,
         parsedInput,
         "input",
+        throwRpcError,
       );
       let result: unknown;
       try {
-        result = await record.handler(validatedInput as never);
+        result = await record.handler(validatedInput as never, {
+          experimental_caller: options.experimental_caller ?? {
+            kind: "client",
+          },
+        });
       } catch (error) {
         return throwRpcError({
           code: "handler_error",
@@ -2011,8 +1813,9 @@ function createFakePluginHostInternal(
         record.outputSchema,
         result,
         "output",
+        throwRpcError,
       );
-      return normalizeRpcJsonResult(validatedOutput);
+      return normalizeRpcJsonResult(validatedOutput, throwRpcError);
     },
 
     async runCli(argv, ctx = {}) {
@@ -2066,11 +1869,7 @@ function createFakePluginHostInternal(
       const app = new Hono();
       app.on(route.method, route.path, async (context) => {
         try {
-          const response = await route.handler(context);
-          if (!(response instanceof Response)) {
-            throw new Error("http route handler must return a Response");
-          }
-          return response;
+          return adoptHttpRouteResponse(await route.handler(context));
         } catch (error) {
           const message = errorMessage(error);
           emitLog(
@@ -2084,6 +1883,146 @@ function createFakePluginHostInternal(
         }
       });
       return app.request(path, { ...init, method: normalizedMethod });
+    },
+
+    async experimental_openWebSocket(path, init) {
+      assertLive();
+      const url = new URL(path, "http://plugin.test");
+      const route = websocketRoutes.find(
+        (candidate) => candidate.path === url.pathname,
+      );
+      if (!route) {
+        throw new Error(
+          `no websocket route ${url.pathname} is registered — registered: ${
+            websocketRoutes.map((candidate) => candidate.path).join(", ") ||
+            "(none)"
+          }`,
+        );
+      }
+      const request = new Request(url, { ...init, method: "GET" });
+      let handlers: ExperimentalPluginWebSocketHandlers;
+      try {
+        handlers = route.handler({
+          request,
+          url,
+          headers: request.headers,
+        });
+        if (
+          typeof handlers !== "object" ||
+          handlers === null ||
+          Array.isArray(handlers)
+        ) {
+          throw new Error("websocket route handler must return an object");
+        }
+        for (const name of [
+          "onOpen",
+          "onMessage",
+          "onClose",
+          "onError",
+        ] as const) {
+          const callback = handlers[name];
+          if (callback !== undefined && typeof callback !== "function") {
+            throw new Error(
+              `websocket route handler ${name} must be a function`,
+            );
+          }
+        }
+      } catch (error) {
+        emitLog(
+          "warn",
+          `websocket ${route.path} connect failed: ${errorMessage(error)}`,
+        );
+        throw error;
+      }
+
+      const sent: Array<string | Uint8Array> = [];
+      const closeCalls: Array<{
+        code: number | null;
+        reason: string | null;
+      }> = [];
+      let readyState = 0;
+      let closeNotified = false;
+      let eventQueue = Promise.resolve();
+      const invoke = async (
+        event: "open" | "message" | "close" | "error",
+        run: () => void | Promise<void>,
+      ): Promise<void> => {
+        eventQueue = eventQueue.then(async () => {
+          try {
+            await run();
+          } catch (error) {
+            emitLog(
+              "warn",
+              `websocket ${route.path} ${event} failed: ${errorMessage(error)}`,
+            );
+          }
+        });
+        await eventQueue;
+      };
+      const socket: ExperimentalPluginWebSocket = {
+        send(data) {
+          sent.push(typeof data === "string" ? data : new Uint8Array(data));
+        },
+        close(code, reason) {
+          closeCalls.push({ code: code ?? null, reason: reason ?? null });
+          if (readyState < 2) readyState = 2;
+        },
+        get readyState() {
+          return readyState;
+        },
+      };
+      const notifyClose = async (
+        code: number,
+        reason: string,
+      ): Promise<void> => {
+        if (closeNotified) return;
+        closeNotified = true;
+        readyState = 3;
+        websocketSessions.delete(session);
+        if (handlers.onClose !== undefined) {
+          await invoke("close", () =>
+            handlers.onClose?.(socket, { code, reason }),
+          );
+        }
+      };
+      const session: ExperimentalFakeWebSocketSession & {
+        closeForReload(): Promise<void>;
+      } = {
+        sent,
+        closeCalls,
+        get readyState() {
+          return readyState;
+        },
+        async receive(data) {
+          if (readyState !== 1) {
+            throw new Error(
+              "cannot receive a websocket message while not open",
+            );
+          }
+          if (handlers.onMessage !== undefined) {
+            await invoke("message", () => handlers.onMessage?.(socket, data));
+          }
+        },
+        async close(code = 1000, reason = "") {
+          if (readyState < 2) socket.close(code, reason);
+          await notifyClose(code, reason);
+        },
+        async error(error) {
+          if (handlers.onError !== undefined) {
+            await invoke("error", () => handlers.onError?.(socket, error));
+          }
+        },
+        async closeForReload() {
+          socket.close(1012, "Plugin reloaded or disabled");
+          await notifyClose(1012, "Plugin reloaded or disabled");
+        },
+      };
+      websocketSessions.add(session);
+      readyState = 1;
+      if (handlers.onOpen !== undefined) {
+        await invoke("open", () => handlers.onOpen?.(socket));
+      }
+      return session;
     },
 
     runService(name) {
@@ -2160,12 +2099,15 @@ function createFakePluginHostInternal(
           instructions: null,
         };
       }
+      const pluginMetadata = deepFreezePluginMetadata(
+        validatePluginMetadata(context.pluginMetadata ?? {}),
+      );
       try {
-        const normalized = normalizeAgentConfiguration({
+        const normalized = normalizePluginAgentConfiguration({
           knownSkillIds: new Set(agentSkillIds),
           knownToolIds: new Set(agentTools.map((tool) => tool.name)),
           pluginId,
-          value: agentConfigurationProvider(context),
+          value: agentConfigurationProvider({ ...context, pluginMetadata }),
         });
         const selectedTools = new Set(normalized.toolIds);
         return {
@@ -2206,6 +2148,17 @@ function createFakePluginHostInternal(
 
     async dispose() {
       await disposeHost(true);
+    },
+
+    async install() {
+      assertLive();
+      for (const handler of [...installHandlers]) {
+        try {
+          await handler();
+        } catch (error) {
+          emitLog("warn", `install handler failed: ${errorMessage(error)}`);
+        }
+      }
     },
   };
 

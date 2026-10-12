@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { fetchPluginList, removePlugin } from "./plugin-settings-queries";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
+import { fetchFrontendCandidates } from "@/lib/plugin-frontend";
+import { markEnabledPluginListStale } from "@/hooks/cache-owners/plugin-cache-owner";
+import { pluginListQueryKey } from "./query-keys";
+import {
+  fetchInstalledPlugins,
+  removePlugin,
+  toPluginListItem,
+} from "./plugin-settings-queries";
+
+const listPlugins = async (f: typeof fetch) => ({
+  plugins: (await fetchInstalledPlugins(f)).map(toPluginListItem),
+});
 
 function fetchReturning(body: unknown, status = 200): typeof fetch {
   return async () =>
@@ -30,6 +42,7 @@ const ROW = {
   status: "running",
   statusDetail: null,
   provenance: "direct",
+  publisherLabel: null,
   isOrphanedBuiltin: false,
   sourceDisplay: "npm · @bb-plugins/linear · pinned",
   updateState: {
@@ -51,16 +64,95 @@ const ROW = {
   logoDarkUrl: null,
 };
 
-describe("fetchPluginList envelope", () => {
+function pluginWithBundle(hash: string) {
+  return {
+    ...ROW,
+    app: {
+      hasApp: true,
+      bundle: {
+        jsUrl: `/api/v1/plugins/linear/assets/app.js?h=${hash}`,
+        cssUrl: null,
+        jsBytes: 1_000,
+        hash,
+        sdkMajor: 0,
+        sdkVersion: "0.4.27",
+        compatible: true,
+      },
+    },
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("plugin list envelope", () => {
+  it("lets the frontend loader reuse the app plugin list", async () => {
+    const plugin = pluginWithBundle("abc");
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(
+      pluginListQueryKey(true),
+      await fetchInstalledPlugins(fetchReturning({ plugins: [plugin] })),
+    );
+    const networkFetch = vi.fn(fetchReturning({ plugins: [plugin] }));
+    vi.stubGlobal("fetch", networkFetch);
+
+    await expect(fetchFrontendCandidates(queryClient)).resolves.toEqual([
+      expect.objectContaining({ pluginId: "linear" }),
+    ]);
+    expect(networkFetch).not.toHaveBeenCalled();
+  });
+
+  it("refreshes plugin inventory after an older request settles", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    let resolveOlderRequest = (_response: Response): void => {};
+    const networkFetch = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOlderRequest = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        fetchReturning({ plugins: [pluginWithBundle("new")] }),
+      );
+    vi.stubGlobal("fetch", networkFetch);
+
+    const olderCandidates = fetchFrontendCandidates(queryClient);
+    await vi.waitFor(() => {
+      expect(networkFetch).toHaveBeenCalledTimes(1);
+    });
+    const refresh = markEnabledPluginListStale({ queryClient });
+    resolveOlderRequest(
+      await fetchReturning({ plugins: [pluginWithBundle("old")] })(""),
+    );
+
+    await expect(olderCandidates).resolves.toEqual([
+      expect.objectContaining({
+        bundle: expect.objectContaining({ hash: "old" }),
+      }),
+    ]);
+    await refresh;
+    await expect(fetchFrontendCandidates(queryClient)).resolves.toEqual([
+      expect.objectContaining({
+        bundle: expect.objectContaining({ hash: "new" }),
+      }),
+    ]);
+    expect(networkFetch).toHaveBeenCalledTimes(2);
+  });
+
   it("binds browser fetch before the SDK invokes it", async () => {
-    const result = await fetchPluginList(
+    const result = await listPlugins(
       receiverSensitiveFetch({ plugins: [ROW] }),
     );
     expect(result.plugins).toHaveLength(1);
   });
 
   it("parses the { enabled, plugins } envelope and normalizes updateState", async () => {
-    const result = await fetchPluginList(fetchReturning({ plugins: [ROW] }));
+    const result = await listPlugins(fetchReturning({ plugins: [ROW] }));
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin?.provenance).toBe("direct");
@@ -70,13 +162,12 @@ describe("fetchPluginList envelope", () => {
       at: 1752300000000,
       detail: "boom",
     });
-    // Absent quiet fields normalize to the explicit quiet value.
     expect(plugin?.updateState.blockedVersion).toBeNull();
     expect(plugin?.updateState.blockedReasons).toEqual([]);
   });
 
   it("preserves authoritative source and activity metadata for detail pages", async () => {
-    const result = await fetchPluginList(
+    const result = await listPlugins(
       fetchReturning({
         plugins: [
           {
@@ -118,7 +209,7 @@ describe("fetchPluginList envelope", () => {
   });
 
   it("rejects an envelope missing plugins instead of half-parsing it", async () => {
-    await expect(fetchPluginList(fetchReturning({}))).rejects.toThrow();
+    await expect(listPlugins(fetchReturning({}))).rejects.toThrow();
   });
 
   it("rejects a list containing rows missing server-mandated fields", async () => {
@@ -127,7 +218,7 @@ describe("fetchPluginList envelope", () => {
     const { sourceDisplay, ...noSourceDisplay } = ROW;
     const { isOrphanedBuiltin, ...noOrphanedBuiltin } = ROW;
     await expect(
-      fetchPluginList(
+      listPlugins(
         fetchReturning({
           plugins: [
             noUpdateState,
@@ -142,28 +233,26 @@ describe("fetchPluginList envelope", () => {
   });
 
   it("drops a row with a partial lastFailure rather than showing the quiet state", async () => {
-    // A rollback whose record lost `at` or `detail` is contract drift; the
-    // quiet state would suppress the Needs-attention pill and banner.
     const partialFailure = {
       ...ROW,
       updateState: { lastFailure: { version: "1.7.0" } },
     };
     await expect(
-      fetchPluginList(fetchReturning({ plugins: [partialFailure] })),
+      listPlugins(fetchReturning({ plugins: [partialFailure] })),
     ).rejects.toThrow();
   });
 
   it("returns an empty list only for a successful empty response", async () => {
-    await expect(
-      fetchPluginList(fetchReturning({ plugins: [] })),
-    ).resolves.toEqual({ plugins: [] });
+    await expect(listPlugins(fetchReturning({ plugins: [] }))).resolves.toEqual(
+      { plugins: [] },
+    );
   });
 
   it("rejects malformed, HTTP, and network failures", async () => {
-    await expect(fetchPluginList(fetchReturning(null))).rejects.toThrow();
-    await expect(fetchPluginList(fetchReturning({}, 404))).rejects.toThrow();
+    await expect(listPlugins(fetchReturning(null))).rejects.toThrow();
+    await expect(listPlugins(fetchReturning({}, 404))).rejects.toThrow();
     await expect(
-      fetchPluginList(async () => {
+      listPlugins(async () => {
         throw new TypeError("network unavailable");
       }),
     ).rejects.toThrow("network unavailable");

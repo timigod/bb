@@ -2,20 +2,29 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BB_DESKTOP_BROWSER_MAX_URL_LENGTH,
   type BbDesktopBrowserAttachRequest,
+  type BbDesktopBrowserFindInPageRequest,
   type BbDesktopBrowserNavigateRequest,
   type BbDesktopBrowserSetBoundsRequest,
   type BbDesktopBrowserSetVisibleRequest,
+  type BbDesktopBrowserStopFindInPageRequest,
+  type BbDesktopBrowserEvaluateRequest,
+  type BbDesktopBrowserEvaluateResult,
 } from "@bb/desktop-contract";
 import {
   BB_DESKTOP_BROWSER_ATTACH_CHANNEL,
   BB_DESKTOP_BROWSER_DETACH_CHANNEL,
+  BB_DESKTOP_BROWSER_EVALUATE_CHANNEL,
+  BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+  BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
   BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
   BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
   BB_DESKTOP_BROWSER_NAVIGATE_CHANNEL,
   BB_DESKTOP_BROWSER_RELOAD_CHANNEL,
   BB_DESKTOP_BROWSER_SET_BOUNDS_CHANNEL,
   BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
+  BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
   BB_DESKTOP_BROWSER_STOP_CHANNEL,
+  BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
 } from "../src/desktop-browser-ipc.js";
 import { registerDesktopBrowserIpc } from "../src/desktop-browser-main-ipc.js";
 import type { DesktopBrowserViewManager } from "../src/desktop-browser-view.js";
@@ -34,11 +43,17 @@ const electronMock = vi.hoisted(() => {
   }
 
   type FakeIpcListener = (event: FakeIpcEvent, payload: unknown) => void;
+  type FakeIpcHandler = (
+    event: FakeIpcEvent,
+    payload: unknown,
+  ) => Promise<unknown>;
 
   const listeners = new Map<string, FakeIpcListener>();
+  const handlers = new Map<string, FakeIpcHandler>();
   const windowsBySender = new Map<FakeWebContents, FakeBrowserWindow>();
 
   return {
+    handlers,
     listeners,
     windowsBySender,
     BrowserWindow: {
@@ -49,6 +64,9 @@ const electronMock = vi.hoisted(() => {
     ipcMain: {
       on(channel: string, listener: FakeIpcListener): void {
         listeners.set(channel, listener);
+      },
+      handle(channel: string, handler: FakeIpcHandler): void {
+        handlers.set(channel, handler);
       },
     },
   };
@@ -61,13 +79,15 @@ vi.mock("electron", () => ({
 
 type AttachCall = Parameters<DesktopBrowserViewManager["attach"]>[0];
 type DetachCall = Parameters<DesktopBrowserViewManager["detach"]>[0];
+type FindInPageCall = Parameters<DesktopBrowserViewManager["findInPage"]>[0];
+type StopFindInPageCall = Parameters<
+  DesktopBrowserViewManager["stopFindInPage"]
+>[0];
 type NavigateCall = Parameters<DesktopBrowserViewManager["navigate"]>[0];
 type SetBoundsCall = Parameters<DesktopBrowserViewManager["setBounds"]>[0];
 type SetVisibleCall = Parameters<DesktopBrowserViewManager["setVisible"]>[0];
 type TabCommandCall = Parameters<DesktopBrowserViewManager["reload"]>[0];
-type WindowResizeCall = Parameters<
-  DesktopBrowserViewManager["beginWindowResize"]
->[0];
+type EvaluateCall = Parameters<DesktopBrowserViewManager["evaluate"]>[0];
 
 interface FakeWebContents {
   id: number;
@@ -89,38 +109,82 @@ interface SendBrowserIpcArgs {
 }
 
 class RecordingDesktopBrowserViewManager implements DesktopBrowserViewManager {
+  createTab(): never {
+    throw new Error("Not used by renderer IPC");
+  }
+
+  listTabs(): [] {
+    return [];
+  }
+
+  closeTab(): void {}
+
+  async captureTab(): Promise<never> {
+    throw new Error("Not used by renderer IPC");
+  }
+
+  getAutomationTabs(): ReturnType<
+    DesktopBrowserViewManager["getAutomationTabs"]
+  > {
+    return [];
+  }
+
+  subscribeAutomationTabs(): () => void {
+    return () => undefined;
+  }
+
+  setAutomationControlled(): void {}
+
+  session(): never {
+    throw new Error("session is not used by IPC tests");
+  }
+
   public readonly attachCalls: AttachCall[] = [];
-  public readonly beginWindowResizeCalls: WindowResizeCall[] = [];
-  public readonly destroyAllCalls: string[] = [];
   public readonly detachCalls: DetachCall[] = [];
-  public readonly endWindowResizeCalls: WindowResizeCall[] = [];
+  public readonly focusCalls: TabCommandCall[] = [];
+  public readonly findInPageCalls: FindInPageCall[] = [];
+  public readonly stopFindInPageCalls: StopFindInPageCall[] = [];
   public readonly goBackCalls: TabCommandCall[] = [];
   public readonly goForwardCalls: TabCommandCall[] = [];
   public readonly navigateCalls: NavigateCall[] = [];
-  public readonly releaseWindowCalls: number[] = [];
   public readonly reloadCalls: TabCommandCall[] = [];
   public readonly setBoundsCalls: SetBoundsCall[] = [];
   public readonly setVisibleCalls: SetVisibleCall[] = [];
+  public readonly evaluateCalls: EvaluateCall[] = [];
+
+  async evaluate(call: EvaluateCall): Promise<BbDesktopBrowserEvaluateResult> {
+    this.evaluateCalls.push(call);
+    return { ok: true, value: "evaluated" };
+  }
+  public readonly setVisibleWithoutFocusCalls: SetVisibleCall[] = [];
   public readonly stopCalls: TabCommandCall[] = [];
 
   attach(args: AttachCall): void {
     this.attachCalls.push(args);
   }
 
-  beginWindowResize(hostWindow: WindowResizeCall): void {
-    this.beginWindowResizeCalls.push(hostWindow);
-  }
+  beginWindowResize(): void {}
 
-  destroyAll(): void {
-    this.destroyAllCalls.push("destroyAll");
-  }
+  prepareWindowReload(): void {}
+
+  destroyAll(): void {}
 
   detach(args: DetachCall): void {
     this.detachCalls.push(args);
   }
 
-  endWindowResize(hostWindow: WindowResizeCall): void {
-    this.endWindowResizeCalls.push(hostWindow);
+  endWindowResize(): void {}
+
+  focus(args: TabCommandCall): void {
+    this.focusCalls.push(args);
+  }
+
+  findInPage(args: FindInPageCall): void {
+    this.findInPageCalls.push(args);
+  }
+
+  stopFindInPage(args: StopFindInPageCall): void {
+    this.stopFindInPageCalls.push(args);
   }
 
   goBack(args: TabCommandCall): void {
@@ -135,9 +199,7 @@ class RecordingDesktopBrowserViewManager implements DesktopBrowserViewManager {
     this.navigateCalls.push(args);
   }
 
-  releaseWindow(hostWebContentsId: number): void {
-    this.releaseWindowCalls.push(hostWebContentsId);
-  }
+  releaseWindow(): void {}
 
   reload(args: TabCommandCall): void {
     this.reloadCalls.push(args);
@@ -151,6 +213,10 @@ class RecordingDesktopBrowserViewManager implements DesktopBrowserViewManager {
     this.setVisibleCalls.push(args);
   }
 
+  setVisibleWithoutFocus(args: SetVisibleCall): void {
+    this.setVisibleWithoutFocusCalls.push(args);
+  }
+
   stop(args: TabCommandCall): void {
     this.stopCalls.push(args);
   }
@@ -159,6 +225,7 @@ class RecordingDesktopBrowserViewManager implements DesktopBrowserViewManager {
 let nextWebContentsId = 1;
 
 beforeEach(() => {
+  electronMock.handlers.clear();
   electronMock.listeners.clear();
   electronMock.windowsBySender.clear();
   nextWebContentsId = 1;
@@ -192,12 +259,50 @@ function oversizedBrowserUrl(): string {
 }
 
 describe("registerDesktopBrowserIpc", () => {
+  it("evaluates page expressions only for valid requests from BrowserWindow-owned senders", async () => {
+    const manager = new RecordingDesktopBrowserViewManager();
+    registerDesktopBrowserIpc(manager);
+    const renderer = createTrustedRenderer("main-window");
+    const handler = electronMock.handlers.get(
+      BB_DESKTOP_BROWSER_EVALUATE_CHANNEL,
+    );
+    if (handler === undefined) {
+      throw new Error("Expected an evaluate handler.");
+    }
+    const request: BbDesktopBrowserEvaluateRequest = {
+      tabId: "browser:a",
+      expression: "document.title",
+      world: "isolated",
+      channel: "agent-annotations",
+    };
+
+    await expect(
+      handler({ sender: createUntrustedSender() }, request),
+    ).resolves.toEqual({
+      ok: false,
+      error: "Browser host window is not available",
+    });
+    await expect(
+      handler({ sender: renderer.sender }, { ...request, world: "worker" }),
+    ).resolves.toEqual({
+      ok: false,
+      error: "Invalid browser page evaluation request",
+    });
+    await expect(
+      handler({ sender: renderer.sender }, request),
+    ).resolves.toEqual({ ok: true, value: "evaluated" });
+    expect(manager.evaluateCalls).toEqual([
+      { hostWindow: renderer.hostWindow, request },
+    ]);
+  });
+
   it("dispatches valid browser commands only from BrowserWindow-owned senders", () => {
     const manager = new RecordingDesktopBrowserViewManager();
     registerDesktopBrowserIpc(manager);
     const renderer = createTrustedRenderer("main-window");
     const untrustedSender = createUntrustedSender();
     const attachRequest: BbDesktopBrowserAttachRequest = {
+      threadId: "thread-1",
       tabId: "browser:a",
       url: "http://localhost:5173/",
       bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -228,6 +333,11 @@ describe("registerDesktopBrowserIpc", () => {
       payload: { tabId: "browser:a" },
       sender: renderer.sender,
     });
+    sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
+      payload: { tabId: "browser:a" },
+      sender: renderer.sender,
+    });
 
     expect(manager.attachCalls).toHaveLength(1);
     expect(manager.attachCalls[0]?.hostWindow).toBe(renderer.hostWindow);
@@ -238,6 +348,67 @@ describe("registerDesktopBrowserIpc", () => {
     expect(manager.reloadCalls).toEqual([
       { hostWindow: renderer.hostWindow, tabId: "browser:a" },
     ]);
+    expect(manager.focusCalls).toEqual([
+      { hostWindow: renderer.hostWindow, tabId: "browser:a" },
+    ]);
+  });
+
+  it("dispatches validated find-in-page requests and rejects malformed ones", () => {
+    const manager = new RecordingDesktopBrowserViewManager();
+    registerDesktopBrowserIpc(manager);
+    const renderer = createTrustedRenderer("main-window");
+    const untrustedSender = createUntrustedSender();
+    const findRequest: BbDesktopBrowserFindInPageRequest = {
+      tabId: "browser:a",
+      text: "WebContents",
+      forward: true,
+      newSession: true,
+    };
+    const stopRequest: BbDesktopBrowserStopFindInPageRequest = {
+      tabId: "browser:a",
+      action: "clearSelection",
+    };
+
+    for (const payload of [
+      { ...findRequest, text: "" },
+      { ...findRequest, text: "a".repeat(1025) },
+      { ...findRequest, forward: "yes" },
+      { ...findRequest, extra: true },
+      { tabId: "browser:a", text: "x" },
+    ]) {
+      sendBrowserIpc({
+        channel: BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+        payload,
+        sender: renderer.sender,
+      });
+    }
+    sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+      payload: findRequest,
+      sender: untrustedSender,
+    });
+    sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_FIND_IN_PAGE_CHANNEL,
+      payload: findRequest,
+      sender: renderer.sender,
+    });
+    sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
+      payload: { tabId: "browser:a", action: "explode" },
+      sender: renderer.sender,
+    });
+    sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_STOP_FIND_IN_PAGE_CHANNEL,
+      payload: stopRequest,
+      sender: renderer.sender,
+    });
+
+    expect(manager.findInPageCalls).toEqual([
+      { hostWindow: renderer.hostWindow, request: findRequest },
+    ]);
+    expect(manager.stopFindInPageCalls).toEqual([
+      { hostWindow: renderer.hostWindow, request: stopRequest },
+    ]);
   });
 
   it("rejects malformed attach and navigate payloads before manager dispatch", () => {
@@ -245,6 +416,7 @@ describe("registerDesktopBrowserIpc", () => {
     registerDesktopBrowserIpc(manager);
     const renderer = createTrustedRenderer("main-window");
     const validAttachRequest: BbDesktopBrowserAttachRequest = {
+      threadId: "thread-1",
       tabId: "browser:a",
       url: "",
       bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -312,6 +484,11 @@ describe("registerDesktopBrowserIpc", () => {
       sender: renderer.sender,
     });
     sendBrowserIpc({
+      channel: BB_DESKTOP_BROWSER_SET_VISIBLE_WITHOUT_FOCUS_CHANNEL,
+      payload: visibleRequest,
+      sender: renderer.sender,
+    });
+    sendBrowserIpc({
       channel: BB_DESKTOP_BROWSER_SET_VISIBLE_CHANNEL,
       payload: visibleRequest,
       sender: renderer.sender,
@@ -319,6 +496,7 @@ describe("registerDesktopBrowserIpc", () => {
 
     for (const channel of [
       BB_DESKTOP_BROWSER_DETACH_CHANNEL,
+      BB_DESKTOP_BROWSER_FOCUS_CHANNEL,
       BB_DESKTOP_BROWSER_GO_BACK_CHANNEL,
       BB_DESKTOP_BROWSER_GO_FORWARD_CHANNEL,
       BB_DESKTOP_BROWSER_RELOAD_CHANNEL,
@@ -356,6 +534,9 @@ describe("registerDesktopBrowserIpc", () => {
       { hostWindow: renderer.hostWindow, request: boundsRequest },
     ]);
     expect(manager.setVisibleCalls).toEqual([
+      { hostWindow: renderer.hostWindow, request: visibleRequest },
+    ]);
+    expect(manager.setVisibleWithoutFocusCalls).toEqual([
       { hostWindow: renderer.hostWindow, request: visibleRequest },
     ]);
     expect(manager.detachCalls).toEqual([

@@ -17,11 +17,6 @@ export type WorkspaceOpenTargetCapability =
   keyof WorkspaceOpenTargetCapabilities;
 export type WorkspaceOpenTargetContextKind = "local" | "remote-ssh";
 
-const RENAMED_WORKSPACE_OPEN_TARGET_IDS: Record<
-  string,
-  WorkspaceOpenTargetId | undefined
-> = { windsurf: "devin-desktop" };
-
 const NATIVE_VIEWABLE_FILE_EXTENSIONS = new Set([
   ".avif",
   ".bmp",
@@ -254,8 +249,6 @@ export function resolvePreferredWorkspaceOpenTarget(
     }
   }
 
-  // Preserve stale preferences rather than clearing them. The app may be
-  // temporarily unavailable and should become primary again after reinstall.
   return resolveFallbackWorkspaceOpenTarget(
     args.capability,
     contextKind,
@@ -307,17 +300,6 @@ function useOverrideUnknownOpenTargetPreference(
   targets: WorkspaceOpenTarget[] | undefined,
 ): void {
   useEffect(() => {
-    const renamedTargetId =
-      preferredTargetId === null
-        ? undefined
-        : RENAMED_WORKSPACE_OPEN_TARGET_IDS[preferredTargetId];
-    if (
-      renamedTargetId !== undefined &&
-      targets?.some((target) => target.id === renamedTargetId)
-    ) {
-      setPreferredTargetId(renamedTargetId);
-      return;
-    }
     if (
       preferredTargetId === null ||
       targets === undefined ||

@@ -1,41 +1,29 @@
-// bb-plugin-side-chat frontend — the plugin-owned side chat surface.
-//
-// "Reply in side chat" (message action bar + selection menu) asks the backend
-// for an idle hidden fork, then opens a thread panel tab rendering the fork
-// with the host-owned ThreadChat: a "Replying to" header above the
-// conversation, a per-message "Send to main thread" action on assistant
-// messages.
 import { useCallback, useState } from "react";
 import { toast } from "sonner";
-import { Icon } from "@bb/shared-ui/icon";
+import { Icon } from "@/components/ui/icon";
 import {
   definePluginApp,
   Markdown,
   ThreadChat,
-  useRpc,
+  useSdk,
   type PluginMessageActionContext,
   type PluginThreadPanelActionContext,
   type PluginThreadPanelProps,
   type ThreadChatMessageAction,
-} from "@bb/plugin-sdk/app";
-import type { sideChatRpcContract } from "./server.js";
+} from "@get-bb/plugin-sdk/app";
 
 const PLUGIN_ID = "side-chat";
-export const PANEL_ACTION_ID = "side-chat";
+const PANEL_ACTION_ID = "side-chat";
 
-/** Every side-chat tab is labeled like the legacy panel tab. */
 const PANEL_TAB_TITLE = "Side chat";
 
-// A type alias (not an interface) so it is assignable to the JsonValue
-// `params` the host persists with the tab.
-export type SideChatPanelParams = {
+type SideChatPanelParams = {
   threadId: string;
   sourceThreadId: string;
   sourceMessageText: string;
   sourceSeqEnd: number | null;
 };
 
-/** Narrow the persisted (untrusted, JSON-round-tripped) panel params. */
 export function parsePanelParams(value: unknown): SideChatPanelParams | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
@@ -61,12 +49,10 @@ export function parsePanelParams(value: unknown): SideChatPanelParams | null {
   };
 }
 
-/**
- * Direct call to this plugin's backend rpc — the message/panel action `run`
- * callbacks are host chrome (not components), so the `useRpc` hook is
- * unavailable there. Same route, envelope, and "local" auth the hook uses.
- */
-async function callBackendRpc(method: string, input: unknown): Promise<unknown> {
+async function callBackendRpc(
+  method: string,
+  input: unknown,
+): Promise<unknown> {
   const response = await fetch(
     `/api/v1/plugins/${PLUGIN_ID}/rpc/${encodeURIComponent(method)}`,
     {
@@ -109,16 +95,9 @@ interface OpenSideChatArgs {
   sourceThreadId: string;
   anchorText: string;
   sourceSeqEnd: number | null;
-  openPanel(options: { title: string; params: SideChatPanelParams }): unknown;
+  openPanel(options: { title: string; params: SideChatPanelParams }): boolean;
 }
 
-/**
- * Single-flight guard: launcher/message-action activations are not debounced
- * by the host, so a double click before the first createSideChat resolves
- * would mint two hidden forks. Equivalent opens (same source/anchor/seq)
- * share the in-flight promise; the map entry clears on settle so a later
- * deliberate re-open still works.
- */
 const inFlightOpens = new Map<string, Promise<void>>();
 
 function openKey({
@@ -132,7 +111,6 @@ function openKey({
   return `${sourceThreadId}|${sourceSeqEnd ?? "tip"}|${anchorText}`;
 }
 
-/** Create the idle hidden fork, then open the panel tab pointing at it. */
 function openSideChat(args: OpenSideChatArgs): Promise<void> {
   const key = openKey(args);
   const pending = inFlightOpens.get(key);
@@ -186,8 +164,6 @@ function ReplyingTo({ anchorText }: { anchorText: string }) {
   const trimmed = anchorText.trim();
   const [expanded, setExpanded] = useState(false);
   const [overflows, setOverflows] = useState(false);
-  // Overflow is measured (not assumed from length) so the fade and the
-  // expand affordance only appear when the clamp actually cuts content.
   const measureRef = useCallback((node: HTMLDivElement | null) => {
     if (node !== null) {
       setOverflows(node.scrollHeight > node.clientHeight + 1);
@@ -197,10 +173,6 @@ function ReplyingTo({ anchorText }: { anchorText: string }) {
     return null;
   }
   const clamped = !expanded;
-  // Mirrors the legacy side-chat header: a "Replying to" label above a
-  // recessed bubble rendering the anchor as markdown. Long anchors clamp
-  // with a bottom fade instead of a hard mid-line cut; clicking the bubble
-  // toggles the full quote.
   return (
     <div className="mx-1 mb-2 flex flex-col items-start gap-1">
       <span className="text-xs leading-none text-muted-foreground">
@@ -242,7 +214,7 @@ function ReplyingTo({ anchorText }: { anchorText: string }) {
 }
 
 function SideChatPanel({ params }: PluginThreadPanelProps) {
-  const rpc = useRpc<typeof sideChatRpcContract>();
+  const sdk = useSdk();
   const parsed = parsePanelParams(params);
   const sideChatThreadId = parsed?.threadId ?? null;
   const sourceThreadId = parsed?.sourceThreadId ?? null;
@@ -250,11 +222,13 @@ function SideChatPanel({ params }: PluginThreadPanelProps) {
   const sendToMain = useCallback(
     async (message: { text: string; threadId: string }) => {
       if (sourceThreadId === null || sideChatThreadId === null) return;
+      const text = message.text.trim();
+      if (text.length === 0) return;
       try {
-        await rpc.call("sendToMain", {
-          sourceThreadId,
+        await sdk.threads.queuedMessages.create({
+          threadId: sourceThreadId,
+          input: [{ type: "text", text, mentions: [] }],
           senderThreadId: sideChatThreadId,
-          text: message.text,
         });
         toast.success("Sent to main thread");
       } catch (error) {
@@ -265,7 +239,7 @@ function SideChatPanel({ params }: PluginThreadPanelProps) {
         );
       }
     },
-    [rpc, sideChatThreadId, sourceThreadId],
+    [sdk, sideChatThreadId, sourceThreadId],
   );
 
   if (parsed === null) {
@@ -292,9 +266,6 @@ function SideChatPanel({ params }: PluginThreadPanelProps) {
         threadId={parsed.threadId}
         variant="compact"
         layout="contained"
-        // The side chat is its own thread: a quick aside may deserve tighter
-        // (or looser) permissions than the thread it forked from, so the
-        // picker stays live here instead of mirroring the source thread.
         permissionPolicy="editable"
         className="min-h-0 flex-1"
         leadingContent={<ReplyingTo anchorText={parsed.sourceMessageText} />}
@@ -325,10 +296,7 @@ export default definePluginApp((app) => {
     title: "Start side chat",
     icon: "SideChat",
     component: SideChatPanel,
-    // The embedded chat owns its layout; padded framing would float the
-    // composer above the main thread's baseline.
     layout: "flush",
-    // Launcher activation forks from the thread tip: no anchor, no seed.
     async run(context: PluginThreadPanelActionContext) {
       await openSideChat({
         sourceThreadId: context.threadId,

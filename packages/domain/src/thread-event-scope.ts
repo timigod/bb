@@ -1,8 +1,8 @@
 import { z } from "zod";
 import type { ThreadEventType } from "./provider-event.js";
 
-export const threadEventScopeKindValues = ["thread", "turn"] as const;
-export const threadEventScopeKindSchema = z.enum(threadEventScopeKindValues);
+const threadEventScopeKindValues = ["thread", "turn"] as const;
+const threadEventScopeKindSchema = z.enum(threadEventScopeKindValues);
 export type ThreadEventScopeKind = z.infer<typeof threadEventScopeKindSchema>;
 
 export const threadEventScopeSchema = z.discriminatedUnion("kind", [
@@ -11,29 +11,25 @@ export const threadEventScopeSchema = z.discriminatedUnion("kind", [
 ]);
 export type ThreadEventScope = z.infer<typeof threadEventScopeSchema>;
 
-export const threadEventScopePolicyValues = [
+const threadEventScopePolicyValues = [
   "thread",
   "turn",
   "thread-or-turn",
 ] as const;
-export const threadEventScopePolicySchema = z.enum(
-  threadEventScopePolicyValues,
-);
-export type ThreadEventScopePolicy = z.infer<
-  typeof threadEventScopePolicySchema
->;
+const threadEventScopePolicySchema = z.enum(threadEventScopePolicyValues);
+type ThreadEventScopePolicy = z.infer<typeof threadEventScopePolicySchema>;
 
-export interface ValidateThreadEventScopeArgs {
+interface ValidateThreadEventScopeArgs {
   scope: ThreadEventScope;
   type: ThreadEventType;
 }
 
-export interface ValidateThreadEventScopeResult {
+interface ValidateThreadEventScopeResult {
   message?: string;
   valid: boolean;
 }
 
-export interface RequireThreadEventScopeTurnIdArgs {
+interface RequireThreadEventScopeTurnIdArgs {
   scope: ThreadEventScope;
   type: ThreadEventType;
 }
@@ -62,14 +58,12 @@ type ThreadEventScopePolicyByType = Record<
   ThreadEventScopePolicy
 >;
 
-type ThreadScopeRationaleByType = Partial<Record<ThreadEventType, string>>;
-
 interface ThreadEventScopePolicyDefinitionEntry {
   definition: ThreadEventScopePolicyDefinition;
   type: ThreadEventType;
 }
 
-export const threadEventScopeDefinitionByType = {
+const threadEventScopeDefinitionByType = {
   "thread/started": {
     policy: "thread",
     rationale: "Thread lifecycle event; it creates the thread timeline itself.",
@@ -119,6 +113,16 @@ export const threadEventScopeDefinitionByType = {
     rationale:
       "Terminal task state can arrive turns after the spawning turn completed; thread scope avoids appending into a closed turn's sequence range.",
   },
+  "item/delegation/progress": {
+    policy: "thread",
+    rationale:
+      "Background delegations outlive their spawning turn exactly like background tasks; thread scope keeps turn windows sequence-contiguous.",
+  },
+  "item/delegation/completed": {
+    policy: "thread",
+    rationale:
+      "A background delegation's terminal state can arrive turns after the spawning turn completed; thread scope avoids appending into a closed turn's sequence range.",
+  },
   "thread/tokenUsage/updated": { policy: "turn" },
   "thread/contextWindowUsage/updated": {
     policy: "thread-or-turn",
@@ -136,6 +140,16 @@ export const threadEventScopeDefinitionByType = {
     policy: "thread",
     rationale:
       "Subscription usage is account-scoped state that can affect multiple turns and threads.",
+  },
+  "provider.env-resolved": {
+    policy: "thread",
+    rationale:
+      "Resolved provider environment is session state and can change between turns.",
+  },
+  "thread/extensionState/updated": {
+    policy: "thread",
+    rationale:
+      "Plugin-declared thread state is current thread metadata (like goals), not part of a specific turn transcript; latest snapshot per kind wins.",
   },
   "provider/warning": {
     policy: "thread-or-turn",
@@ -192,6 +206,11 @@ export const threadEventScopeDefinitionByType = {
     rationale:
       "Thread-management operations use thread scope outside provider turns; tool-owned operations use turn scope so the operation stays with the tool call that caused it.",
   },
+  "system/interaction/lifecycle": {
+    policy: "thread-or-turn",
+    rationale:
+      "A provider interaction belongs to the turn that raised it; a plugin may raise one outside any turn.",
+  },
   "system/permissionGrant/lifecycle": { policy: "turn" },
   "system/userQuestion/lifecycle": { policy: "turn" },
   "system/thread-provisioning": {
@@ -215,14 +234,6 @@ function getThreadEventScopePolicyDefinitionEntries(): ThreadEventScopePolicyDef
   );
 }
 
-function getThreadEventTypesForScopePolicy(
-  policy: ThreadEventScopePolicy,
-): ThreadEventType[] {
-  return getThreadEventScopePolicyDefinitionEntries()
-    .filter((entry) => entry.definition.policy === policy)
-    .map((entry) => entry.type);
-}
-
 function buildThreadEventScopePolicyByType(): ThreadEventScopePolicyByType {
   const policies: Partial<ThreadEventScopePolicyByType> = {};
   for (const entry of getThreadEventScopePolicyDefinitionEntries()) {
@@ -231,38 +242,7 @@ function buildThreadEventScopePolicyByType(): ThreadEventScopePolicyByType {
   return policies as ThreadEventScopePolicyByType;
 }
 
-function buildThreadScopeRationaleByType(): ThreadScopeRationaleByType {
-  const rationales: ThreadScopeRationaleByType = {};
-  for (const entry of getThreadEventScopePolicyDefinitionEntries()) {
-    if (entry.definition.rationale) {
-      rationales[entry.type] = entry.definition.rationale;
-    }
-  }
-  return rationales;
-}
-
-export const turnOnlyThreadEventTypes =
-  getThreadEventTypesForScopePolicy("turn");
-export const threadOnlyThreadEventTypes =
-  getThreadEventTypesForScopePolicy("thread");
-export const threadOrTurnThreadEventTypes =
-  getThreadEventTypesForScopePolicy("thread-or-turn");
-export const threadEventScopePolicyByType = buildThreadEventScopePolicyByType();
-export const threadScopeRationaleByType = buildThreadScopeRationaleByType();
-
-type ThreadEventTypeForScopePolicy<Policy extends ThreadEventScopePolicy> = {
-  [Type in ThreadEventType]: (typeof threadEventScopeDefinitionByType)[Type]["policy"] extends Policy
-    ? Type
-    : never;
-}[ThreadEventType];
-
-/**
- * Event types whose scope policy is strictly "thread" (always persisted with
- * turn_id NULL). Derived from threadEventScopeDefinitionByType at the type
- * level so downstream subsets can tie themselves to the scope policy instead
- * of restating it.
- */
-export type ThreadOnlyThreadEventType = ThreadEventTypeForScopePolicy<"thread">;
+const threadEventScopePolicyByType = buildThreadEventScopePolicyByType();
 
 export function threadScope(): ThreadEventScope {
   return { kind: "thread" };
@@ -306,13 +286,4 @@ export function validateThreadEventScope(
   }
 
   return { valid: true };
-}
-
-export function assertThreadEventScope(
-  args: ValidateThreadEventScopeArgs,
-): void {
-  const result = validateThreadEventScope(args);
-  if (!result.valid) {
-    throw new Error(result.message ?? "Invalid thread event scope");
-  }
 }

@@ -12,6 +12,7 @@ import {
   threadListEntrySchema,
 } from "@bb/domain";
 import {
+  rejectMultipleWorkspaceSelectors,
   branchListQuerySchema,
   isCommaSeparatedIncludeQueryValue,
   pathListIncludeQueryValueSchema,
@@ -138,7 +139,6 @@ export const projectListQuerySchema = z.object({
       { message: "Invalid include" },
     )
     .optional(),
-  /** Include the singleton personal project; omitted preserves ordinary-only listing. */
   includePersonal: z.enum(["true", "false"]).optional(),
 });
 export type ProjectListQuery = z.infer<typeof projectListQuerySchema>;
@@ -151,27 +151,10 @@ const projectWorkspaceRoutingFields = {
   ),
 } as const;
 
-function rejectMultipleProjectWorkspaceSelectors(
-  query: { environmentId?: string; hostId?: string },
-  context: z.RefinementCtx,
-): void {
-  if (query.environmentId !== undefined && query.hostId !== undefined) {
-    context.addIssue({
-      code: "custom",
-      message: "hostId and environmentId are mutually exclusive",
-    });
-  }
-}
-
-/**
- * Route project workspace discovery through an environment's workspace or an
- * explicit project source host. Omitting both intentionally falls back to the
- * primary host's project source.
- */
 export const projectWorkspaceRoutingQuerySchema = z
   .object(projectWorkspaceRoutingFields)
   .partial()
-  .superRefine(rejectMultipleProjectWorkspaceSelectors);
+  .superRefine(rejectMultipleWorkspaceSelectors);
 export type ProjectWorkspaceRoutingQuery = z.infer<
   typeof projectWorkspaceRoutingQuerySchema
 >;
@@ -183,7 +166,7 @@ export const projectFilesQuerySchema = z
     limit: z.string().regex(/^\d+$/).optional(),
   })
   .partial()
-  .superRefine(rejectMultipleProjectWorkspaceSelectors);
+  .superRefine(rejectMultipleWorkspaceSelectors);
 export type ProjectFilesQuery = z.infer<typeof projectFilesQuerySchema>;
 
 export const projectPathsQuerySchema = z
@@ -200,24 +183,15 @@ export const projectPathsQuerySchema = z
     query: true,
     limit: true,
   })
-  .superRefine(rejectMultipleProjectWorkspaceSelectors);
+  .superRefine(rejectMultipleWorkspaceSelectors);
 export type ProjectPathsQuery = z.infer<typeof projectPathsQuerySchema>;
 
-export const projectFileContentQuerySchema = z
-  .object({
-    ...projectWorkspaceRoutingFields,
-    path: z.string().min(1),
+export const projectBranchesQuerySchema = branchListQuerySchema
+  .extend({
+    hostId: z.string().min(1),
+    selectedBranch: gitBranchNameSchema.optional(),
   })
-  .partial({ hostId: true, environmentId: true })
-  .superRefine(rejectMultipleProjectWorkspaceSelectors);
-export type ProjectFileContentQuery = z.infer<
-  typeof projectFileContentQuerySchema
->;
-
-export const projectBranchesQuerySchema = branchListQuerySchema.extend({
-  hostId: z.string().min(1),
-  selectedBranch: gitBranchNameSchema.optional(),
-});
+  .strict();
 export type ProjectBranchesQuery = z.infer<typeof projectBranchesQuerySchema>;
 
 export const projectBranchesResponseSchema = projectSourceCheckoutSchema.extend(
@@ -279,7 +253,6 @@ export type UpdateProjectSourceRequest = z.infer<
   typeof updateProjectSourceRequestSchema
 >;
 
-/** `command` = Claude Code legacy slash command (`.claude/commands/*.md`). */
 export const providerCommandSourceSchema = z.enum(["skill", "command"]);
 export type ProviderCommandSource = z.infer<typeof providerCommandSourceSchema>;
 
@@ -291,27 +264,15 @@ export const providerCommandOriginSchema = z.enum([
 export type ProviderCommandOrigin = z.infer<typeof providerCommandOriginSchema>;
 
 export const providerCommandSchema = z.object({
-  /** Invocation name, e.g. "review" or "frontend:component". */
   name: z.string(),
   source: providerCommandSourceSchema,
   origin: providerCommandOriginSchema,
-  /** `null` = no description (menu falls back to the name). */
   description: z.string().nullable(),
-  /** `null` = no argument hint. */
   argumentHint: z.string().nullable(),
-  /** Present when this skill is contributed by a running bb plugin. */
   pluginId: z.string().min(1).optional(),
 });
 export type ProviderCommand = z.infer<typeof providerCommandSchema>;
 
-/**
- * The command typeahead menu's visual sections, top-to-bottom: built-in agent
- * commands, skills, Claude Code's legacy project commands, then user commands.
- * This single ordered list is the one source of truth for both the server's
- * flat sort (which buckets the response in this order) and the composer menu's
- * section grouping, so keyboard navigation (which walks the flat order) can
- * never disagree with what the user sees.
- */
 export const PROVIDER_COMMAND_SECTIONS = [
   "agent-command",
   "skill",
@@ -320,9 +281,6 @@ export const PROVIDER_COMMAND_SECTIONS = [
 ] as const;
 export type ProviderCommandSection = (typeof PROVIDER_COMMAND_SECTIONS)[number];
 
-/**
- * Derive the menu section a command belongs to from its source + origin.
- */
 export function providerCommandSection(cmd: {
   source: ProviderCommandSource;
   origin: ProviderCommandOrigin;
@@ -336,11 +294,6 @@ export function providerCommandSection(cmd: {
   return cmd.origin === "project" ? "project-command" : "user-command";
 }
 
-/**
- * Section rank used as the primary sort key for the command-list response, so
- * the flat order is grouped in {@link PROVIDER_COMMAND_SECTIONS} order. Lower
- * ranks sort first.
- */
 export function providerCommandSectionRank(cmd: {
   source: ProviderCommandSource;
   origin: ProviderCommandOrigin;
@@ -353,76 +306,44 @@ export const commandListResponseSchema = z.object({
 });
 export type CommandListResponse = z.infer<typeof commandListResponseSchema>;
 
-/** Query for the complete command catalog available to a project and provider. */
 export const projectCommandsQuerySchema = z
   .object({
     ...projectWorkspaceRoutingFields,
-    /** Provider whose command/skill surface to discover (e.g. `claude-code`, `codex`). */
     provider: z.string().min(1),
   })
   .partial({ hostId: true, environmentId: true })
   .strict()
-  .superRefine(rejectMultipleProjectWorkspaceSelectors);
+  .superRefine(rejectMultipleWorkspaceSelectors);
 export type ProjectCommandsQuery = z.infer<typeof projectCommandsQuerySchema>;
 
-/**
- * Product scope of a discovered skill, derived server-side from the daemon's raw
- * `(provider, rootKind)`. bb scopes are provider-agnostic; provider-owned
- * skills retain project/user scope as presentation metadata; `plugin` covers
- * skills bundled by either a bb plugin or a provider plugin. The opaque
- * `SkillSummary.id` is the only
- * server-resolvable identity.
- */
 export const skillScopeSchema = z.enum([
   "bb-builtin",
   "bb-user",
   "bb-project",
-  "claude-user",
-  "claude-project",
-  "codex-user",
-  "codex-project",
-  "cursor-user",
-  "cursor-project",
+  "provider-user",
+  "provider-project",
   "shared-user",
   "shared-project",
   "plugin",
 ]);
 export type SkillScope = z.infer<typeof skillScopeSchema>;
 
-/** Command-surface provider a skill is discovered under. */
-export const skillProviderSchema = z.enum([
-  "claude-code",
-  "codex",
-  "acp-cursor",
-]);
+export const skillProviderSchema = z.string().min(1);
 export type SkillProvider = z.infer<typeof skillProviderSchema>;
 
-/** Opaque, deterministic identity issued by authoritative host discovery. */
 export const installedSkillIdSchema = z.string().regex(/^skill_[a-f0-9]{64}$/u);
-export type InstalledSkillId = z.infer<typeof installedSkillIdSchema>;
 
-/** SHA-256 of the exact bytes read from SKILL.md. */
 export const skillRevisionSchema = z.string().regex(/^[a-f0-9]{64}$/u);
-export type SkillRevision = z.infer<typeof skillRevisionSchema>;
 
 export const skillSummarySchema = z.object({
   id: installedSkillIdSchema,
-  /** Invocation name (parent dir / frontmatter `name`). */
   name: z.string(),
   description: z.string().nullable(),
-  /**
-   * `null` for provider-agnostic bb scopes — a bb skill is discovered under both
-   * providers, so it is listed once with `provider: null` (de-duped on path).
-   */
   provider: skillProviderSchema.nullable(),
   scope: skillScopeSchema,
-  /** Owning plugin id for bundled skills; `null` for every other scope. */
   pluginId: z.string().min(1).nullable(),
-  /** Absolute path to the SKILL.md. */
   filePath: z.string(),
-  /** `true` when the skill is user-owned and its full lifecycle is manageable. */
   manageable: z.boolean(),
-  /** Exact registry entry that installed this skill; `null` for every other source. */
   registrySkillId: z.string().min(1).nullable(),
 });
 export type SkillSummary = z.infer<typeof skillSummarySchema>;
@@ -432,13 +353,7 @@ export const skillListResponseSchema = z.object({
 });
 export type SkillListResponse = z.infer<typeof skillListResponseSchema>;
 
-/** Skills listing is project-level; only the workspace needs scoping. */
 export const projectSkillsQuerySchema = z.object({
-  /**
-   * Required + nullable, mirroring {@link projectFilesQuerySchema}: an
-   * environment id scopes discovery to that workspace; `null` (empty string on
-   * the wire) uses the project's default source.
-   */
   environmentId: z.preprocess(
     (value) => (value === "" ? null : value),
     z.string().min(1).nullable(),
@@ -446,37 +361,22 @@ export const projectSkillsQuerySchema = z.object({
 });
 export type ProjectSkillsQuery = z.infer<typeof projectSkillsQuerySchema>;
 
-/** Local skill scopes whose SKILL.md can be edited safely in bb. */
 export const editableSkillScopeSchema = z.enum([
   "bb-user",
   "bb-project",
-  "claude-user",
-  "claude-project",
-  "codex-user",
-  "codex-project",
-  "cursor-user",
-  "cursor-project",
+  "provider-user",
+  "provider-project",
 ]);
 export type EditableSkillScope = z.infer<typeof editableSkillScopeSchema>;
-
-/** User-owned local scopes that can be deleted after server-side resolution. */
-export const deletableSkillScopeSchema = editableSkillScopeSchema;
-export type DeletableSkillScope = z.infer<typeof deletableSkillScopeSchema>;
 
 export const deleteSkillRequestSchema = z
   .object({
     skillId: installedSkillIdSchema,
-    /**
-     * Workspace used to discover project-local skills; `null` uses the
-     * project's default source. The server resolves the authoritative skill
-     * path — a client `filePath` is never accepted.
-     */
     environmentId: z.string().min(1).nullable(),
   })
   .strict();
 export type DeleteSkillRequest = z.infer<typeof deleteSkillRequestSchema>;
 
-/** Resolve a skill identity server-side before listing or reading its files. */
 export const projectSkillFilesQuerySchema = z.object({
   skillId: installedSkillIdSchema,
   environmentId: z.preprocess(
@@ -508,7 +408,6 @@ export const skillFilesResponseSchema = z.object({
 });
 export type SkillFilesResponse = z.infer<typeof skillFilesResponseSchema>;
 
-/** Edit a writable local skill's SKILL.md. */
 export const updateSkillRequestSchema = z
   .object({
     skillId: installedSkillIdSchema,
@@ -526,13 +425,6 @@ export type ProjectResponse = z.infer<typeof projectResponseSchema>;
 
 export const projectWithThreadsResponseSchema = projectResponseSchema.extend({
   threads: z.array(threadListEntrySchema),
-  /**
-   * Resolved provider/model/reasoning/permission/tier defaults for creating a
-   * root thread in this project. Inlined so the new-thread composer can render
-   * exactly what the server will use without a second round-trip per visit.
-   * `null` means the server cannot form concrete defaults for the current
-   * policy/provider combination.
-   */
   defaultExecutionOptions: projectExecutionDefaultsSchema.nullable(),
 });
 export type ProjectWithThreadsResponse = z.infer<
@@ -549,6 +441,7 @@ export type SidebarBootstrapResponse = z.infer<
 >;
 
 export const uploadedPromptAttachmentSchema = z.object({
+  sourceProjectId: z.string().min(1).optional(),
   type: z.enum(["localImage", "localFile"]),
   path: z.string(),
   name: z.string(),

@@ -3,15 +3,15 @@ import { getThreadEventScopeTurnId } from "@bb/domain";
 import type { AgentRuntime } from "../types.js";
 
 export type RuntimeWaitPredicate = () => boolean;
-export type RuntimeWaitFailureDescription = () => string | null | undefined;
-export type RuntimeWaitConditionConfig = number | RuntimeWaitConditionOptions;
-export type RuntimeThreadEventPredicate = (event: ThreadEvent) => boolean;
-export type RuntimeErrorEvent = Extract<
+type RuntimeWaitFailureDescription = () => string | null | undefined;
+type RuntimeWaitConditionConfig = number | RuntimeWaitConditionOptions;
+type RuntimeThreadEventPredicate = (event: ThreadEvent) => boolean;
+type RuntimeErrorEvent = Extract<
   ThreadEvent,
   { type: "provider/error" | "system/error" }
 >;
 
-export interface RuntimeWaitConditionOptions {
+interface RuntimeWaitConditionOptions {
   describeFailure?: RuntimeWaitFailureDescription;
   failFast?: RuntimeWaitFailureDescription;
   intervalMs?: number;
@@ -19,7 +19,7 @@ export interface RuntimeWaitConditionOptions {
   timeoutMs?: number;
 }
 
-export interface RuntimeFailureContext {
+interface RuntimeFailureContext {
   describeFailure?: RuntimeWaitFailureDescription;
   events?: ThreadEvent[];
   failFast?: RuntimeWaitFailureDescription;
@@ -28,20 +28,20 @@ export interface RuntimeFailureContext {
   threadId?: string;
 }
 
-export interface RuntimeStateWaitArgs extends RuntimeFailureContext {
+interface RuntimeStateWaitArgs extends RuntimeFailureContext {
   label: string;
   predicate: RuntimeWaitPredicate;
   timeoutMs?: number;
 }
 
-export interface RuntimeThreadEventWaitArgs extends RuntimeFailureContext {
+interface RuntimeThreadEventWaitArgs extends RuntimeFailureContext {
   events: ThreadEvent[];
   label: string;
   predicate: RuntimeThreadEventPredicate;
   timeoutMs?: number;
 }
 
-export interface RuntimeThreadTurnStartedWaitArgs extends RuntimeFailureContext {
+interface RuntimeThreadTurnStartedWaitArgs extends RuntimeFailureContext {
   events: ThreadEvent[];
   label?: string;
   threadId: string;
@@ -49,7 +49,7 @@ export interface RuntimeThreadTurnStartedWaitArgs extends RuntimeFailureContext 
   turnId?: string;
 }
 
-export interface RuntimeThreadTurnCompletedWaitArgs extends RuntimeFailureContext {
+interface RuntimeThreadTurnCompletedWaitArgs extends RuntimeFailureContext {
   events: ThreadEvent[];
   label?: string;
   threadId: string;
@@ -57,7 +57,7 @@ export interface RuntimeThreadTurnCompletedWaitArgs extends RuntimeFailureContex
   turnId?: string;
 }
 
-export interface RuntimeThreadAgentMessageWaitArgs extends RuntimeFailureContext {
+interface RuntimeThreadAgentMessageWaitArgs extends RuntimeFailureContext {
   events: ThreadEvent[];
   label?: string;
   text: string;
@@ -82,7 +82,7 @@ function isRuntimeErrorEvent(event: ThreadEvent): event is RuntimeErrorEvent {
   return event.type === "provider/error" || event.type === "system/error";
 }
 
-function formatRuntimeErrorEvent(event: RuntimeErrorEvent): string {
+export function formatRuntimeErrorEvent(event: RuntimeErrorEvent): string {
   const detail = event.detail ? ` detail=${event.detail}` : "";
   return `${event.type}: ${event.message}${detail}`;
 }
@@ -157,10 +157,6 @@ function failFastRuntimeFailure(args: RuntimeFailureContext): string | null {
   return null;
 }
 
-/**
- * Raw polling primitive for building intent-named runtime wait helpers.
- * Tests should prefer diagnosed helpers such as waitForThreadTurnCompleted.
- */
 export async function waitForRuntimeConditionUnsafe(
   condition: RuntimeWaitPredicate,
   config?: RuntimeWaitConditionConfig,
@@ -171,9 +167,12 @@ export async function waitForRuntimeConditionUnsafe(
   const label = options.label ?? "condition";
   const deadline = Date.now() + timeoutMs;
 
-  while (Date.now() < deadline) {
+  while (true) {
     if (condition()) {
       return;
+    }
+    if (Date.now() >= deadline) {
+      break;
     }
     const failFastMessage = options.failFast?.();
     if (failFastMessage) {
@@ -211,15 +210,24 @@ export async function waitForRuntimeThreadEvent(
 
 export async function waitForThreadTurnStarted(
   args: RuntimeThreadTurnStartedWaitArgs,
-): Promise<void> {
+): Promise<{ event: ThreadEvent; turnId: string }> {
+  const predicate = (event: ThreadEvent): boolean =>
+    event.type === "turn/started" &&
+    event.threadId === args.threadId &&
+    (!args.turnId || getThreadEventScopeTurnId(event.scope) === args.turnId);
   await waitForRuntimeThreadEvent({
     ...args,
     label: args.label ?? `turn/started for ${args.threadId}`,
-    predicate: (event) =>
-      event.type === "turn/started" &&
-      event.threadId === args.threadId &&
-      (!args.turnId || getThreadEventScopeTurnId(event.scope) === args.turnId),
+    predicate,
   });
+  const event = args.events.find(predicate);
+  const turnId = event ? getThreadEventScopeTurnId(event.scope) : undefined;
+  if (!event || turnId === undefined) {
+    throw new Error(
+      `turn/started for ${args.threadId} vanished after it was observed`,
+    );
+  }
+  return { event, turnId };
 }
 
 export async function waitForThreadTurnCompleted(

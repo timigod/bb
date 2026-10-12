@@ -1,35 +1,420 @@
 # Debugging And QA
 
+- `pnpm dev` and `pnpm start:worktree` save the absolute source checkout path in `<data dir>/bb-dev-instance.json`. Storage reports use this record to identify development data even after the checkout is removed. Older instances can be identified from `bb-app-runtime.json` or hash-verified path matches; unknown source paths are reported explicitly.
 - `pnpm dev` prints the active frontend URL, server API URL, host daemon port, data dir, and logs dir. Do not assume fixed dev ports.
+- `pnpm mobile:apk:dev` builds a standalone ARM64 Android APK at `apps/mobile/build-output/bb-dev.apk`, named **bb dev** with an orange icon and separate package/data from the installed app. Append `-- x86_64` for an Intel emulator. See [the mobile build instructions](../apps/mobile/README.md#android-local-apk-and-verification) for prerequisites, installation, and per-thread delivery.
+- `pnpm start:worktree` builds production artifacts and serves the optimized app bundle from the checkout-specific dev server URL, while keeping the same dev data directory and deterministic server/host-daemon ports. It has no Vite dev server or hot reload.
+- `pnpm start:worktree-remote` is the trusted-network variant of `pnpm start:worktree`; it binds that server to all IPv4 interfaces.
+- `pnpm desktop` packages the Electron app and launches it against the installed data directory, ports and Electron user-data directory, the same targets a released build uses. It therefore shares the single-instance lock with an installed bb: quit that first, or the launch focuses it instead of starting your build.
+- `pnpm desktop:worktree` packages and launches it against this checkout's data directory and deterministic ports, the same instance `pnpm start:worktree` uses, so a packaged build never touches `~/.bb` or port 38886. It also points Electron's own user-data directory at `$BB_DATA_DIR/desktop` — window state, storage and the single-instance lock all live there. Without that the build would share `~/Library/Application Support/bb` with an installed bb, fail to take the lock, and quit while the installed app focuses itself, which reads as a successful launch of code that never ran. Override it with `BB_DESKTOP_USER_DATA_DIR`. It refuses to start when the server or host-daemon port is busy, because a stale server there would answer for the build you meant to test. DevTools stay closed unless you set `BB_DESKTOP_OPEN_DEVTOOLS=1`, matching a released build. Both commands always repackage first; Turbo caches everything except electron-builder itself. Signing is left to electron-builder's keychain auto-discovery, so machines without a Developer ID identity produce unsigned artifacts and macOS shows the usual first-launch warning.
 - The packaged app defaults to server/frontend `:38886`, host daemon `:38887`, data dir `~/.bb/`, and logs under `~/.bb/logs/`.
+- `bb-app` (including `pnpm start`), `bb-server`, and `bb-host-daemon` capture service stdout and stderr directly in `logs/server-stdio.log` and `logs/host-daemon-stdio.log` under the selected data directory. These append across restarts and are separate from rotating application logs. Use `tail -F` on these files for console output and early startup errors; service output is no longer forwarded to the launcher's terminal.
+- Connect's `tunnel closed` warnings include the last transport error's original message and code, `connectedDurationMs`, and `lastHeartbeatAckAgeMs`. A null duration means the opening handshake never completed; a null acknowledgement age means no heartbeat acknowledgement arrived on that connection. They also carry the Cloudflare `colo` and `ray` the tunnel connected through, and `traffic`: open HTTP and WebSocket streams, bytes each way, how long each direction had been quiet, and bytes still buffered for sending. `tunnel connected` and `handshake timed out` lines carry the dial's timings in milliseconds since dialing: `lookupMs`, `connectMs`, `tlsMs`, and `upgradeMs` (the gate's 101 response). A timed-out dial with `tlsMs` set but no `upgradeMs` reached Cloudflare and was waiting on the gate. These warnings appear in the server logs and `<dataDir>/plugins/connect/logs/plugin.log`.
+- The bb connect gate answers every proxied request within the response-head timeout (30 s, 90 s for voice transcription), counted from when the Worker receives it. A request that misses it gets a 504 naming the stuck stage: `routing`, `tunnel-object`, `request-body`, `response-head`, or `finishing`. Workers Logs keeps only about 1% of gate requests, so the gate also writes these delays to the Analytics Engine dataset `bb_connect_gate_events` (`bb_connect_gate_events_staging` on staging): `blob1` is `stall` for a 504 or `slow` for a tunnel dial still unanswered after 3 s, then `blob2` stage, `blob3` method, `blob4` host, `blob5` path, `double1` elapsed milliseconds, and `double2` tunnel-object attempts (more than 1 means the object restarted and the gate replayed the dial). For a stall that reached the tunnel object, the gate then asks that object for its tunnel's state: `blob6` is `connected`, `disconnected`, or `unknown` (the object did not answer within 2 s), and `double3` is how many milliseconds ago the tunnel's last heartbeat was answered, or -1 when there is none. A bb heartbeats every 20 s, so an age of minutes means the tunnel is dead while the object still holds it open; a recent age means the bb is connected but its server did not answer. Routing stalls and `slow` events leave `blob6` empty and `double3` at -1. The tunnel object also writes a `tunnel-gap` event to the same dataset each time a server's tunnel opens after a period with none: `blob2` is how the previous tunnel ended (`closed`, `lost`, or `unreported` when its close never reached the object), `blob3` is `replaced-live` when that previous tunnel had itself replaced a working one, `blob4` is the host, `double1` is how long the server had no tunnel in milliseconds (measured from the previous open when the close was unreported), and `double2` is how long the previous tunnel lasted, or -1 when unreported. A bb whose own abandoned dial replaced its working tunnel shows as `replaced-live` with a short or unreported previous tunnel (on staging the abandoned tunnel was reported `lost` about 10 s after it opened); when `double1` plus `double2` is close to 300,000, that bb then waited out the five-minute takeover backoff. Query it with the Analytics Engine SQL API using a token with Account Analytics Read, for example `SELECT timestamp, blob1, blob2, blob5, double2 FROM bb_connect_gate_events WHERE blob4 = '<handle>.getbb.app' ORDER BY timestamp DESC`.
 - Entity IDs in URLs (`proj_*`, `thr_*`) are primary keys. Query them directly against the active data dir: `sqlite3 <data>/bb.db "SELECT * FROM threads WHERE id = 'thr_xxx';"`.
 - API routes are under `/api/v1/`, for example `GET /api/v1/threads/:id`.
 - Use `curl` against the server API to isolate frontend issues from server behavior.
 - Use the CLI to inspect state: `pnpm bb thread show <id>`, `pnpm bb project list`, `pnpm bb status`. From source, use `pnpm bb:dev`.
 
-## Local Dev QA Launcher
+## Desktop Browser Tab Recovery
 
-Use `scripts/bb-dev-app` when validating changes in the desktop dev app or helping QA from this checkout:
+Saved desktop browser tabs keep their URL and owning host/window. Opening one
+in the desktop app attaches the existing view when that window still owns it,
+including after its connection generation changes. While the desktop or host is
+reconnecting, the panel retries for about a minute, then offers Try again.
 
-- `pnpm dev:status` runs `scripts/bb-dev-app status` to print the active branch, dev URLs, data dir, and logs.
-- `scripts/bb-dev-app current` restarts the dev server on the current branch.
-- `scripts/bb-dev-app main` fetches `origin/main`, fast-forwards `main`, and launches the dev server from this checkout.
-- `scripts/bb-dev-app branch <branch>` switches to a local branch, or creates it from `origin/<branch>`, then launches the dev server.
-- `pnpm dev:stop` runs `scripts/bb-dev-app stop` to stop the launcher-managed dev server and desktop.
-- `scripts/bb-dev-app logs dev` and `scripts/bb-dev-app logs desktop` follow logs.
+After a window closes or the app relaunches, the panel reopens the saved URL in
+the current window on the same host once the host confirms the old window is
+gone. Native history and unsaved page state are not restored. The desktop broker
+suppresses teardown snapshots from destroyed windows so closing a window does
+not delete its saved tabs before another window can recover them. The server adopts
+the restored tab from the window's browser snapshot and closes competing restored
+views if two windows reopen it concurrently. Snapshots from a stale restoring
+generation cannot adopt the tab. A newer snapshot from the same window and
+thread cancels a pending adoption, including when the newer snapshot is empty.
 
-By default the launcher starts only the dev server (web frontend, server, host daemon) and prints the URL without opening a browser. Pass `--open` to open the browser after startup. Pass `--desktop` (e.g. `scripts/bb-dev-app current --desktop`) to also launch the Electron desktop shell — only do this when the user is testing a desktop-only change.
+Web clients, other hosts, and other live windows show the saved URL and its
+availability instead of attaching a native view. Copy link remains available;
+Open in browser accepts only HTTP(S) URLs. The panel's tab close control also
+works in this state. Selecting another saved tab rechecks its owning window;
+Try again also rechecks a window previously reported as live after it closes.
+Inspect the persisted owner with
+`bb thread tabs show <threadId> --json` or `sdk.threads.tabs.get`, and compare it
+with `bb browser instances --host <hostId> --json` or
+`sdk.experimental_desktopBrowsers.listInstances`. Recovery uses the existing
+native snapshot and browser APIs; no daemon wire fields change.
 
-Branch switches intentionally keep dirty work in this checkout; git will stop if a local file would be overwritten. Set `BB_DEV_APP_STASH_DIRTY=1` for a one-off launch that stashes first.
+## Reproducing Test Order Failures
 
-For CLI QA against the dev instance, run `eval "$(scripts/bb-dev-app env)"` first. This sets `BB_SERVER_URL`, `BB_HOST_DAEMON_PORT`, and `BB_PROJECT_ID=proj_personal` so `pnpm bb:dev ...` does not accidentally target the packaged app.
+CI's test shards shuffle test files and tests within each file. Vitest prints the seed for
+runs that execute; unchanged Turbo tasks can still reuse cached results.
+Reproduce a failing package with its logged seed:
+
+```bash
+pnpm exec turbo run test --filter=@bb/app -- --sequence.shuffle --sequence.seed=4721 --maxWorkers=2
+```
+
+For a repository-wide order audit, omit the filter and use `--concurrency=4`
+before Turbo's `--` separator. CI caps each Vitest process at two workers so
+package concurrency does not multiply into unbounded worker contention.
+Use a second seed after
+repairing order dependencies. Reset test-owned mock implementations, fixture
+arrays, persisted preferences, and databases before each test. Await background
+work and close streams, workers, and subprocesses before removing their files or
+tearing down their environment. Worker isolation does not restore built-in
+process objects or cancel resources that a test leaves running.
+
+## ACP Steer Cancellation Failures
+
+ACP steering cancels the active prompt before submitting the follow-up. If that
+prompt returns an error during cancellation, BB marks the session for rebuilding
+before the next turn. The replacement process attempts `session/load`; providers
+without working session restoration start fresh and report the loss of in-agent
+history. The failed turn stays failed, and an unsent steer is not acknowledged as
+accepted.
+
+Older Hermes adapters can throw `NoneType.startswith` during cancellation and
+leave their internal session marked running. Update Hermes to include
+[the null-response fix](https://github.com/NousResearch/hermes-agent/commit/8f0322da5b82029f3bc4d16fbaa2c986299abfc6)
+and [the running-state cleanup](https://github.com/NousResearch/hermes-agent/commit/bccd45618c16b605822dd179cd0399abdecaf698),
+then restart its retained process with `bb thread stop <thread-id>` before sending
+a new message. BB's recovery prevents reuse after a cancellation error; it does
+not repair the older adapter's failing turn.
+
+## Machine Authentication Cache
+
+Successful verification of an unlimited daemon host key is cached in server
+memory for 30 seconds, capped at the key's expiry. The cache holds at most
+1,024 entries and retains only token hashes. Hits neither read nor write the
+authentication database and do not extend the cache lifetime. The next request
+after expiry uses the existing verifier and updates usage timestamps, so
+`lastRequest` and `updatedAt` describe the last full verification rather than
+every request. A burst of concurrent cold requests can still perform separate
+verifications before the first result is cached.
+
+Revocation and reenrollment invalidate that host's cached keys and prevent
+already-running verifications from returning or caching invalidated credentials.
+Restarting the server discards the cache. Enrollment keys and keys with quotas,
+refills, or enabled rate limiting always use the existing verifier. Direct edits
+to authentication rows outside the machine-auth service are observed when the
+cache expires; QA that changes a warmed key's database fields must account for
+that window. Expiry known when caching is enforced on every hit.
+
+## Slow Database Operations
+
+The server logs `Slow DB query` when a prepared statement, `exec` batch, or
+complete transaction takes at least 100 ms. `durationMs` measures elapsed time;
+`cpuDurationMs` measures CPU time on the calling thread. A large gap indicates
+waiting or descheduling, not necessarily inefficient SQL. It does not by itself
+distinguish filesystem I/O, lock waits, and scheduler contention.
+
+`operation: "transaction"` includes the callback, commit, and rollback; its SQL
+label identifies the transaction mode rather than containing callback SQL.
+Statements inside it may also log, so do not add their durations to the
+transaction duration. Commit timing matters because SQLite's automatic WAL
+checkpoint can perform filesystem writes and synchronization on the server
+thread. `operation: "exec"` also covers maintenance batches. SQL string
+literals are redacted and parameter values are never logged.
+
+Only while performance diagnostics are enabled, slow-DB records also include
+`diagnostics.resourceUsage`: process-wide deltas for `minorPageFault`,
+`majorPageFault`, `fsRead`, `fsWrite`, `voluntaryContextSwitches`, and
+`involuntaryContextSwitches`. These are counts, not bytes or durations, from
+[Node's resourceUsage](https://nodejs.org/api/process.html#processresourceusage).
+They can include activity on other process threads. Unsupported OS counters
+remain zero; in particular, zero filesystem counters do not rule out I/O or
+fsync waits. Page faults do not identify whether the fault was on the SQLite
+mmap, the server heap, or another mapping, and these counters do not measure
+swap-in bytes.
+
+`diagnostics.wal.sizeBytes` is the WAL's physical file size, sampled only when
+emitting a slow log with diagnostics enabled. Missing or inaccessible WAL files
+and in-memory databases report null. WAL size can include space reused by
+earlier generations; it does not measure uncheckpointed backlog or identify
+checkpoint progress. Resource sampling is also disabled with the live gate.
+
+## Pending Question Drafts
+
+Native provider questions and Ask User Question plugin forms save partial
+selections, free text, and the current question in browser-local storage under
+`bb.question-draft.v1:<threadId>:<interactionId>`. These drafts survive thread
+navigation and page reloads on the same browser/device. They are cleared after
+successful submission or cancellation and retained if either request fails.
+When local storage is unavailable, an in-memory fallback preserves drafts
+across navigation until the page reloads. Drafts are not sent to the agent until
+submitted, and CLI/SDK answers do not read the browser's draft.
+There is no time-based expiry. If an interaction is resolved elsewhere, its
+draft can remain in local storage but is never rendered as an active question;
+the server's pending interaction list controls that. Clearing browser site data
+removes these drafts. Older clients ignore this new storage namespace. Only the
+native question form and Ask User Question plugin opt in; secret-request forms
+do not use this storage.
+
+## Native Draft Rollback
+
+Migration `0132_thread_drafts` now only adds the temporary `threads.draft`
+column. Its original pre-release SQL merged Drafts plugin queue entries into
+that column and deleted the held rows and built-in plugin installation. The
+original hash remains accepted by `migration-history.ts` for databases that
+already ran it; it is not replayed.
+
+Migration `0133_remove_thread_drafts` drops the column without converting its
+contents back into queued messages. Databases upgrading through the revised
+`0132` retain their existing queue rows and Drafts plugin installation. Databases
+that ran the original `0132` lose the stored core draft contents, retaining their
+thread rows and any remaining queued messages. The restored built-in plugin is
+installed through normal server startup. Reintroducing native drafts requires
+a new migration after `0133`.
+
+## Archive Confirmation Counts
+
+`GET /api/v1/threads/:id/child-summary` and `sdk.threads.childSummary` return
+`nonDeletedChildCount` for deletion (direct children, including archived rows)
+and `unarchivedDescendantCount` for archive confirmation. The latter follows
+the same hierarchy, lifecycle-owner, and hidden source-fork edges as
+`archive-all`, deduplicates threads, traverses archived intermediaries, and
+excludes hidden, already archived, or deleted candidates and the requested root.
+Hidden threads still participate in the archive cascade, and visible descendants
+beneath hidden threads still count toward confirmation.
+The UI adds the root to the displayed total and skips confirmation when no
+unarchived descendants remain or the General setting `confirmThreadArchive`
+is disabled. The summary is a preview; concurrent changes
+can alter the eventual archive result. CLI and SDK archive calls remain
+non-interactive.
+
+## File Content Routes
+
+Clients read file bytes through path-shaped GET routes, so relative URLs in
+HTML and markdown resolve against the same route:
+
+- `/api/v1/threads/:id/thread-storage/files/:path` reads the thread's storage
+  folder.
+- `/api/v1/threads/:id/host-files/:absolutePath` and
+  `/api/v1/hosts/:id/files/:absolutePath` read the thread environment's host or
+  the named host from its filesystem root. The path omits the leading `/`; a
+  first segment such as `C:` selects that Windows drive root.
+- `/api/v1/environments/:id/files/:path` reads the environment workspace, and
+  `/api/v1/environments/:id/revisions/:ref/files/:path` reads `HEAD` or a
+  4-40 character hex commit from it.
+- `/api/v1/projects/:id/files/:path` and
+  `/api/v1/projects/:id/hosts/:hostId/files/:path` read the project's local-path
+  source on the primary or named host.
+
+Media elements, HTML iframes, markdown images, and Download links use these
+URLs directly. The server resolves the root on every request, so they need no
+setup and do not expire.
+
+Plugins that preview an arbitrary host directory instead mint a lease:
+`POST /api/v1/files/previews` with `{ hostId?, rootPath, ttlMs? }` returns
+`{ baseUrl, expiresAtMs }`, and `GET /api/v1/file-previews/:lease/:path` reads
+that root. Minting the same root again returns the same `baseUrl` and extends
+its expiry. Leases live in server memory and do not survive a server restart.
+
+File content reads support a single HTTP byte range for media playback, seeking, and
+file preview sampling. Responses advertise `Accept-Ranges: bytes`; bounded,
+open-ended, and suffix ranges return `206` with `Content-Range` and the selected
+bytes. Unsatisfiable ranges return `416` with `Content-Range: bytes */<size>`.
+Malformed ranges, unsupported units, and multipart ranges fall back to the full
+`200` response. HEAD ignores Range. Revision routes read the file with one
+whole-file daemon read, so those responses ignore Range, keep the daemon's
+25 MB non-image limit, and revalidate with a strong SHA-256 ETag.
+
+File previews request the first 64 KiB. A complete sample becomes the preview
+directly. Otherwise the sample, its MIME type, and the `Content-Range` size
+classify the file: images and videos render from the file URL, binaries show
+their size and a Download link, and text is fetched in full only when it is at
+most 25 MB. The Download link is the file URL with the anchor `download`
+attribute, so the browser streams it to disk without the 25 MB limit.
+
+`If-None-Match` revalidation takes precedence over Range. Streamed responses use
+weak metadata ETags (`W/"file-<revision>"`), not content SHA-256 hashes. This
+avoids reading an entire large file just to validate it. Because the validator
+is weak, any `If-Range` header falls back to a full `200` response, including a
+matching weak tag or date. All raw file responses carry `Content-Security-Policy:
+sandbox allow-scripts`, including SVG and XHTML, so directly opened documents
+cannot acquire the app's origin privileges. HTML also carries the no-store
+policy, at any size; the app renders an HTML iframe only for files up
+to 5 MiB and shows larger HTML as source or, past 25 MB, as a Download.
+
+The server uses `host.read_file_chunk` for a metadata-only probe (`length: 0`),
+then reads at most 1 MiB per RPC as the HTTP consumer pulls data. HEAD, `304`,
+and `416` responses read no contents. Cancelling or aborting stops subsequent
+reads; an already in-flight RPC can finish. Each RPC opens and closes its file
+handle, so no remote read session needs cleanup. Offsets and lengths are
+validated at the daemon boundary, and paths remain confined to the route's root.
+
+The daemon returns a revision based on device, inode, size, and nanosecond
+mtime/ctime. Every content read checks the expected revision before and after
+reading from its open descriptor. A mismatch before response headers produces
+retryable `409 file_changed`; a change or error after streaming starts aborts
+the HTTP body. The server also rejects short/misaligned chunks. This detects
+ordinary writes, truncation, and replacement; it is not an immutable filesystem
+snapshot or a cryptographic guarantee against changes hidden by filesystem
+metadata granularity.
+
+Streamed reads bypass the whole-file size caps (including the 25 MiB
+non-image cap); each chunk stays bounded regardless of file size. `host.read_file`
+consumers such as `POST /files/read` and revision routes keep their
+whole-file limits and SHA-256 validators. `sdk.projects.fileContent` (and
+`bb project content`) reads through the project file routes and decides utf8 versus
+base64 from the returned bytes. Host-daemon protocol 219 introduced the chunk
+RPC; older enrolled daemons cannot serve streamed reads until updated.
+
+## Stale Workspace Claims
+
+Failed thread provisioning immediately requests environment cleanup. If a previous
+failure left a claim behind, sends, environment admission, and provider path claims
+repair it when they encounter it; restarting the server is not required.
+
+Claims owned by threads that are still starting or stopping remain blocked. A stale
+claim on a ready or shared checkout is released locally, preserving the workspace.
+A partially created environment retains its claim and is scheduled for the existing
+background lifecycle cleanup. Sends report `workspace_busy` with “Workspace cleanup
+is pending. Try again shortly.” until removal completes. Provider cleanup is never
+awaited by this admission repair, and startup does not scan for abandoned claims.
+
+## Local Dev QA
+
+Run `pnpm dev` from this checkout and keep it running in a terminal. It prints
+the checkout-specific URLs, data directory, and logs directory. Stop it with
+Ctrl-C. For desktop-only changes, start
+`pnpm exec turbo run dev --filter=@bb/desktop` in a second terminal.
+
+Use the Node version in `.nvmrc` (22.19.0). Desktop development requires
+Node 22.19 or newer in the Node 22 release line.
+
+A bb connect shared-port URL is a different browser origin from localhost. If
+QA through that URL needs the browser-local host daemon, restart the dev app
+with the share origin configured after exposing its app port:
+
+```bash
+BB_APP_URL=https://<handle>--<app-port>.getbb.app pnpm dev
+```
+
+The port remains stable for the checkout, so the existing share continues to
+work after the restart. The host daemon intentionally rejects remote origins
+that are not configured; otherwise any webpage could drive its local editor
+API.
+
+For CLI QA, `pnpm bb:dev` derives this checkout's server and daemon endpoints.
+In the test shell, clear inherited endpoint and thread context overrides first
+so commands target the dev instance. Keep these changes inside that shell.
 
 Test agents with:
 
 ```bash
-eval "$(scripts/bb-dev-app env)"
+unset BB_SERVER_URL BB_HOST_DAEMON_PORT BB_THREAD_ID BB_ENVIRONMENT_ID BB_THREAD_STORAGE BB_PROJECT_ID BB_CLI BB_CLI_REEXEC
 pnpm bb:dev thread spawn --project proj_personal --provider codex --permission-mode accept-edits --title "Smoke test" --prompt "Reply only with ok." --json
 ```
+
+## Desktop Browser CDP Prototype
+
+Run the isolated Electron compatibility fixture through Turbo:
+
+```bash
+pnpm exec turbo run smoke:browser-cdp --filter=@bb/desktop > /tmp/browser-cdp-smoke.log 2>&1
+```
+
+The harness currently requires Linux x64, `xvfb-run`, and network access to
+GitHub releases. It downloads checksum-pinned DevBrowser 1.0.0-rc.2 and
+agent-browser 0.36.0 into a fresh temporary directory, bundles the fixture,
+and drives real `WebContentsView` tabs through the production CDP bridge and
+native adapter. It uses a local fixture website and a separate Electron
+profile, without starting a BB core or reading an existing BB store.
+
+The command prints its artifact directory, including screenshots, protocol
+method traces, and the result summary. Connection credentials are redacted
+from the diagnostic output. Desktop startup now registers the native broker;
+`bb browser` and `bb.sdk.experimental_desktopBrowsers` expose its public API.
+This fixture also exercises service-created hidden automation tabs and leases.
+The fixture verifies simultaneous control of a hidden thread and another
+thread, in addition to both clients’ main-page workflows. It verifies trusted
+snapshot-reference clicks in same-origin and nested iframes, scrolling,
+selector clicks in a cross-origin iframe with a native child CDP session,
+and pointer input in a hidden thread’s iframe. Site isolation is enabled
+for the fixture. Unmodified RC2 omits cross-origin iframe contents from
+snapshots; use the local-build mode below for the implemented cross-origin
+ref support. Popup control remains untested.
+
+To validate a modified DevBrowser build, run:
+
+```bash
+pnpm exec turbo run smoke:browser-cdp --filter=@bb/desktop -- --dev-browser /absolute/path/to/dev-browser > /tmp/browser-cdp-local-smoke.log 2>&1
+```
+
+The `--dev-browser` option copies that binary into the artifact directory,
+records its SHA256 and local-build provenance, and adds required cross-origin
+snapshot-ref tests. These reject old refs after same-URL reloads, origin
+changes, frame removal, and parent navigation, even after a fresh snapshot
+has allocated new refs. It checks both the stale-ref error and absence of
+click side effects. Frame origin changes are driven through the parent
+iframe’s `src`: Puppeteer’s `Frame.goto()` can lose its session on a renderer
+swap, including in ordinary Chrome. The default command continues to test the unmodified
+release. Run the task with `-- --help` for usage.
+
+The native adapter uses one viewport capture before pointer input following
+attachment or navigation, so input does not race the renderer’s readiness.
+Concurrent pointer commands share that capture and preserve their order.
+Attachment enables Chromium focus emulation and temporarily disables background
+throttling, restoring the original throttling state on detach. While a CDP
+screenshot is pending, bounded native captures request frames without revealing
+the view; they stop at completion or a five-second deadline. The original CDP
+screenshot parameters are preserved.
+The image is discarded locally; pending input is rejected if navigation
+or a replacement controller invalidates it. A failed capture can be retried,
+and detaching one virtual session cancels its pending input while other
+sessions remain usable.
+
+After library cleanup and writing the result, the runner allows five seconds
+for Electron to quit. If it remains alive, the runner terminates its fixture
+process group and records `forcedExit: true`. A successful smoke command with
+that flag proves the listed browser checks, not graceful Electron shutdown.
+
+## Desktop Browser Broker Integration
+
+```bash
+pnpm exec turbo run smoke:browser-broker --filter=@bb/desktop -- --dev-browser /absolute/path/to/dev-browser > /tmp/browser-broker-smoke.log 2>&1
+```
+
+This isolated fixture uses an in-memory migrated test server, the actual SDK
+and CLI, an authenticated host broker, the desktop broker client, and real
+Electron tabs. The test harness supplies the server-to-host RPC responder;
+it does not start a full enrolled daemon or prove remote-machine transport.
+It verifies private connection-file permissions, ownership, browser input,
+capture, revocation, and connection generations. The default downloads the
+checksum-pinned release; the optional binary path records local provenance.
+No existing BB store or browser profile is used.
+
+## Record Provider Bridge Traffic
+
+Export `BB_PROVIDER_BRIDGE_RECORD_DIR` before you start the dev app and every
+provider bridge records its runtime and provider wires as NDJSON:
+
+```bash
+BB_PROVIDER_BRIDGE_RECORD_DIR=$HOME/.bb/provider-recordings/raw pnpm dev
+```
+
+In a second terminal, run:
+
+```bash
+unset BB_SERVER_URL BB_HOST_DAEMON_PORT BB_THREAD_ID BB_ENVIRONMENT_ID BB_THREAD_STORAGE BB_PROJECT_ID BB_CLI BB_CLI_REEXEC
+pnpm bb:dev thread spawn --project proj_personal --provider codex --prompt "Run git status." --json
+ls ~/.bb/provider-recordings/raw/codex/
+```
+
+The layout is `<dir>/<providerId>/<threadId>/<direction>.ndjson`, plus a
+`_process` scope for lines that belong to no thread. See
+[provider-bridge-protocol.md](provider-bridge-protocol.md), "Record mode",
+for the entry format. Raw recordings can contain secrets and absolute paths.
+Run `node scripts/provider-recordings/redact.mjs <raw-dir> <out-dir>` before
+you share one, and never commit a raw recording.
+
+To compare two checkouts' bridges on the committed recordings, run
+`pnpm parity --old <checkout> --new . [--provider <id>] [--cell <name>]`.
+Each leg replays every cell through its own bridge, assembler, and timeline
+projection; the run prints a PASS/FAIL line per cell with event and row
+counts and exits non-zero on any diff outside
+`packages/provider-bridge-protocol/recordings/parity-allowlist.json`.
 
 ## Performance Fixture Database
 
@@ -37,7 +422,7 @@ Use `pnpm seed:perf` to fill a dev database with a large, realistic fixture:
 many projects, ~1,200 threads, and ~400k event rows with production-like
 payloads. Use it to reproduce performance problems that only appear at scale.
 
-- Start the dev app once first (`scripts/bb-dev-app current`), then stop it and
+- Start the dev app once first (`pnpm dev`), then stop it and
   seed. The fixture then attaches to the real local host, so agents still run.
 - By default the command seeds this checkout's dev data dir. Pass
   `--data-dir <path>` for another target. The command refuses to touch `~/.bb`.
@@ -45,9 +430,135 @@ payloads. Use it to reproduce performance problems that only appear at scale.
   deletes the database file first. Without `--reset` the fixture appends.
 - Example: `pnpm seed:perf -- --reset --events 400000`.
 
+## Provider Corpus
+
+The provider corpus is a private set of real production threads (307 threads,
+330,626 event rows, extracted from a personal `~/.bb/bb.db`). It is the
+regression oracle for the provider-plugin migration: every layer must project
+the same rows and build timelines at the same speed. The corpus contains real
+prompts, code, and paths, so it is **never committed**; `.gitignore` blocks
+every `provider-corpus/` directory except the in-repo harness and scripts.
+
+- Location: `~/.bb/provider-corpus/` by default. Tests read it through
+  `BB_PROVIDER_CORPUS_DIR` and skip when the variable is unset or the directory
+  has no `manifest.json`, so CI and fresh checkouts stay green.
+- Layout: `manifest.json` (thread selection and reasons), `profile.json`,
+  `threads/<provider>/<threadId>/{meta.json,events.ndjson}`, and the generated
+  `snapshots/` directory described below.
+- Reader: `@bb/test-helpers` exports `corpusAvailable()`,
+  `listCorpusThreads({ provider?, reasons? })`, and `loadCorpusThread(id)`.
+  Event rows decode through the same `parseStoredThreadEvent` the server uses.
+
+Gates under `apps/server/test/provider-corpus/`:
+
+- `row-snapshots.test.ts` loads each thread into in-memory SQLite and projects
+  every timeline page the way `GET /threads/:id/timeline` does (default and
+  nested variants), then compares the rows with
+  `snapshots/rows/<provider>/<threadId>.json`.
+- `timeline-perf.test.ts` measures the 10 largest threads per provider (latest
+  page and full page walk, five builds each, calibrated against a synthetic
+  thread built in the same run) and compares with `snapshots/perf-baseline.json`.
+  The CI micro-benchmark in the same file needs no corpus. Each sample clears
+  the decoded-event cache and the latest-page selection memo, so the gate keeps
+  measuring cold builds.
+- `timeline-streaming-memo.test.ts` marks each thread active, appends streaming
+  rows to its latest turn tick by tick (plus one late output delta for the
+  previous root turn), and requires every latest-page build to equal a build on
+  a fresh connection with empty caches. It prints how many builds reused the
+  selection memo and the warm and cold tick build times.
+
+Run them:
+
+```bash
+scripts/provider-corpus/snapshot-rows.sh compare   # default mode, fails on diffs
+scripts/provider-corpus/snapshot-rows.sh write     # refresh the baseline
+```
+
+The script wraps `pnpm exec turbo run test:provider-corpus --filter=@bb/server`
+with `BB_PROVIDER_CORPUS_SNAPSHOT=write|compare`. Turbo strips undeclared
+variables, so use that task (not the package `test` task) when you set the
+corpus variables. Each run writes `snapshots/rows-last-run.json` and
+`snapshots/perf-last-run.md` with totals and the perf table.
+
+Compare mode fails on any row diff that `snapshots/allowlist.json` does not
+cover. An entry names a scope, a path, and the PR that made the change:
+
+```json
+[
+  {
+    "threadId": "thr_abc123",
+    "path": "/variants/*/pages/*/rows/*/output",
+    "pr": "#1234",
+    "reason": "…"
+  },
+  {
+    "provider": "codex",
+    "path": "/variants/default/pages/**/planSteps",
+    "pr": "#1235",
+    "reason": "…"
+  },
+  { "*": true, "path": "/variants/**/maxSeq", "pr": "#1236", "reason": "…" }
+]
+```
+
+`path` is a JSON pointer over the snapshot, or a glob where `*` matches one
+segment and `**` any number. The run prints the entries it used; an entry that
+covers nothing fails the run because it is stale.
+
+`snapshots/rows` is the baseline minted on `main` and shared by every
+workstream, so never run `write` against it from a feature branch. A PR that
+intentionally changes rows carries its own allowlist in the repository
+(`apps/server/test/provider-corpus/allowlists/<ws>.json`, same schema, merged
+after the shared file) and compares with
+`BB_PROVIDER_CORPUS_ALLOWLIST=<that file>`. A snapshot of the branch's own
+rows goes to a shadow directory: `BB_PROVIDER_CORPUS_SNAPSHOT_DIR=<dir>`
+redirects both `write` and `compare`. Re-mint `snapshots/rows` from `main`
+after such a PR merges and delete the allowlist file it carried.
+
+A pointer allowlist cannot describe a change that adds or removes rows: every
+later sibling shifts and the diff reports the whole turn. For such a change,
+carry a row-class file instead
+(`apps/server/test/provider-corpus/allowlists/<ws>-row-classes.json`) and set
+`BB_PROVIDER_CORPUS_ROW_CLASSES=<that file>` on the compare run. The gate then
+matches rows by identity (`callId`, `itemId`, `interactionId`, turn id, or row
+id), buckets every change into the first class whose matcher fits, and fails
+on a change no class claims or an entry that claims nothing (judged per
+entry, so a dead matcher cannot hide behind a sibling with the same name). A
+class names a `reason` and one matcher: `added`, `removed`, `moved` (the row left one
+nesting level for another), `resegmented` (a turn shows a different number of
+visible segments), `reshaped` (`from`/`to` kinds, optionally the other
+`fields` the reshape may touch), or `changed` with the `fields` it may touch;
+each narrows by `kind`, `workKind`, `role`, and `nested`. Turn bounds that follow a changed child fall into the built-in
+`container-bounds` class. The run prints the count per class and records them
+in `rows-last-run.json`. To iterate on the classes without re-projecting the
+corpus, mint the branch's rows once into a shadow directory and classify the
+two directories offline:
+
+```bash
+pnpm exec tsx scripts/provider-corpus/classify-row-diff.ts \
+  ~/.bb/provider-corpus/snapshots/rows ~/.bb/provider-corpus/snapshots/rows.<ws> \
+  --classes apps/server/test/provider-corpus/allowlists/<ws>-row-classes.json --verbose
+```
+
+Perf compare mode passes when each thread's normalized cost is within 10% of
+the baseline (or within 5 ms of intrinsic cost for the small latest-page
+builds) and the median event size is within 15%. The normalized cost is the
+minimum build time over five samples divided by the minimum time of a fixed
+CPU workload (JSON codec and sorting over a deterministic document) run once
+per sample right before the builds. The workload shares no code with the
+timeline, so a uniform timeline regression still moves the ratio, while
+machine speed and steady load cancel. Each thread gets up to three attempts so
+a burst of load does not fail the run (write mode keeps the median attempt);
+raw p50/p95 are printed for information. The
+baseline records the gate settings and compare mode refuses a baseline
+written with different ones. Run the gate on a machine whose load average is
+below its core count: when the machine is oversubscribed the table header
+says so and even paired ratios drift by 10–20%.
+
 ## Local Cloud
 
-Run the Cloud dashboard and Connect worker against one local D1 database:
+Run the Cloud dashboard, the Connect worker, and the AI gateway against one
+local D1 database:
 
 ```bash
 pnpm cloud:dev
@@ -55,18 +566,305 @@ pnpm cloud:dev
 
 The command applies migrations and prints the dashboard URL. Create a local
 email/password account, claim a handle, create a pairing code, and run the
-displayed `bb connect` command against a bb started with `pnpm dev`. The same
-worktree-specific local origin serves the dashboard at `bb.localhost` and
-routes `<handle>.bb.localhost` through the Connect worker. Email/password auth
+displayed `bb account login --code` command against a bb started with
+`pnpm dev` (`bb connect --code` does the same and also turns remote access
+back on). A browser sign-in started with
+`bb account login` opens `<local origin>/link?code=…` on the same origin. The
+same worktree-specific local origin serves the dashboard at `bb.localhost`,
+sends `bb.localhost/api/ai/*` to the AI gateway worker, and routes
+`<handle>.bb.localhost` through the Connect worker. Email/password auth
 is enabled only for this loopback workflow; production remains GitHub-only.
 `pnpm dev` automatically sets `BB_DEV_CONNECT_BASE_URL` to that worktree's
-local Cloud origin. While the bb is unpaired, Extensions → Plugins → Connect
-therefore opens the local dashboard and a pasted code redeems locally. An
-explicit `bb connect --server ...` or `--base-url ...` still wins, so the dev bb
-can still pair with getbb.app.
+local Cloud origin. While the bb is signed out, Settings → bb account and
+Settings → Installed plugins → Connect therefore sign in against the local
+Cloud, and a pasted code redeems locally. An explicit `--base-url ...` (or
+`bb connect --server ...`) still wins, so the dev bb can still sign in to
+getbb.app.
 Local machine enrollment follows the same origin: local `http:` server URLs
 produce `ws:` machine tunnels and `http:` share URLs, while non-local machine
 enrollment remains HTTPS-only.
 
+The AI gateway answers `503 unavailable` until an OpenRouter key is present.
+Export `OPENROUTER_API_KEY` in the shell before `pnpm cloud:dev` to pass it
+through to the local worker; the startup banner says which mode is active.
+To exercise the whole chain without OpenRouter, export
+`BB_CLOUD_DEV_AI_UPSTREAM_BASE_URL` (for example `http://127.0.0.1:4599/api/v1`)
+pointing at a local OpenAI-compatible fake, plus any non-empty
+`OPENROUTER_API_KEY`.
+The production gateway gets the key from the repository's `OPENROUTER_API_KEY`
+Actions secret, which `deploy-ai-gateway.yml` uploads with each deploy. Set the
+staging key with `wrangler secret put OPENROUTER_API_KEY --env staging` from
+`apps/ai-gateway`. Use a dedicated OpenRouter key with account-wide zero data
+retention and a daily credit limit.
+
 Ctrl-C stops the local services. Local D1 state is kept under
 `.wrangler/cloud-dev`.
+
+To test a source bb against the deployed staging Cloud instead, start it with
+`pnpm dev --staging`. bb account and Connect then sign in, redeem codes, open
+tunnels, and call the AI gateway at `https://vibecodethis.site`; no
+`pnpm cloud:dev` is needed. The flag only changes the default origin, so a
+dev data dir already signed in elsewhere keeps its account until
+`bb account logout`.
+
+## Provider-literal ratchet (G1)
+
+`node scripts/check-provider-literal-ratchet.mjs` counts provider-_id_ literals
+(`"codex"`, `"claude-code"`, `"acp-…"`, `providerId === "…"`, `isAcpProviderId`, …)
+in core (everything outside `plugins/provider-*` and `examples/`) and compares a
+per-file count against `scripts/provider-literal-baseline.json`. The count may
+only go down. Adding a provider-id branch to core fails CI. When you remove
+literals, regenerate the baseline with `--write` and commit it so the reduction
+is recorded. `--list` prints every hit. When the baseline reaches zero, delete
+it and the guard. This is guardrail G1 of the provider-plugin migration
+(the provider-plugin API design (docs/provider-plugin-api.md, added by the v3 contract PR; overview at https://get-bb.github.io/reports/design/provider-plugin-api.html)).
+
+## Linux AppImage Node runtime
+
+The AppImage launcher probes user namespaces and injects `--no-sandbox` when
+they are unavailable. Electron running as Node rejects that Chromium flag.
+The owned runtime supplies it after Node's `--` argument separator: AppRun sees
+the explicit flag and skips injection, while Node treats it as a script
+argument. The bridge subprocess receives only its script path. The AppImage
+lifecycle smoke exercises this launch and verifies that its runtime mount
+survives closing the GUI.
+
+## Prepared Worktree Restarts
+
+`pnpm start` and `pnpm start:worktree` always run Turbo-backed preparation before
+launching. Turbo decides which tasks need rebuilding and restores unchanged
+artifacts from cache. Native modules are checked and repaired when necessary.
+Worktree startup retains stable checkout-specific data, ports, telemetry, and
+runtime policy.
+
+Use `pnpm start --dryrun` or `pnpm start:worktree --dryrun` ahead of startup.
+The same command selects its normal dotenv settings and runtime policy, prepares
+artifacts through Turbo, prints resolved ports, bind host, data/config/log paths
+and runtime entrypoints as JSON, then exits. It does not launch services, migrate
+instance data or require ports to be free. Dry runs still write build outputs and
+may repair native modules. Install dependencies with
+`pnpm install --frozen-lockfile` beforehand when needed.
+
+Build tasks clean their own outputs when they run. Startup does not clear output
+directories before invoking Turbo. Cache hits use Turbo's normal restoration
+behavior, which restores cached files but can leave extra files from an earlier
+build. There is no custom preparation receipt or whole-checkout hashing pass.
+Do not prepare concurrently with another preparation or against build files
+still served by a live instance.
+
+Preparation writes build outputs in the checkout. If the previous process serves
+those same paths, preparation can change files it reads: this is not an atomic
+release switch. Use a separate staging checkout to warm the shared Turbo cache
+while the old instance runs, then stop the verified instance, update/install and
+prepare its stable checkout, and launch. For an already stopped, fully prepared
+checkout, normal startup restores its artifacts through Turbo cache hits. Moving
+the serving checkout changes the default instance data and ports; do not move it as a restart shortcut.
+
+The repo-level programmatic entry point is `prepareRuntime()` in
+`scripts/start-bb.mjs`. This is a source-maintenance helper, not a new
+installed `bb` command or public plugin SDK API. The source launcher accepts `--dryrun` for preparation and configuration preview.
+`pnpm start` keeps its existing production dotenv and packaged runtime policy.
+
+Turbo output ownership is separate: server `build` owns `apps/server/dist`,
+`@bb/bundled-plugins#build` assembles `packages/bundled-plugins/dist` from 33 independently
+cached `<plugin-package>#prepare:bundled` tasks. Each plugin declares
+`@bb/plugin-build` as a workspace dev dependency and runs
+`bb-plugin-build prepare-bundled` from its own directory. Turbo builds the shared
+executable through `^build` before preparation. The executable bundles the plugin
+without importing server policy or requiring a TypeScript loader. Each plugin
+task owns only its
+`plugins/<name>/.bundled-runtime` directory; regular plugin builds still own
+`plugins/<name>/dist`. Changing one plugin rebuilds its preparation and final
+assembly, while unchanged plugins restore from cache. Shared SDK/toolchain
+changes deliberately invalidate every plugin. The assembly package declares its
+plugin dependencies in `package.json`; Turbo
+uses `^prepare:bundled` to build them. Adding a bundled plugin requires its
+package script and workspace dependency, checked against the runtime registry
+by the startup test suite. Shared sources are hashed through workspace `topo`
+dependencies rather than repository-wide source globs.
+Bundled preparation uses temporary source copies and never writes the regular
+plugin `dist` directories. `bb-app#build` depends on and
+copies prepared plugins into its own package output. The plugin task hashes
+plugin sources, manifests, branding, skills, staging scripts/entries, lockfile,
+patches, workspace configuration, SDK/build-tool sources and versions, and theme;
+generated modules and SDK artifacts arrive through explicit dependency edges.
+The source preparation runner supplies `BB_BUILD_TOOLCHAIN` with Node, OS, and
+architecture to partition Turbo cache entries; callers should use the runner
+rather than set this internal build identity themselves.
+
+Built source servers resolve plugins and the bundled marketplace from
+`packages/bundled-plugins/dist` before looking beside the server bundle.
+This prevents legacy `apps/server/dist/builtin-plugins` artifacts left by a
+Turbo cache restore from overriding newly prepared plugins. Installed packages
+use their shipped `server/dist/builtin-plugins` directory. Built-in plugins
+update with the server; users do not update them separately.
+
+## Reviewing UI Code Splits
+
+See [UI code splitting](ui-code-splitting.md) for the app's `defineSplit`
+contract, explicit preload scopes, bundle-boundary guards, and parallel worker
+handoff requirements. Use an isolated production build with browser request
+interception to review loading and failure states and verify cold-download
+behavior. Keep temporary review stories and fixtures out of the final diff.
+
+## Pull Request Status And Daemon Compatibility
+
+Host-daemon protocol 228 makes `thread.storage.delete` and recursive directory
+removal through `host.remove_path` stop processes with working directories
+inside the target before deleting files. The latter also covers orphaned
+thread storage cleanup and CLI/SDK file removal. This uses the worktree removal
+process sweep on macOS and Linux; Windows does not enumerate process working
+directories. Older daemons must update to receive these cleanup semantics.
+
+Host-daemon protocol 226 opens the service tier: `serviceTier` in execution
+options is any non-empty tier id instead of `fast` or `default`, and
+`model/list` entries may carry `supportedServiceTiers`. A daemon on 225 rejects
+tier ids other than `fast` and `default`.
+
+Host-daemon protocol 224 removes wire members that neither side used: the
+`host.file_metadata` command, the `disallowedTools` runtime-context field, the
+`cwd` and `requirement` fields on provider installation and usage commands, the
+`appliedAs` field of `turn.submit` results, and the `serviceManager` field of
+`server_move.inspect` results.
+
+Host-daemon protocol 223 upgrades Zod to 4.6.5. String length constraints now
+count Unicode code points rather than UTF-16 code units. For example, a
+controller label containing 256 emoji passes the 256-character limit; 257
+emoji fails. Daemons on protocol 222 must update before reconnecting so the
+server and daemon enforce the same validation behavior.
+
+Host-daemon protocol 222 adds required `autoMerge` and nullable `inMergeQueue`
+fields to `workspace.pull_request` results. A null queue value means the
+separate GitHub GraphQL lookup was unavailable; other PR data remains usable.
+The server checks protocol compatibility before parsing session payloads.
+A daemon still on 221 is rejected with `protocol_version_mismatch` and cannot
+serve workspace RPCs until it updates and reconnects. Auto-update-enabled
+older daemons install the server's matching bb-app artifact; disabled or failed
+updates leave the machine disconnected until a manual update succeeds. This
+is an intentional version gate, not backward-compatible field defaulting.
+
+## Opt-in server performance diagnostics
+
+Run `pnpm start --perf-diagnostics` (or `pnpm start:worktree --perf-diagnostics`)
+when investigating slowness. `bb-app --perf-diagnostics` uses the same launcher
+option. The equivalent startup setting is `BB_PERF_DIAGNOSTICS=1`; it defaults
+to false and requires a server restart. Remove the flag/setting and restart to
+turn it off. This does not enable profiling for the daemon or other servers.
+
+When both gates are on, the mode logs database operations taking at least 25 ms, API requests taking
+at least 100 ms, and event-loop stalls of at least 100 ms. Every five seconds,
+`Server performance sample` records process and main-thread CPU time, loop
+utilization/delay, GC duration/count/max, and memory. CPU values are totals for
+that interval, not attribution to an individual request. GC callbacks can be
+delayed by a blocked loop. These measurements distinguish CPU pressure from
+elapsed-time stalls but do not prove a particular OS scheduling or I/O cause.
+
+Continuous V8 CPU sampling at 1 ms writes a `.cpuprofile` every 30 seconds to
+`$BB_DATA_DIR/logs/performance/`. Profiles are retained for up to 12 hours with a total cap of 1 GB
+(1,000,000,000 bytes), deleting oldest captures first when either limit is
+reached. Each file is limited to 12 MiB (oversized captures are discarded).
+Cleanup runs when collection starts and before each save, including captures
+from previous sessions. Space for the pending file is reserved inside the
+total cap. Turning collection off leaves saved captures until collection
+starts again; their age does not reset. Rotation starts the next named capture
+before ending the current one, keeping the V8 profiler active instead of
+rebuilding its code map every 30 seconds. At most two diagnostic captures
+overlap during the handoff; no process-lifetime profile accumulates. Initial
+profiler setup and the final shutdown capture still run on the server thread.
+Graceful
+shutdown saves the partial window; a crash can lose the current window.
+`Server CPU profile saved` logs its path, PID, and UTC start/end times. Copy
+relevant files before age or size retention removes them. Load a profile in Chrome
+DevTools' JavaScript profiler to inspect sampled stacks. No inspector network
+port is opened. Save records explicitly report `sampleTimeBasis: elapsed` and
+`nativeFramesMayIncludeWaiting: true`. Sampling can miss short calls and does not identify native
+I/O waits precisely.
+
+Profiling, serialization, and extra logging add overhead, so leave this off
+for routine operation. Files use private permissions and can contain local
+paths and function names; inspect before sharing. Existing logs retain their
+normal rotation policy. No request bodies or SQL bindings are added by this
+mode. A capture failure is logged and disables CPU capture for that process;
+summary logging continues. Profiles already saved remain after disabling it.
+
+Diagnostics require **both** startup permission (`--perf-diagnostics` or
+`BB_PERF_DIAGNOSTICS=1`) and the **Server performance diagnostics** toggle in
+Settings → Experiments. The toggle is only shown when startup permission is present; a saved experiment value does not make it visible. The experiment defaults to off. Use
+`bb settings experiment performanceDiagnostics true` to enable it, or `false`
+to stop it; SDK clients use the existing experiments update endpoint. The
+experiment takes effect live on that server. Without startup permission it
+cannot start collection. Turning it off restores normal logging thresholds,
+stops the sampler and flushes the in-flight profile; existing files remain.
+The launch flag only grants permission and still requires a restart to change.
+
+### Turn traces
+
+While both gates are on, every message sent through the send API also writes
+one `Turn trace` info line once its first streamed output is stored and
+broadcast. `turnTrace.spans` holds milliseconds since the server received the
+send: `dispatch.checkpoint.done`, `runtimeConfig.*` (runtime configuration
+assembly, including the daemon reads it waits on), `command.sent`,
+`send.responded`, `command.settled`, and `firstOutput.batchReceived`,
+`firstOutput.committed`, `firstOutput.notified` for the first event batch that
+carries an agent message, reasoning, or plan delta. `turnTrace.rpcs` lists every
+daemon RPC the send awaited with its start offset and duration.
+`turnTrace.daemon.spans` are the daemon's own offsets from receiving
+`turn.submit`: `lanes.entered`, `skills.staged`, `runtime.ready`,
+`input.staged`, `bridge.turnStarted`, and `events.flushed`. Server and daemon
+offsets use different clocks, so compare durations rather than offsets:
+`command.settled - command.sent - daemon events.flushed` is the round trip
+spent on the network. `outcome` is `output`, `not-sent` (queued or refused),
+`command-failed`, `completed-without-output`, `superseded` by a newer traced
+send on the thread, or `no-output` after two minutes. Queue drains, retries,
+and other server-initiated dispatches are not traced.
+
+### Diagnose a captured stall
+
+1. Record the affected request path and approximate UTC time. Find its
+   `Slow API request` and nearby `Event loop stalled` records. For timelines,
+   match the thread ID to `Thread timeline build blocked the event loop` and
+   inspect the stage timings. `inFlightWorkAtObservation` can name an unrelated asynchronous
+   long poll; it is not proof of what blocked the loop. Compare `longestSynchronousWork`
+   and its `longestSynchronousWorkWallMs` / `longestSynchronousWorkCpuMs`
+   measurements with the profile stacks instead. `stallAttribution` is
+   `unattributed` when no measured synchronous operation is long enough to
+   explain the maximum delay, allowing one 20 ms sampling interval of tolerance.
+   Otherwise it is `candidate`, and `stallCauseCandidate` names that operation.
+   A candidate is not a confirmed cause: the operation and delay may occur at
+   different times in the five-second window. The longest measured operation
+   remains in the log even when attribution is unavailable. CPU profiler start,
+   completion and serialization are measured as `cpu-profile:start`,
+   `cpu-profile:finish` and `cpu-profile:serialize`.
+2. Find the `Server CPU profile saved` interval covering that time and PID.
+   Copy the file before rotation overwrites it. In the JavaScript profiler,
+   select the affected time window and inspect the bottom-up view and caller
+   stack. Packaged captures name functions and bundled JavaScript locations;
+   match function names against the exact source revision used to build it.
+3. Compare sampled stacks with `mainThreadCpuMs`, GC totals and SQL
+   `cpuDurationMs`. A native SQLite call may appear throughout an elapsed wait
+   without consuming equivalent CPU. A slow SQL operation with very little
+   CPU indicates waiting, but does not identify the lock owner or prove disk
+   I/O. Interval CPU totals include other requests and background work.
+4. Repeat with a small control workload. Expected long polls can generate
+   slow-request records without blocking the event loop; require corroborating
+   loop delay, stage timings or sampled execution before calling them stalls.
+
+### Workspace context read limits
+
+The server supplies `host.read_workspace_agent_context` with project skill
+read policy: at most 1,000 non-hidden, non-excluded directories, 10 MiB per
+`SKILL.md`, and 32 MiB total JSON-encoded content strings. The aggregate budget
+allows several large skills in one catalog while bounding retained content.
+It is a pragmatic starting policy, not a measured catalog-size requirement or
+a transport ceiling. JSON quotes and escapes count toward this budget;
+directory metadata, shared skill discovery, and workspace instructions do not.
+The daemon reads files sequentially with bounded buffers. Oversized files and
+files exceeding the remaining budget are skipped with server warnings; smaller
+later files can still fit. Enumeration remains sorted and reports count
+truncation separately. Only exact-case `SKILL.md` files are eligible, and
+symlinked skill directories/files and roots escaping the workspace are rejected
+or skipped before their contents are read.
+
+Command lookup sets `includeAgentInstructions: false`, so an invalid
+`.bb/AGENTS.md` cannot break the command catalog. Turn preparation sets it to
+`true` and continues to report instruction-read errors.

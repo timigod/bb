@@ -1,8 +1,13 @@
+import { focusPaneComposer } from "@/lib/pane-composer-focus";
 import { cn } from "@bb/shared-ui/lib/utils";
-import { PANE_FOCUS_APP_COMMAND_IDS } from "@bb/domain";
+import {
+  PANE_DIRECTION_APP_COMMAND_IDS,
+  PANE_FOCUS_APP_COMMAND_IDS,
+} from "@bb/domain";
 import { useAtom, useAtomValue, useStore } from "jotai";
 import {
   Fragment,
+  memo,
   useCallback,
   useContext,
   useEffect,
@@ -10,10 +15,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   type SetStateAction,
 } from "react";
-import { useNavigate } from "react-router-dom";
 import { useRouteState } from "@/hooks/useRouteState";
 import {
   getThreadRoutePath,
@@ -22,7 +28,6 @@ import {
 import { useIsMutating } from "@tanstack/react-query";
 import { BbHttpError } from "@/lib/sdk";
 import { useThread } from "@/hooks/queries/thread-queries";
-import { useThreadSplitsEnabled } from "@/hooks/useThreadSplitsEnabled";
 import { useSplitWorkspaceActive } from "@/hooks/useSplitWorkspaceActive";
 import {
   dimInactiveSplitsAtom,
@@ -30,7 +35,6 @@ import {
   splitLayoutAtom,
 } from "@/lib/split-layout/atoms";
 import {
-  clampSplitPairFraction,
   computePaneRects,
   countPanes,
   findPane,
@@ -42,6 +46,10 @@ import {
   setFocus,
   swapPanes,
 } from "@/lib/split-layout";
+import {
+  createSplitResizeFlexPair,
+  createSplitResizeSnapSession,
+} from "@/lib/split-resize-snap";
 import type {
   LayoutNode,
   PaneContent,
@@ -61,6 +69,7 @@ import {
   useIndexedAppCommandHandlers,
 } from "@/components/commands/AppCommandProvider";
 import {
+  DefaultPaneContextProvider,
   PaneContext,
   createPaneSecondaryPanelRegistry,
   useOptionalPaneContext,
@@ -68,8 +77,8 @@ import {
   type PaneSecondaryPanelRegistration,
   type PaneSecondaryPanelRegistry,
 } from "./PaneContext";
-import { ThreadDetailView } from "./ThreadDetailView";
-import { RootComposeView } from "@/views/RootComposeView";
+import { LazyThreadDetailView as ThreadDetailView } from "./LazyThreadDetailView";
+import { LazyRootComposeView as RootComposeView } from "@/views/LazyRootComposeView";
 import { PluginPanelView } from "@/views/PluginPanelView";
 import {
   AppPageHeader,
@@ -81,22 +90,20 @@ import { resourceRouteLabelAtom } from "@/components/layout/resourceRouteLabelAt
 import { resolveAutomationBreadcrumbs } from "@/components/tools/tools-navigation";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
-import { CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS } from "@/components/ui/chromeStyleTokens";
-import { usePluginSlots } from "@/lib/plugin-slots";
+import { CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS } from "@bb/shared-ui/chrome-style-tokens";
+import { usePluginNavPanelChrome } from "@/lib/plugin-nav-panel-chrome";
 import {
   PluginPanelHeaderActions,
   PluginPanelHeaderCenter,
 } from "@/components/plugin/PluginPanelHeader";
-import {
-  getAdjacentPaneId,
-  getPaneIdAtReadingIndex,
-} from "./splitPaneCommands";
+import { getAdjacentPaneId, getDirectionalPaneId } from "./splitPaneCommands";
 import {
   applyThreadPaneActionToLayout,
   createSinglePaneLayout,
   focusedPaneRoute,
   paneContentRoute,
   reconcileLayoutForContent,
+  replaceOriginPaneContent,
   threadPaneContent,
 } from "./splitThreadNavigation";
 import { ThreadDetailWorkerPoolProvider } from "./ThreadDetailWorkerPoolProvider";
@@ -110,12 +117,52 @@ import { SecondaryPanelHostLayoutContext } from "@/components/secondary-panel/Se
 import {
   CONTEXT_INACTIVE_TEXT_CLASS,
   CONTEXT_SELECTION_SURFACE_CLASS,
-} from "@/components/ui/context-selection";
+} from "@bb/shared-ui/context-selection";
 import { PaneMaximizeButton } from "./PaneMaximizeButton";
-import { SplitDimmingButton } from "./SplitDimmingButton";
 import { wsManager } from "@/lib/ws";
+import { useImmediateRouteNavigate } from "@/components/ui/app-route-anchor";
+import { PluginDetailOpenerBoundary } from "@/components/plugin/plugin-detail-opener";
+import { defineSplit } from "@/lib/define-split";
+import { LazyPluginDetailPaneView } from "@/views/ToolsViewSplits";
 
-// A `pointerdown`-relative move threshold before a pane-header drag engages.
+const LazyPluginPanelRightPanelHost = defineSplit<
+  ComponentProps<
+    typeof import("@/components/plugin/PluginPanelRightPanelHost").PluginPanelRightPanelHost
+  >
+>({
+  id: "plugin-panel-right-panel-host",
+  load: () =>
+    import("@/components/plugin/PluginPanelRightPanelHost").then(
+      (module) => module.PluginPanelRightPanelHost,
+    ),
+  loading: () => null,
+  tier: "intent",
+});
+
+function PluginPagePanelHost({
+  children,
+  ...props
+}: {
+  children: ReactNode;
+  flushPageInsets?: boolean;
+  paneId?: string;
+  panelPath: string;
+  pluginId: string;
+  subPath: string;
+}) {
+  const pane = useOptionalPaneContext();
+  return (
+    <PluginDetailOpenerBoundary
+      key={`${props.pluginId}/${props.panelPath}`}
+      isFocused={pane?.isFocused ?? true}
+    >
+      <LazyPluginPanelRightPanelHost {...props}>
+        {children}
+      </LazyPluginPanelRightPanelHost>
+    </PluginDetailOpenerBoundary>
+  );
+}
+
 const PANE_DRAG_ENGAGE_DISTANCE_PX = 7;
 
 type BeginPaneDrag = (
@@ -126,15 +173,12 @@ type BeginPaneDrag = (
 
 const EMPTY_PATH: SplitPath = [];
 
-type NavigateInPane = (paneId: string, thread: ThreadRoutePathArgs) => void;
+type NavigateInPane = (
+  paneId: string,
+  originContent: PaneContent,
+  thread: ThreadRoutePathArgs,
+) => void;
 
-/**
- * Renders the 1–8 thread panes that live in the main content area. It bridges
- * the URL-follows-focus and external-navigation policies between the global
- * split-layout atom and the route, then recursively draws the layout tree.
- * A single pane renders identically to the pre-split page surface (no wrapper,
- * no focus ring); compact viewports disable splits entirely.
- */
 interface SplitThreadAreaProps {
   routeContent?: PaneContent;
 }
@@ -144,12 +188,6 @@ interface PreservedScrollPosition {
   top: number;
 }
 
-/**
- * Browsers and virtualized timelines can normalize an invisible scroller back
- * to zero during the maximize layout transition. Record user-visible pane
- * scrollers as they move, ignore normalization events from hidden panes, and
- * restore the same mounted elements after each maximize/restore transition.
- */
 function usePreservedSplitScrollPositions(maximizedPaneId: string | null) {
   const workspaceRef = useRef<HTMLDivElement>(null);
   const positionsRef = useRef(new Map<HTMLElement, PreservedScrollPosition>());
@@ -182,30 +220,37 @@ function usePreservedSplitScrollPositions(maximizedPaneId: string | null) {
     }
     previousMaximizedPaneIdRef.current = maximizedPaneId;
 
-    const restore = () => {
+    const restore = (): boolean => {
       const workspace = workspaceRef.current;
+      let corrected = false;
       for (const [element, position] of positionsRef.current) {
         if (workspace === null || !workspace.contains(element)) {
           positionsRef.current.delete(element);
           continue;
         }
+        if (
+          element.scrollLeft === position.left &&
+          element.scrollTop === position.top
+        ) {
+          continue;
+        }
         element.scrollLeft = position.left;
         element.scrollTop = position.top;
+        corrected = true;
       }
+      return corrected;
     };
 
-    // Restore before paint, then briefly across animation frames so passive
-    // timeline effects, virtualization, and browser scroll anchoring cannot
-    // overwrite the saved position while pane visibility settles.
     restore();
     let frame: number | null = null;
-    let framesRemaining = 30;
+    let framesRemaining = 5;
     const restoreUntilSettled = () => {
-      restore();
+      const corrected = restore();
       framesRemaining -= 1;
-      if (framesRemaining > 0) {
-        frame = window.requestAnimationFrame(restoreUntilSettled);
-      }
+      frame =
+        corrected && framesRemaining > 0
+          ? window.requestAnimationFrame(restoreUntilSettled)
+          : null;
     };
     frame = window.requestAnimationFrame(restoreUntilSettled);
     return () => {
@@ -228,9 +273,8 @@ export function SplitThreadArea(props: SplitThreadAreaProps = {}) {
 
 function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
   const { projectId, threadId } = useRouteState();
-  const threadSplitsEnabled = useThreadSplitsEnabled();
   const splitWorkspaceActive = useSplitWorkspaceActive();
-  const navigate = useNavigate();
+  const navigate = useImmediateRouteNavigate();
   const store = useStore();
   const [storedLayout, setLayout] = useAtom(splitLayoutAtom);
   const dimsInactiveSplits = useAtomValue(dimInactiveSplitsAtom);
@@ -250,19 +294,15 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
     [routeContent, routeThread],
   );
 
-  // Fold external navigation (initial load, sidebar click, deep link) into the
-  // layout. The reconcile is idempotent, so a URL that already matches the
-  // focused pane is a no-op — no history spam, no render loop.
   useEffect(() => {
-    if (!threadSplitsEnabled || currentContent === null) {
+    if (currentContent === null) {
       return;
     }
     setLayout((previous) =>
       reconcileLayoutForContent(previous, currentContent),
     );
-  }, [currentContent, setLayout, threadSplitsEnabled]);
+  }, [currentContent, setLayout]);
 
-  // Effective layout for render/handlers before the effect seeds the atom.
   const layout: SplitLayout | null =
     storedLayout ??
     (currentContent?.kind === "thread" && routeThread
@@ -295,15 +335,9 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
     [captureVisibleScrollPositions, setMaximizedPaneIdAtom],
   );
 
-  // CLI/SDK pane actions arrive as ephemeral server broadcasts. This split
-  // owner applies them so agent-driven transitions share the local control's
-  // scroll snapshot and focus/URL policy.
   useEffect(
     () =>
       wsManager.onThreadPaneAction((signal) => {
-        if (!threadSplitsEnabled) {
-          return;
-        }
         const current = store.get(splitLayoutAtom);
         if (current === null) {
           return;
@@ -329,13 +363,9 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
           store.set(dimInactiveSplitsAtom, next.dimInactiveSplits);
         }
       }),
-    [navigate, setMaximizedPaneId, store, threadSplitsEnabled],
+    [navigate, setMaximizedPaneId, store],
   );
 
-  // A maximized pane is always the focused/address-bar owner. External opens
-  // and keyboard focus commands can change focus without going through the
-  // local callbacks below, so carry maximization to that newly focused pane.
-  // Stale persisted ids fail safe by restoring the whole split.
   useEffect(() => {
     if (maximizedPaneId === null) return;
     if (
@@ -351,60 +381,160 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
     }
   }, [layout, maximizedPane, maximizedPaneId, setMaximizedPaneId]);
 
-  // Content navigation inside a pane pushes history like the page surface does
-  // today. replacePaneContent focuses the pane, so the pushed URL matches it.
+  const workspaceMountedRef = useRef(false);
+  useEffect(() => {
+    workspaceMountedRef.current = true;
+    return () => {
+      workspaceMountedRef.current = false;
+    };
+  }, []);
+
   const navigateInPane = useCallback<NavigateInPane>(
-    (paneId, thread) => {
-      setLayout((previous) =>
-        previous === null
-          ? previous
-          : replacePaneContent(previous, paneId, threadPaneContent(thread)),
+    (paneId, originContent, thread) => {
+      const current = store.get(splitLayoutAtom);
+      if (current === null) return;
+      const next = replaceOriginPaneContent(
+        current,
+        paneId,
+        originContent,
+        threadPaneContent(thread),
       );
-      navigate(getThreadRoutePath(thread));
+      if (next === null) return;
+      store.set(splitLayoutAtom, next);
+      if (workspaceMountedRef.current && next.focusedPaneId === paneId) {
+        navigate(getThreadRoutePath(thread));
+      }
     },
-    [navigate, setLayout],
+    [navigate, store],
   );
 
-  // Focusing a pane rewrites the URL with replace (focus changes shouldn't spam
-  // history), and the focused pane becomes the address bar's owner.
-  const focusPane = useCallback(
-    (paneId: string) => {
-      if (layout === null || layout.focusedPaneId === paneId) {
+  const [keyboardFocusRequest, setKeyboardFocusRequest] = useState<{
+    paneId: string;
+  } | null>(null);
+  useEffect(() => {
+    if (keyboardFocusRequest === null) return;
+    const paneId = keyboardFocusRequest.paneId;
+    const pane = layout === null ? null : findPane(layout.root, paneId);
+    const workspace = preservedScrollWorkspaceRef.current;
+    const root = Array.from(
+      workspace?.querySelectorAll<HTMLElement>("[data-split-pane-id]") ?? [],
+    ).find((element) => element.dataset.splitPaneId === paneId);
+    if (!root || !pane || layout?.focusedPaneId !== paneId) return;
+    let observer: MutationObserver | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const cancel = () => {
+      observer?.disconnect();
+      clearTimeout(timeout);
+    };
+    const finish = () => {
+      cancelAnimationFrame(frame);
+      cancel();
+      setKeyboardFocusRequest((current) =>
+        current === keyboardFocusRequest ? null : current,
+      );
+    };
+    const focus = () => {
+      if (!root.isConnected || root.getAttribute("aria-hidden") === "true")
+        return false;
+      const composer = root.querySelector<HTMLElement>(
+        "[data-promptbox] [contenteditable='true'], [data-promptbox] textarea:not(:disabled)",
+      );
+      if (composer) {
+        focusPaneComposer(composer);
+        return document.activeElement === composer;
+      }
+      return false;
+    };
+    const frame = requestAnimationFrame(() => {
+      if (focus()) {
+        finish();
         return;
       }
-      const pane = findPane(layout.root, paneId);
-      setLayout(setFocus(layout, paneId));
-      if (maximizedPaneId !== null) {
+      const content =
+        root.querySelector<HTMLElement>("[data-pane-content]") ?? root;
+      const control =
+        pane.content.kind === "thread"
+          ? null
+          : content.querySelector<HTMLElement>(
+              "input:not(:disabled), textarea:not(:disabled), [contenteditable='true'], button:not(:disabled), a[href], [tabindex='0']",
+            );
+      (control ?? root).focus({ preventScroll: true });
+      observer = new MutationObserver(() => {
+        if (document.activeElement !== root) {
+          finish();
+          return;
+        }
+        if (focus()) finish();
+      });
+      observer.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["contenteditable", "disabled"],
+      });
+      timeout = setTimeout(finish, 1000);
+    });
+    document.addEventListener("pointerdown", finish, true);
+    document.addEventListener("keydown", finish, true);
+    return () => {
+      cancelAnimationFrame(frame);
+      cancel();
+      document.removeEventListener("pointerdown", finish, true);
+      document.removeEventListener("keydown", finish, true);
+    };
+  }, [keyboardFocusRequest, layout, preservedScrollWorkspaceRef]);
+
+  const focusPane = useCallback(
+    (paneId: string) => {
+      const current = store.get(splitLayoutAtom);
+      if (current === null || current.focusedPaneId === paneId) {
+        return;
+      }
+      const pane = findPane(current.root, paneId);
+      store.set(splitLayoutAtom, setFocus(current, paneId));
+      if (store.get(maximizedPaneIdAtom) !== null) {
         setMaximizedPaneId(paneId);
       }
       if (pane !== null) {
         navigate(paneContentRoute(pane.content), { replace: true });
       }
     },
-    [layout, maximizedPaneId, navigate, setLayout, setMaximizedPaneId],
+    [navigate, setMaximizedPaneId, store],
   );
 
   const closePane = useCallback(
     (paneId: string) => {
-      if (layout === null) {
+      const current = store.get(splitLayoutAtom);
+      if (current === null) {
         return;
       }
-      const next = removePane(layout, paneId);
-      if (next === layout) {
+      if (countPanes(current.root) === 1) {
+        const pane = findPane(current.root, paneId);
+        if (pane === null || pane.content.kind === "new-thread") return;
+        store.set(
+          splitLayoutAtom,
+          replacePaneContent(current, paneId, { kind: "new-thread" }),
+        );
+        setMaximizedPaneId(null);
+        navigate(paneContentRoute({ kind: "new-thread" }), { replace: true });
         return;
       }
-      setLayout(next);
-      if (maximizedPaneId === paneId) {
+      const next = removePane(current, paneId);
+      if (next === current) {
+        return;
+      }
+      store.set(splitLayoutAtom, next);
+      if (store.get(maximizedPaneIdAtom) === paneId) {
         setMaximizedPaneId(null);
       }
-      if (next.focusedPaneId !== layout.focusedPaneId) {
+      if (next.focusedPaneId !== current.focusedPaneId) {
         const route = focusedPaneRoute(next);
         if (route !== null) {
           navigate(route, { replace: true });
         }
       }
     },
-    [layout, maximizedPaneId, navigate, setLayout, setMaximizedPaneId],
+    [navigate, setMaximizedPaneId, store],
   );
 
   const toggleMaximizePane = useCallback(
@@ -474,12 +604,6 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
     [setLayout],
   );
 
-  // Prune a pane whose thread turned out to be deleted or archived (a restored
-  // layout can reference a stale thread; archived threads don't belong in split
-  // panes). Reuses the close navigation sync: focus falls to a survivor and the
-  // URL follows. The last pane is left as-is so single-pane viewing of a stale
-  // thread stays at parity with the pre-split page (a bare "Not found"). Reads
-  // the store imperatively so concurrent per-pane signals act on fresh state.
   const pruneStalePane = useCallback(
     (paneId: string) => {
       const current = store.get(splitLayoutAtom);
@@ -491,7 +615,7 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
         return;
       }
       store.set(splitLayoutAtom, next);
-      if (maximizedPaneId === paneId) {
+      if (store.get(maximizedPaneIdAtom) === paneId) {
         setMaximizedPaneId(null);
       }
       if (next.focusedPaneId !== current.focusedPaneId) {
@@ -501,14 +625,9 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
         }
       }
     },
-    [maximizedPaneId, navigate, setMaximizedPaneId, store],
+    [navigate, setMaximizedPaneId, store],
   );
 
-  // Pane reorder: dragging a pane header through the shared split-drag layer.
-  // Edge drop = movePane (allowed at the cap — moves never add a pane), center
-  // drop = swapPanes. Both ops set the layout's focus, and the URL follows it.
-  // Read the layout imperatively from the store so a drop always acts on the
-  // latest arrangement, not the value captured when the drag began.
   const beginPaneDrag = useCallback<BeginPaneDrag>(
     (paneId, event, label) => {
       const startLayout = store.get(splitLayoutAtom);
@@ -525,15 +644,11 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
           : null;
       const startX = event.clientX;
       const startY = event.clientY;
-      beginSplitDrag(startX, startY, {
+      beginSplitDrag({
         ghostLabel: label,
         sourceEl,
         shouldEngage: (x, y) =>
           Math.hypot(x - startX, y - startY) > PANE_DRAG_ENGAGE_DISTANCE_PX,
-        // A maximized pane is the only hit-testable pane. Reveal the preserved
-        // tree once the drag owns the gesture so move/swap targets are usable,
-        // then restore the dragged pane's maximized presentation on every end
-        // path. The layout tree and pane instances remain untouched here.
         onEngage: restoreMaximizeAfterDrag
           ? () => setMaximizedPaneId(null)
           : undefined,
@@ -544,10 +659,6 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
                 current !== null &&
                 findPane(current.root, current.focusedPaneId) !== null
               ) {
-                // Edge moves preserve the pane id; center swaps move its
-                // content into the target pane id. Both operations focus the
-                // dragged content's destination, which is what must remain
-                // maximized.
                 setMaximizedPaneId(current.focusedPaneId);
               }
             }
@@ -577,21 +688,29 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
     [navigate, setMaximizedPaneId, store],
   );
 
-  // A disabled experiment and compact viewports both render the route thread as
-  // single page surface (byte-identical to the pre-split page). The layout atom
-  // is preserved so the arrangement returns when the gate opens again. AppLayout
-  // reads the same predicate to decide whether it owns the header — see
-  // useSplitWorkspaceActive.
-  if (!splitWorkspaceActive || layout === null || currentContent === null) {
-    return currentContent ? (
-      <StandalonePaneContent content={currentContent} />
-    ) : null;
+  if (layout === null || currentContent === null) return null;
+  if (!splitWorkspaceActive) {
+    return (
+      <StandalonePaneContent
+        content={currentContent}
+        paneId={layout.focusedPaneId}
+        onRequestClose={
+          currentContent.kind === "new-thread"
+            ? null
+            : () => closePane(layout.focusedPaneId)
+        }
+        onNavigateInPane={navigateInPane}
+      />
+    );
   }
 
   const commandHandlers = (
     <SplitPaneCommandHandlers
       closePane={closePane}
-      focusPane={focusPane}
+      focusPane={(paneId) => {
+        focusPane(paneId);
+        setKeyboardFocusRequest({ paneId });
+      }}
       isSplitActive={isSplitActive}
       layout={layout}
       maximizedPaneId={effectiveMaximizedPaneId}
@@ -602,10 +721,6 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
 
   const firstPane = panes[0];
   if (panes.length === 1 && firstPane !== undefined) {
-    // Single pane: DOM-identical to the pre-split page surface — no wrapper, no
-    // focus ring, no pane chrome. Sidebar drops still create the first split by
-    // hit-testing the main content region (see useThreadRowSplitDrag's
-    // single-pane fallback), so no wrapper element is needed here.
     return (
       <>
         {commandHandlers}
@@ -614,11 +729,14 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
           paneId={firstPane.paneId}
           isFocused
           isSplitPane={false}
+          timelineEnabled
           secondaryPanelRegistry={null}
           reservesWindowPanelToggle={false}
-          onRequestClose={null}
+          onClosePane={
+            firstPane.content.kind === "new-thread" ? null : closePane
+          }
           isMaximized={false}
-          onToggleMaximize={null}
+          onToggleMaximizePane={null}
           isBoundedPane={false}
           isTopRow
           ownsWindowTopLeft
@@ -631,11 +749,6 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
   return (
     <>
       {commandHandlers}
-      {/* Full-bleed like the single-pane page surface: outer edges stay flush,
-          so the top pane headers share the chrome axis with the pinned sidebar
-          trigger exactly like the unsplit page. overflow-hidden keeps short
-          windows from scrolling the whole split when stacked panes hit their
-          min content height. */}
       <div
         ref={preservedScrollWorkspaceRef}
         className="relative -m-4 flex min-h-0 min-w-0 flex-1 overflow-hidden md:-m-5"
@@ -655,7 +768,10 @@ function SplitThreadAreaContent({ routeContent }: SplitThreadAreaProps) {
             focusedPaneId={effectiveMaximizedPaneId ?? layout.focusedPaneId}
             maximizedPaneId={effectiveMaximizedPaneId}
             secondaryPanelRegistry={secondaryPanelRegistry}
-            onFocusPane={focusPane}
+            onFocusPane={(paneId) => {
+              setKeyboardFocusRequest(null);
+              focusPane(paneId);
+            }}
             onClosePane={closePane}
             onToggleMaximizePane={toggleMaximizePane}
             onMovePaneToSide={movePaneToSide}
@@ -680,7 +796,6 @@ interface SplitPaneCommandHandlersProps {
   toggleMaximizePane: (paneId: string) => void;
 }
 
-/** Mounted only while the experiment is enabled, so OFF unregisters commands. */
 function SplitPaneCommandHandlers({
   closePane,
   focusPane,
@@ -691,6 +806,29 @@ function SplitPaneCommandHandlers({
   toggleMaximizePane,
 }: SplitPaneCommandHandlersProps) {
   useAppCommandContext("splitActive", isSplitActive);
+  const directionalTargets = useMemo(
+    () =>
+      (["left", "right", "top", "bottom"] as const).map((direction) =>
+        isSplitActive
+          ? getDirectionalPaneId(layout.root, layout.focusedPaneId, direction)
+          : null,
+      ),
+    [isSplitActive, layout.root, layout.focusedPaneId],
+  );
+  useEffect(() => {
+    getBbDesktopInfo()?.setSplitNavigationEnabled?.(
+      isSplitActive,
+      PANE_DIRECTION_APP_COMMAND_IDS.filter(
+        (_, index) => directionalTargets[index] !== null,
+      ),
+    );
+  }, [isSplitActive, directionalTargets]);
+  useIndexedAppCommandHandlers(PANE_DIRECTION_APP_COMMAND_IDS, (index) => {
+    const paneId = directionalTargets[index];
+    if (!paneId) return false;
+    focusPane(paneId);
+    return true;
+  });
   useAppCommandHandler("pane.focus.previous", () => {
     if (!isSplitActive) return false;
     const paneId = getAdjacentPaneId(panes, layout.focusedPaneId, -1);
@@ -705,7 +843,7 @@ function SplitPaneCommandHandlers({
   });
   useIndexedAppCommandHandlers(PANE_FOCUS_APP_COMMAND_IDS, (index) => {
     if (!isSplitActive) return false;
-    const paneId = getPaneIdAtReadingIndex(panes, index);
+    const paneId = panes[index]?.paneId ?? null;
     if (paneId !== null) focusPane(paneId);
     return true;
   });
@@ -726,11 +864,8 @@ interface SplitTreeProps {
   node: LayoutNode;
   path: SplitPath;
   dimsInactiveSplits: boolean;
-  /** Whether this subtree touches the workspace's top edge. */
   isTopRow: boolean;
-  /** Whether this subtree touches the workspace's left edge. */
   isLeftEdge: boolean;
-  /** Whether this subtree touches the workspace's right edge. */
   isRightEdge: boolean;
   focusedPaneId: string;
   maximizedPaneId: string | null;
@@ -760,28 +895,21 @@ function SplitTree(props: SplitTreeProps) {
     return (
       <div
         onPointerDown={() => props.onFocusPane(node.paneId)}
-        // Flush tiles: no rounding, outer edges flush; a straight hairline
-        // seam separates panes (see SplitDivider). Bounded panes suppress
-        // the content's page-bleed negative margins (see
-        // PaneContextValue.isBoundedPane) so content fills the tile exactly.
         aria-hidden={isHiddenByMaximize || undefined}
-        // Electron can retain a composited frame from animated descendants
-        // (notably the New Thread welcome mark) after visibility changes.
-        // Skip subtree painting while preserving the mounted pane and its box.
         style={isHiddenByMaximize ? { contentVisibility: "hidden" } : undefined}
         className={cn(
           "relative flex min-h-0 min-w-0 flex-1 overflow-hidden",
           isHiddenByMaximize && "invisible pointer-events-none",
           isMaximized && "absolute inset-0 z-30",
         )}
+        tabIndex={-1}
         data-split-pane-id={node.paneId}
         data-focused={isFocused ? "true" : "false"}
         data-maximized={isMaximized ? "true" : undefined}
       >
-        {/* Only mounted in split mode, so single panes never pay for the extra
-            thread subscription (and never prune the last pane). */}
         {node.content.kind === "thread" ? (
           <PaneStaleWatcher
+            key={node.content.threadId}
             threadId={node.content.threadId}
             onStale={() => props.onPruneStalePane(node.paneId)}
           />
@@ -791,15 +919,13 @@ function SplitTree(props: SplitTreeProps) {
           paneId={node.paneId}
           isFocused={isFocused}
           isSplitPane
+          timelineEnabled={!isHiddenByMaximize}
           secondaryPanelRegistry={props.secondaryPanelRegistry}
-          // Position alone decides this: the host pins its toggle over the
-          // workspace corner, so a plugin pane sitting there must reserve the
-          // same footprint or the toggle lands on its Close pane button.
           reservesWindowPanelToggle={isMaximized || (isTopRow && isRightEdge)}
-          onRequestClose={() => props.onClosePane(node.paneId)}
+          onClosePane={props.onClosePane}
           isMaximized={isMaximized}
-          onToggleMaximize={() => props.onToggleMaximizePane(node.paneId)}
-          onMoveToSide={(side) => props.onMovePaneToSide(node.paneId, side)}
+          onToggleMaximizePane={props.onToggleMaximizePane}
+          onMovePaneToSide={props.onMovePaneToSide}
           isBoundedPane
           isTopRow={isMaximized || isTopRow}
           ownsWindowTopLeft={
@@ -810,9 +936,6 @@ function SplitTree(props: SplitTreeProps) {
           onNavigateInPane={props.onNavigateInPane}
           onBeginPaneDrag={props.onBeginPaneDrag}
         />
-        {/* Recede inactive pane bodies without adding another boundary. Pane
-            headers sit above this layer so titles, selected tabs, and controls
-            stay crisp while the timeline and composer step back. */}
         <div
           aria-hidden
           data-pane-focus-scrim=""
@@ -829,6 +952,7 @@ function SplitTree(props: SplitTreeProps) {
 
   return (
     <div
+      data-split-resize-grid-root=""
       className={cn(
         "flex min-h-0 min-w-0 flex-1",
         node.dir === "col" ? "flex-col" : "flex-row",
@@ -838,6 +962,8 @@ function SplitTree(props: SplitTreeProps) {
         <Fragment key={paneKey(child)}>
           {index > 0 ? (
             <SplitDivider
+              boundaryIndex={index}
+              childCount={node.children.length}
               dir={node.dir}
               hidden={props.maximizedPaneId !== null}
               onResize={(fraction) => props.onResize(path, index - 1, fraction)}
@@ -851,12 +977,7 @@ function SplitTree(props: SplitTreeProps) {
               {...props}
               node={child}
               path={[...path, index]}
-              // Horizontal siblings all remain on the same top row. In a
-              // vertical stack, only the first child can inherit the parent
-              // subtree's contact with the workspace top edge.
               isTopRow={isTopRow && (node.dir === "row" || index === 0)}
-              // Vertical siblings share the parent's left edge. In a
-              // horizontal row, only the first child can inherit it.
               isLeftEdge={isLeftEdge && (node.dir === "col" || index === 0)}
               isRightEdge={
                 isRightEdge &&
@@ -875,42 +996,57 @@ interface WorkspacePaneContentProps {
   paneId: string;
   isFocused: boolean;
   isSplitPane: boolean;
+  timelineEnabled: boolean;
   secondaryPanelRegistry: PaneSecondaryPanelRegistry | null;
   reservesWindowPanelToggle: boolean;
-  onRequestClose: (() => void) | null;
+  onClosePane: ((paneId: string) => void) | null;
   isMaximized: boolean;
-  onToggleMaximize: (() => void) | null;
-  onMoveToSide?: (side: SplitSide) => void;
-  // True inside multi-pane split cards; suppresses the page-bleed margins so
-  // content fills the card exactly (see PaneContextValue.isBoundedPane).
+  onToggleMaximizePane: ((paneId: string) => void) | null;
+  onMovePaneToSide?: (paneId: string, side: SplitSide) => void;
   isBoundedPane: boolean;
   isTopRow: boolean;
   ownsWindowTopLeft: boolean;
   onNavigateInPane: NavigateInPane;
-  // Absent for the single-pane surface — a lone pane has nothing to reorder.
   onBeginPaneDrag?: BeginPaneDrag;
 }
 
-function WorkspacePaneContent({
+const WorkspacePaneContent = memo(function WorkspacePaneContent({
   content,
   paneId,
   isFocused,
   isSplitPane,
+  timelineEnabled,
   secondaryPanelRegistry,
   reservesWindowPanelToggle,
-  onRequestClose,
+  onClosePane,
   isMaximized,
-  onToggleMaximize,
-  onMoveToSide,
+  onToggleMaximizePane,
+  onMovePaneToSide,
   isBoundedPane,
   isTopRow,
   ownsWindowTopLeft,
   onNavigateInPane,
   onBeginPaneDrag,
 }: WorkspacePaneContentProps) {
+  const onRequestClose = useMemo(
+    () => (onClosePane === null ? null : () => onClosePane(paneId)),
+    [onClosePane, paneId],
+  );
+  const onToggleMaximize = useMemo(
+    () =>
+      onToggleMaximizePane === null ? null : () => onToggleMaximizePane(paneId),
+    [onToggleMaximizePane, paneId],
+  );
+  const onMoveToSide = useMemo(
+    () =>
+      onMovePaneToSide === undefined
+        ? undefined
+        : (side: SplitSide) => onMovePaneToSide(paneId, side),
+    [onMovePaneToSide, paneId],
+  );
   const navigateInPane = useCallback(
-    (thread: ThreadRoutePathArgs) => onNavigateInPane(paneId, thread),
-    [onNavigateInPane, paneId],
+    (thread: ThreadRoutePathArgs) => onNavigateInPane(paneId, content, thread),
+    [content, onNavigateInPane, paneId],
   );
   const beginPaneDrag = useMemo(
     () =>
@@ -986,24 +1122,105 @@ function WorkspacePaneContent({
         surface="pane"
         projectId={content.projectId}
         threadId={content.threadId}
+        timelineEnabled={timelineEnabled}
       />
     </PaneContext.Provider>
   );
-}
+});
 
-function StandalonePaneContent({ content }: { content: PaneContent }) {
-  if (content.kind === "thread") {
-    return <ThreadDetailView surface="page" />;
+function StandalonePaneContent({
+  content,
+  paneId,
+  onRequestClose,
+  onNavigateInPane,
+}: {
+  content: PaneContent;
+  paneId: string;
+  onRequestClose: (() => void) | null;
+  onNavigateInPane: NavigateInPane;
+}) {
+  const navPanelChrome = usePluginNavPanelChrome();
+  const navigateInPane = useCallback(
+    (thread: ThreadRoutePathArgs) => onNavigateInPane(paneId, content, thread),
+    [content, onNavigateInPane, paneId],
+  );
+  if (content.kind === "thread" || content.kind === "new-thread") {
+    return (
+      <DefaultPaneContextProvider
+        onRequestClose={onRequestClose}
+        navigateInPane={navigateInPane}
+      >
+        {content.kind === "thread" ? (
+          <ThreadDetailView surface="page" />
+        ) : (
+          <RootComposeView />
+        )}
+      </DefaultPaneContextProvider>
+    );
   }
-  if (content.kind === "new-thread") {
-    return <RootComposeView />;
+  if (content.kind === "plugin-detail") {
+    return <LazyPluginDetailPaneView pluginId={content.pluginId} />;
   }
-  return (
+  const panelEntry = navPanelChrome.find(
+    (candidate) =>
+      candidate.chrome.pluginId === content.pluginId &&
+      candidate.chrome.path === content.panelPath,
+  );
+  const panel = panelEntry?.panel ?? undefined;
+  const panelChrome = panelEntry?.chrome;
+  const body = (
     <PluginPanelView
       pluginId={content.pluginId}
       panelPath={content.panelPath}
       subPath={content.subPath}
     />
+  );
+  const paneActions = onRequestClose ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon"
+      className={cn(
+        HEADER_PANE_ACTION_ICON_BUTTON_CLASS,
+        CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS,
+      )}
+      aria-label="Close pane"
+      onClick={onRequestClose}
+    >
+      <Icon name="ClosePluginPane" />
+    </Button>
+  ) : null;
+  return (
+    <PluginPagePanelHost
+      flushPageInsets
+      pluginId={content.pluginId}
+      panelPath={content.panelPath}
+      paneId={paneId}
+      subPath={content.subPath}
+    >
+      {panelChrome ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <AppPageHeader
+            center={<PluginPanelHeaderCenter chrome={panelChrome} />}
+            actions={
+              panel ? (
+                <PluginPanelHeaderActions
+                  panel={panel}
+                  paneId={paneId}
+                  subPath={content.subPath}
+                  paneActions={paneActions}
+                />
+              ) : (
+                paneActions
+              )
+            }
+          />
+          <div className="flex min-h-0 flex-1 flex-col p-4 md:p-5">{body}</div>
+        </div>
+      ) : (
+        body
+      )}
+    </PluginPagePanelHost>
   );
 }
 
@@ -1022,7 +1239,7 @@ function NonThreadPaneContent({
   isTopRow: boolean;
   ownsWindowTopLeft: boolean;
 }) {
-  const { navPanels } = usePluginSlots();
+  const navPanelChrome = usePluginNavPanelChrome();
   const resourceRouteLabel = useAtomValue(resourceRouteLabelAtom);
   const dimsInactiveSplits = useAtomValue(dimInactiveSplitsAtom);
   const { reservesWindowPanelToggle, isFocused } = useOptionalPaneContext() ?? {
@@ -1030,18 +1247,19 @@ function NonThreadPaneContent({
     isFocused: true,
   };
   const hostLayout = useContext(SecondaryPanelHostLayoutContext);
-  // The corner belongs to the pane unless the host paints its toggle there.
   const showsWindowPanelToggle = hostLayout?.pinsCornerToggle === true;
   const [desktopInfo] = useState(getBbDesktopInfo);
   const usesDesktopChrome = shouldUseMacosDesktopChrome(desktopInfo);
-  const panel =
+  const panelEntry =
     content.kind === "plugin-panel"
-      ? navPanels.find(
+      ? navPanelChrome.find(
           (candidate) =>
-            candidate.pluginId === content.pluginId &&
-            candidate.path === content.panelPath,
+            candidate.chrome.pluginId === content.pluginId &&
+            candidate.chrome.path === content.panelPath,
         )
       : undefined;
+  const panel = panelEntry?.panel ?? undefined;
+  const panelChrome = panelEntry?.chrome;
   const automationBreadcrumbs =
     content.kind === "plugin-panel"
       ? resolveAutomationBreadcrumbs(
@@ -1049,7 +1267,9 @@ function NonThreadPaneContent({
           isFocused ? resourceRouteLabel : null,
         )
       : null;
-  const label = panel?.title ?? "New thread";
+  const label =
+    panelChrome?.title ??
+    (content.kind === "plugin-detail" ? "Extension" : "New thread");
   const handlePointerDown = (event: ReactPointerEvent) => {
     if (
       event.target instanceof Element &&
@@ -1059,15 +1279,8 @@ function NonThreadPaneContent({
     }
     if (event.button === 0) beginPaneDrag?.(event, label);
   };
-  const actions = (
+  const paneActions = (
     <>
-      <SplitDimmingButton />
-      {panel ? (
-        <PluginPanelHeaderActions
-          panel={panel}
-          subPath={content.kind === "plugin-panel" ? content.subPath : ""}
-        />
-      ) : null}
       <PaneMaximizeButton />
       {onRequestClose ? (
         <Button
@@ -1090,25 +1303,30 @@ function NonThreadPaneContent({
           />
         </Button>
       ) : null}
+    </>
+  );
+  const actions = (
+    <>
+      {panel ? (
+        <PluginPanelHeaderActions
+          panel={panel}
+          subPath={content.kind === "plugin-panel" ? content.subPath : ""}
+          paneActions={paneActions}
+        />
+      ) : (
+        paneActions
+      )}
       {reservesWindowPanelToggle && showsWindowPanelToggle ? (
-        // The host's shortcut hint drops below the chrome row; reserve only
-        // its stable 28px corner button beside these pane actions. Whenever
-        // the host hides that toggle, the pane actions sit flush at the pane
-        // edge instead of trailing an empty slot.
         <span aria-hidden className={HEADER_ICON_BUTTON_CLASS} />
       ) : null}
     </>
   );
 
-  return (
+  const contentMarkup = (
     <div
       className={cn(
         "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
-        // Single-pane surfaces own their own padding (the compose page and
-        // plugin panels both re-apply it inside), so cancel the app layout's
-        // page padding here. Otherwise the right panel floats 20px off the
-        // window edges instead of sitting flush like it does on a thread.
-        !isBoundedPane && "-m-4 md:-m-5",
+        !isBoundedPane && content.kind === "new-thread" && "-m-4 md:-m-5",
       )}
     >
       {isBoundedPane || panel ? (
@@ -1123,15 +1341,11 @@ function NonThreadPaneContent({
               }
               className={cn(
                 "relative flex min-w-0 flex-1 items-center",
-                isBoundedPane && "-mx-2 -my-1 rounded-md px-2 py-1",
+                isBoundedPane && "-my-1 -ml-2 rounded-md px-2 py-1",
                 isBoundedPane && isFocused && CONTEXT_SELECTION_SURFACE_CLASS,
                 beginPaneDrag &&
                   cn(
                     "cursor-grab touch-none select-none",
-                    // AppPageHeader is an OS window-drag region on macOS.
-                    // Carve this pane-reorder handle out so Electron routes
-                    // the pointer gesture to the split drag layer, matching
-                    // the thread-title handle in ThreadDetailHeader.
                     usesDesktopChrome && MACOS_WINDOW_NO_DRAG_CLASS,
                   ),
               )}
@@ -1142,8 +1356,8 @@ function NonThreadPaneContent({
                   breadcrumbs={automationBreadcrumbs}
                   usesDesktopChrome={usesDesktopChrome}
                 />
-              ) : panel ? (
-                <PluginPanelHeaderCenter panel={panel} />
+              ) : panelChrome ? (
+                <PluginPanelHeaderCenter chrome={panelChrome} />
               ) : (
                 <p
                   className={cn(
@@ -1154,7 +1368,9 @@ function NonThreadPaneContent({
                       CONTEXT_INACTIVE_TEXT_CLASS,
                   )}
                 >
-                  New thread
+                  {content.kind === "plugin-detail"
+                    ? "Extension"
+                    : "New thread"}
                 </p>
               )}
             </div>
@@ -1163,16 +1379,16 @@ function NonThreadPaneContent({
         />
       ) : null}
       <div
+        data-pane-content=""
         className={cn(
           "flex min-h-0 min-w-0 flex-1 flex-col p-4 md:p-5",
-          // Keep plugin-owned z-index layers inside the plugin surface. The
-          // split host's focus scrim can then treat the pane atomically instead
-          // of landing between a plugin's main content and internal drawer.
           isBoundedPane && content.kind === "plugin-panel" && "isolate",
         )}
       >
         {content.kind === "new-thread" ? (
           <RootComposeView />
+        ) : content.kind === "plugin-detail" ? (
+          <LazyPluginDetailPaneView pluginId={content.pluginId} />
         ) : (
           <PluginPanelView
             pluginId={content.pluginId}
@@ -1183,9 +1399,24 @@ function NonThreadPaneContent({
       </div>
     </div>
   );
+
+  return content.kind === "plugin-panel" ? (
+    <PluginPagePanelHost
+      flushPageInsets={!isBoundedPane}
+      pluginId={content.pluginId}
+      panelPath={content.panelPath}
+      subPath={content.subPath}
+    >
+      {contentMarkup}
+    </PluginPagePanelHost>
+  ) : (
+    contentMarkup
+  );
 }
 
 interface SplitDividerProps {
+  boundaryIndex: number;
+  childCount: number;
   dir: "row" | "col";
   hidden: boolean;
   onResize: (fraction: number) => void;
@@ -1224,9 +1455,6 @@ function freezeOffscreenTimelineRows(
   const frozenRows: FrozenTimelineRow[] = [];
   const viewportRects = new Map<HTMLElement, DOMRect>();
 
-  // Batch every geometry read before writing styles so this setup incurs at
-  // most one layout pass. Keep one viewport of overscan on each side; only
-  // rows far outside the clipped pane are skipped during the drag.
   for (const row of rows) {
     const viewport = findVerticalScrollViewport(row);
     if (viewport === null) continue;
@@ -1266,12 +1494,26 @@ function freezeOffscreenTimelineRows(
   };
 }
 
-function SplitDivider({ dir, hidden, onResize }: SplitDividerProps) {
+function SplitDivider({
+  boundaryIndex,
+  childCount,
+  dir,
+  hidden,
+  onResize,
+}: SplitDividerProps) {
   const horizontal = dir === "row";
+  const finishResizeRef = useRef<(() => void) | null>(null);
+  useEffect(
+    () => () => {
+      finishResizeRef.current?.();
+    },
+    [],
+  );
 
   const handlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       event.preventDefault();
+      finishResizeRef.current?.();
       const hitTarget = event.currentTarget;
       const divider = hitTarget.parentElement;
       if (!(divider instanceof HTMLDivElement)) {
@@ -1285,8 +1527,6 @@ function SplitDivider({ dir, hidden, onResize }: SplitDividerProps) {
       ) {
         return;
       }
-      // The adjacent pair's outer bounds do not move during this drag. Read
-      // them once instead of forcing layout twice for every pointer event.
       const previousRect = previous.getBoundingClientRect();
       const nextRect = next.getBoundingClientRect();
       const start = horizontal ? previousRect.left : previousRect.top;
@@ -1298,75 +1538,80 @@ function SplitDivider({ dir, hidden, onResize }: SplitDividerProps) {
 
       hitTarget.setPointerCapture(event.pointerId);
       divider.dataset.dragging = "true";
+      const pointerId = event.pointerId;
+      const snapSession = createSplitResizeSnapSession(
+        divider,
+        horizontal ? "x" : "y",
+        { boundaryIndex, childCount },
+      );
+      const pointerDownPosition = horizontal ? event.clientX : event.clientY;
+      snapSession.resolve({ end, pointer: pointerDownPosition, start });
 
-      const previousGrow = Number.parseFloat(
-        window.getComputedStyle(previous).flexGrow,
-      );
-      const nextGrow = Number.parseFloat(
-        window.getComputedStyle(next).flexGrow,
-      );
-      const pairTotal =
-        Number.isFinite(previousGrow) &&
-        Number.isFinite(nextGrow) &&
-        previousGrow + nextGrow > 0
-          ? previousGrow + nextGrow
-          : 1;
-      const previousFlex = previous.style.flex;
-      const nextFlex = next.style.flex;
+      const pair = createSplitResizeFlexPair(previous, next);
       const restoreTimelineRows = freezeOffscreenTimelineRows(previous, next);
       let pendingFraction: number | null = null;
       let finished = false;
 
       const onMove = (moveEvent: PointerEvent) => {
+        if (moveEvent.pointerId !== pointerId) return;
         const pointer = horizontal ? moveEvent.clientX : moveEvent.clientY;
-        const fraction = clampSplitPairFraction((pointer - start) / span);
+        const { fraction } = snapSession.resolve({
+          end,
+          pointer,
+          start,
+        });
         pendingFraction = fraction;
 
-        // Keep high-frequency drag state local to the two flex items. Writing
-        // the persisted split-layout atom here would rerender every pane and
-        // sidebar split indicator, and serialize localStorage, on every move.
-        previous.style.flex = `${pairTotal * fraction} 1 0px`;
-        next.style.flex = `${pairTotal * (1 - fraction)} 1 0px`;
+        pair.apply(fraction);
       };
       const finish = (commit: boolean) => {
         if (finished) return;
         finished = true;
+        finishResizeRef.current = null;
         delete divider.dataset.dragging;
         hitTarget.removeEventListener("pointermove", onMove);
         hitTarget.removeEventListener("pointerup", onUp);
         hitTarget.removeEventListener("pointercancel", onCancel);
+        hitTarget.removeEventListener("lostpointercapture", onLostCapture);
+        if (hitTarget.hasPointerCapture?.(pointerId)) {
+          hitTarget.releasePointerCapture(pointerId);
+        }
+        snapSession.clear();
         restoreTimelineRows();
         if (commit && pendingFraction !== null) {
-          // Commit once so the imperative flex values above become the
-          // canonical persisted layout without a visual jump.
           onResize(pendingFraction);
           return;
         }
-        previous.style.flex = previousFlex;
-        next.style.flex = nextFlex;
+        pair.restore();
       };
-      const onUp = () => finish(true);
-      const onCancel = () => finish(false);
+      const onUp = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        finish(true);
+      };
+      const onCancel = (cancelEvent: PointerEvent) => {
+        if (cancelEvent.pointerId !== pointerId) return;
+        finish(false);
+      };
+      const onLostCapture = (lostEvent: PointerEvent) => {
+        if (lostEvent.pointerId !== pointerId) return;
+        finish(false);
+      };
       hitTarget.addEventListener("pointermove", onMove);
       hitTarget.addEventListener("pointerup", onUp);
       hitTarget.addEventListener("pointercancel", onCancel);
+      hitTarget.addEventListener("lostpointercapture", onLostCapture);
+      finishResizeRef.current = () => finish(false);
     },
-    [horizontal, onResize],
+    [boundaryIndex, childCount, horizontal, onResize],
   );
 
   return (
     <div
       role="separator"
+      data-split-resize-grid-boundary={boundaryIndex}
+      data-split-resize-grid-count={childCount}
       aria-orientation={horizontal ? "vertical" : "horizontal"}
       className={cn(
-        // A one-pixel seam between flush tiles — squared ends, no rounding,
-        // only BETWEEN splits (outer edges stay flush). Hover/drag warms it as
-        // the resize affordance. The absolutely-positioned child preserves a
-        // generous grab target without consuming layout space.
-        //
-        // Stay above the pane focus scrim (z-20) and the pane headers (z-[21]).
-        // In a column split, the lower pane's header touches the seam, so a
-        // lower divider layer loses the grab target to that header.
         "group relative z-[25] flex-shrink-0 transition-colors",
         "bg-border-seam",
         "hover:bg-ring/40 data-[dragging]:bg-ring/40",
@@ -1394,20 +1639,12 @@ interface PaneStaleWatcherProps {
   onStale: () => void;
 }
 
-/**
- * Watches a split pane's thread and signals when it becomes deleted (a 404 once
- * the query settles) or archived, so the pane can be pruned. Shares the same
- * react-query cache entry the pane's own view already subscribes to, so it adds
- * a subscriber, not a fetch. Renders nothing.
- */
 function PaneStaleWatcher({ threadId, onStale }: PaneStaleWatcherProps) {
   const { data: thread, isSuccess, isError, error } = useThread(threadId);
-  // Archive optimistically stamps `archivedAt` before the server confirms, and a
-  // failed archive rolls it back — but the rollback can't restore a pane already
-  // pruned from the layout. So only treat "archived" as stale when no archive
-  // mutation is in flight (i.e. the archived state is server-settled). Delete,
-  // by contrast, drops the query and refetches, so its 404 / `deletedAt` are
-  // already server-confirmed and need no gate.
+  const hasObservedUnarchived = useRef(false);
+  const unarchivesInFlight = useIsMutating({
+    mutationKey: ["unarchive-thread"],
+  });
   const archivesInFlight = useIsMutating({
     predicate: (mutation) =>
       mutation.options.meta?.lifecycleOperation === "archive_thread",
@@ -1421,20 +1658,31 @@ function PaneStaleWatcher({ threadId, onStale }: PaneStaleWatcherProps) {
     thread !== undefined &&
     thread.archivedAt !== null &&
     archivesInFlight === 0;
-  const isStale = isGone || isDeleted || isConfirmedArchived;
+  const isUnarchived =
+    isSuccess && thread !== undefined && thread.archivedAt === null;
 
-  // Keep the latest callback without re-arming the fire effect: it fires once
-  // when staleness is first observed. Pruning unmounts this watcher (or is a
-  // no-op on the last pane), so a single fire is enough.
   const onStaleRef = useRef(onStale);
   useEffect(() => {
     onStaleRef.current = onStale;
   }, [onStale]);
   useEffect(() => {
-    if (isStale) {
+    if (isUnarchived && unarchivesInFlight === 0) {
+      hasObservedUnarchived.current = true;
+    }
+    if (
+      isGone ||
+      isDeleted ||
+      (isConfirmedArchived && hasObservedUnarchived.current)
+    ) {
       onStaleRef.current();
     }
-  }, [isStale]);
+  }, [
+    isConfirmedArchived,
+    isDeleted,
+    isGone,
+    isUnarchived,
+    unarchivesInFlight,
+  ]);
 
   return null;
 }

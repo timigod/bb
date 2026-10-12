@@ -4,6 +4,7 @@ import {
   createProject,
   createThread,
   environments,
+  threads,
   migrate,
   noopNotifier,
   updateThread,
@@ -19,23 +20,34 @@ import { NotificationHub } from "../../src/ws/hub.js";
 import { WatchInterestCoordinator } from "../../src/ws/watch-interests.js";
 import { createMockHubSocket } from "../helpers/mock-hub-socket.js";
 
-function setup() {
-  const db = createConnection(":memory:");
+function setup(queries?: string[]) {
+  const db = createConnection(
+    ":memory:",
+    queries
+      ? {
+          slowQueryThresholdMs: 0,
+          slowQueryLogger: {
+            info(fields) {
+              queries.push(fields.sql);
+            },
+          },
+        }
+      : undefined,
+  );
   migrate(db);
   const hub = new NotificationHub();
   const watchInterests = new WatchInterestCoordinator({ db, hub });
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
     source: { type: "local_path", hostId: host.id, path: "/tmp/test" },
   });
   const environment = createEnvironment(db, noopNotifier, {
+    providerOwnsPath: false,
     projectId: project.id,
     hostId: host.id,
-    workspaceProvisionType: "unmanaged",
     path: "/tmp/test-workspace",
     status: "ready",
   });
@@ -77,7 +89,6 @@ describe("WatchInterestCoordinator", () => {
           environmentId: environment.id,
           workspaceContext: {
             workspacePath: "/tmp/test-workspace",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -162,7 +173,6 @@ describe("WatchInterestCoordinator", () => {
           environmentId: environment.id,
           workspaceContext: {
             workspacePath: "/tmp/test-workspace",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -173,16 +183,16 @@ describe("WatchInterestCoordinator", () => {
   it("omits unresolved workspace targets from snapshots", () => {
     const { db, host, project, watchInterests } = setup();
     const unready = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
-      workspaceProvisionType: "unmanaged",
       path: "/tmp/unready",
       status: "provisioning",
     });
     const destroyed = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
-      workspaceProvisionType: "unmanaged",
       path: "/tmp/destroyed",
       status: "destroyed",
     });
@@ -207,9 +217,9 @@ describe("WatchInterestCoordinator", () => {
     const daemonSocket = createMockHubSocket();
     const socket = createMockHubSocket();
     const environment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
       projectId: project.id,
       hostId: host.id,
-      workspaceProvisionType: "unmanaged",
       path: "/tmp/later-ready",
       status: "provisioning",
     });
@@ -234,7 +244,6 @@ describe("WatchInterestCoordinator", () => {
           environmentId: environment.id,
           workspaceContext: {
             workspacePath: "/tmp/later-ready",
-            workspaceProvisionType: "unmanaged",
           },
         },
       ],
@@ -332,5 +341,113 @@ describe("WatchInterestCoordinator", () => {
       ],
       workspaceTargets: [],
     });
+  });
+  it("batches a refresh while removing moved, archived and destroyed targets from their previous hosts", () => {
+    const queries: string[] = [];
+    const { db, environment, host, hub, project, watchInterests } =
+      setup(queries);
+    const otherHost = upsertHost(db, noopNotifier, { name: "other-host" });
+    const otherEnvironment = createEnvironment(db, noopNotifier, {
+      providerOwnsPath: false,
+      projectId: project.id,
+      hostId: otherHost.id,
+      path: "/tmp/other-workspace",
+      status: "ready",
+    });
+    const firstDaemon = createMockHubSocket();
+    const secondDaemon = createMockHubSocket();
+    hub.registerDaemon("first", host.id, firstDaemon);
+    hub.registerDaemon("second", otherHost.id, secondDaemon);
+    const socket = createMockHubSocket();
+    for (const target of [environment, otherEnvironment])
+      watchInterests.subscribe(socket, {
+        kind: "environment-detail",
+        environmentId: target.id,
+      });
+    const watched = Array.from({ length: 12 }, (_, index) =>
+      createThread(db, noopNotifier, {
+        projectId: project.id,
+        environmentId: index % 2 === 0 ? environment.id : otherEnvironment.id,
+        providerId: "test-provider",
+      }),
+    );
+    for (const thread of watched)
+      watchInterests.subscribe(socket, {
+        kind: "thread-detail",
+        threadId: thread.id,
+      });
+    db.update(environments)
+      .set({ hostId: otherHost.id, path: "/tmp/moved" })
+      .where(eq(environments.id, environment.id))
+      .run();
+    queries.length = 0;
+    hub.notifyEnvironment(environment.id, ["metadata-changed"]);
+    const reads = queries.filter((sql) => sql.startsWith("select ")).length;
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThanOrEqual(4);
+    expect(lastDaemonMessage(firstDaemon)).toMatchObject({
+      workspaceTargets: [],
+      threadStorageTargets: [],
+    });
+    expect(lastDaemonMessage(secondDaemon)).toMatchObject({
+      workspaceTargets: [
+        {
+          environmentId: environment.id,
+          workspaceContext: { workspacePath: "/tmp/moved" },
+        },
+        { environmentId: otherEnvironment.id },
+      ],
+      threadStorageTargets: watched.map((thread) => ({
+        threadId: thread.id,
+        environmentId: thread.environmentId,
+      })),
+    });
+    const generation = watchInterests.reconcileWatchSetForHost(
+      otherHost.id,
+    ).generation;
+    hub.notifyEnvironment(environment.id, ["metadata-changed"]);
+    expect(
+      watchInterests.reconcileWatchSetForHost(otherHost.id).generation,
+    ).toBe(generation);
+    db.update(threads)
+      .set({ archivedAt: Date.now() })
+      .where(eq(threads.id, watched[0]!.id))
+      .run();
+    hub.notifyThread(watched[0]!.id, ["archived-changed"]);
+    expect(
+      watchInterests.reconcileWatchSetForHost(otherHost.id)
+        .threadStorageTargets,
+    ).toHaveLength(11);
+    db.update(threads)
+      .set({ deletedAt: Date.now() })
+      .where(eq(threads.id, watched[2]!.id))
+      .run();
+    hub.notifyThread(watched[2]!.id, ["thread-deleted"]);
+    expect(
+      watchInterests.reconcileWatchSetForHost(otherHost.id)
+        .threadStorageTargets,
+    ).toHaveLength(10);
+    db.update(environments)
+      .set({ status: "destroyed" })
+      .where(eq(environments.id, otherEnvironment.id))
+      .run();
+    hub.notifyEnvironment(otherEnvironment.id, ["status-changed"]);
+    expect(watchInterests.reconcileWatchSetForHost(otherHost.id)).toMatchObject(
+      {
+        workspaceTargets: [{ environmentId: environment.id }],
+        threadStorageTargets: watched
+          .filter((_, index) => index > 2 && index % 2 === 0)
+          .map((thread) => ({
+            threadId: thread.id,
+            environmentId: thread.environmentId,
+          })),
+      },
+    );
+    watchInterests.releaseSocket(socket);
+    expect(lastDaemonMessage(secondDaemon)).toMatchObject({
+      workspaceTargets: [],
+      threadStorageTargets: [],
+    });
+    db.$client.close();
   });
 });

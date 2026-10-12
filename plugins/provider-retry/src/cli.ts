@@ -1,99 +1,196 @@
-import type { BbPluginApi, PluginCliContext } from "@bb/plugin-sdk";
-import type { ProviderRetryView } from "./contract.js";
-import type { ProviderRetryService } from "./service.js";
+import { readRetryDiagnostic } from "./diagnostics.js";
+import {
+  PluginCliError,
+  cliCommand,
+  defineCli,
+  type BbPluginApi,
+  type PluginCliContext,
+  type PluginCliResult,
+} from "@get-bb/plugin-sdk";
+import {
+  findQueuedRetry,
+  listQueuedRetries,
+  type QueuedRetry,
+} from "./queued-retries.js";
 
-function requestedThreadId(
-  argv: string[],
-  context: PluginCliContext,
-): string | null {
-  return (
-    argv.find((value) => !value.startsWith("--")) ?? context.threadId ?? null
-  );
-}
+const JSON_OPTION = {
+  type: "boolean",
+  description: "Emit machine-readable JSON",
+} as const;
 
-function textView(view: ProviderRetryView): string {
+const THREAD_ID_POSITIONAL = {
+  name: "thread-id",
+  description: "Thread whose pending retry to act on; defaults to this thread",
+} as const;
+
+function textQueuedRetry(queued: QueuedRetry): string {
   const retry =
-    view.retryAtMs === null
+    queued.sendAt === null
       ? "pending"
-      : `retrying ${new Date(view.retryAtMs).toISOString()}`;
-  return `${view.threadId}\t${view.providerId}\t${retry}`;
+      : `retrying ${new Date(queued.sendAt).toISOString()}`;
+  return `${queued.threadId}\t${queued.id}\t${retry}`;
 }
 
-export function registerProviderRetryCli(
+function requiredThreadId(
+  requested: string | undefined,
+  context: PluginCliContext,
+  command: "cancel" | "retry" | "explain",
+): string {
+  const threadId = requested ?? context.threadId;
+  if (threadId === undefined) {
+    throw new PluginCliError(
+      `A thread id is required: bb provider-retry ${command} <thread-id>`,
+      { code: "missing_thread_id", exitCode: 2 },
+    );
+  }
+  return threadId;
+}
+
+async function act(
   bb: BbPluginApi,
-  service: ProviderRetryService,
-): void {
-  bb.cli.register({
-    name: "provider-retry",
-    summary: "Manage pending automatic provider retries",
-    commands: [
+  threadId: string,
+  json: boolean,
+  command: "cancel" | "retry",
+): Promise<PluginCliResult> {
+  const queued = await findQueuedRetry(bb, threadId);
+  if (queued === null) {
+    throw new PluginCliError(
+      `No pending provider retry exists for ${threadId}.`,
       {
-        name: "status",
-        summary: "Show pending automatic provider retries",
-        usage: "bb provider-retry status [thread-id] [--json]",
+        code: "no_pending_retry",
+        hint: "Run `bb provider-retry status` for the threads with a pending retry.",
       },
-      {
-        name: "cancel",
-        summary: "Cancel a pending automatic provider retry",
-        usage: "bb provider-retry cancel <thread-id> [--json]",
-      },
-    ],
-    async run(argv, context) {
-      const [command, ...args] = argv;
-      if (command !== "status" && command !== "cancel") {
-        return {
-          exitCode: 2,
-          stderr:
-            "Usage: bb provider-retry <status|cancel> [thread-id] [--json]\n",
-        };
-      }
+    );
+  }
+  if (command === "cancel") {
+    await bb.sdk.threads.queuedMessages.delete({
+      threadId: queued.threadId,
+      queuedMessageId: queued.id,
+    });
+  } else {
+    await bb.sdk.threads.queuedMessages.send({
+      threadId: queued.threadId,
+      queuedMessageId: queued.id,
+      mode: "auto",
+    });
+  }
+  if (json) {
+    return {
+      exitCode: 0,
+      stdout: `${JSON.stringify({ ok: true, threadId, queuedMessageId: queued.id }, null, 2)}\n`,
+    };
+  }
+  return {
+    exitCode: 0,
+    stdout:
+      command === "cancel"
+        ? `Cancelled provider retry for ${threadId}.\n`
+        : `Retrying ${threadId} now.\n`,
+  };
+}
 
-      const threadId = requestedThreadId(args, context);
-      if (command === "cancel") {
-        if (threadId === null) {
-          return {
-            exitCode: 2,
-            stderr:
-              "A thread id is required: bb provider-retry cancel <thread-id>\n",
-          };
-        }
-        const cancelled = await service.cancel(threadId);
-        if (args.includes("--json")) {
-          return {
-            exitCode: cancelled ? 0 : 1,
-            stdout: `${JSON.stringify({ cancelled }, null, 2)}\n`,
-          };
-        }
-        return cancelled
-          ? {
-              exitCode: 0,
-              stdout: `Cancelled provider retry for ${threadId}.\n`,
-            }
-          : {
-              exitCode: 1,
-              stderr: `No pending provider retry exists for ${threadId}.\n`,
-            };
-      }
-
-      const views =
-        threadId === null
-          ? service.list()
-          : [service.status(threadId)].filter(
-              (view): view is ProviderRetryView => view !== null,
+export function registerProviderRetryCli(bb: BbPluginApi): void {
+  bb.cli.register(
+    defineCli({
+      name: "provider-retry",
+      summary: "Manage pending automatic provider retries",
+      description:
+        "A pending retry is an ordinary durable queued row: cancel deletes it, retry sends it now instead of waiting for its window.",
+      usageErrorExitCode: 2,
+      commands: {
+        status: cliCommand({
+          summary: "Show pending automatic provider retries",
+          positionals: [
+            {
+              name: "thread-id",
+              description:
+                "Thread to scope the listing to; defaults to this thread, and lists every thread outside one",
+            },
+          ],
+          options: { json: JSON_OPTION },
+          async run(input, context) {
+            const threadId =
+              input.positionals["thread-id"] ?? context.threadId ?? null;
+            const queued = await listQueuedRetries(
+              bb,
+              threadId === null ? undefined : threadId,
             );
-      if (args.includes("--json")) {
-        return {
-          exitCode: 0,
-          stdout: `${JSON.stringify({ retries: views }, null, 2)}\n`,
-        };
-      }
-      return {
-        exitCode: 0,
-        stdout:
-          views.length === 0
-            ? "No provider retries are pending.\n"
-            : `${views.map(textView).join("\n")}\n`,
-      };
-    },
-  });
+            if (input.options.json) {
+              return {
+                exitCode: 0,
+                stdout: `${JSON.stringify({ retries: queued }, null, 2)}\n`,
+              };
+            }
+            return {
+              exitCode: 0,
+              stdout:
+                queued.length === 0
+                  ? "No provider retries are pending.\n"
+                  : `${queued.map(textQueuedRetry).join("\n")}\n`,
+            };
+          },
+        }),
+        explain: cliCommand({
+          summary: "Explain the last automatic retry decision for a thread",
+          positionals: [THREAD_ID_POSITIONAL],
+          options: { json: JSON_OPTION },
+          async run(input, context) {
+            const threadId = requiredThreadId(
+              input.positionals["thread-id"],
+              context,
+              "explain",
+            );
+            const diagnostic = await readRetryDiagnostic(bb, threadId);
+            if (input.options.json)
+              return {
+                exitCode: 0,
+                stdout: `${JSON.stringify({ threadId, diagnostic }, null, 2)}\n`,
+              };
+            if (diagnostic === null)
+              return {
+                exitCode: 0,
+                stdout: `No automatic retry decision recorded for ${threadId}.\n`,
+              };
+            const { decision, availability } = diagnostic;
+            return {
+              exitCode: 0,
+              stdout: `${threadId}: ${decision.kind === "retry" ? `Scheduled for ${new Date(decision.sendAt).toISOString()}` : "Skipped"}: ${decision.reason}${availability.kind === "unavailable" ? ` (${availability.reason})` : ""}.\n`,
+            };
+          },
+        }),
+        cancel: cliCommand({
+          summary: "Cancel a pending automatic provider retry",
+          positionals: [THREAD_ID_POSITIONAL],
+          options: { json: JSON_OPTION },
+          run: (input, context) =>
+            act(
+              bb,
+              requiredThreadId(
+                input.positionals["thread-id"],
+                context,
+                "cancel",
+              ),
+              input.options.json,
+              "cancel",
+            ),
+        }),
+        retry: cliCommand({
+          summary: "Send a pending provider retry now instead of waiting",
+          positionals: [THREAD_ID_POSITIONAL],
+          options: { json: JSON_OPTION },
+          run: (input, context) =>
+            act(
+              bb,
+              requiredThreadId(
+                input.positionals["thread-id"],
+                context,
+                "retry",
+              ),
+              input.options.json,
+              "retry",
+            ),
+        }),
+      },
+    }),
+  );
 }

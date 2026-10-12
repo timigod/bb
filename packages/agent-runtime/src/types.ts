@@ -1,4 +1,5 @@
 import type {
+  PermissionMode,
   AvailableModel,
   ClientTurnRequestId,
   DynamicTool,
@@ -7,59 +8,36 @@ import type {
   PendingInteractionCreate,
   PendingInteractionResolution,
   PromptInput,
+  ProviderFork,
+  ProviderRecoveryKind,
   RuntimeThreadExecutionOptions,
   ThreadEvent,
   ToolCallRequest,
   ToolCallResponse,
 } from "@bb/domain";
-import type { HostDaemonAcpLaunchSpec } from "@bb/host-daemon-contract";
+import type {
+  ProviderHealthResult,
+  ProviderInstallationRunResult,
+  ProviderInstallationStatus,
+  ProviderUsageResult,
+  SkillsConfigureRoot,
+} from "@bb/provider-bridge-protocol";
 
 export type AgentRuntimeShellEnvironment = Record<string, string>;
 
+export interface AgentRuntimeContributedEnvEntry {
+  name: string;
+  value: string | { serverPath: string };
+  source:
+    | { plugin: string }
+    | { core: "machine-git" | "machine-environment" | "project-environment" };
+  reason: string;
+}
+
 export type AgentRuntimeExecutionOptions = RuntimeThreadExecutionOptions;
 
-export interface AgentRuntimeCodexSkillRoot {
-  id: string;
-  providerId: "codex";
-  skillDirectoryRootPath: string;
-}
+export type AgentRuntimeSkillRoot = SkillsConfigureRoot;
 
-export interface AgentRuntimeClaudeCodeSkillRoot {
-  id: string;
-  providerId: "claude-code";
-  localPluginPath: string;
-}
-
-export interface AgentRuntimePiSkillRoot {
-  id: string;
-  providerId: "pi";
-  skillDirectoryRootPath: string;
-}
-
-export interface AgentRuntimeAcpSkill {
-  description: string;
-  name: string;
-}
-
-export interface AgentRuntimeAcpSkillRoot {
-  id: string;
-  providerId: "acp";
-  skillDirectoryRootPath: string;
-  skills: readonly AgentRuntimeAcpSkill[];
-}
-
-export type AgentRuntimeSkillRoot =
-  | AgentRuntimeAcpSkillRoot
-  | AgentRuntimeClaudeCodeSkillRoot
-  | AgentRuntimeCodexSkillRoot
-  | AgentRuntimePiSkillRoot;
-
-/**
- * Final per-thread state snapshot taken when a provider process exits,
- * captured before the runtime clears the thread's state. This is the only way
- * consumers can distinguish an idle session from a crashed active turn or a
- * turn request awaiting its first provider lifecycle event.
- */
 export interface AgentRuntimeProcessExitThreadState {
   activeTurnId: string | null;
   pendingTurnStart: boolean;
@@ -76,139 +54,133 @@ export interface AgentRuntimeProcessExitInfo {
   stderr: string | null;
 }
 
-// ---------------------------------------------------------------------------
-// Runtime options
-// ---------------------------------------------------------------------------
-
 export interface AgentRuntimeOptions {
-  /** Working directory for provider processes. */
   workspacePath: string;
 
-  /** Extra paths workspace-write providers may mutate in addition to workspacePath. */
   additionalWorkspaceWriteRoots?: readonly string[];
 
-  /** Environment variables passed to ALL provider processes. */
   env?: Record<string, string>;
 
-  /** Environment variables injected into agent shell execution via adapters. */
   shellEnv?: AgentRuntimeShellEnvironment;
 
-  /** Root directory containing per-thread storage directories. */
   threadStorageRootPath?: string;
 
-  /** Optional directory containing bundled provider bridges. */
   bridgeBundleDir?: string;
+  turnStartWatchdog?: { thresholdMs?: number; intervalMs?: number };
+  rateLimitRetry?: { delaysMs?: readonly number[] };
+  threadCreation?: { requestTimeoutMs?: number };
 
-  /** Optional executable used to run Node-based provider bridges. */
-  bridgeNodeExecutablePath?: string;
-
-  /** Optional env values needed by the executable used for Node-based bridges. */
-  bridgeNodeEnv?: Record<string, string>;
-
-  /** Optional caller-provided skill roots to expose to provider sessions. */
   skillRoots?: readonly AgentRuntimeSkillRoot[];
 
-  /** Called when a provider emits a translated event.
-   *  Every event has `threadId` (bb ID) and `providerThreadId` (provider's internal ID). */
   onEvent: (event: ThreadEvent) => void;
 
-  /** Called when a provider needs to execute a tool.
-   *  `threadId` is always the BB thread id and `providerThreadId` is always present. */
-  onToolCall: (request: ToolCallRequest) => Promise<ToolCallResponse>;
+  onToolCall: (
+    request: ToolCallRequest,
+    signal?: AbortSignal,
+  ) => Promise<ToolCallResponse>;
 
-  /** Called when a provider pauses for user permission or approval.
-   *  The runtime converts provider-native requests into bb's shared pending-interaction contract. */
   onInteractiveRequest?: (
     request: PendingInteractionCreate,
   ) => Promise<PendingInteractionResolution>;
 
-  /** Called on provider stderr lines. */
   onStderr?: (line: string, threadId?: string) => void;
 
-  /** Called when a provider process exits unexpectedly. */
   onProcessExit?: (info: AgentRuntimeProcessExitInfo) => void;
+
+  onProviderRecovery?: (hint: AgentRuntimeProviderRecoveryHint) => void;
 }
 
-// ---------------------------------------------------------------------------
-// Runtime interface
-// ---------------------------------------------------------------------------
+export interface AgentRuntimeProviderRecoveryHint {
+  providerId: string;
+  threadId?: string;
+  kind: ProviderRecoveryKind;
+  message: string;
+  retryable: boolean;
+}
+
+export interface AgentRuntimeBridgeLaunch {
+  pluginId: string;
+  dataDir: string;
+  source: { kind: "artifact"; digest: string; artifactPath: string };
+  capabilities: {
+    providerInstallation: boolean;
+    supportsServiceTier: boolean;
+    permissionModes: PermissionMode[];
+    supportsThreadArchive: boolean;
+    supportsThreadRename: boolean;
+    fork: ProviderFork;
+  };
+  providerOptions: JsonObject;
+  envPassthrough: readonly string[];
+}
 
 export interface EnsureProviderArgs {
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
-  /**
-   * Providers with thread-scoped processes use this to start the process for a
-   * specific bb thread. Omit it for provider-scoped maintenance work such as
-   * model listing.
-   */
-  forThreadId?: string;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots?: readonly AgentRuntimeSkillRoot[];
   providerId: string;
 }
 
 export interface StartThreadArgs {
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots?: readonly AgentRuntimeSkillRoot[];
   environmentId: string;
   threadId: string;
   projectId: string;
   providerId: string;
+  contributedEnv?: readonly AgentRuntimeContributedEnvEntry[];
   clientRequestId?: ClientTurnRequestId;
   input?: PromptInput[];
-  inputGroups?: PromptInput[][];
   options: AgentRuntimeExecutionOptions;
   instructions?: string;
   dynamicTools?: DynamicTool[];
-  disallowedTools?: readonly string[];
   instructionMode?: InstructionMode;
-  /** JSON Schema constraining the session's structured output. Session-level
-   *  structured output is claude-code only (SDK `outputFormat` is fixed at
-   *  query creation); other adapters reject it. Absent means no structured
-   *  output. */
-  outputSchema?: JsonObject;
-  /**
-   * Present means fork the new thread from this source provider session
-   * instead of starting fresh; absent means a normal start.
-   */
-  fork?: { sourceProviderThreadId: string };
+  fork?: {
+    sourceProviderThreadId: string;
+    sourceProviderCheckpointId?: string;
+  };
 }
 
 export interface StartThreadResult {
   providerThreadId: string;
 }
 
-export interface PrepareThreadRewindArgs {
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
+interface PrepareThreadRewindArgs {
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots?: readonly AgentRuntimeSkillRoot[];
   environmentId: string;
   threadId: string;
   leaseId: string;
   projectId: string;
   providerId: string;
+  contributedEnv?: readonly AgentRuntimeContributedEnvEntry[];
   sourceProviderThreadId: string;
   retainThroughProviderCheckpoint: string;
   options: AgentRuntimeExecutionOptions;
   instructions?: string;
   dynamicTools?: DynamicTool[];
-  disallowedTools?: readonly string[];
   instructionMode?: InstructionMode;
 }
 
-export interface PrepareThreadRewindResult {
+interface PrepareThreadRewindResult {
   providerThreadId: string;
 }
 
-export interface DiscardThreadRewindArgs {
+interface DiscardThreadRewindArgs {
   leaseId: string;
 }
 
 export interface ResumeThreadArgs {
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots?: readonly AgentRuntimeSkillRoot[];
   environmentId: string;
   threadId: string;
   projectId?: string;
   providerThreadId?: string;
   providerId: string;
+  contributedEnv?: readonly AgentRuntimeContributedEnvEntry[];
   options: AgentRuntimeExecutionOptions;
   instructions?: string;
   dynamicTools?: DynamicTool[];
-  disallowedTools?: readonly string[];
   instructionMode?: InstructionMode;
 }
 
@@ -219,9 +191,9 @@ export interface ResumeThreadResult {
 export interface RunTurnArgs {
   threadId: string;
   input: PromptInput[];
-  inputGroups?: PromptInput[][];
   clientRequestId: ClientTurnRequestId;
   options: AgentRuntimeExecutionOptions;
+  contributedEnv?: readonly AgentRuntimeContributedEnvEntry[];
   instructions?: string;
 }
 
@@ -229,17 +201,17 @@ export interface SteerTurnArgs {
   threadId: string;
   expectedTurnId: string;
   input: PromptInput[];
-  inputGroups?: PromptInput[][];
   clientRequestId: ClientTurnRequestId;
   options: AgentRuntimeExecutionOptions;
+  contributedEnv?: readonly AgentRuntimeContributedEnvEntry[];
   instructions?: string;
 }
 
-export interface SteerTurnAppliedResult {
+interface SteerTurnAppliedResult {
   status: "steered";
 }
 
-export interface SteerTurnStaleResult {
+interface SteerTurnStaleResult {
   status: "stale";
   activeTurnId: string | null;
 }
@@ -266,6 +238,10 @@ export interface WaitForActiveTurnArgs {
 export interface ReapIdleProviderSessionsArgs {
   idleForMs: number;
   nowMs: number;
+  runThreadExclusive?: (
+    threadId: string,
+    work: () => Promise<ReapedIdleProviderSession | null>,
+  ) => Promise<ReapedIdleProviderSession | null>;
 }
 
 export interface ReapedIdleProviderSession {
@@ -284,17 +260,19 @@ export interface RenameThreadArgs {
   title: string;
 }
 
-export interface ClearThreadGoalArgs {
+interface ClearThreadGoalArgs {
   threadId: string;
 }
 
-export interface ArchiveThreadArgs {
+interface ArchiveThreadArgs {
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
   providerId: string;
   providerThreadId: string;
   threadId: string;
 }
 
-export interface UnarchiveThreadArgs {
+interface UnarchiveThreadArgs {
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
   providerId: string;
   providerThreadId: string;
   threadId: string;
@@ -302,8 +280,19 @@ export interface UnarchiveThreadArgs {
 
 export interface ListModelsArgs {
   providerId: string;
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
   cwd?: string;
+}
+
+interface ProviderMaintenanceArgs {
+  providerId: string;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  cwd?: string;
+}
+
+interface ProviderInstallationStatusArgs extends ProviderMaintenanceArgs {
+  requirement?: "thread_rewind";
+  checkUpdates?: boolean;
 }
 
 export interface AgentRuntime {
@@ -323,12 +312,6 @@ export interface AgentRuntime {
 
   steerTurn(args: SteerTurnArgs): Promise<SteerTurnResult>;
 
-  /**
-   * Stops the thread's active turn and removes the thread from the runtime:
-   * identity, execution config, and turn state are cleared, so `hasThread`
-   * reports `false` afterwards and the next turn must go through
-   * `resumeThread`. The provider process keeps running for other threads.
-   */
   stopThread(args: StopThreadArgs): Promise<StopThreadResult>;
 
   clearThreadGoal(args: ClearThreadGoalArgs): Promise<{ cleared: boolean }>;
@@ -344,45 +327,37 @@ export interface AgentRuntime {
     selectedOnlyModels: AvailableModel[];
   }>;
 
+  providerHealth(args: ProviderMaintenanceArgs): Promise<ProviderHealthResult>;
+
+  providerUsage(args: ProviderMaintenanceArgs): Promise<ProviderUsageResult>;
+
+  providerInstallationStatus(
+    args: ProviderInstallationStatusArgs,
+  ): Promise<ProviderInstallationStatus>;
+
+  providerInstallationRun(
+    args: ProviderMaintenanceArgs & { action: "install" | "update" },
+  ): Promise<ProviderInstallationRunResult>;
+
   listRunningProviders(): string[];
 
-  /** Active turn id for the thread, or `null` when no turn is running. */
   getActiveTurnId(threadId: string): string | null;
 
-  /**
-   * Resolves with the active turn id as soon as one is known: immediately if
-   * a turn is already active, on the next `turn/started` observation
-   * otherwise. Resolves `null` on timeout or when the thread goes idle
-   * (stopped, cleared, or its provider process exits) before a turn starts.
-   */
   waitForActiveTurn(
     threadId: string,
     args: WaitForActiveTurnArgs,
   ): Promise<string | null>;
 
-  /** Provider identity for a hosted thread, or `null` when not hosted. */
   getProviderSession(threadId: string): AgentRuntimeProviderSession | null;
 
-  /**
-   * Stops idle live provider sessions without deleting bb thread state or
-   * provider history. The next turn must resume from the persisted provider
-   * thread id.
-   */
   reapIdleProviderSessions(
     args: ReapIdleProviderSessionsArgs,
   ): Promise<ReapIdleProviderSessionsResult>;
 
-  /** Whether the runtime currently hosts the thread (turns can run on it). */
   hasThread(threadId: string): boolean;
 
-  /** Thread ids with an active turn or an accepted turn awaiting its first event. */
   getLiveThreadIds(): string[];
 
-  /**
-   * Whether any hosted thread still has an open background task (a workflow or
-   * backgrounded command). These outlive their spawning turn, so a runtime with
-   * no active turn can still be doing real work that a shutdown would destroy.
-   */
   hasOpenBackgroundWork(): boolean;
 
   shutdown(): Promise<void>;

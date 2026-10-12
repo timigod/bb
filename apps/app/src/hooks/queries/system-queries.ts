@@ -1,94 +1,165 @@
-import { useQuery } from "@tanstack/react-query";
-import {
-  listBuiltInAgentProviderInfos,
-  listClaudeCodeFallbackModels,
-} from "@bb/agent-providers";
-import { toRecord } from "@bb/core-ui";
+import { queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { QueryClient, QueryKey } from "@tanstack/react-query";
+import type {
+  PermissionMode,
+  ProviderInfo,
+  ProviderModelCatalogScope,
+} from "@bb/domain";
+import { SYSTEM_EXECUTION_OPTIONS_QUERY_KEY } from "@/hooks/queries/query-keys";
+import { permissionModeValues } from "@bb/domain";
 import type {
   SystemCliSkillsStatusResponse,
-  SystemConfigResponse,
   SystemExecutionOptionsResponse,
-  OnboardingAgentOverview,
+  SystemProvidersQuery,
+  SystemProviderStatesResponse,
   SystemVersionResponse,
 } from "@bb/server-contract";
-import type {
-  DiscoverReposResult,
-  ProviderCliStatusResponse,
-} from "@bb/host-daemon-contract";
-import type { ProviderUsageResponse } from "@bb/host-daemon-contract";
+import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
 import { BbHttpError, sdk } from "@/lib/sdk";
+import { isAbortLikeError } from "@/lib/mutation-errors";
 import {
-  claudeModelCatalogCacheKey,
-  readCachedClaudeModelCatalog,
-  writeCachedClaudeModelCatalog,
-} from "@/lib/claude-model-catalog-cache";
-import { useSystemRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
+  modelCatalogCacheKey,
+  readCachedModelCatalog,
+  writeCachedModelCatalog,
+} from "@/lib/model-catalog-cache";
 import {
+  providerListCacheKey,
+  readCachedProviderList,
+  writeCachedProviderList,
+} from "@/lib/provider-list-cache";
+import {
+  useHostListRealtimeSubscription,
+  useSystemRealtimeSubscription,
+} from "@/hooks/useRealtimeSubscription";
+import {
+  allSystemExecutionOptionsQueryKeyPrefix,
+  allSystemProvidersQueryKeyPrefix,
   hostProviderCliStatusQueryKey,
   systemCliSkillsQueryKey,
-  onboardingAgentsQueryKey,
-  onboardingReposQueryKey,
+  systemAiServicesQueryKey,
   systemConfigQueryKey,
   systemExecutionOptionsQueryKey,
-  systemUsageLimitsQueryKey,
+  systemProvidersQueryKey,
+  systemProviderCatalogQueryKey,
+  systemProviderStatesQueryKey,
+  systemThemeQueryKey,
   systemVersionQueryKey,
+  uiPreferencesQueryKey,
 } from "./query-keys";
-import { requireEnabledQueryArg } from "./query-helpers";
+import { requireEnabledQueryArg, type QueryOptions } from "./query-helpers";
 import {
-  FOCUS_OWNED_LIVE_QUERY_POLICY,
   SERVER_SESSION_QUERY_POLICY,
   SESSION_STATIC_QUERY_POLICY,
 } from "./query-policies";
 
-export interface UseSystemExecutionOptionsArgs {
+interface UseSystemExecutionOptionsArgs {
   enabled?: boolean;
   environmentId?: string;
   hostId?: string;
   providerId?: string;
 }
 
-export interface UseOnboardingAgentsOptions extends QueryOptions {
+interface SystemExecutionOptionsQueryArgs {
+  environmentId: string | null;
+  hostId: string | null;
+  providerId: string | null;
+  writeLastKnown: boolean;
+}
+
+interface UseSystemProviderStatesOptions extends QueryOptions {
   environmentId?: string;
   hostId?: string;
   poll?: boolean;
 }
 
-interface QueryOptions {
-  enabled?: boolean;
-}
+type SystemProviderRoutingArgs =
+  | { environmentId: string; hostId?: never }
+  | { environmentId?: never; hostId: string }
+  | { environmentId?: never; hostId?: never };
+
+type UseSystemProvidersArgs = QueryOptions &
+  SystemProviderRoutingArgs &
+  Pick<SystemProvidersQuery, "capability">;
+
+type UseSystemProviderInfoArgs = UseSystemProvidersArgs & {
+  providerId?: string;
+};
 
 const SYSTEM_EXECUTION_OPTIONS_RETRY_DELAY_MS = 250;
 const SYSTEM_EXECUTION_OPTIONS_RETRY_COUNT = 1;
-const CLAUDE_CODE_PROVIDER_ID = "claude-code";
+const PLACEHOLDER_PERMISSION_CEILING: PermissionMode = permissionModeValues[0];
 
-// Claude's account-scoped model probe spawns a CLI process on the host, so
-// waiting for it leaves the composer with no model list for seconds. Render a
-// provisional catalog immediately and let the authoritative rows replace it when
-// the probe lands.
-//
-// Prefer the last catalog this account actually reported: its ids match what the
-// fresh probe will return, so a selection made during the preload window
-// survives instead of snapping back to a default. The curated aliases are only
-// for a cold cache, where no account-scoped ids are known yet.
-//
-// Callers must gate model recovery on `isPlaceholderData` either way: a cached
-// catalog can be stale, so absence from this list is not evidence that a stored
-// model was retired.
-function claudeCodePlaceholderExecutionOptions(
-  cacheKey: string,
-): SystemExecutionOptionsResponse {
-  const cached = readCachedClaudeModelCatalog(cacheKey);
+function isSameExecutionOptionsRoute(
+  previousQueryKey: QueryKey | undefined,
+  environmentId: string | null,
+  hostId: string | null,
+): boolean {
+  return (
+    previousQueryKey?.[0] === SYSTEM_EXECUTION_OPTIONS_QUERY_KEY &&
+    previousQueryKey[1] === environmentId &&
+    previousQueryKey[2] === hostId
+  );
+}
+
+function resolveExecutionOptionsPlaceholder({
+  previousData,
+  previousQueryKey,
+  environmentId,
+  hostId,
+  providerId,
+  catalogCacheKey,
+  providersCacheKey,
+}: {
+  previousData: SystemExecutionOptionsResponse | undefined;
+  previousQueryKey: QueryKey | undefined;
+  environmentId: string | null;
+  hostId: string | null;
+  providerId: string | null;
+  catalogCacheKey: string;
+  providersCacheKey: string;
+}): SystemExecutionOptionsResponse | undefined {
+  const previousProviders = isSameExecutionOptionsRoute(
+    previousQueryKey,
+    environmentId,
+    hostId,
+  )
+    ? previousData?.providers
+    : undefined;
+  const cached = readCachedModelCatalog(catalogCacheKey);
+  const remembered = readCachedProviderList(providersCacheKey);
+  const providers =
+    previousProviders ??
+    (remembered !== null && remembered.length > 0 ? remembered : null);
+  if (
+    providers === null ||
+    (providerId !== null &&
+      !providers.some((provider) => provider.id === providerId))
+  ) {
+    return undefined;
+  }
   return {
-    providers: listBuiltInAgentProviderInfos(),
-    models: cached?.models ?? listClaudeCodeFallbackModels(),
+    providers,
+    models: cached?.models ?? [],
     selectedOnlyModels: cached?.selectedOnlyModels ?? [],
-    permissionCeiling: "full",
+    permissionCeiling: PLACEHOLDER_PERMISSION_CEILING,
     modelLoadError: null,
   };
 }
 
-function isAbortLikeError(error: unknown): boolean {
-  return toRecord(error)?.name === "AbortError";
+export function findCachedProviderInfo(
+  queryClient: import("@tanstack/react-query").QueryClient,
+  providerId: string,
+): ProviderInfo | null {
+  const entries = queryClient.getQueriesData<SystemExecutionOptionsResponse>({
+    queryKey: [SYSTEM_EXECUTION_OPTIONS_QUERY_KEY],
+  });
+  for (const [, data] of entries) {
+    const match = data?.providers.find((info) => info.id === providerId);
+    if (match !== undefined) {
+      return match;
+    }
+  }
+  return null;
 }
 
 function shouldRetrySystemExecutionOptions(
@@ -110,6 +181,229 @@ function shouldRetrySystemExecutionOptions(
   return true;
 }
 
+export function useKnownProviderModelCatalogScope(
+  providerId: string,
+): ProviderModelCatalogScope | undefined {
+  const queryClient = useQueryClient();
+  if (providerId.length === 0) {
+    return undefined;
+  }
+  const scopeIn = (
+    providers: readonly ProviderInfo[] | undefined,
+  ): ProviderModelCatalogScope | undefined =>
+    providers?.find((provider) => provider.id === providerId)?.capabilities
+      .modelCatalogScope;
+  for (const [, options] of queryClient.getQueriesData<{
+    providers: ProviderInfo[];
+  }>({ queryKey: allSystemExecutionOptionsQueryKeyPrefix() })) {
+    const scope = scopeIn(options?.providers);
+    if (scope !== undefined) {
+      return scope;
+    }
+  }
+  for (const [, providers] of queryClient.getQueriesData<ProviderInfo[]>({
+    queryKey: allSystemProvidersQueryKeyPrefix(),
+  })) {
+    const scope = scopeIn(providers);
+    if (scope !== undefined) {
+      return scope;
+    }
+  }
+  return undefined;
+}
+
+export function useSystemProviders(args: UseSystemProvidersArgs = {}) {
+  const capability = args.capability ?? null;
+  const environmentId = args.environmentId ?? null;
+  const hostId = args.hostId ?? null;
+  const enabled = args.enabled ?? true;
+  useSystemRealtimeSubscription({ enabled });
+  const providersCacheKey = providerListCacheKey({ environmentId, hostId });
+  return useQuery<ProviderInfo[]>({
+    queryKey: systemProvidersQueryKey({ capability, environmentId, hostId }),
+    queryFn: async ({ signal }) => {
+      const capabilityFilter =
+        args.capability === undefined ? {} : { capability: args.capability };
+      const providers = await (args.environmentId !== undefined
+        ? sdk.providers.list({
+            ...capabilityFilter,
+            environmentId: args.environmentId,
+            signal,
+          })
+        : args.hostId !== undefined
+          ? sdk.providers.list({
+              ...capabilityFilter,
+              hostId: args.hostId,
+              signal,
+            })
+          : sdk.providers.list({ ...capabilityFilter, signal }));
+      if (capability === null) {
+        writeCachedProviderList(providersCacheKey, providers);
+      }
+      return providers;
+    },
+    enabled,
+    staleTime: 60_000,
+    placeholderData: () => {
+      const remembered = readCachedProviderList(providersCacheKey);
+      if (remembered === null) return undefined;
+      const eligible =
+        capability === null
+          ? remembered
+          : remembered.filter((provider) => provider.maintenance[capability]);
+      return eligible.length > 0 ? eligible : undefined;
+    },
+  });
+}
+
+export function useSystemProviderInfo({
+  providerId,
+  ...args
+}: UseSystemProviderInfoArgs): ProviderInfo | null {
+  const queryClient = useQueryClient();
+  const providersQuery = useSystemProviders({
+    ...args,
+    enabled: (args.enabled ?? true) && providerId !== undefined,
+  });
+  return (
+    providersQuery.data?.find((provider) => provider.id === providerId) ??
+    (providerId === undefined
+      ? null
+      : findCachedProviderInfo(queryClient, providerId))
+  );
+}
+
+async function requestOfferedProviderExecutionOptions({
+  environmentId,
+  hostId,
+  providerId,
+  signal,
+}: Omit<SystemExecutionOptionsQueryArgs, "writeLastKnown"> & {
+  signal: AbortSignal;
+}): Promise<{
+  response: SystemExecutionOptionsResponse;
+  loadedProviderId: string | null;
+}> {
+  const request = (requestedProviderId: string | null) =>
+    sdk.system.executionOptions({
+      environmentId: environmentId ?? undefined,
+      hostId: hostId ?? undefined,
+      providerId: requestedProviderId ?? undefined,
+      signal,
+    });
+  const response = await request(providerId);
+  const fallbackProviderId = response.providers[0]?.id;
+  if (
+    providerId === null ||
+    fallbackProviderId === undefined ||
+    response.providers.some((provider) => provider.id === providerId)
+  ) {
+    return { response, loadedProviderId: providerId };
+  }
+  return {
+    response: await request(fallbackProviderId),
+    loadedProviderId: fallbackProviderId,
+  };
+}
+
+function systemExecutionOptionsQueryOptions({
+  environmentId,
+  hostId,
+  providerId,
+  writeLastKnown,
+}: SystemExecutionOptionsQueryArgs) {
+  return queryOptions<SystemExecutionOptionsResponse>({
+    queryKey: systemExecutionOptionsQueryKey({
+      environmentId,
+      hostId,
+      providerId,
+    }),
+    queryFn: async ({ signal }) => {
+      const { response, loadedProviderId } =
+        await requestOfferedProviderExecutionOptions({
+          environmentId,
+          hostId,
+          providerId,
+          signal,
+        });
+      const modelsProviderId =
+        loadedProviderId ?? response.providers[0]?.id ?? null;
+      if (writeLastKnown) {
+        writeCachedProviderList(
+          providerListCacheKey({ environmentId, hostId }),
+          response.providers,
+        );
+        if (response.modelLoadError === null) {
+          const catalog = {
+            models: response.models,
+            selectedOnlyModels: response.selectedOnlyModels,
+          };
+          writeCachedModelCatalog(
+            modelCatalogCacheKey({
+              environmentId,
+              hostId,
+              providerId: loadedProviderId,
+            }),
+            catalog,
+          );
+          if (loadedProviderId === null && modelsProviderId !== null) {
+            writeCachedModelCatalog(
+              modelCatalogCacheKey({
+                environmentId,
+                hostId,
+                providerId: modelsProviderId,
+              }),
+              catalog,
+            );
+          }
+        }
+      }
+      if (
+        writeLastKnown &&
+        response.modelLoadError?.providerId === modelsProviderId &&
+        response.models.length === 0 &&
+        response.selectedOnlyModels.length === 0 &&
+        (response.modelLoadError?.code === "failed" ||
+          response.modelLoadError?.code === "timeout")
+      ) {
+        const cached = readCachedModelCatalog(
+          modelCatalogCacheKey({
+            environmentId,
+            hostId,
+            providerId: modelsProviderId,
+          }),
+        );
+        if (
+          cached !== null &&
+          (cached.models.length > 0 || cached.selectedOnlyModels.length > 0)
+        ) {
+          return { ...response, ...cached, modelLoadError: null };
+        }
+      }
+      return response;
+    },
+    staleTime: 60_000,
+    retry: shouldRetrySystemExecutionOptions,
+    retryDelay: SYSTEM_EXECUTION_OPTIONS_RETRY_DELAY_MS,
+  });
+}
+
+export function prefetchSystemExecutionOptions(
+  queryClient: QueryClient,
+  args: { routing: SystemProvidersQuery; providerIds: readonly string[] },
+): void {
+  for (const providerId of args.providerIds) {
+    void queryClient.prefetchQuery(
+      systemExecutionOptionsQueryOptions({
+        environmentId: args.routing.environmentId ?? null,
+        hostId: args.routing.hostId ?? null,
+        providerId,
+        writeLastKnown: false,
+      }),
+    );
+  }
+}
+
 export function useSystemExecutionOptions(
   args: UseSystemExecutionOptionsArgs = {},
 ) {
@@ -118,46 +412,83 @@ export function useSystemExecutionOptions(
   const providerId = args.providerId ?? null;
   const enabled = args.enabled ?? true;
   useSystemRealtimeSubscription({ enabled });
-  const isClaudeCode = providerId === CLAUDE_CODE_PROVIDER_ID;
-  const catalogCacheKey = claudeModelCatalogCacheKey({
+  useHostListRealtimeSubscription({ enabled });
+  const providersCacheKey = providerListCacheKey({ environmentId, hostId });
+  const catalogCacheKey = modelCatalogCacheKey({
     environmentId,
     hostId,
+    providerId,
   });
-
-  return useQuery<SystemExecutionOptionsResponse>({
-    queryKey: systemExecutionOptionsQueryKey({
+  return useQuery({
+    ...systemExecutionOptionsQueryOptions({
       environmentId,
       hostId,
       providerId,
+      writeLastKnown: true,
     }),
-    queryFn: async ({ signal }) => {
-      const response = await sdk.system.executionOptions({
-        environmentId: args.environmentId,
-        hostId: args.hostId,
-        providerId: args.providerId,
-        signal,
-      });
-      // Only a verified catalog is worth remembering. Caching a provisional list
-      // would let the server's probe-failure fallback masquerade as this
-      // account's real models on the next cold load.
-      if (isClaudeCode && response.modelLoadError === null) {
-        writeCachedClaudeModelCatalog(catalogCacheKey, {
-          models: response.models,
-          selectedOnlyModels: response.selectedOnlyModels,
-        });
-      }
-      return response;
-    },
     enabled,
+    placeholderData: (previousData, previousQuery) =>
+      resolveExecutionOptionsPlaceholder({
+        previousData,
+        previousQueryKey: previousQuery?.queryKey,
+        environmentId,
+        hostId,
+        providerId,
+        catalogCacheKey,
+        providersCacheKey,
+      }),
+  });
+}
+
+export function systemConfigQueryOptions() {
+  return queryOptions({
+    queryKey: systemConfigQueryKey(),
+    queryFn: ({ signal }) => sdk.system.config({ signal }),
     staleTime: 60_000,
-    retry: shouldRetrySystemExecutionOptions,
-    retryDelay: SYSTEM_EXECUTION_OPTIONS_RETRY_DELAY_MS,
-    ...(isClaudeCode
-      ? {
-          placeholderData: () =>
-            claudeCodePlaceholderExecutionOptions(catalogCacheKey),
-        }
-      : {}),
+  });
+}
+
+export function systemAiServicesQueryOptions() {
+  return queryOptions({
+    queryKey: systemAiServicesQueryKey(),
+    queryFn: ({ signal }) => sdk.system.aiServices({ signal }),
+    staleTime: 10_000,
+  });
+}
+
+export function useSystemAiServices(options?: QueryOptions) {
+  const enabled = options?.enabled ?? true;
+  useSystemRealtimeSubscription({ enabled });
+
+  return useQuery({
+    ...systemAiServicesQueryOptions(),
+    enabled,
+  });
+}
+
+export function uiPreferencesQueryOptions() {
+  return queryOptions({
+    queryKey: uiPreferencesQueryKey(),
+    queryFn: ({ signal }) => sdk.system.uiPreferences.list({ signal }),
+    staleTime: 60_000,
+  });
+}
+
+export function useUiPreferences(options?: QueryOptions) {
+  const enabled = options?.enabled ?? true;
+  useSystemRealtimeSubscription({ enabled });
+
+  return useQuery({
+    ...uiPreferencesQueryOptions(),
+    enabled,
+  });
+}
+
+export function systemThemeQueryOptions(themeId: string) {
+  return queryOptions({
+    queryKey: systemThemeQueryKey(themeId),
+    queryFn: ({ signal }) => sdk.theme.resolve({ signal, themeId }),
+    staleTime: 60_000,
   });
 }
 
@@ -165,19 +496,12 @@ export function useSystemConfig(options?: QueryOptions) {
   const enabled = options?.enabled ?? true;
   useSystemRealtimeSubscription({ enabled });
 
-  return useQuery<SystemConfigResponse>({
-    queryKey: systemConfigQueryKey(),
-    queryFn: ({ signal }) => sdk.system.config({ signal }),
+  return useQuery({
+    ...systemConfigQueryOptions(),
     enabled,
-    staleTime: 60_000,
   });
 }
 
-/**
- * Per-machine install state of bb's built-in CLI skills. Each read asks every
- * enrolled machine's daemon, so it is fetched on demand (the settings section)
- * rather than kept fresh in the background.
- */
 export function useCliSkillsStatus(options?: QueryOptions) {
   return useQuery<SystemCliSkillsStatusResponse>({
     queryKey: systemCliSkillsQueryKey(),
@@ -196,7 +520,7 @@ export function useSystemVersion(options?: QueryOptions) {
   });
 }
 
-export interface UseHostProviderCliStatusArgs {
+interface UseHostProviderCliStatusArgs {
   hostId: string | null;
   enabled?: boolean;
 }
@@ -221,56 +545,30 @@ export function useHostProviderCliStatus({
   });
 }
 
-/**
- * Live agent state for onboarding. Polled while the step is open so installing
- * or signing in from a terminal updates the list without a manual refresh.
- */
-export function useOnboardingAgents(options: UseOnboardingAgentsOptions = {}) {
+export function useSystemProviderStates(
+  options: UseSystemProviderStatesOptions = {},
+) {
   const environmentId = options.environmentId ?? null;
   const hostId = options.hostId ?? null;
-  return useQuery<OnboardingAgentOverview>({
-    queryKey: onboardingAgentsQueryKey({ environmentId, hostId }),
+  return useQuery<SystemProviderStatesResponse>({
+    queryKey: systemProviderStatesQueryKey({ environmentId, hostId }),
     queryFn: ({ signal }) =>
-      sdk.system.onboardingAgents({
+      sdk.system.providerStates({
         environmentId: options.environmentId,
         hostId: options.hostId,
         signal,
       }),
     enabled: options.enabled ?? true,
-    // Each read runs CLI health checks, known-agent checks, and up to three
-    // provider usage requests, so this polls slowly and only while the agents
-    // step is actually on screen. An explicit re-check covers the impatient
-    // case. Other readers (the composer's provider default) want one answer.
     ...(options.poll === false
       ? { staleTime: 60_000 }
       : { refetchInterval: 15_000 }),
   });
 }
 
-/** Candidate projects on the host. Runs once when the projects step opens. */
-export function useOnboardingRepos(options: QueryOptions = {}) {
-  return useQuery<DiscoverReposResult>({
-    queryKey: onboardingReposQueryKey(),
-    queryFn: ({ signal }) => sdk.system.onboardingRepos({ signal }),
-    enabled: options.enabled ?? true,
-    staleTime: Infinity,
-  });
-}
-
-export interface UseSystemUsageLimitsArgs extends QueryOptions {
-  hostId?: string;
-}
-
-export function useSystemUsageLimits(args: UseSystemUsageLimitsArgs = {}) {
-  const hostId = args.hostId ?? null;
-  return useQuery<ProviderUsageResponse>({
-    queryKey: systemUsageLimitsQueryKey(hostId),
-    queryFn: ({ signal }) =>
-      sdk.system.usageLimits({
-        ...(args.hostId === undefined ? {} : { hostId: args.hostId }),
-        signal,
-      }),
-    enabled: args.enabled ?? true,
-    ...FOCUS_OWNED_LIVE_QUERY_POLICY,
+export function useSystemProviderCatalog() {
+  useSystemRealtimeSubscription({ enabled: true });
+  return useQuery({
+    queryKey: systemProviderCatalogQueryKey(),
+    queryFn: () => sdk.providers.catalog(),
   });
 }

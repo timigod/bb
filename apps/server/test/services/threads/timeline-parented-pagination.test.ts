@@ -16,7 +16,7 @@ import {
 } from "@bb/db";
 import type { DbConnection } from "@bb/db";
 import type { TimelineRow } from "@bb/server-contract";
-import { buildThreadTimeline } from "../../../src/services/threads/timeline.js";
+import { buildThreadTimelineWithProfile } from "../../../src/services/threads/timeline.js";
 
 const providerThreadId = "provider-root";
 
@@ -38,7 +38,6 @@ function setup(): SetupResult {
   migrate(db);
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
@@ -70,6 +69,7 @@ function insertCrossWindowSubagentEvents(
       scope: threadScope(),
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({
         direction: "outbound",
         source: "spawn",
@@ -90,6 +90,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({}),
     },
     {
@@ -100,6 +101,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({ clientRequestId: firstRequestId }),
     },
     {
@@ -110,6 +112,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: "toolu_agent_1",
       itemKind: "toolCall",
+      parentToolCallId: null,
       data: JSON.stringify({
         item: {
           type: "toolCall",
@@ -131,6 +134,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: "toolu_agent_1",
       itemKind: "toolCall",
+      parentToolCallId: null,
       data: JSON.stringify({
         item: {
           type: "toolCall",
@@ -152,6 +156,7 @@ function insertCrossWindowSubagentEvents(
       scope: threadScope(),
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({
         direction: "outbound",
         source: "tell",
@@ -172,6 +177,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({}),
     },
     {
@@ -182,6 +188,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({ clientRequestId: secondRequestId }),
     },
     {
@@ -192,6 +199,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: "middle-message",
       itemKind: "agentMessage",
+      parentToolCallId: null,
       data: JSON.stringify({
         item: {
           type: "agentMessage",
@@ -207,6 +215,7 @@ function insertCrossWindowSubagentEvents(
       scope: threadScope(),
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({
         direction: "outbound",
         source: "tell",
@@ -227,6 +236,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({}),
     },
     {
@@ -237,6 +247,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: null,
       data: JSON.stringify({ clientRequestId: thirdRequestId }),
     },
     {
@@ -247,6 +258,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: "newest-message",
       itemKind: "agentMessage",
+      parentToolCallId: null,
       data: JSON.stringify({
         item: {
           type: "agentMessage",
@@ -263,6 +275,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: null,
       itemKind: null,
+      parentToolCallId: "toolu_agent_1",
       data: JSON.stringify({ parentToolCallId: "toolu_agent_1" }),
     },
     {
@@ -273,6 +286,7 @@ function insertCrossWindowSubagentEvents(
       providerThreadId,
       itemId: "child-message",
       itemKind: "agentMessage",
+      parentToolCallId: "toolu_agent_1",
       data: JSON.stringify({
         item: {
           type: "agentMessage",
@@ -290,7 +304,7 @@ function nestedRows(row: TimelineRow): readonly TimelineRow[] {
     return row.children ?? [];
   }
   if (row.kind === "work" && row.workKind === "delegation") {
-    return row.childRows;
+    return row.childRows ?? [];
   }
   return [];
 }
@@ -318,14 +332,16 @@ describe("thread timeline parented pagination", () => {
     const { db, thread } = setup();
     insertCrossWindowSubagentEvents(db, thread);
 
-    const timeline = buildThreadTimeline(db, thread, {
+    const timeline = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
       eventBudget: 1_000_000,
-      includeProviderUnhandledOperations: false,
+      includeClearedContextHistory: false,
+      includeDiagnosticOperations: false,
       includeNestedRows: true,
       maxInlineOutputChars: null,
       maxSeq: 51,
       page: { kind: "latest", segmentLimit: 1 },
-    });
+    }).response;
 
     expect(rowTexts(timeline.rows)).toContain("Newest response.");
     expect(rowTexts(timeline.rows)).not.toContain("SECOND_SUBAGENT_OUTPUT");
@@ -335,21 +351,30 @@ describe("thread timeline parented pagination", () => {
     const { db, thread } = setup();
     insertCrossWindowSubagentEvents(db, thread);
 
-    const timeline = buildThreadTimeline(db, thread, {
+    const latest = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
       eventBudget: 1_000_000,
-      includeProviderUnhandledOperations: false,
+      includeClearedContextHistory: false,
+      includeDiagnosticOperations: false,
+      includeNestedRows: true,
+      maxInlineOutputChars: null,
+      maxSeq: 51,
+      page: { kind: "latest", segmentLimit: 2 },
+    }).response;
+    const timeline = buildThreadTimelineWithProfile(db, thread, {
+      completedTurnDisplay: "collapse",
+      eventBudget: 1_000_000,
+      includeClearedContextHistory: false,
+      includeDiagnosticOperations: false,
       includeNestedRows: true,
       maxInlineOutputChars: null,
       maxSeq: 51,
       page: {
         kind: "older",
-        beforeCursor: {
-          anchorId: `${thread.id}:user-seed:20`,
-          anchorSeq: 20,
-        },
+        beforeCursor: latest.timelinePage.olderCursor!,
         segmentLimit: 1,
       },
-    });
+    }).response;
     const delegation = flattenRows(timeline.rows).find(
       (
         row,

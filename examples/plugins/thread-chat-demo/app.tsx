@@ -1,22 +1,36 @@
-// bb-plugin-thread-chat-demo — the frontend bundle.
-//
-// Demonstrates the two chat-integration surfaces added for the sidechat
-// rebuild:
-//
-// - `ThreadChat`, the one host-owned SDK component: a nav panel that renders
-//   any thread's full chat (timeline + composer) from just a thread id, and
-//   a thread panel that renders the current thread compactly.
-// - `messageAction`, host-rendered chrome on every chat message (and the
-//   text-selection menu): "Open in demo panel" opens this plugin's own
-//   thread panel anchored on the clicked message via `openPanel`.
 import { useState } from "react";
-import { definePluginApp, ThreadChat, useBbContext } from "@bb/plugin-sdk/app";
+import {
+  definePluginApp,
+  experimental_useAppPanel,
+  experimental_useFixedTabTarget,
+  ThreadChat,
+  useBbContext,
+  useBbNavigate,
+  type PluginFixedTabRegistration,
+  type JsonValue,
+} from "@get-bb/plugin-sdk/app";
+
+type DemoThreadTarget = { kind: "thread"; threadId: string };
+
+function isDemoThreadTarget(value: JsonValue): value is DemoThreadTarget {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 2 &&
+    value.kind === "thread" &&
+    typeof value.threadId === "string" &&
+    value.threadId.length > 0
+  );
+}
 
 function ThreadChatDemoPanel({ subPath }: { subPath: string }) {
   const { threadId: routeThreadId } = useBbContext();
   const [threadId, setThreadId] = useState(subPath);
   const [focusRequest, setFocusRequest] = useState(0);
   const activeThreadId = threadId || routeThreadId || "";
+  const panel = experimental_useAppPanel();
+  const navigate = useBbNavigate();
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b p-2">
@@ -32,6 +46,31 @@ function ThreadChatDemoPanel({ subPath }: { subPath: string }) {
           onClick={() => setFocusRequest((nonce) => nonce + 1)}
         >
           Focus composer
+        </button>
+        <button
+          type="button"
+          disabled={!activeThreadId}
+          className="h-8 cursor-pointer rounded-md border px-2 text-sm hover:bg-surface-recessed disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={() =>
+            panel.openFixedTab({
+              surface: { kind: "current" },
+              tab: demoThreadFixedTab,
+              target: { kind: "thread", threadId: activeThreadId },
+            })
+          }
+        >
+          Open compact tab
+        </button>
+        <button
+          type="button"
+          className="h-8 cursor-pointer rounded-md border px-2 text-sm hover:bg-surface-recessed"
+          onClick={() =>
+            navigate.openUrl(
+              "https://github.com/get-bb/bb/tree/main/examples/plugins/thread-chat-demo",
+            )
+          }
+        >
+          View source
         </button>
       </div>
       {activeThreadId ? (
@@ -51,6 +90,32 @@ function ThreadChatDemoPanel({ subPath }: { subPath: string }) {
     </div>
   );
 }
+
+function DemoThreadFixedTab() {
+  const targetState = experimental_useFixedTabTarget(demoThreadFixedTab);
+  return targetState === null ? (
+    <p className="p-4 text-sm text-muted-foreground">
+      Choose “Open compact tab” from the demo page.
+    </p>
+  ) : (
+    <ThreadChat
+      key={targetState.sequence}
+      threadId={targetState.target.threadId}
+      variant="compact"
+      className="h-full"
+    />
+  );
+}
+
+const demoThreadFixedTab: PluginFixedTabRegistration<DemoThreadTarget> = {
+  panelId: "thread-chat-demo",
+  id: "compact-thread",
+  title: "Compact thread",
+  icon: "PanelRight",
+  component: DemoThreadFixedTab,
+  layout: "flush",
+  experimental_target: { validate: isDemoThreadTarget },
+};
 
 interface DemoPanelParams {
   anchorText?: string;
@@ -83,7 +148,11 @@ function MessageAnchoredPanel({
           Anchored on: {selectedText ?? anchorText}
         </div>
       ) : null}
-      <ThreadChat threadId={threadId} variant="compact" className="min-h-0 flex-1" />
+      <ThreadChat
+        threadId={threadId}
+        variant="compact"
+        className="min-h-0 flex-1"
+      />
     </div>
   );
 }
@@ -95,12 +164,14 @@ export default definePluginApp((app) => {
     icon: "MessageSquarePlus",
     path: "thread-chat",
     component: ThreadChatDemoPanel,
+    fixedTabs: [demoThreadFixedTab],
   });
   app.slots.threadPanelAction({
     id: "demo-panel",
     title: "ThreadChat demo panel",
     icon: "MessageSquarePlus",
     component: MessageAnchoredPanel,
+    layout: "flush",
   });
   app.slots.messageAction({
     id: "open-in-demo-panel",

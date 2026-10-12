@@ -13,18 +13,20 @@ import {
   finalizeOperationMessage,
   interruptOperationMessage,
 } from "./parse-operation-message.js";
+import { flushActiveToolCell } from "./tool-activity-cells.js";
 import {
-  flushActiveToolCell,
+  createToolActivityState,
   flushPendingToolActivityOutput,
   interruptPendingToolActivity,
 } from "./tool-activity-projection.js";
-import { createToolActivityState } from "./tool-activity-projection.js";
 import {
   createOperationProjectionState,
   flushPendingFileEditOutput,
+  interruptOpenCompactions,
   type CompactionTurnFinalizationStatus,
   type OperationProjectionState,
 } from "./operation-projection.js";
+import type { EventMeta } from "./event-decode.js";
 import {
   createReasoningProjectionState,
   finalizeOpenReasoningLifecycles,
@@ -57,7 +59,7 @@ type TurnCompletedStatus = Extract<
 >["status"];
 
 interface CompleteTurnArgs {
-  completedAt: number;
+  meta: EventMeta;
   state: ProjectionState;
   status: TurnCompletedStatus;
   turnId: string;
@@ -69,8 +71,9 @@ interface FinalizeProjectionMessagesArgs {
 }
 
 interface ThreadInterruptedArgs {
-  completedAt: number;
+  meta: EventMeta;
   state: ProjectionState;
+  threadId: string;
 }
 
 export interface ProjectionState
@@ -136,23 +139,37 @@ export function onTurnCompleted(args: CompleteTurnArgs): void {
   args.state.openTurnIds.delete(args.turnId);
   if (args.status === "interrupted") {
     args.state.pendingFinalizationByTurnId.set(args.turnId, {
-      completedAt: args.completedAt,
+      completedAt: args.meta.createdAt,
       status: "interrupted",
     });
   }
-  finalizeOpenReasoningLifecyclesForTurn(args.state, args.turnId);
+  finalizeOpenReasoningLifecyclesForTurn({
+    meta: args.meta,
+    state: args.state,
+    status: args.status === "completed" ? "completed" : "interrupted",
+    turnId: args.turnId,
+  });
 }
 
 export function onThreadInterrupted(args: ThreadInterruptedArgs): void {
-  args.state.threadInterruptedAt = args.completedAt;
+  args.state.threadInterruptedAt = args.meta.createdAt;
+  interruptOpenCompactions({
+    state: args.state,
+    meta: args.meta,
+    threadId: args.threadId,
+  });
   for (const turnId of args.state.openTurnIds) {
     args.state.pendingFinalizationByTurnId.set(turnId, {
-      completedAt: args.completedAt,
+      completedAt: args.meta.createdAt,
       status: "interrupted",
     });
   }
   closeOpenTurns(args.state);
-  finalizeOpenReasoningLifecycles(args.state);
+  finalizeOpenReasoningLifecycles({
+    meta: args.meta,
+    state: args.state,
+    status: "interrupted",
+  });
 }
 
 export function flushProjectionBufferedOutputs(state: ProjectionState): void {
@@ -166,9 +183,6 @@ export function flushProjectionBufferedOutputsAfterTurnCompleted(
   turnId: string,
 ): void {
   flushBufferedAssistantMessagesForTurn(state, turnId);
-  // Tool and file-edit buffers predate turn-scoped assistant buffering. Their
-  // call identity is not uniformly scope-qualified, so retain the established
-  // global flush behavior until that state is redesigned end to end.
   flushPendingToolActivityOutput(state);
   flushPendingFileEditOutput(state);
 }
@@ -204,6 +218,14 @@ function finalizePendingMessages(args: FinalizeProjectionMessagesArgs): void {
 
   for (const message of args.state.messages) {
     if (message.kind !== "operation") continue;
+    if (
+      args.options?.threadStatus === "idle" &&
+      message.opType === "compaction" &&
+      message.scope.kind === "turn" &&
+      args.state.closedTurnIds.has(message.scope.turnId)
+    ) {
+      continue;
+    }
     finalizeOperationMessage(message, args.options);
   }
 
@@ -255,8 +277,13 @@ function finalizePendingMessageForInterruptedTurn(
         message.lifecycle = "interrupted";
       }
       return;
+    case "plugin-form-lifecycle":
+      if (message.status === "pending") {
+        message.status = "interrupted";
+        message.lifecycle = "cancelled";
+      }
+      return;
     case "assistant-text":
-    case "debug/raw-event":
     case "delegation":
     case "error":
     case "user":

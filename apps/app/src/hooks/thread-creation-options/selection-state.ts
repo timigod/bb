@@ -1,4 +1,9 @@
-import type { PermissionMode, ReasoningLevel, ServiceTier } from "@bb/domain";
+import type {
+  PermissionMode,
+  ReasoningLevel,
+  ServiceTier,
+  SessionOptionSelections,
+} from "@bb/domain";
 import type {
   CreateExecutionInputSources,
   ExecutionInputFieldSource,
@@ -11,7 +16,7 @@ import type {
   StoredServiceTier,
 } from "./persisted-selection-fields";
 
-export type ThreadCreationOptionsScope = "new-thread" | "component-local";
+type ThreadCreationOptionsScope = "new-thread" | "component-local";
 
 export interface ThreadPromptSelections {
   selectedProviderId: string;
@@ -31,17 +36,17 @@ export type ScopedExecutionInputSources =
 export interface UsePromptModelReasoningOptions {
   enabled?: boolean;
   environmentId?: string;
+  environmentHostId?: string;
   scope?: ThreadCreationOptionsScope;
   resetKey?: string | number | null;
   initialProviderId?: string;
-  /** When no project default or persisted choice exists, select the first
-   * connected provider reported by the routed machine. */
-  preferConnectedProviderWhenUnset?: boolean;
+  preferReadyProviderWhenUnset?: boolean;
   initialModel?: string;
   initialServiceTier?: ServiceTier;
   initialReasoningLevel?: ReasoningLevel;
   initialPermissionMode?: PermissionMode;
   initialEnvironmentSelectionValue?: string;
+  sessionOptionSelections?: SessionOptionSelections;
   preferenceProjectId?: string | null;
   resolveProviderRouting?: (
     environmentSelectionValue: string,
@@ -56,7 +61,7 @@ export interface UseComponentLocalCreationOptions extends UsePromptModelReasonin
   scope: "component-local";
 }
 
-export interface StoredCreateExecutionValues {
+interface StoredCreateExecutionValues {
   selectedProviderId: string;
   selectedModel: string;
   serviceTier: StoredServiceTier;
@@ -64,7 +69,7 @@ export interface StoredCreateExecutionValues {
   permissionMode: StoredPermissionMode;
 }
 
-export interface EffectiveCreateExecutionValues {
+interface EffectiveCreateExecutionValues {
   selectedProviderId: string;
   selectedModel: string;
   serviceTier: ServiceTier | undefined;
@@ -72,7 +77,7 @@ export interface EffectiveCreateExecutionValues {
   permissionMode: PermissionMode;
 }
 
-export interface BuildExecutionInputSourcesArgs {
+interface BuildExecutionInputSourcesArgs {
   effectiveValues: EffectiveCreateExecutionValues;
   forceExplicitModel?: boolean;
   initialProviderSource?: ExecutionInputFieldSource;
@@ -81,13 +86,13 @@ export interface BuildExecutionInputSourcesArgs {
   touchedFields: ReadonlySet<ThreadPromptField>;
 }
 
-export interface SyncThreadPromptSelectionsArgs {
+interface SyncThreadPromptSelectionsArgs {
   currentSelections: ThreadPromptSelections;
   nextSelections: ThreadPromptSelections;
   touchedFields: ReadonlySet<ThreadPromptField>;
 }
 
-export interface UpdateThreadPromptSelectionsArgs {
+interface UpdateThreadPromptSelectionsArgs {
   currentSelections: ThreadPromptSelections;
   field: ThreadPromptField;
   value: ThreadPromptSelections[ThreadPromptField];
@@ -102,7 +107,7 @@ interface ResolveCreateExecutionInputSourceArgs {
 
 interface ResolvePermissionModeSelectionArgs {
   rawPermissionMode: PermissionMode;
-  supportedPermissionModes: readonly PermissionMode[];
+  permissionModes: readonly PermissionMode[];
 }
 
 function hasValue(value: string): boolean {
@@ -228,8 +233,6 @@ export function buildExecutionInputSources({
     touchedFields.has("serviceTier") ||
     touchedFields.has("reasoningLevel") ||
     touchedFields.has("permissionMode");
-  // Existing-thread submissions are all-or-nothing once an execution control is
-  // touched, so the server never merges stale last-run values with new UI picks.
   const forcesExplicitExecutionFields =
     scope === "component-local" && hasTouchedExecutionField;
 
@@ -298,28 +301,21 @@ export function buildExecutionInputSources({
 
 export function resolvePermissionModeSelection({
   rawPermissionMode,
-  supportedPermissionModes,
+  permissionModes,
 }: ResolvePermissionModeSelectionArgs): PermissionMode {
-  if (supportedPermissionModes.includes(rawPermissionMode)) {
+  if (permissionModes.includes(rawPermissionMode)) {
     return rawPermissionMode;
   }
-  // Auto is the product default. Providers without native automatic review
-  // fall back to Full Access rather than implying that Accept Edits provides
-  // equivalent automatic approval behavior.
-  if (supportedPermissionModes.includes("auto")) {
+  if (permissionModes.includes("auto")) {
     return "auto";
   }
-  if (supportedPermissionModes.includes("full")) {
+  if (permissionModes.includes("full")) {
     return "full";
   }
-  return supportedPermissionModes[0] ?? "auto";
+  return permissionModes[0] ?? "auto";
 }
 
 export function formatModelLabel(value: string): string {
-  // Case-normalises a raw model id into a displayable label. The brand prefix
-  // strip ("Claude " / "GPT-") is a presentation rule applied by the picker
-  // itself (see `stripModelBrandPrefix`) so stories and prod render identically
-  // without anyone having to remember to format.
   return value
     .split("-")
     .map((part) => {

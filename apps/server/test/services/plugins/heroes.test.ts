@@ -1,15 +1,9 @@
 import { createHmac } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getLatestThreadSequence, getThread } from "@bb/db";
 import { turnScope } from "@bb/domain";
-import {
-  generatedSkillsRootPath,
-  pluginCommandsSkillDir,
-} from "../../../src/services/plugins/plugin-commands-skill.js";
-import { resolveInjectedSkillSources } from "../../../src/services/skills/injected-skills.js";
 import { applyLoggedThreadLifecycleEvent } from "../../../src/services/threads/lifecycle-outcome.js";
 import {
   seedEvent,
@@ -23,16 +17,14 @@ import {
   testLogger,
   type TestAppHarness,
 } from "../../helpers/test-app.js";
+import { installFakeGitWorktreeProvider } from "../../helpers/environment-provider.js";
 
 const BASE = "http://127.0.0.1:3334";
 
-/** The repo's real hero example plugins — installed exactly as shipped. */
 const EXAMPLES_DIR = fileURLToPath(
   new URL("../../../../../examples/plugins", import.meta.url),
 );
 
-// The examples pin engines.bb to ">=0.9"; the harness default app version
-// ("0.0.0-test") would legitimately mark them incompatible.
 const APP_VERSION = "1.0.0";
 
 function slackHeaders(
@@ -90,18 +82,6 @@ describe("hero plugin: agent-enrichment", () => {
     };
   }
 
-  it("bb docs search returns excerpts from the bundled docs via the CLI endpoint", async () => {
-    const result = await runDocs(["search", "conventional commits"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("conventions.md");
-    expect(result.stdout).toContain("conventional commits");
-
-    // The kv cache backs `bb docs last`.
-    const last = await runDocs(["last"]);
-    expect(last.exitCode).toBe(0);
-    expect(last.stdout).toContain('"conventional commits"');
-  });
-
   it("the caseSensitive boolean setting changes search behavior without a reload", async () => {
     const insensitive = await runDocs(["search", "CONVENTIONAL COMMITS"]);
     expect(insensitive.stdout).toContain("conventions.md");
@@ -113,54 +93,12 @@ describe("hero plugin: agent-enrichment", () => {
     expect(sensitive.exitCode).toBe(0);
     expect(sensitive.stdout).toContain("No matches");
   });
-
-  it("its command reaches agents through the generated plugin-commands skill", async () => {
-    const skillFile = join(
-      pluginCommandsSkillDir(harness.config.dataDir),
-      "SKILL.md",
-    );
-    const content = await readFile(skillFile, "utf8");
-    expect(content).toContain("## bb docs —");
-    expect(content).toContain("bb docs search <query...>");
-
-    // Resolved the same way thread-runtime-config wires the generated root.
-    const sources = resolveInjectedSkillSources(testLogger, {
-      additionalSkillsRootPaths: [
-        generatedSkillsRootPath(harness.config.dataDir),
-      ],
-      builtinSkillsRootPath: join(harness.config.dataDir, "builtin-skills"),
-      dataDir: harness.config.dataDir,
-      skillTreeRegistry: harness.deps.skillTreeRegistry,
-    });
-    expect(
-      sources.find((source) => source.name === "plugin-commands"),
-    ).toMatchObject({ kind: "tree", entryPath: "SKILL.md" });
-  });
-
-  it("auto-imports its skills/ directory through the plugin skills tier", () => {
-    const pluginSkillRoots = harness.pluginService.listSkillRootContributions();
-    expect(pluginSkillRoots).toContainEqual(
-      expect.objectContaining({
-        rootPath: join(EXAMPLES_DIR, "agent-enrichment", "skills"),
-      }),
-    );
-    // Resolved the same way thread-runtime-config wires the plugin tier.
-    const sources = resolveInjectedSkillSources(testLogger, {
-      builtinSkillsRootPath: join(harness.config.dataDir, "builtin-skills"),
-      dataDir: harness.config.dataDir,
-      pluginSkillRoots,
-      skillTreeRegistry: harness.deps.skillTreeRegistry,
-    });
-    const skill = sources.find((source) => source.name === "repo-conventions");
-    expect(skill).toBeDefined();
-    expect(skill?.description).toContain("Conventions");
-    expect(skill).toMatchObject({ kind: "tree", entryPath: "SKILL.md" });
-  });
 });
 
 describe("hero plugin: slack-bot", () => {
   it("webhook → spawn → thread.idle → chat.postMessage, end to end", async () => {
     const server = await startTestServer({ appVersion: APP_VERSION });
+    installFakeGitWorktreeProvider();
     const realFetch = globalThis.fetch;
     const slackCalls: Array<{ url: string; body: Record<string, unknown> }> =
       [];
@@ -172,9 +110,6 @@ describe("hero plugin: slack-bot", () => {
         path: "/tmp/slack-bot-hero-source",
       });
 
-      // Mock ONLY the outbound Slack Web API (the true external boundary);
-      // everything else — including the plugin's loopback bb.sdk calls —
-      // passes through to the real fetch.
       globalThis.fetch = (async (
         input: Parameters<typeof fetch>[0],
         init?: Parameters<typeof fetch>[1],
@@ -202,11 +137,9 @@ describe("hero plugin: slack-bot", () => {
         join(EXAMPLES_DIR, "slack-bot"),
       );
       expect(entry.id).toBe("slack-bot");
-      // Unconfigured: loaded, but honestly reporting what it needs.
       expect(entry.status).toBe("needs-configuration");
       expect(entry.statusDetail).toContain("bb plugin config slack-bot");
 
-      // Configure (as `bb plugin config slack-bot set ...` would) + reload.
       const signingSecret = "test-signing-secret";
       await server.pluginService.updateSettings("slack-bot", {
         botToken: "xoxb-test-token",
@@ -221,7 +154,6 @@ describe("hero plugin: slack-bot", () => {
 
       const eventsUrl = `${server.baseUrl}/api/v1/plugins/slack-bot/http/events`;
 
-      // An unsigned request never reaches the event handlers.
       const forged = await realFetch(eventsUrl, {
         method: "POST",
         headers: {
@@ -233,7 +165,6 @@ describe("hero plugin: slack-bot", () => {
       });
       expect(forged.status).toBe(401);
 
-      // Slack's URL-verification handshake round-trips the challenge.
       const challengeBody = JSON.stringify({
         type: "url_verification",
         challenge: "challenge-123",
@@ -248,8 +179,6 @@ describe("hero plugin: slack-bot", () => {
         challenge: "challenge-123",
       });
 
-      // An app_mention spawns an attributed BB thread and records the
-      // Slack-thread ↔ BB-thread mapping in kv.
       const mentionBody = JSON.stringify({
         type: "event_callback",
         event: {
@@ -277,12 +206,11 @@ describe("hero plugin: slack-bot", () => {
       expect(threadRow?.originPluginId).toBe("slack-bot");
       expect(threadRow?.title).toBe("Slack: summarize the release notes");
 
-      // Drive the spawned thread to idle through the real lifecycle seam
-      // (no live provider in tests) with an assistant message on record.
       const lifecycleDeps = {
         db: server.db,
         hub: server.hub,
         logger: testLogger,
+        providerRegistry: server.deps.providerRegistry,
       };
       applyLoggedThreadLifecycleEvent(lifecycleDeps, {
         threadId: threadId as string,
@@ -312,7 +240,6 @@ describe("hero plugin: slack-bot", () => {
       });
       expect(outcome.applied).toBe(true);
 
-      // thread.idle → chat.postMessage into the originating Slack thread.
       await vi.waitFor(() => expect(slackCalls).toHaveLength(1));
       expect(slackCalls[0]?.url).toBe("https://slack.com/api/chat.postMessage");
       expect(slackCalls[0]?.body).toEqual({
@@ -321,7 +248,6 @@ describe("hero plugin: slack-bot", () => {
         text: "Release notes: all green.",
       });
 
-      // The failure-isolation stats saw the handler and recorded no errors.
       const listed = server.pluginService
         .list()
         .find((p) => p.id === "slack-bot");

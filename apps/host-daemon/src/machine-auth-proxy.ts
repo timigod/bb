@@ -8,10 +8,9 @@ import type { AddressInfo, Socket } from "node:net";
 import type { Duplex } from "node:stream";
 
 const LOOPBACK_HOST = "127.0.0.1";
-const MACHINE_HEADER = "x-bb-connect-machine";
 
-export interface StartMachineAuthProxyOptions {
-  machineCredential: string;
+interface StartMachineAuthProxyOptions {
+  serverHeaders: Record<string, string>;
   serverUrl: string;
   port?: number;
 }
@@ -21,11 +20,6 @@ export interface MachineAuthProxy {
   close(): Promise<void>;
 }
 
-// Headers no non-browser client sends. `Origin` rides every browser write and
-// WebSocket handshake; `Sec-Fetch-Site` rides every browser fetch, including a
-// blind `no-cors` GET that carries no `Origin`. `Sec-Fetch-Mode` is NOT a
-// discriminator: Node's own `fetch` sends `sec-fetch-mode: cors`, so keying on
-// it would reject the runtime processes this proxy exists to serve.
 const BROWSER_REQUEST_HEADERS = ["origin", "sec-fetch-site"] as const;
 
 const REJECTED_SOCKET_MESSAGES = {
@@ -36,20 +30,10 @@ const REJECTED_SOCKET_MESSAGES = {
 
 type RejectedSocketStatus = keyof typeof REJECTED_SOCKET_MESSAGES;
 
-/**
- * Whether a web page made this request. This proxy exists for the Node runtime
- * processes it hands `BB_SERVER_URL` to, and it stamps every forwarded request
- * with a machine credential. A page can reach any loopback port it can guess,
- * and a `no-cors` request still acts even though its response stays hidden, so
- * a browsed page must never borrow that credential.
- */
-export function isBrowserRequest(headers: IncomingHttpHeaders): boolean {
+function isBrowserRequest(headers: IncomingHttpHeaders): boolean {
   return BROWSER_REQUEST_HEADERS.some((name) => headers[name] !== undefined);
 }
 
-// The only authorities that reach this proxy legitimately. It binds 127.0.0.1
-// and hands out `http://127.0.0.1:<port>`, so every real caller sends one of
-// these.
 const LOOPBACK_AUTHORITY_HOSTNAMES = new Set([
   "127.0.0.1",
   "localhost",
@@ -73,15 +57,7 @@ function parseHostAuthority(
   }
 }
 
-/**
- * Whether the request's `Host` is this proxy's own loopback authority.
- *
- * A page on a public hostname that DNS-rebinds to 127.0.0.1 reaches this socket
- * carrying that public name in `Host`. {@link isBrowserRequest} cannot see it:
- * `http://rebind.example` is not a potentially trustworthy URL, so Chromium
- * sends no `Sec-Fetch-*`, and a `no-cors` GET sends no `Origin` either.
- */
-export function isProxyLoopbackAuthority(
+function isProxyLoopbackAuthority(
   host: string | undefined,
   boundPort: number,
 ): boolean {
@@ -113,67 +89,79 @@ function writeRejectedSocket(
   );
 }
 
-function upstreamHeaders(
-  headers: IncomingHttpHeaders,
+function rejectedProxyStatus(
+  request: IncomingMessage,
+  boundPort: number | null,
+): Extract<RejectedSocketStatus, 400 | 403> | null {
+  if (
+    boundPort === null ||
+    isBrowserRequest(request.headers) ||
+    !isProxyLoopbackAuthority(request.headers.host, boundPort)
+  ) {
+    return 403;
+  }
+  if (!isOriginFormTarget(request.url)) {
+    return 400;
+  }
+  return null;
+}
+
+function openUpstreamRequest(
+  request: IncomingMessage,
   target: URL,
-  machineCredential: string,
-): IncomingHttpHeaders {
-  return {
-    ...headers,
-    host: target.host,
-    [MACHINE_HEADER]: machineCredential,
-  };
+  serverHeaders: Record<string, string>,
+): http.ClientRequest {
+  const requestFn = target.protocol === "https:" ? https.request : http.request;
+  return requestFn({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port,
+    method: request.method,
+    path: request.url,
+    headers: {
+      ...request.headers,
+      host: target.host,
+      ...serverHeaders,
+    },
+  });
 }
 
 function proxyRequest(args: {
   boundPort: number | null;
-  machineCredential: string;
+  serverHeaders: Record<string, string>;
   request: IncomingMessage;
   response: ServerResponse;
   target: URL;
 }): void {
-  if (
-    args.boundPort === null ||
-    isBrowserRequest(args.request.headers) ||
-    !isProxyLoopbackAuthority(args.request.headers.host, args.boundPort)
-  ) {
-    args.response.writeHead(403).end();
-    return;
-  }
-  if (!isOriginFormTarget(args.request.url)) {
-    args.response.writeHead(400).end();
+  const rejectedStatus = rejectedProxyStatus(args.request, args.boundPort);
+  if (rejectedStatus !== null) {
+    args.response.writeHead(rejectedStatus).end();
     return;
   }
 
-  const requestFn =
-    args.target.protocol === "https:" ? https.request : http.request;
-  const upstream = requestFn(
-    {
-      protocol: args.target.protocol,
-      hostname: args.target.hostname,
-      port: args.target.port,
-      method: args.request.method,
-      path: args.request.url,
-      headers: upstreamHeaders(
-        args.request.headers,
-        args.target,
-        args.machineCredential,
-      ),
-    },
-    (upstreamResponse) => {
-      args.response.writeHead(
-        upstreamResponse.statusCode ?? 502,
-        upstreamResponse.statusMessage,
-        upstreamResponse.headers,
-      );
-      upstreamResponse.pipe(args.response);
-    },
+  const upstream = openUpstreamRequest(
+    args.request,
+    args.target,
+    args.serverHeaders,
   );
+  upstream.once("response", (upstreamResponse) => {
+    args.response.writeHead(
+      upstreamResponse.statusCode ?? 502,
+      upstreamResponse.statusMessage,
+      upstreamResponse.headers,
+    );
+    upstreamResponse.on("error", () => args.response.destroy());
+    upstreamResponse.on("close", () => {
+      if (!upstreamResponse.complete) args.response.destroy();
+    });
+    upstreamResponse.pipe(args.response);
+  });
   upstream.on("error", () => {
-    if (!args.response.headersSent) {
-      args.response.writeHead(502);
+    if (args.response.headersSent) {
+      args.response.destroy();
+      return;
     }
-    args.response.end();
+    args.response.writeHead(502).end();
   });
   args.request.pipe(upstream);
 }
@@ -182,38 +170,29 @@ function proxyUpgrade(args: {
   boundPort: number | null;
   clientSocket: Duplex;
   head: Buffer;
-  machineCredential: string;
+  serverHeaders: Record<string, string>;
   request: IncomingMessage;
   target: URL;
 }): void {
-  if (
-    args.boundPort === null ||
-    isBrowserRequest(args.request.headers) ||
-    !isProxyLoopbackAuthority(args.request.headers.host, args.boundPort)
-  ) {
-    writeRejectedSocket(args.clientSocket, 403);
-    return;
-  }
-  if (!isOriginFormTarget(args.request.url)) {
-    writeRejectedSocket(args.clientSocket, 400);
+  const rejectedStatus = rejectedProxyStatus(args.request, args.boundPort);
+  if (rejectedStatus !== null) {
+    writeRejectedSocket(args.clientSocket, rejectedStatus);
     return;
   }
 
-  const requestFn =
-    args.target.protocol === "https:" ? https.request : http.request;
-  const upstreamRequest = requestFn({
-    protocol: args.target.protocol,
-    hostname: args.target.hostname,
-    port: args.target.port,
-    method: args.request.method,
-    path: args.request.url,
-    headers: upstreamHeaders(
-      args.request.headers,
-      args.target,
-      args.machineCredential,
-    ),
-  });
+  const upstreamRequest = openUpstreamRequest(
+    args.request,
+    args.target,
+    args.serverHeaders,
+  );
   upstreamRequest.on("upgrade", (response, upstreamSocket, upstreamHead) => {
+    upstreamSocket.on("error", () => upstreamSocket.destroy());
+    upstreamSocket.on("close", () => args.clientSocket.destroy());
+    args.clientSocket.on("close", () => upstreamSocket.destroy());
+    if (args.clientSocket.destroyed) {
+      upstreamSocket.destroy();
+      return;
+    }
     const statusLine = `HTTP/${response.httpVersion} ${response.statusCode ?? 101} ${response.statusMessage ?? "Switching Protocols"}\r\n`;
     const headerLines = response.rawHeaders
       .reduce<string[]>((lines, value, index) => {
@@ -231,6 +210,8 @@ function proxyUpgrade(args: {
     writeRejectedSocket(args.clientSocket, 400),
   );
   upstreamRequest.on("error", () => args.clientSocket.destroy());
+  args.clientSocket.on("error", () => args.clientSocket.destroy());
+  args.clientSocket.on("close", () => upstreamRequest.destroy());
   upstreamRequest.end();
 }
 
@@ -244,13 +225,11 @@ export async function startMachineAuthProxy(
     );
   }
   const sockets = new Set<Socket>();
-  // Read at request time, so the handlers see the port the socket actually
-  // bound rather than the (possibly zero) requested one.
   let boundPort: number | null = null;
   const server = http.createServer((request, response) =>
     proxyRequest({
       boundPort,
-      machineCredential: options.machineCredential,
+      serverHeaders: options.serverHeaders,
       request,
       response,
       target,
@@ -262,7 +241,7 @@ export async function startMachineAuthProxy(
       boundPort,
       clientSocket: socket,
       head,
-      machineCredential: options.machineCredential,
+      serverHeaders: options.serverHeaders,
       request,
       target,
     }),
@@ -283,10 +262,6 @@ export async function startMachineAuthProxy(
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    // Accepted trade-off: any same-user local process can use this proxy while
-    // the daemon runs. It is restricted to one server origin and exposes no
-    // durable credential that can be exfiltrated from an agent environment.
-    // Browsed pages are NOT included in that trade: they are rejected above.
     server.listen(options.port ?? 0, LOOPBACK_HOST);
   });
 

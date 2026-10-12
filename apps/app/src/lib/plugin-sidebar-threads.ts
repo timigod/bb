@@ -1,69 +1,47 @@
 import type { ThreadListEntry } from "@bb/domain";
-import type {
-  PluginSidebarThread,
-  PluginSidebarThreadIndicator,
-} from "@bb/plugin-sdk";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
 import {
   getThreadListIndicatorLabel,
-  hasActiveBackgroundAgentActivity,
-  hasActiveBackgroundCommandActivity,
-  hasActiveGoalActivity,
-  hasActivePlanModeActivity,
-  hasActiveWorkflowActivity,
-  isRuntimeBusyThread,
-  isUnreadDoneThread,
   resolveThreadListIndicator,
-} from "./thread-activity";
-import { isThreadRead } from "./thread-read-state";
+  threadListIndicatorStateForThread,
+} from "@bb/client-core";
+import { isThreadRead } from "@bb/client-core";
+import {
+  EMPTY_TITLE_MENTION_RESOURCES,
+  resolveThreadTitleDisplayText,
+  type ThreadTitleMentionResources,
+} from "@/components/thread/ThreadTitleMentions";
+import { getThreadDisplayTitle } from "./thread-title";
+import { getThreadRoutePath } from "./route-paths";
 
-/**
- * The ONE place a host `ThreadListEntry` becomes the plugin-facing
- * `PluginSidebarThread`. Two mappers would drift; this one is unit-tested
- * against the host's own indicator precedence.
- *
- * `hasUnsubmittedDraft` is deliberately not part of the mapping: an
- * unsubmitted composer draft is per-client, per-composer state that the
- * built-in row reads with its own hook, and one array-wide mapper cannot call
- * a hook per thread.
- *
- * So `indicator` never reports "draft" or "working-draft". The one visible
- * consequence: an idle, unread, successful thread that also holds a draft
- * reads as "unread-success" here where the built-in row paints "draft". Every
- * other state is unaffected, because a draft outranks nothing else.
- */
 export function toPluginSidebarThread(
   entry: ThreadListEntry,
-  /**
-   * Machine names by host id. The plugin cannot resolve a bare host id, so
-   * the host resolves it here and hands over a name the row can print.
-   */
   hostNamesById: ReadonlyMap<string, string> = new Map(),
+  titleResources: ThreadTitleMentionResources = EMPTY_TITLE_MENTION_RESOURCES,
 ): PluginSidebarThread {
-  const isUnreadDone = isUnreadDoneThread(entry);
-  const hasUnreadError = isUnreadDone && entry.status === "error";
-  const indicator: PluginSidebarThreadIndicator = resolveThreadListIndicator({
-    hasPendingInteraction: entry.hasPendingInteraction,
-    hasUnsubmittedDraft: false,
-    hasUnreadError,
-    hasUnreadSuccess: isUnreadDone && !hasUnreadError,
-    isBackgroundAgentActive: hasActiveBackgroundAgentActivity(entry),
-    isBackgroundCommandActive: hasActiveBackgroundCommandActivity(entry),
-    isGoalActive: hasActiveGoalActivity(entry),
-    isPlanModeActive: hasActivePlanModeActivity(entry),
-    isRuntimeActive: isRuntimeBusyThread(entry),
-    isWorkflowActive: hasActiveWorkflowActivity(entry),
-  });
+  const indicator = resolveThreadListIndicator(
+    threadListIndicatorStateForThread(entry, false),
+  );
 
   return {
     id: entry.id,
     projectId: entry.projectId,
     title: entry.title,
     titleFallback: entry.titleFallback,
+    displayTitle: resolveThreadTitleDisplayText(
+      getThreadDisplayTitle(entry),
+      titleResources,
+    ),
     parentThreadId: entry.parentThreadId,
+    lifecycleOwnerThreadId: entry.lifecycleOwnerThreadId,
+    sourceThreadId: entry.sourceThreadId,
     sectionId: entry.sectionId,
     originKind: entry.originKind,
     originPluginId: entry.originPluginId,
     providerId: entry.providerId,
+    status: entry.status,
+    runtimeStatus: entry.runtime.displayStatus,
+    queuedWork: entry.queuedWork,
     hasPendingInteraction: entry.hasPendingInteraction,
     activity: {
       workflows: entry.activity.activeWorkflowCount,
@@ -74,12 +52,14 @@ export function toPluginSidebarThread(
     },
     indicator,
     indicatorLabel: getThreadListIndicatorLabel(indicator),
-    // Plain read state, not `isUnreadDoneThread`: a plugin list may show
-    // child threads and running threads, both of which that helper excludes
-    // by design (it answers "should this row show a done dot").
     isUnread: !isThreadRead(entry),
     isPinned: entry.pinnedAt !== null,
+    pinnedAt: entry.pinnedAt,
+    pinSortKey: entry.pinSortKey,
     isArchived: entry.archivedAt !== null,
+    archivedAt: entry.archivedAt,
+    href: getThreadRoutePath({ projectId: entry.projectId, threadId: entry.id }),
+    isHidden: entry.visibility === "hidden",
     environment:
       entry.environmentId === null
         ? null
@@ -87,6 +67,9 @@ export function toPluginSidebarThread(
             id: entry.environmentId,
             name: entry.environmentName,
             branchName: entry.environmentBranchName,
+            path: entry.environmentPath,
+            isWorktree: entry.environmentIsWorktree,
+            providerId: entry.environmentProviderId,
             workspaceDisplayKind: entry.environmentWorkspaceDisplayKind,
           },
     host:
@@ -94,8 +77,6 @@ export function toPluginSidebarThread(
         ? null
         : {
             id: entry.environmentHostId,
-            // An unknown host still gets a row: fall back to the id rather
-            // than dropping the machine entirely.
             name:
               hostNamesById.get(entry.environmentHostId) ??
               entry.environmentHostId,

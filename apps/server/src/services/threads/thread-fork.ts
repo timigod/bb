@@ -1,12 +1,7 @@
 import { getEnvironment, getThread } from "@bb/db";
-import {
-  PERSONAL_PROJECT_ID,
-  type Environment,
-  type PromptInput,
-  type Thread,
-} from "@bb/domain";
-import { supportsNativeFork } from "@bb/agent-providers";
-import type { EnvironmentArgs, ForkThreadRequest } from "@bb/server-contract";
+import type { EnvironmentRow } from "@bb/db";
+import type { PromptInput, Thread } from "@bb/domain";
+import type { ForkThreadRequest } from "@bb/server-contract";
 import type { LoggedPendingInteractionWorkSessionDeps } from "../../types.js";
 import { ApiError } from "../../errors.js";
 import { resolveExistingThreadPermissionMode } from "./thread-execution-plan.js";
@@ -33,8 +28,11 @@ function requireForkSourceThread(
   return sourceThread;
 }
 
-function requireForkCapableProvider(sourceThread: Thread): void {
-  if (!supportsNativeFork(sourceThread.providerId)) {
+function requireForkCapableProvider(
+  deps: Pick<ThreadForkDeps, "providerRegistry">,
+  sourceThread: Thread,
+): void {
+  if (!deps.providerRegistry.supportsFork(sourceThread.providerId)) {
     throw new ApiError(
       400,
       "invalid_request",
@@ -46,7 +44,7 @@ function requireForkCapableProvider(sourceThread: Thread): void {
 function requireSourceEnvironment(
   deps: Pick<ThreadForkDeps, "db">,
   sourceThread: Thread,
-): Environment {
+): EnvironmentRow {
   const environment =
     sourceThread.environmentId === null
       ? null
@@ -61,48 +59,13 @@ function requireSourceEnvironment(
   return environment;
 }
 
-function resolveForkEnvironment(
-  sourceEnvironment: Environment,
-  args: {
-    projectId: string;
-    workspace: ForkThreadRequest["workspace"];
-  },
-): EnvironmentArgs {
-  if (args.workspace === "reuse") {
-    return { type: "reuse", environmentId: sourceEnvironment.id };
-  }
-  if (
-    args.projectId === PERSONAL_PROJECT_ID ||
-    sourceEnvironment.workspaceProvisionType === "personal"
-  ) {
-    return {
-      type: "host",
-      hostId: sourceEnvironment.hostId,
-      workspace: { type: "personal" },
-    };
-  }
-  const sourceBranchName = sourceEnvironment.branchName?.trim();
-  return {
-    type: "host",
-    hostId: sourceEnvironment.hostId,
-    workspace: {
-      type: "managed-worktree",
-      baseBranch: sourceBranchName
-        ? { kind: "named", name: sourceBranchName }
-        : { kind: "default" },
-    },
-  };
-}
-
 export async function createThreadForkFromRequest(
   deps: ThreadForkDeps,
   request: ForkThreadRequest,
 ) {
   const sourceThread = requireForkSourceThread(deps, request.sourceThreadId);
-  requireForkCapableProvider(sourceThread);
+  requireForkCapableProvider(deps, sourceThread);
   const sourceEnvironment = requireSourceEnvironment(deps, sourceThread);
-  // A fork continues the source conversation, so it defaults to the source's
-  // recorded execution options rather than provider defaults.
   const sourceExecution = getLastExecutionOptions(deps, sourceThread.id);
   const visibleInput = request.input ?? [];
   const agentContextSeed = request.agentContextSeed ?? [];
@@ -113,15 +76,18 @@ export async function createThreadForkFromRequest(
   return createThreadFromRequest(
     deps,
     {
-      environment: resolveForkEnvironment(sourceEnvironment, {
-        projectId: sourceThread.projectId,
-        workspace: request.workspace,
-      }),
+      environment: request.environment ?? {
+        type: "reuse",
+        environmentId: sourceEnvironment.id,
+      },
       input,
       origin: request.origin,
       ...(request.originPluginId === undefined
         ? {}
         : { originPluginId: request.originPluginId }),
+      ...(request.pluginMetadata === undefined
+        ? {}
+        : { pluginMetadata: request.pluginMetadata }),
       originKind: "fork",
       permissionMode:
         request.permissionMode ??
@@ -138,6 +104,7 @@ export async function createThreadForkFromRequest(
       ...(request.sourceSeqEnd === undefined
         ? {}
         : { sourceSeqEnd: request.sourceSeqEnd }),
+      lifecycleOwnerThreadId: request.lifecycleOwnerThreadId,
       sourceThreadId: sourceThread.id,
       startedOnBehalfOf: isSeedOnlyIdleFork
         ? { initiator: "agent", senderThreadId: sourceThread.id }

@@ -1,4 +1,3 @@
-/** Use Vite as the tunneled origin when a source-dev bb pairs locally. */
 export function resolveLocalCloudLoopbackUrl(
   serverUrl: string | undefined,
   rawDevAppPort: string | undefined,
@@ -13,7 +12,11 @@ export function resolveLocalCloudLoopbackUrl(
   } catch {
     return null;
   }
-  if (url.protocol !== "http:" || !url.hostname.endsWith(".localhost")) {
+  const localCloud =
+    url.protocol === "http:" && url.hostname.endsWith(".localhost");
+  const stagingCloud =
+    url.protocol === "https:" && url.hostname.endsWith(".vibecodethis.site");
+  if (!localCloud && !stagingCloud) {
     return null;
   }
   return `http://127.0.0.1:${port}`;

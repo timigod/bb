@@ -1,7 +1,14 @@
-import { eq, isNotNull } from "drizzle-orm";
+import {
+  requestEnvironmentRemoval,
+  sweepProviderEnvironment,
+} from "../environments/environment-engine.js";
+import { cancelAbandonedProviderCreations } from "../threads/thread-environment-providers.js";
+import { eq, isNotNull, inArray } from "drizzle-orm";
 import {
   deleteProject,
   getProject,
+  getEnvironment,
+  lifecycleThreadTreeIdsForProject,
   listEnvironments,
   markProjectDeleted,
   markThreadDeleted,
@@ -9,21 +16,14 @@ import {
   threads,
   type DbQueryConnection,
 } from "@bb/db";
-import type { Environment, Thread, ThreadStatus } from "@bb/domain";
+import type { Thread, ThreadStatus } from "@bb/domain";
 import type {
   AppDeps,
   LoggedPendingInteractionWorkSessionDeps,
 } from "../../types.js";
 import { deleteProjectAttachments } from "./attachments.js";
-import {
-  requestEnvironmentCleanup,
-  runEnvironmentCleanupAdvance,
-} from "../environments/environment-cleanup-internal.js";
 import { deferAfterResponse } from "../lib/response-deferral.js";
-import {
-  finalizeStoppedThread,
-  requestActiveRuntimeThreadStopIfNeeded,
-} from "../threads/thread-lifecycle.js";
+import { requestThreadStorageDeletion } from "../threads/thread-lifecycle.js";
 import { NotificationBuffer } from "../lib/notification-buffer.js";
 import { emitPluginThreadDeleted } from "../plugins/plugin-thread-events.js";
 
@@ -60,12 +60,14 @@ function listProjectDeletionThreads(
       status: threads.status,
     })
     .from(threads)
-    .where(eq(threads.projectId, args.projectId))
+    .where(
+      inArray(threads.id, lifecycleThreadTreeIdsForProject(args.projectId)),
+    )
     .all();
 }
 
 function tombstoneProjectThreadsForDeletion(
-  deps: Pick<AppDeps, "db" | "hub">,
+  deps: ProjectDeletionDeps,
   args: ProjectDeletionArgs,
 ): { deletedThreads: Thread[]; projectThreads: ProjectDeletionThread[] } {
   const notificationBuffer = new NotificationBuffer();
@@ -90,7 +92,10 @@ function tombstoneProjectThreadsForDeletion(
     { behavior: "immediate" },
   );
   notificationBuffer.flushInto(deps.hub);
-  for (const thread of result.deletedThreads) emitPluginThreadDeleted(thread);
+  for (const thread of result.deletedThreads) {
+    emitPluginThreadDeleted(thread);
+    cancelAbandonedProviderCreations(deps, thread.id);
+  }
   return result;
 }
 
@@ -107,12 +112,6 @@ function hasRemainingProjectThreads(
   );
 }
 
-function hasRemainingManagedEnvironments(environments: Environment[]): boolean {
-  return environments.some(
-    (environment) => environment.managed && environment.status !== "destroyed",
-  );
-}
-
 export function beginProjectDeletion(
   deps: ProjectDeletionDeps,
   args: ProjectDeletionArgs,
@@ -121,20 +120,19 @@ export function beginProjectDeletion(
     return;
   }
 
-  const projectEnvironments = listEnvironments(deps.db, args.projectId);
+  const projectEnvironments = listEnvironments(deps.db, {
+    projectId: args.projectId,
+  });
   const environmentsById = new Map(
     projectEnvironments.map((environment) => [environment.id, environment]),
   );
   const { projectThreads } = tombstoneProjectThreadsForDeletion(deps, args);
   for (const thread of projectThreads) {
     const environment = thread.environmentId
-      ? (environmentsById.get(thread.environmentId) ?? null)
+      ? (environmentsById.get(thread.environmentId) ??
+        getEnvironment(deps.db, thread.environmentId))
       : null;
-    if (environment) {
-      // Project deletion finalization owns non-runtime cleanup; only active
-      // runtime work needs a daemon stop request here.
-      requestActiveRuntimeThreadStopIfNeeded(deps, thread, environment);
-    }
+    requestThreadStorageDeletion(deps, thread, environment);
   }
 }
 
@@ -167,7 +165,9 @@ export async function advanceProjectDeletion(
     return true;
   }
 
-  const projectEnvironments = listEnvironments(deps.db, args.projectId);
+  const projectEnvironments = listEnvironments(deps.db, {
+    projectId: args.projectId,
+  });
   const environmentsById = new Map(
     projectEnvironments.map((environment) => [environment.id, environment]),
   );
@@ -176,7 +176,8 @@ export async function advanceProjectDeletion(
   });
   for (const thread of projectThreads) {
     const environment = thread.environmentId
-      ? (environmentsById.get(thread.environmentId) ?? null)
+      ? (environmentsById.get(thread.environmentId) ??
+        getEnvironment(deps.db, thread.environmentId))
       : null;
 
     if (thread.deletedAt === null) {
@@ -185,38 +186,22 @@ export async function advanceProjectDeletion(
       });
       if (deletedThread) emitPluginThreadDeleted(deletedThread);
     }
+    cancelAbandonedProviderCreations(deps, thread.id);
     deps.terminalSessions.closeDeletedThreadTerminals({ threadId: thread.id });
-    if (environment) {
-      // Project deletion finalization owns non-runtime cleanup; only active
-      // runtime work needs a daemon stop request here.
-      requestActiveRuntimeThreadStopIfNeeded(deps, thread, environment);
-    }
-    finalizeStoppedThread(deps, {
-      threadId: thread.id,
-    });
+    requestThreadStorageDeletion(deps, thread, environment);
   }
 
-  for (const environment of projectEnvironments) {
-    if (!environment.managed || environment.status === "destroyed") {
-      continue;
-    }
-
-    requestEnvironmentCleanup(deps, {
-      environmentId: environment.id,
-    });
-    await runEnvironmentCleanupAdvance(deps, {
-      environmentId: environment.id,
-    });
-  }
-
-  const refreshedEnvironments = listEnvironments(deps.db, args.projectId);
-  if (
-    hasRemainingProjectThreads(deps, args.projectId) ||
-    hasRemainingManagedEnvironments(refreshedEnvironments)
-  ) {
+  if (hasRemainingProjectThreads(deps, args.projectId)) {
     return false;
   }
 
+  for (const environment of projectEnvironments) {
+    if (environment.environmentProviderId === null) continue;
+    if (!requestEnvironmentRemoval(deps, environment.id)) return false;
+    await sweepProviderEnvironment(deps, environment.id);
+    const current = getEnvironment(deps.db, environment.id);
+    if (current !== null && current.teardownStatus !== "removed") return false;
+  }
   deleteProject(deps.db, deps.hub, args.projectId);
   await deleteProjectAttachments(deps.config.dataDir, args.projectId);
   return true;

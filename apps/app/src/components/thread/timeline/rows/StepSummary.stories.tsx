@@ -4,7 +4,8 @@ import {
   commandRow,
   conversationRow,
   fileChangeRow,
-  toolRow,
+  fileReadRow,
+  searchRow,
 } from "@/test/fixtures/thread-timeline-rows";
 import { StoryCard, StoryRow } from "../../../../../.ladle/story-card";
 
@@ -21,11 +22,6 @@ const baseProps = {
   workspaceRootPath: undefined,
 };
 
-// The projection composes a step's id from its first child row, same shape as
-// bundle ids. Mirroring the formula here lets stories target the projected
-// step with `initialExpanded` without flipping the scope to active. If the
-// projection's id formula changes, thread-view's tests will catch it before
-// this helper does.
 function workSummaryId(children: readonly TimelineRow[]): string {
   const first = children[0];
   if (!first) {
@@ -39,27 +35,11 @@ function workSummaryId(children: readonly TimelineRow[]): string {
   ].join(":");
 }
 
-interface ExplorationToolRowArgs {
-  callId: string;
-  seq: number;
-  toolName: "Read" | "Grep" | "Glob";
-  toolArgs: Record<string, string | number | boolean>;
-  intentPath: string | null;
-  intentType: "read" | "search" | "list_files";
-  output: string;
-}
-
-// ---------------------------------------------------------------------------
-// Step summaries are produced by `buildTimelineViewRows` when an
-// assistant-message boundary closes an open step that holds multiple
-// summarizable work rows. Concept transitions inside the step (commands ->
-// file-changes -> commands, exploration -> file-changes, etc.) become bundles
-// inside the step-summary's children.
-//
-// Raw rows below are pulled from thr_zeb7z9afmw turn 019dd185 — sequences
-// 35564..36155. The trailing assistant message is just an em-dash so the
-// boundary is visible without dominating the story canvas.
-// ---------------------------------------------------------------------------
+type ExplorationRowArgs = { callId: string; seq: number } & (
+  | { kind: "read"; path: string }
+  | { kind: "search"; query: string; path: string | null }
+  | { kind: "list"; pattern: string; path: string | null }
+);
 
 const THREAD_ID = "thr_zeb7z9afmw";
 const TURN_ID = "019dd185-ef12-7d50-aa48-47882e9c8aaf";
@@ -77,7 +57,6 @@ const closingAssistantMessage: TimelineRow = conversationRow({
   attachments: null,
 });
 
-// ---- Commands: real turbo build/test commands from the same turn ----------
 const commandTurboBuild: TimelineRow = commandRow({
   id: `${THREAD_ID}:command:call_buildDomainCoreUi`,
   threadId: THREAD_ID,
@@ -203,7 +182,6 @@ const commandGitDiffStat: TimelineRow = commandRow({
   durationMs: 500,
 });
 
-// ---- File changes: real diffs from the same turn --------------------------
 const fileChangeAssistantStream: TimelineRow = fileChangeRow({
   id: `${THREAD_ID}:fileChange:35564`,
   threadId: THREAD_ID,
@@ -313,105 +291,74 @@ const fileChangeToViewMessages: TimelineRow = fileChangeRow({
   approvalStatus: null,
 });
 
-// ---- Exploration tools (Read / Grep / Glob with real intents) -------------
-function explorationToolRow(args: ExplorationToolRowArgs): TimelineRow {
-  return toolRow({
-    id: `${THREAD_ID}:tool:${args.callId}`,
+function explorationRow(args: ExplorationRowArgs): TimelineRow {
+  const base = {
     threadId: THREAD_ID,
     turnId: TURN_ID,
     sourceSeqStart: args.seq,
     sourceSeqEnd: args.seq,
     startedAt: 1777337100000 + args.seq,
     createdAt: 1777337100000 + args.seq + 50,
-    status: "completed",
+    status: "completed" as const,
     callId: args.callId,
-    toolName: args.toolName,
-    toolArgs: args.toolArgs,
-    output: args.output,
-    approvalStatus: null,
-    activityIntents:
-      args.intentType === "read"
-        ? [
-            {
-              type: "read",
-              command: args.toolName,
-              name: args.intentPath?.split("/").pop() ?? args.toolName,
-              path: args.intentPath,
-            },
-          ]
-        : args.intentType === "search"
-          ? [
-              {
-                type: "search",
-                command: args.toolName,
-                query:
-                  typeof args.toolArgs.pattern === "string"
-                    ? args.toolArgs.pattern
-                    : null,
-                path: args.intentPath,
-              },
-            ]
-          : [
-              {
-                type: "list_files",
-                command: args.toolName,
-                path: args.intentPath,
-              },
-            ],
     durationMs: 50,
-  });
+  };
+  switch (args.kind) {
+    case "read":
+      return fileReadRow({
+        ...base,
+        id: `${THREAD_ID}:file-read:${args.callId}`,
+        path: args.path,
+      });
+    case "search":
+      return searchRow({
+        ...base,
+        id: `${THREAD_ID}:search:${args.callId}`,
+        mode: "content",
+        query: args.query,
+        path: args.path,
+      });
+    case "list":
+      return searchRow({
+        ...base,
+        id: `${THREAD_ID}:search:${args.callId}`,
+        mode: "path",
+        query: args.pattern,
+        path: args.path,
+      });
+  }
 }
 
-const readAssistantStream = explorationToolRow({
+const readAssistantStream = explorationRow({
   callId: "call_read_assist_stream",
   seq: 35100,
-  toolName: "Read",
-  toolArgs: {
-    file_path: "packages/core-ui/src/assistant-stream-projection.ts",
-  },
-  intentPath: "packages/core-ui/src/assistant-stream-projection.ts",
-  intentType: "read",
-  output: "...file contents...",
+  kind: "read",
+  path: "packages/core-ui/src/assistant-stream-projection.ts",
 });
 
-const readIndex = explorationToolRow({
+const readIndex = explorationRow({
   callId: "call_read_index",
   seq: 35110,
-  toolName: "Read",
-  toolArgs: { file_path: "packages/core-ui/src/index.ts" },
-  intentPath: "packages/core-ui/src/index.ts",
-  intentType: "read",
-  output: "...file contents...",
+  kind: "read",
+  path: "packages/core-ui/src/index.ts",
 });
 
-const grepFinalized = explorationToolRow({
+const grepFinalized = explorationRow({
   callId: "call_grep_finalized",
   seq: 35120,
-  toolName: "Grep",
-  toolArgs: {
-    pattern: "finalizedReasoningMessageKeys",
-    path: "packages/core-ui/src",
-  },
-  intentPath: "packages/core-ui/src",
-  intentType: "search",
-  output: "src/assistant-stream-projection.ts:24\nsrc/to-view-messages.ts:131",
+  kind: "search",
+  query: "finalizedReasoningMessageKeys",
+  path: "packages/core-ui/src",
 });
 
-const globTests = explorationToolRow({
+const globTests = explorationRow({
   callId: "call_glob_tests",
   seq: 35130,
-  toolName: "Glob",
-  toolArgs: { pattern: "packages/core-ui/test/*.test.ts" },
-  intentPath: "packages/core-ui/test",
-  intentType: "list_files",
-  output: "test/to-view-messages.assistant-streams.test.ts",
+  kind: "list",
+  pattern: "packages/core-ui/test/*.test.ts",
+  path: "packages/core-ui/test",
 });
 
-// ---- Step compositions ----------------------------------------------------
-// Each array is "work rows that share an open step" + the closing assistant
-// message that flushes them into a step-summary.
-
-// 4 commands → 3 file-changes → 2 commands (3 bundles)
 const mixedThreeBundlesRows: TimelineRow[] = [
   commandTurboBuild,
   commandTurboTestServer,
@@ -425,7 +372,6 @@ const mixedThreeBundlesRows: TimelineRow[] = [
   closingAssistantMessage,
 ];
 
-// 2 reads → 2 file-changes (2 bundles)
 const exploreThenEditRows: TimelineRow[] = [
   readAssistantStream,
   readIndex,
@@ -434,7 +380,6 @@ const exploreThenEditRows: TimelineRow[] = [
   closingAssistantMessage,
 ];
 
-// 2 reads → 1 grep → 1 glob (single exploration bundle, ~4 children)
 const explorationOnlyRows: TimelineRow[] = [
   readAssistantStream,
   readIndex,
@@ -443,7 +388,6 @@ const explorationOnlyRows: TimelineRow[] = [
   closingAssistantMessage,
 ];
 
-// 2 commands → 4 file-changes (2 bundles) — typical "verify, then edit" shape
 const commandsThenFilesRows: TimelineRow[] = [
   commandTurboBuild,
   commandTurboTestServer,
@@ -454,7 +398,6 @@ const commandsThenFilesRows: TimelineRow[] = [
   closingAssistantMessage,
 ];
 
-// Single concept all the way (4 commands) — single bundle inside the step.
 const allCommandsRows: TimelineRow[] = [
   commandTurboBuild,
   commandTurboTestServer,

@@ -5,9 +5,34 @@ import {
   pluginPackageJsonSchema,
   type PluginPackageJson,
 } from "@bb/domain";
-import { assertValidPluginCompactIconSvg } from "./svg-asset.js";
+import { isPathWithinDirectory } from "@bb/process-utils";
+import {
+  assertValidPluginCompactIconSvg,
+  assertValidPluginIconSvg,
+  assertValidPluginLogoSvg,
+} from "./svg-asset.js";
 
-function resolveManifestPath(
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export async function readPluginPackageJsonFile(
+  packageJsonPath: string,
+): Promise<unknown> {
+  let raw: string;
+  try {
+    raw = await readFile(packageJsonPath, "utf8");
+  } catch {
+    throw new Error(`no readable package.json at ${packageJsonPath}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(`package.json is not valid JSON at ${packageJsonPath}`);
+  }
+}
+
+export function resolveManifestPath(
   rootDir: string,
   entry: string,
   label: string,
@@ -16,12 +41,52 @@ function resolveManifestPath(
     throw new Error(`manifest ${label} must be relative, got "${entry}"`);
   }
   const resolved = resolve(rootDir, entry);
-  if (resolved !== rootDir && !resolved.startsWith(rootDir + "/")) {
+  if (!isPathWithinDirectory(resolve(rootDir), resolved)) {
     throw new Error(
       `manifest ${label} escapes the plugin directory: "${entry}"`,
     );
   }
   return resolved;
+}
+
+export async function resolveManifestEntryFile(
+  rootDir: string,
+  entry: string,
+  label: string,
+): Promise<string> {
+  const resolved = resolveManifestPath(rootDir, entry, label);
+  try {
+    await stat(resolved);
+  } catch {
+    throw new Error(`manifest ${label} points at a missing file: ${entry}`);
+  }
+  return resolved;
+}
+
+export async function resolveManifestAssetFile(
+  rootDir: string,
+  assetPath: string,
+  label: string,
+): Promise<string> {
+  let assetStat;
+  try {
+    assetStat = await stat(assetPath);
+  } catch {
+    throw new Error(`manifest ${label} points at a missing file`);
+  }
+  if (!assetStat.isFile()) {
+    throw new Error(`manifest ${label} must point at a file`);
+  }
+  const [realRoot, realAsset] = await Promise.all([
+    realpath(rootDir),
+    realpath(assetPath),
+  ]);
+  if (!isPathWithinDirectory(realRoot, realAsset)) {
+    throw new Error(
+      `manifest ${label} escapes the plugin directory through a symlink`,
+    );
+  }
+  return realAsset;
 }
 
 export async function validatePluginBuildManifest(
@@ -54,28 +119,30 @@ export async function validatePluginBuildManifest(
         `manifest ${label} must point at a .svg, .png, or .webp file, got "${entry}"`,
       );
     }
-    const assetPath = resolveManifestPath(rootDir, entry, label);
-    let assetStat;
-    try {
-      assetStat = await stat(assetPath);
-    } catch {
-      throw new Error(`manifest ${label} points at a missing file`);
-    }
-    if (!assetStat.isFile()) {
-      throw new Error(`manifest ${label} must point at a file`);
-    }
-    const [realRoot, realAsset] = await Promise.all([
-      realpath(rootDir),
-      realpath(assetPath),
-    ]);
-    if (realAsset !== realRoot && !realAsset.startsWith(realRoot + "/")) {
-      throw new Error(
-        `manifest ${label} escapes the plugin directory through a symlink`,
-      );
-    }
+    const realAsset = await resolveManifestAssetFile(
+      rootDir,
+      resolveManifestPath(rootDir, entry, label),
+      label,
+    );
     if (label === "bb.branding.icon") {
       assertValidPluginCompactIconSvg(await readFile(realAsset), label);
+    } else if (/\.svg$/iu.test(entry)) {
+      assertValidPluginLogoSvg(
+        await readFile(realAsset),
+        `manifest ${label} (${JSON.stringify(entry)})`,
+      );
     }
+  }
+  for (const [name, entry] of Object.entries(
+    parsed.data.bb.branding.experimental_icons ?? {},
+  )) {
+    const label = `bb.branding.experimental_icons["${name}"]`;
+    const realAsset = await resolveManifestAssetFile(
+      rootDir,
+      resolveManifestPath(rootDir, entry, label),
+      label,
+    );
+    assertValidPluginIconSvg(await readFile(realAsset), label);
   }
   return parsed.data;
 }

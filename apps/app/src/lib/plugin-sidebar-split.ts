@@ -1,13 +1,56 @@
 import { useMemo } from "react";
+import { useAtomValue } from "jotai";
+import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
 import type {
+  PluginSidebarSplitLayout,
   PluginSidebarSplitPane,
   PluginSidebarThreadSplit,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import { usePaneContentSplitIndicator } from "@/components/sidebar/paneContentSplitIndicator";
 import { useThreadRowSplitDrag } from "@/components/sidebar/useThreadRowSplitDrag";
+import { useThreadTitleDisplayText } from "@/components/thread/ThreadTitleMentions";
 import { getThreadDisplayTitle } from "./thread-title";
 import { useSidebarThreadEntry } from "./plugin-sidebar-hooks";
-import type { PaneContent } from "./split-layout";
+import {
+  computePaneRects,
+  countPanes,
+  listPanes,
+  type PaneContent,
+  type SplitLayout,
+} from "./split-layout";
+import { splitLayoutAtom } from "./split-layout/atoms";
+
+export function toPluginSidebarSplitLayout(
+  layout: SplitLayout | null,
+): PluginSidebarSplitLayout | null {
+  if (layout === null || countPanes(layout.root) < 2) return null;
+  const rects = computePaneRects(layout.root);
+  return {
+    panes: listPanes(layout.root).flatMap((pane) => {
+      const rect = rects.get(pane.paneId);
+      return rect === undefined
+        ? []
+        : [
+            {
+              paneId: pane.paneId,
+              rect: { x: rect.x, y: rect.y, width: rect.w, height: rect.h },
+              threadId:
+                pane.content.kind === "thread" ? pane.content.threadId : null,
+              isFocused: pane.paneId === layout.focusedPaneId,
+            },
+          ];
+    }),
+  };
+}
+
+export function useSidebarSplitLayout(): PluginSidebarSplitLayout | null {
+  const isCompact = useIsCompactViewport();
+  const layout = useAtomValue(splitLayoutAtom);
+  return useMemo(
+    () => (isCompact ? null : toPluginSidebarSplitLayout(layout)),
+    [isCompact, layout],
+  );
+}
 
 const NO_SPLIT: PluginSidebarThreadSplit = {
   splitProps: {},
@@ -15,19 +58,14 @@ const NO_SPLIT: PluginSidebarThreadSplit = {
   layout: null,
 };
 
-/**
- * Per-row drag-to-split support for a plugin thread list — the same two host
- * hooks the built-in `ThreadRow` uses, re-exposed as a prop bag plus plain
- * data. The plugin owns the element; the host owns the gesture.
- */
 export function useSidebarThreadSplit(
   threadId: string,
 ): PluginSidebarThreadSplit {
   const entry = useSidebarThreadEntry(threadId);
-  // An unknown thread still has to run both hooks unconditionally, so it uses
-  // placeholder content that can never match a real pane.
   const projectId = entry?.projectId ?? "";
-  const title = entry ? getThreadDisplayTitle(entry) : "";
+  const title = useThreadTitleDisplayText(
+    entry ? getThreadDisplayTitle(entry) : "",
+  );
   const { onPointerDown } = useThreadRowSplitDrag({
     projectId,
     threadId,
@@ -46,8 +84,6 @@ export function useSidebarThreadSplit(
         ? null
         : indicator.miniMap.map((slot) => ({
             paneId: slot.paneId,
-            // Renamed from the host's terse w/h: a plugin contract should not
-            // inherit an internal abbreviation.
             rect: {
               x: slot.rect.x,
               y: slot.rect.y,

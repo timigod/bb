@@ -10,7 +10,11 @@ import {
   type WorkspaceOpenTargetIcon,
   type WorkspaceOpenTargetId,
 } from "@bb/host-daemon-contract";
-import { sanitizeInheritedChildProcessEnv } from "@bb/process-utils";
+import {
+  execPortableFile,
+  pathExists,
+  sanitizeInheritedChildProcessEnv,
+} from "@bb/process-utils";
 import {
   BASIC_FILE_OPEN_CAPABILITIES,
   FILE_MANAGER_OPEN_CAPABILITIES,
@@ -22,6 +26,12 @@ import {
   buildLocalTerminalShellArgs,
   buildRemoteTerminalSshArgs,
 } from "./terminal.js";
+import {
+  buildWindowsDefaultOpenInvocation,
+  buildWindowsFileManagerOpenInvocation,
+  buildWindowsTerminalOpenInvocation,
+  type WindowsTerminalProgram,
+} from "./windows-open-targets.js";
 import type {
   BuildMacRemoteSshOpenArgs,
   BuildMacTerminalOpenArgs,
@@ -62,6 +72,10 @@ export type {
   OpenPathInTargetArgs,
   WorkspaceOpenTargetRuntime,
 } from "./types.js";
+
+export interface WorkspaceOpenTargetRuntimeOptions {
+  shellPath?: string;
+}
 
 const execFileAsync = promisify(execFile);
 const DESKTOP_APP_TARGET_ID_PREFIX = "desktop-app:";
@@ -298,6 +312,45 @@ async function getFileManagerExecutable(
   return null;
 }
 
+async function getWindowsTerminalProgram(
+  runtime: WorkspaceOpenTargetRuntime,
+): Promise<WindowsTerminalProgram> {
+  return (await isExecutableAvailable("wt", runtime))
+    ? "windows-terminal"
+    : "powershell";
+}
+
+async function listWindowsPlatformWorkspaceOpenTargets(
+  runtime: WorkspaceOpenTargetRuntime,
+): Promise<WorkspaceOpenTarget[]> {
+  return [
+    {
+      id: "default-app",
+      label: "Default App",
+      kind: "default-app",
+      icon: { kind: "symbol", name: "default-app" },
+      capabilities: BASIC_FILE_OPEN_CAPABILITIES,
+    },
+    {
+      id: "file-manager",
+      label: "File Explorer",
+      kind: "file-manager",
+      icon: { kind: "symbol", name: "file-manager" },
+      capabilities: FILE_MANAGER_OPEN_CAPABILITIES,
+    },
+    {
+      id: "terminal",
+      label:
+        (await getWindowsTerminalProgram(runtime)) === "windows-terminal"
+          ? "Windows Terminal"
+          : "PowerShell",
+      kind: "terminal",
+      icon: { kind: "symbol", name: "terminal" },
+      capabilities: FILE_MANAGER_OPEN_CAPABILITIES,
+    },
+  ];
+}
+
 async function getTerminalExecutable(
   runtime: WorkspaceOpenTargetRuntime,
 ): Promise<string | null> {
@@ -364,6 +417,16 @@ function parseDesktopEntryValue(line: string): [string, string] | null {
   ];
 }
 
+const LINUX_WORKSPACE_APPLICATION_CATEGORIES = new Set([
+  "FileManager",
+  "TerminalEmulator",
+  "TextEditor",
+]);
+
+function parseDesktopEntryList(value: string | undefined): string[] {
+  return value?.split(";").filter(Boolean) ?? [];
+}
+
 function parseLinuxDesktopApplication(
   desktopFilePath: string,
   content: string,
@@ -398,7 +461,14 @@ function parseLinuxDesktopApplication(
 
   const label = fields.get("Name");
   const exec = fields.get("Exec");
-  if (!label || !exec) {
+  const categories = parseDesktopEntryList(fields.get("Categories"));
+  if (
+    !label ||
+    !exec ||
+    !categories.some((category) =>
+      LINUX_WORKSPACE_APPLICATION_CATEGORIES.has(category),
+    )
+  ) {
     return null;
   }
 
@@ -463,14 +533,25 @@ function toLinuxDesktopApplicationOpenTarget(
   };
 }
 
+const WINDOWS_EXEC_MAX_BUFFER_BYTES = 1024 * 1024;
+
 async function defaultExecFile(
   file: string,
   args: string[],
   options?: ExecFileOptions,
 ): Promise<ExecFileResult> {
-  const result = await execFileAsync(file, args, {
-    env: sanitizeInheritedChildProcessEnv({ env: options?.env ?? process.env }),
+  const env = sanitizeInheritedChildProcessEnv({
+    env: options?.env ?? process.env,
   });
+  if (process.platform === "win32") {
+    const result = await execPortableFile(file, args, {
+      cwd: os.homedir(),
+      env,
+      maxBuffer: WINDOWS_EXEC_MAX_BUFFER_BYTES,
+    });
+    return { stdout: result.stdout };
+  }
+  const result = await execFileAsync(file, args, { env });
   return {
     stdout: result.stdout,
   };
@@ -485,8 +566,14 @@ async function execInvocation(
   });
 }
 
-function createDefaultRuntime(): WorkspaceOpenTargetRuntime {
+export function createWorkspaceOpenTargetRuntime(
+  options: WorkspaceOpenTargetRuntimeOptions = {},
+): WorkspaceOpenTargetRuntime {
   const homeDirectory = os.homedir();
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(options.shellPath !== undefined ? { PATH: options.shellPath } : {}),
+  };
   return {
     applicationDirectories: [
       "/Applications",
@@ -498,7 +585,7 @@ function createDefaultRuntime(): WorkspaceOpenTargetRuntime {
       "/usr/local/share/applications",
       path.join(homeDirectory, ".local/share/applications"),
     ],
-    env: process.env,
+    env,
     execFile: defaultExecFile,
     platform: process.platform,
   };
@@ -521,15 +608,6 @@ function getMacApplicationCandidatePaths(
       path.join(directory, `${appName}.app`),
     ),
   );
-}
-
-async function pathExists(candidatePath: string): Promise<boolean> {
-  try {
-    await fs.access(candidatePath);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function isWslRuntime(runtime: WorkspaceOpenTargetRuntime): boolean {
@@ -901,6 +979,12 @@ export async function listWorkspaceOpenTargetsWithRuntime(
   runtime: WorkspaceOpenTargetRuntime,
   options: ListWorkspaceOpenTargetsOptions = {},
 ): Promise<WorkspaceOpenTarget[]> {
+  if (runtime.platform === "win32") {
+    return [
+      ...(await listCliWorkspaceOpenTargets(runtime)),
+      ...(await listWindowsPlatformWorkspaceOpenTargets(runtime)),
+    ];
+  }
   if (runtime.platform !== "darwin") {
     if (runtime.platform !== "linux") {
       return [];
@@ -1015,11 +1099,31 @@ async function isExecutableAvailable(
   runtime: WorkspaceOpenTargetRuntime,
 ): Promise<boolean> {
   try {
+    await runtime.execFile(
+      runtime.platform === "win32" ? "where.exe" : "which",
+      [executable],
+      { env: runtime.env },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isServiceExecutableAvailable(
+  executable: string,
+  runtime: WorkspaceOpenTargetRuntime,
+): Promise<boolean> {
+  try {
     await runtime.execFile("which", [executable]);
     return true;
   } catch {
     return false;
   }
+}
+
+function isMacServiceExecutable(executable: string): boolean {
+  return executable === "open" || executable === "osascript";
 }
 
 async function resolveMacBundledExecutable(
@@ -1049,7 +1153,7 @@ async function resolveMacBundledExecutable(
   return {
     file: executablePath,
     argsPrefix: bundledExecutable.toArgsPrefix?.(appPath) ?? [],
-    env: bundledExecutable.toEnv?.(runtime.env),
+    env: bundledExecutable.toEnv?.(runtime.env) ?? runtime.env,
   };
 }
 
@@ -1059,8 +1163,16 @@ async function resolveMacCommandExecutable(
   runtime: WorkspaceOpenTargetRuntime,
 ): Promise<ResolvedMacCommandExecutable | null> {
   for (const candidate of [command, ...(command.fallbackExecutables ?? [])]) {
-    if (await isExecutableAvailable(candidate.executable, runtime)) {
-      return { file: candidate.executable, argsPrefix: [] };
+    const serviceExecutable = isMacServiceExecutable(candidate.executable);
+    const available = serviceExecutable
+      ? await isServiceExecutableAvailable(candidate.executable, runtime)
+      : await isExecutableAvailable(candidate.executable, runtime);
+    if (available) {
+      return {
+        file: candidate.executable,
+        argsPrefix: [],
+        ...(serviceExecutable ? {} : { env: runtime.env }),
+      };
     }
     if (candidate.bundledExecutable !== undefined) {
       const resolved = await resolveMacBundledExecutable(
@@ -1207,7 +1319,9 @@ async function maybeResolveMacFileOpenInvocation(
     return null;
   }
 
-  if (!(await isExecutableAvailable(fileOpenCommand.executable, runtime))) {
+  if (
+    !(await isServiceExecutableAvailable(fileOpenCommand.executable, runtime))
+  ) {
     return null;
   }
 
@@ -1266,9 +1380,7 @@ async function resolveXcodeXedPath(
         return selectedXedPath;
       }
     }
-  } catch {
-    // Fall through to the app bundle below.
-  }
+  } catch {}
 
   const appPath = await findMacApplicationPath(definition, runtime);
   if (appPath === null) {
@@ -1348,6 +1460,7 @@ async function maybeResolveXcodeOpenInvocation(
         : ["--line", String(args.lineNumber)]),
       args.existingPath.path,
     ],
+    env: runtime.env,
   };
 }
 
@@ -1539,6 +1652,7 @@ async function resolvePlatformDefaultOpenInvocation(
   return {
     file: executable,
     args: [args.existingPath.path],
+    env: runtime.env,
   };
 }
 
@@ -1561,6 +1675,7 @@ async function resolvePlatformFileManagerOpenInvocation(
   return {
     file: executable,
     args: [openPath],
+    env: runtime.env,
   };
 }
 
@@ -1598,12 +1713,15 @@ async function resolvePlatformTerminalOpenInvocation(
     });
   }
 
-  return buildLinuxTerminalOpenInvocation(executable, {
-    columnNumber: args.columnNumber,
-    lineNumber: args.lineNumber,
-    path: args.existingPath.path,
-    pathType: args.existingPath.type,
-  });
+  return {
+    ...buildLinuxTerminalOpenInvocation(executable, {
+      columnNumber: args.columnNumber,
+      lineNumber: args.lineNumber,
+      path: args.existingPath.path,
+      pathType: args.existingPath.type,
+    }),
+    env: runtime.env,
+  };
 }
 
 async function resolvePlatformTerminalRemoteSshOpenInvocation(
@@ -1625,7 +1743,10 @@ async function resolvePlatformTerminalRemoteSshOpenInvocation(
     });
   }
 
-  return buildLinuxTerminalRemoteSshInvocation(executable, args);
+  return {
+    ...buildLinuxTerminalRemoteSshInvocation(executable, args),
+    env: runtime.env,
+  };
 }
 
 function splitDesktopExec(exec: string): string[] {
@@ -1765,17 +1886,20 @@ async function resolveLinuxDesktopApplicationOpenInvocation(
       message: `Workspace open target is unavailable: ${args.desktopFileId}`,
     });
   }
-  return buildLinuxDesktopApplicationInvocation(
-    application,
-    args.existingPath.path,
-  );
+  return {
+    ...buildLinuxDesktopApplicationInvocation(
+      application,
+      args.existingPath.path,
+    ),
+    env: runtime.env,
+  };
 }
 
 async function resolvePlatformOpenInvocation(
   args: OpenPathInTargetArgs,
   runtime: WorkspaceOpenTargetRuntime,
 ): Promise<ExecFileInvocation> {
-  if (runtime.platform !== "linux") {
+  if (runtime.platform !== "linux" && runtime.platform !== "win32") {
     throw new WorkspaceOpenTargetError({
       code: "unsupported_platform",
       message: "Workspace open targets are not supported on this platform",
@@ -1851,6 +1975,22 @@ async function resolvePlatformOpenInvocation(
       },
       runtime,
     );
+  }
+
+  if (runtime.platform === "win32") {
+    const windowsArgs = { env: runtime.env, existingPath };
+    if (args.targetId === "default-app") {
+      return buildWindowsDefaultOpenInvocation(windowsArgs);
+    }
+    if (args.targetId === "file-manager") {
+      return buildWindowsFileManagerOpenInvocation(windowsArgs);
+    }
+    if (args.targetId === "terminal") {
+      return buildWindowsTerminalOpenInvocation({
+        ...windowsArgs,
+        terminal: await getWindowsTerminalProgram(runtime),
+      });
+    }
   }
 
   if (args.targetId === "default-app") {
@@ -1932,16 +2072,4 @@ export async function openPathInTargetWithRuntime(
     runtime,
   );
   await execInvocation(invocation, runtime);
-}
-
-export async function listWorkspaceOpenTargets(
-  options: ListWorkspaceOpenTargetsOptions = {},
-): Promise<WorkspaceOpenTarget[]> {
-  return listWorkspaceOpenTargetsWithRuntime(createDefaultRuntime(), options);
-}
-
-export async function openPathInTarget(
-  args: OpenPathInTargetArgs,
-): Promise<void> {
-  await openPathInTargetWithRuntime(args, createDefaultRuntime());
 }

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  calculateUnexpectedRestartDelay,
   runDevSupervisorWithRuntime,
   type DevSupervisorChildProcess,
   type DevSupervisorChildSpawnRequest,
@@ -340,23 +339,6 @@ class FakeDevSupervisorRuntime implements DevSupervisorRuntime {
 }
 
 describe("runDevSupervisor", () => {
-  it("calculates capped exponential restart delays", () => {
-    const baseArgs = {
-      initialDelayMs: 1_000,
-      maxDelayMs: 10_000,
-    };
-
-    expect(calculateUnexpectedRestartDelay({ ...baseArgs, attempt: 1 })).toBe(
-      1_000,
-    );
-    expect(calculateUnexpectedRestartDelay({ ...baseArgs, attempt: 2 })).toBe(
-      2_000,
-    );
-    expect(calculateUnexpectedRestartDelay({ ...baseArgs, attempt: 5 })).toBe(
-      10_000,
-    );
-  });
-
   it("keeps running and respawns after an unexpected child exit", async () => {
     const runtime = new FakeDevSupervisorRuntime([
       createUnexpectedExitPlan(0),
@@ -435,8 +417,6 @@ describe("runDevSupervisor", () => {
     runtime.runNextTimer(1_000);
     await runtime.waitForActiveTimerDelay(2_000);
     runtime.runNextTimer(2_000);
-    // A child that runs long enough to be considered stable starts a fresh
-    // crash sequence, so its next restart uses the initial backoff.
     await runtime.waitForActiveTimerDelay(1_000);
 
     expect(runtime.stderr).toContain(

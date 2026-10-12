@@ -10,21 +10,81 @@ import type {
   ToolCallRequest,
 } from "@bb/domain";
 import { isApprovalPendingInteractionPayload } from "@bb/domain";
-import type { ProviderAdapter } from "./provider-adapter.js";
+import type { BridgeProtocolAdapter } from "./bridge-protocol-adapter.js";
 import {
   type JsonRpcMessage,
   ProviderResponseEncodeError,
   sendJsonRpcError,
   sendJsonRpcResult,
-  sendProviderRequestDecodeErrorIfKnown,
   sendProviderResponseEncodeErrorIfKnown,
-} from "./runtime-json-rpc.js";
-import { shouldAutoDenyInteractiveRequest } from "./shared/permission-policy.js";
+} from "@bb/provider-bridge-protocol/bridge-kit";
+import { shouldAutoDenyInteractiveRequest } from "@bb/provider-bridge-protocol/bridge-kit";
+
+export class RuntimeToolCalls {
+  private readonly pending = new Map<
+    string,
+    Map<
+      string | number,
+      {
+        controller: AbortController;
+        threadId: string;
+        turnId: string;
+      }
+    >
+  >();
+
+  start(scope: string, request: ToolCallRequest): AbortController | null {
+    let calls = this.pending.get(scope);
+    if (!calls) {
+      calls = new Map();
+      this.pending.set(scope, calls);
+    }
+    if (calls.has(request.requestId)) return null;
+    const controller = new AbortController();
+    calls.set(request.requestId, {
+      controller,
+      threadId: request.threadId,
+      turnId: request.turnId,
+    });
+    return controller;
+  }
+
+  finish(
+    scope: string,
+    requestId: string | number,
+    controller: AbortController,
+  ): void {
+    const calls = this.pending.get(scope);
+    if (calls?.get(requestId)?.controller !== controller) return;
+    calls.delete(requestId);
+    if (calls?.size === 0) this.pending.delete(scope);
+  }
+
+  cancel(scope: string, requestId: string | number): void {
+    const call = this.pending.get(scope)?.get(requestId);
+    if (!call) return;
+    this.finish(scope, requestId, call.controller);
+    call.controller.abort();
+  }
+
+  cancelThread(threadId: string, turnId?: string): void {
+    for (const [scope, calls] of this.pending) {
+      for (const [requestId, call] of calls) {
+        if (
+          call.threadId === threadId &&
+          (turnId === undefined || call.turnId === turnId)
+        ) {
+          this.cancel(scope, requestId);
+        }
+      }
+    }
+  }
+}
 
 export type RuntimeProviderRequestKind = "interactive request" | "tool call";
 
-export interface RuntimeProviderRequestProcess {
-  adapter: ProviderAdapter;
+interface RuntimeProviderRequestProcess {
+  adapter: BridgeProtocolAdapter;
   child: ChildProcess;
   interactiveRequestScope: string;
 }
@@ -36,20 +96,21 @@ export interface ResolveRuntimeProviderRequestThreadIdArgs {
   threadIdHint: string | undefined;
 }
 
-export interface RuntimeProviderRequestArgs {
+interface RuntimeProviderRequestArgs {
   parsedId: string | number;
   parsedMethod: string;
   providerProcess: RuntimeProviderRequestProcess;
   rawRequest: JsonRpcMessage;
 }
 
-export interface HandleRuntimeProviderRequestArgs extends RuntimeProviderRequestArgs {
+interface HandleRuntimeProviderRequestArgs extends RuntimeProviderRequestArgs {
   getActiveTurnId: (threadId: string) => string | null;
   getThreadExecutionOptions: (
     threadId: string,
   ) => AgentRuntimeExecutionOptions | undefined;
   onInteractiveRequest: AgentRuntimeOptions["onInteractiveRequest"];
   onToolCall: AgentRuntimeOptions["onToolCall"];
+  toolCalls: RuntimeToolCalls;
   resolveThreadId: (
     args: ResolveRuntimeProviderRequestThreadIdArgs,
   ) => string | null;
@@ -60,25 +121,6 @@ interface ResolveRuntimeProviderRequestTurnIdArgs extends HandleRuntimeProviderR
   resolvedThreadId: string;
   turnId: string | null;
 }
-
-interface ExplicitProviderRequestTurnId {
-  kind: "explicit";
-  turnId: string;
-}
-
-interface UnresolvedProviderRequestTurnId {
-  kind: "unresolved";
-}
-
-interface InvalidProviderRequestTurnId {
-  kind: "invalid";
-  message: string;
-}
-
-type ProviderRequestTurnIdWireValue =
-  | ExplicitProviderRequestTurnId
-  | UnresolvedProviderRequestTurnId
-  | InvalidProviderRequestTurnId;
 
 function scopeProviderRequestId(
   scope: string,
@@ -92,7 +134,7 @@ function buildDeniedInteractiveResolution(
 ): PendingInteractionResolution {
   if (!isApprovalPendingInteractionPayload(payload)) {
     throw new ProviderResponseEncodeError(
-      "User-question interactive requests cannot be auto-denied",
+      "Only approval interactive requests can be auto-denied",
     );
   }
   if (!payload.availableDecisions.includes("deny")) {
@@ -105,36 +147,11 @@ function buildDeniedInteractiveResolution(
   };
 }
 
-function classifyProviderRequestTurnIdWireValue(
-  turnId: string | null,
-): ProviderRequestTurnIdWireValue {
-  if (turnId === null) {
-    return { kind: "unresolved" };
-  }
-  if (turnId.length === 0) {
-    return {
-      kind: "invalid",
-      message:
-        "Provider request turnId must be a non-empty string when known; use null when unresolved",
-    };
-  }
-  return { kind: "explicit", turnId };
-}
-
 function resolveRuntimeProviderRequestTurnId(
   args: ResolveRuntimeProviderRequestTurnIdArgs,
 ): string | null {
-  const providerTurnId = classifyProviderRequestTurnIdWireValue(args.turnId);
-  if (providerTurnId.kind === "invalid") {
-    sendJsonRpcError({
-      child: args.providerProcess.child,
-      id: args.parsedId,
-      message: providerTurnId.message,
-    });
-    return null;
-  }
-  if (providerTurnId.kind === "explicit") {
-    return providerTurnId.turnId;
+  if (args.turnId !== null) {
+    return args.turnId;
   }
 
   const activeTurnId = args.getActiveTurnId(args.resolvedThreadId);
@@ -153,23 +170,9 @@ function resolveRuntimeProviderRequestTurnId(
 function handleToolCallProviderRequest(
   args: HandleRuntimeProviderRequestArgs,
 ): boolean {
-  let toolCallReq: ReturnType<ProviderAdapter["decodeToolCallRequest"]>;
-  try {
-    toolCallReq = args.providerProcess.adapter.decodeToolCallRequest(
-      args.rawRequest,
-    );
-  } catch (error) {
-    if (
-      sendProviderRequestDecodeErrorIfKnown({
-        child: args.providerProcess.child,
-        error,
-        id: args.parsedId,
-      })
-    ) {
-      return true;
-    }
-    throw error;
-  }
+  const toolCallReq = args.providerProcess.adapter.decodeToolCallRequest(
+    args.rawRequest,
+  );
   if (!toolCallReq) {
     return false;
   }
@@ -204,9 +207,16 @@ function handleToolCallProviderRequest(
       ? { arguments: toolCallReq.arguments }
       : {}),
   };
-  void args
-    .onToolCall(scopedToolCallReq)
+  const scope = args.providerProcess.interactiveRequestScope;
+  const controller = args.toolCalls.start(scope, scopedToolCallReq);
+  if (!controller) return true;
+  void Promise.resolve()
+    .then(() => {
+      controller.signal.throwIfAborted();
+      return args.onToolCall(scopedToolCallReq, controller.signal);
+    })
     .then((response) => {
+      if (controller.signal.aborted) return;
       sendJsonRpcResult({
         child: args.providerProcess.child,
         id: args.parsedId,
@@ -214,12 +224,16 @@ function handleToolCallProviderRequest(
       });
     })
     .catch((err) => {
+      if (controller.signal.aborted) return;
       sendJsonRpcError({
         child: args.providerProcess.child,
         id: args.parsedId,
         message: err instanceof Error ? err.message : String(err),
       });
-    });
+    })
+    .finally(() =>
+      args.toolCalls.finish(scope, scopedToolCallReq.requestId, controller),
+    );
   return true;
 }
 
@@ -227,27 +241,9 @@ function handleInteractiveProviderRequest(
   args: HandleRuntimeProviderRequestArgs,
 ): boolean {
   const providerId = args.providerProcess.adapter.id;
-  const decodeInteractiveRequest =
-    args.providerProcess.adapter.decodeInteractiveRequest;
-  if (!decodeInteractiveRequest) {
-    return false;
-  }
-
-  let interactiveReq: ReturnType<typeof decodeInteractiveRequest>;
-  try {
-    interactiveReq = decodeInteractiveRequest(args.rawRequest);
-  } catch (error) {
-    if (
-      sendProviderRequestDecodeErrorIfKnown({
-        child: args.providerProcess.child,
-        error,
-        id: args.parsedId,
-      })
-    ) {
-      return true;
-    }
-    throw error;
-  }
+  const interactiveReq = args.providerProcess.adapter.decodeInteractiveRequest(
+    args.rawRequest,
+  );
   if (!interactiveReq) {
     return false;
   }
@@ -259,14 +255,6 @@ function handleInteractiveProviderRequest(
     threadIdHint: interactiveReq.threadId,
   });
   if (!resolvedThreadId) {
-    return true;
-  }
-  if (!args.providerProcess.adapter.buildInteractiveResponse) {
-    sendJsonRpcError({
-      child: args.providerProcess.child,
-      id: args.parsedId,
-      message: `Provider "${providerId}" cannot encode interactive response for "${interactiveReq.method}"`,
-    });
     return true;
   }
   const buildInteractiveResponse =
@@ -301,7 +289,7 @@ function handleInteractiveProviderRequest(
     interactiveReq.payload,
   );
   const runtimeOwnsApprovalPolicy =
-    args.providerProcess.adapter.approvalRequestPolicy === "runtime";
+    args.providerProcess.adapter.approvalEnforcedBy === "runtime";
   const executionOptions = runtimeOwnsApprovalPolicy
     ? args.getThreadExecutionOptions(resolvedThreadId)
     : undefined;
@@ -349,7 +337,7 @@ function handleInteractiveProviderRequest(
       child: args.providerProcess.child,
       id: args.parsedId,
       message:
-        "No interactive request handler is configured for user-question interactions",
+        "No interactive request handler is configured for request interactions",
     });
     return true;
   }

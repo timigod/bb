@@ -1,30 +1,44 @@
 import fs from "node:fs/promises";
-import semver from "semver";
-import type { PromptInput } from "@bb/domain";
-import type { HostDaemonCommandResult } from "@bb/host-daemon-contract";
-import { resolveContainedPath } from "@bb/process-utils";
+import path from "node:path";
+import type { AgentRuntimeBridgeLaunch } from "@bb/agent-runtime";
+import { flattenPromptInputGroups } from "@bb/domain";
+import { killProcessesWithCwdUnder } from "@bb/process-utils";
+import {
+  COMPETING_TURN_ERROR_CODE,
+  type HostDaemonCommandResult,
+} from "@bb/host-daemon-contract";
 import type { RuntimeEntry } from "../runtime-manager.js";
 import {
   CommandDispatchError,
   ExpectedCommandDispatchError,
+  resolveRuntimeBridgeLaunch,
   type CommandDispatchOptions,
   type CommandOf,
 } from "../command-dispatch-support.js";
 import {
+  requireContainedPath,
   stagePromptAttachmentGroups,
   stagePromptAttachments,
 } from "./prompt-attachments.js";
+import { providerInstallationGateKey } from "../provider-installation-gate.js";
 import { requireResolvedWorkspaceForCommand } from "../workspace-resolution.js";
-import { getProviderCliStatusForProvider } from "../provider-cli-health.js";
+import {
+  currentTurnSubmitTrace,
+  markTurnSubmitTraceSpan,
+} from "../turn-submit-trace.js";
 
 type TurnSubmitCommand = CommandOf<"turn.submit">;
 type ExistingThreadRuntimeCommand =
   | TurnSubmitCommand
   | CommandOf<"thread.goal.clear">;
 
+const TURN_SUBMIT_ACTIVE_TURN_WAIT_MS = 5_000;
+const TURN_SUBMIT_STEER_ATTEMPTS = 2;
+
 interface ResumeThreadRuntimeIfMissingArgs {
   command: ExistingThreadRuntimeCommand;
   entry: RuntimeEntry;
+  options: CommandDispatchOptions;
 }
 
 interface StageThreadCommandInputArgs {
@@ -40,28 +54,33 @@ interface StageThreadCommandInputArgs {
 interface StagedThreadCommandInput {
   cleanup: () => Promise<void>;
   input: TurnSubmitCommand["input"];
-  inputGroups?: TurnSubmitCommand["inputGroups"];
 }
 
+export async function deleteThreadStorage(
+  command: CommandOf<"thread.storage.delete">,
+  options: CommandDispatchOptions,
+): Promise<void> {
+  const storagePath = requireContainedPath(
+    options.threadStorageRootPath,
+    path.join(options.threadStorageRootPath, command.threadId),
+    "Thread storage path escapes the storage root",
+  );
+  await killProcessesWithCwdUnder({ directories: [storagePath] });
+  await fs.rm(storagePath, { recursive: true, force: true });
+}
+
+type ThreadStartRuntimeCommand =
+  | CommandOf<"thread.start">
+  | CommandOf<"thread.rewind.prepare">;
+
 interface RequireSupportedProviderCliArgs {
-  command: CommandOf<"thread.start"> | CommandOf<"thread.rewind.prepare">;
+  command: ThreadStartRuntimeCommand;
   options: CommandDispatchOptions;
 }
 
-const CODEX_REWIND_MINIMUM_SUPPORTED_VERSION = "0.143.0";
-
-function requireConfinedPath(rootPath: string, candidatePath: string): string {
-  const resolved = resolveContainedPath({
-    rootPath,
-    candidatePath,
-  });
-  if (!resolved) {
-    throw new CommandDispatchError(
-      "invalid_path",
-      "Thread storage path escapes the storage root",
-    );
-  }
-  return resolved;
+interface ThreadStartRuntime {
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  entry: RuntimeEntry;
 }
 
 async function cleanupAfterPostStagingFailure(
@@ -69,70 +88,58 @@ async function cleanupAfterPostStagingFailure(
 ): Promise<void> {
   try {
     await cleanup();
-  } catch {
-    // Preserve the runtime/provisioning failure that triggered cleanup.
-  }
-}
-
-async function cleanupStagedInputs(
-  cleanups: readonly (() => Promise<void>)[],
-): Promise<void> {
-  await Promise.all(cleanups.map((cleanup) => cleanup()));
-}
-
-function groupedInputForRuntime(
-  inputGroups: readonly PromptInput[][],
-): PromptInput[] {
-  return inputGroups.flatMap((input, index) =>
-    index === 0
-      ? input
-      : [{ type: "text" as const, text: "\n\n", mentions: [] }, ...input],
-  );
+  } catch {}
 }
 
 async function requireSupportedProviderCliForThreadStart({
   command,
   options,
 }: RequireSupportedProviderCliArgs): Promise<void> {
-  if (command.providerId !== "codex") {
+  if (!command.bridgeLaunch.capabilities.providerInstallation) {
     return;
   }
 
-  const status =
-    (await options.getProviderCliStatusForProvider?.(command.providerId)) ??
-    (await getProviderCliStatusForProvider("codex", {
-      env: options.runtimeManager.getShellEnv(),
-    }));
-  const minimumVersion =
+  const requirement =
     command.type === "thread.rewind.prepare"
-      ? CODEX_REWIND_MINIMUM_SUPPORTED_VERSION
-      : status.minimumSupportedVersion;
-  const versionUnsupported =
-    command.type === "thread.rewind.prepare"
-      ? status.currentVersion === null ||
-        !semver.gte(
-          status.currentVersion,
-          CODEX_REWIND_MINIMUM_SUPPORTED_VERSION,
-        )
-      : status.versionUnsupported;
-  if (!versionUnsupported) {
+      ? ("thread_rewind" as const)
+      : undefined;
+  await options.refreshShellEnv({ allowStale: true });
+  const status = await options.runtimeManager.providerInstallationGate.run(
+    providerInstallationGateKey({
+      providerId: command.providerId,
+      bridgeLaunch: command.bridgeLaunch,
+      requirement,
+    }),
+    async () => {
+      const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+        command.bridgeLaunch,
+        options,
+      );
+      return options.providerInstallationStatus({
+        providerId: command.providerId,
+        bridgeLaunch,
+        checkUpdates: false,
+        ...(requirement !== undefined ? { requirement } : {}),
+      });
+    },
+  );
+  if (!status.versionUnsupported) {
     return;
   }
 
   const currentVersion = status.currentVersion
     ? ` ${status.currentVersion}`
     : "";
-  const requiredVersion = minimumVersion ?? "a newer version";
+  const requiredVersion = status.minimumSupportedVersion ?? "a newer version";
   throw new ExpectedCommandDispatchError(
     "provider_cli_unsupported_version",
-    `Codex${currentVersion} is too old for this operation. Update Codex to ${requiredVersion} or newer.`,
+    `Provider "${command.providerId}"${currentVersion} is too old for this operation. Update it to ${requiredVersion} or newer.`,
   );
 }
 
 async function stageThreadCommandInput(
   args: StageThreadCommandInputArgs,
 ): Promise<StagedThreadCommandInput> {
-  const cleanups: (() => Promise<void>)[] = [];
   if (args.command.inputGroups !== undefined) {
     const stagedGroups = await stagePromptAttachmentGroups({
       fetchProjectAttachment: args.fetchProjectAttachment,
@@ -144,12 +151,11 @@ async function stageThreadCommandInput(
     });
     return {
       cleanup: stagedGroups.cleanup,
-      input: groupedInputForRuntime(stagedGroups.inputGroups),
-      inputGroups: stagedGroups.inputGroups,
+      input: flattenPromptInputGroups(stagedGroups.inputGroups),
     };
   }
 
-  const stagedInput = await stagePromptAttachments({
+  return stagePromptAttachments({
     fetchProjectAttachment: args.fetchProjectAttachment,
     input: args.command.input,
     projectId: args.projectId,
@@ -157,18 +163,30 @@ async function stageThreadCommandInput(
     threadStorageRootPath: args.threadStorageRootPath,
     threadId: args.command.threadId,
   });
-  cleanups.push(stagedInput.cleanup);
+}
 
-  return {
-    cleanup: () => cleanupStagedInputs(cleanups),
-    input: stagedInput.input,
-  };
+async function resolveThreadStartRuntime(
+  command: ThreadStartRuntimeCommand,
+  options: CommandDispatchOptions,
+): Promise<ThreadStartRuntime> {
+  const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+    command.bridgeLaunch,
+    options,
+  );
+  const entry = await requireResolvedWorkspaceForCommand({
+    environmentId: command.environmentId,
+    injectedSkillSources: command.injectedSkillSources,
+    runtimeManager: options.runtimeManager,
+    targetThreadId: command.threadId,
+    workspaceContext: command.workspaceContext,
+  });
+  return { bridgeLaunch, entry };
 }
 
 async function resumeThreadRuntimeIfMissing(
   args: ResumeThreadRuntimeIfMissingArgs,
 ): Promise<void> {
-  const { command, entry } = args;
+  const { command, entry, options } = args;
   const { resumeContext } = command;
   if (entry.runtime.hasThread(command.threadId)) {
     return;
@@ -179,21 +197,22 @@ async function resumeThreadRuntimeIfMissing(
       `No provider thread id available for thread ${command.threadId}`,
     );
   }
+  const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+    command.resumeContext.bridgeLaunch ?? command.bridgeLaunch,
+    options,
+  );
   await entry.runtime.resumeThread({
-    ...(command.resumeContext.acpLaunchSpec !== undefined
-      ? { acpLaunchSpec: command.resumeContext.acpLaunchSpec }
-      : command.acpLaunchSpec !== undefined
-        ? { acpLaunchSpec: command.acpLaunchSpec }
-        : {}),
+    bridgeLaunch,
+    skillRoots: entry.skillRoots,
     environmentId: command.environmentId,
     threadId: command.threadId,
     projectId: resumeContext.projectId,
     providerThreadId: resumeContext.providerThreadId,
     providerId: resumeContext.providerId,
+    contributedEnv: resumeContext.contributedEnv,
     options: command.options,
     instructions: resumeContext.instructions,
     dynamicTools: resumeContext.dynamicTools,
-    disallowedTools: resumeContext.disallowedTools,
     instructionMode: resumeContext.instructionMode,
   });
 }
@@ -204,9 +223,10 @@ export async function startThread(
 ): Promise<HostDaemonCommandResult<"thread.start">> {
   await requireSupportedProviderCliForThreadStart({ command, options });
   if (command.threadStoragePath) {
-    const confined = requireConfinedPath(
+    const confined = requireContainedPath(
       options.threadStorageRootPath,
       command.threadStoragePath,
+      "Thread storage path escapes the storage root",
     );
     await fs.mkdir(confined, { recursive: true });
   }
@@ -217,31 +237,23 @@ export async function startThread(
     threadStorageRootPath: options.threadStorageRootPath,
   });
   try {
-    const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      injectedSkillSources: command.injectedSkillSources,
-      runtimeManager: options.runtimeManager,
-      targetThreadId: command.threadId,
-      workspaceContext: command.workspaceContext,
-    });
+    const { bridgeLaunch, entry } = await resolveThreadStartRuntime(
+      command,
+      options,
+    );
     const result = await entry.runtime.startThread({
-      ...(command.acpLaunchSpec !== undefined
-        ? { acpLaunchSpec: command.acpLaunchSpec }
-        : {}),
+      bridgeLaunch,
+      skillRoots: entry.skillRoots,
       environmentId: command.environmentId,
       threadId: command.threadId,
       projectId: command.projectId,
       providerId: command.providerId,
+      contributedEnv: command.contributedEnv,
       clientRequestId: command.requestId,
       input: staged.input,
-      ...(staged.inputGroups !== undefined
-        ? { inputGroups: staged.inputGroups }
-        : {}),
       options: command.options,
       instructions: command.instructions,
       dynamicTools: command.dynamicTools,
-      disallowedTools: command.disallowedTools,
       instructionMode: command.instructionMode,
       ...(command.fork ? { fork: command.fork } : {}),
     });
@@ -257,29 +269,24 @@ export async function prepareThreadRewind(
   options: CommandDispatchOptions,
 ): Promise<HostDaemonCommandResult<"thread.rewind.prepare">> {
   await requireSupportedProviderCliForThreadStart({ command, options });
-  const entry = await requireResolvedWorkspaceForCommand({
-    dataDir: options.dataDir,
-    environmentId: command.environmentId,
-    injectedSkillSources: command.injectedSkillSources,
-    runtimeManager: options.runtimeManager,
-    targetThreadId: command.threadId,
-    workspaceContext: command.workspaceContext,
-  });
+  const { bridgeLaunch, entry } = await resolveThreadStartRuntime(
+    command,
+    options,
+  );
   return entry.runtime.prepareThreadRewind({
-    ...(command.acpLaunchSpec !== undefined
-      ? { acpLaunchSpec: command.acpLaunchSpec }
-      : {}),
+    bridgeLaunch,
+    skillRoots: entry.skillRoots,
     environmentId: command.environmentId,
     threadId: command.threadId,
     leaseId: command.leaseId,
     projectId: command.projectId,
     providerId: command.providerId,
+    contributedEnv: command.contributedEnv,
     sourceProviderThreadId: command.sourceProviderThreadId,
     retainThroughProviderCheckpoint: command.retainThroughProviderCheckpoint,
     options: command.options,
     instructions: command.instructions,
     dynamicTools: command.dynamicTools,
-    disallowedTools: command.disallowedTools,
     instructionMode: command.instructionMode,
   });
 }
@@ -302,17 +309,14 @@ export async function ensureThreadRuntime(
 ): Promise<RuntimeEntry> {
   const { resumeContext } = command;
   const entry = await requireResolvedWorkspaceForCommand({
-    dataDir: options.dataDir,
     environmentId: command.environmentId,
     injectedSkillSources: resumeContext.injectedSkillSources,
     runtimeManager: options.runtimeManager,
     targetThreadId: command.threadId,
     workspaceContext: resumeContext.workspaceContext,
   });
+  markTurnSubmitTraceSpan("skills.staged");
 
-  // A new turn owns the provider session, so it interrupts an old turn that
-  // the thread left behind. A goal clear does not own it, so it waits for
-  // that turn instead of stopping it.
   const released =
     await options.runtimeManager.releaseThreadFromOtherEnvironments({
       activeTurn: command.type === "turn.submit" ? "interrupt" : "keep",
@@ -326,57 +330,127 @@ export async function ensureThreadRuntime(
       `Thread ${command.threadId} still runs a turn in environment ${busyEnvironmentId}`,
     );
   }
-  await resumeThreadRuntimeIfMissing({ command, entry });
+  await resumeThreadRuntimeIfMissing({ command, entry, options });
+  markTurnSubmitTraceSpan("runtime.ready");
   return entry;
 }
 
 async function runSubmittedTurn(
   command: TurnSubmitCommand,
   entry: RuntimeEntry,
-): Promise<HostDaemonCommandResult<"turn.submit">> {
+): Promise<void> {
   await entry.runtime.runTurn({
     threadId: command.threadId,
     input: command.input,
-    ...(command.inputGroups !== undefined
-      ? { inputGroups: command.inputGroups }
-      : {}),
     clientRequestId: command.requestId,
     options: command.options,
+    contributedEnv: command.resumeContext.contributedEnv,
     instructions: command.resumeContext.instructions,
   });
-  return { appliedAs: "new-turn" };
 }
 
 async function steerSubmittedTurn(
   command: TurnSubmitCommand,
   entry: RuntimeEntry,
   expectedTurnId: string,
-): Promise<HostDaemonCommandResult<"turn.submit">> {
-  const result = await entry.runtime.steerTurn({
-    threadId: command.threadId,
-    expectedTurnId,
-    input: command.input,
-    ...(command.inputGroups !== undefined
-      ? { inputGroups: command.inputGroups }
-      : {}),
-    clientRequestId: command.requestId,
-    options: command.options,
-    instructions: command.resumeContext.instructions,
-  });
+): Promise<void> {
+  let targetTurnId = expectedTurnId;
+  let activeTurnId: string | null = null;
+  for (let attempt = 0; attempt < TURN_SUBMIT_STEER_ATTEMPTS; attempt += 1) {
+    const result = await entry.runtime.steerTurn({
+      threadId: command.threadId,
+      expectedTurnId: targetTurnId,
+      input: command.input,
+      clientRequestId: command.requestId,
+      options: command.options,
+      contributedEnv: command.resumeContext.contributedEnv,
+      instructions: command.resumeContext.instructions,
+    });
 
-  if (result.status === "steered") {
-    return { appliedAs: "steer" };
-  }
-  // A stale steer still represents a user send intent. If the target turn
-  // ended before dispatch reached the daemon, preserve the message as a new turn.
-  if (command.target.mode === "auto" || command.target.mode === "steer") {
-    return runSubmittedTurn(command, entry);
+    if (result.status === "steered") {
+      return;
+    }
+    activeTurnId = result.activeTurnId;
+    if (attempt === TURN_SUBMIT_STEER_ATTEMPTS - 1) {
+      break;
+    }
+    const liveTurnId = await resolveLiveSubmittedTurnTarget(command, entry);
+    if (liveTurnId === null) {
+      return runSubmittedTurn(command, entry);
+    }
+    if (liveTurnId === targetTurnId) {
+      break;
+    }
+    targetTurnId = liveTurnId;
   }
 
   throw new CommandDispatchError(
     "stale_turn",
-    `Expected active turn ${expectedTurnId} for thread ${command.threadId}, but active turn is ${result.activeTurnId ?? "none"}`,
+    `Expected active turn ${targetTurnId} for thread ${command.threadId}, but active turn is ${activeTurnId ?? "none"}`,
   );
+}
+
+async function resolveLiveSubmittedTurnTarget(
+  command: TurnSubmitCommand,
+  entry: RuntimeEntry,
+): Promise<string | null> {
+  const activeTurnId = entry.runtime.getActiveTurnId(command.threadId);
+  if (activeTurnId !== null) {
+    return activeTurnId;
+  }
+  if (!entry.runtime.getLiveThreadIds().includes(command.threadId)) {
+    return null;
+  }
+  const awaitedTurnId = await entry.runtime.waitForActiveTurn(
+    command.threadId,
+    {
+      timeoutMs: TURN_SUBMIT_ACTIVE_TURN_WAIT_MS,
+    },
+  );
+  if (awaitedTurnId !== null) {
+    return awaitedTurnId;
+  }
+  const refreshedTurnId = entry.runtime.getActiveTurnId(command.threadId);
+  if (refreshedTurnId !== null) {
+    return refreshedTurnId;
+  }
+  if (entry.runtime.getLiveThreadIds().includes(command.threadId)) {
+    throw new CommandDispatchError(
+      COMPETING_TURN_ERROR_CODE,
+      `Refusing to start a competing turn while ${command.threadId} is still starting`,
+    );
+  }
+  return null;
+}
+
+async function resolveSubmittedTurnTarget(
+  command: TurnSubmitCommand,
+  entry: RuntimeEntry,
+): Promise<string | null> {
+  if (command.target.mode === "start") {
+    return null;
+  }
+  if (
+    command.target.mode === "steer" &&
+    command.target.expectedTurnId !== null
+  ) {
+    return command.target.expectedTurnId;
+  }
+  return (
+    (await resolveLiveSubmittedTurnTarget(command, entry)) ??
+    command.target.expectedTurnId
+  );
+}
+
+async function deliverSubmittedTurn(
+  command: TurnSubmitCommand,
+  entry: RuntimeEntry,
+): Promise<void> {
+  const resolvedTurnId = await resolveSubmittedTurnTarget(command, entry);
+  if (command.target.mode === "start" || resolvedTurnId === null) {
+    return runSubmittedTurn(command, entry);
+  }
+  return steerSubmittedTurn(command, entry, resolvedTurnId);
 }
 
 export async function submitTurn(
@@ -390,39 +464,22 @@ export async function submitTurn(
     projectId: command.resumeContext.projectId,
     threadStorageRootPath: options.threadStorageRootPath,
   });
+  markTurnSubmitTraceSpan("input.staged");
   const stagedCommand = {
     ...command,
     input: staged.input,
-    ...(staged.inputGroups !== undefined
-      ? { inputGroups: staged.inputGroups }
-      : {}),
   };
   try {
-    await resumeThreadRuntimeIfMissing({ command: stagedCommand, entry });
-    switch (command.target.mode) {
-      case "start":
-        return await runSubmittedTurn(stagedCommand, entry);
-      case "auto":
-        return command.target.expectedTurnId
-          ? await steerSubmittedTurn(
-              stagedCommand,
-              entry,
-              command.target.expectedTurnId,
-            )
-          : await runSubmittedTurn(stagedCommand, entry);
-      case "steer":
-        if (!command.target.expectedTurnId) {
-          // The server saw no active turn, but the user's intent is still "send".
-          return await runSubmittedTurn(stagedCommand, entry);
-        }
-        return await steerSubmittedTurn(
-          stagedCommand,
-          entry,
-          command.target.expectedTurnId,
-        );
-    }
+    await resumeThreadRuntimeIfMissing({
+      command: stagedCommand,
+      entry,
+      options,
+    });
+    await deliverSubmittedTurn(stagedCommand, entry);
   } catch (error) {
     await cleanupAfterPostStagingFailure(staged.cleanup);
     throw error;
   }
+  markTurnSubmitTraceSpan("bridge.turnStarted");
+  return { trace: currentTurnSubmitTrace() };
 }

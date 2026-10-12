@@ -1,25 +1,49 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { defaultAppSettings } from "@bb/domain";
 import {
-  createConnection,
   getAppKeybindingOverrides,
   getAppSettings,
-  migrate,
   setAppKeybindingOverrides,
   setAppSettings,
   type DbConnection,
 } from "../../src/index.js";
+import { createMigratedConnection } from "../helpers/migrated-connection.js";
 
 describe("app settings data", () => {
   let db: DbConnection;
 
   beforeEach(() => {
-    db = createConnection(":memory:");
-    migrate(db);
+    db = createMigratedConnection();
   });
 
   afterEach(() => {
     db.$client.close();
+  });
+
+  it("defaults archive confirmation to enabled and persists opting out", () => {
+    expect(getAppSettings(db).confirmThreadArchive).toBe(true);
+    setAppSettings(db, { ...defaultAppSettings, confirmThreadArchive: false });
+    expect(getAppSettings(db).confirmThreadArchive).toBe(false);
+  });
+
+  it("preserves the legacy diagnostic preference and lets the new preference override it", () => {
+    db.$client.exec(
+      "INSERT INTO app_settings_values (key, value, updated_at) VALUES ('showUnhandledProviderEvents', 'true', 1)",
+    );
+    expect(getAppSettings(db).showDiagnosticEvents).toBe(true);
+    db.$client.exec(
+      "INSERT INTO app_settings_values (key, value, updated_at) VALUES ('showDiagnosticEvents', 'false', 2)",
+    );
+    expect(getAppSettings(db).showDiagnosticEvents).toBe(false);
+    setAppSettings(db, { ...defaultAppSettings, showDiagnosticEvents: true });
+    expect(getAppSettings(db).showDiagnosticEvents).toBe(true);
+    expect(
+      db.$client
+        .prepare(
+          "SELECT key FROM app_settings_values WHERE key = 'showUnhandledProviderEvents'",
+        )
+        .get(),
+    ).toBeUndefined();
   });
 
   it("persists keyboard overrides without clobbering general settings", () => {
@@ -28,23 +52,46 @@ describe("app settings data", () => {
     ];
     setAppSettings(db, {
       ...defaultAppSettings,
-      caffeinate: true,
       showKeyboardHints: false,
       steerActiveThreadOnEnter: true,
-      codexMemoryEnabled: false,
+      providerOrder: ["pi"],
+      defaultProviderId: "pi",
     });
     setAppKeybindingOverrides(db, overrides);
 
     expect(getAppSettings(db)).toEqual({
       ...defaultAppSettings,
-      caffeinate: true,
       showKeyboardHints: false,
       steerActiveThreadOnEnter: true,
-      codexMemoryEnabled: false,
+      providerOrder: ["pi"],
+      defaultProviderId: "pi",
     });
     expect(getAppKeybindingOverrides(db)).toEqual(overrides);
 
     setAppSettings(db, defaultAppSettings);
     expect(getAppKeybindingOverrides(db)).toEqual(overrides);
+  });
+
+  it("ignores retired keys and falls back per key on an unreadable value", () => {
+    setAppSettings(db, {
+      ...defaultAppSettings,
+      steerActiveThreadOnEnter: true,
+    });
+    db.$client.exec(`
+      INSERT INTO app_settings_values (key, value, updated_at)
+      VALUES ('retiredPreference', 'true', 1)
+      ON CONFLICT (key) DO UPDATE SET value = 'true';
+      UPDATE app_settings_values
+      SET value = '"yes"'
+      WHERE key = 'showKeyboardHints';
+      UPDATE app_settings_values
+      SET value = 'not json'
+      WHERE key = 'providerOrder';
+    `);
+
+    expect(getAppSettings(db)).toEqual({
+      ...defaultAppSettings,
+      steerActiveThreadOnEnter: true,
+    });
   });
 });

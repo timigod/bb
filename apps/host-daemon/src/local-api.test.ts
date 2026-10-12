@@ -24,7 +24,6 @@ describe("local API server", () => {
       bindHost: "localhost",
       healthPath: "/health",
       healthValue: "ok",
-      mode: "full",
       port: 0,
       ...overrides,
     };
@@ -35,10 +34,6 @@ describe("local API server", () => {
     server = null;
   });
 
-  // The in-app browser can now reach any loopback port bb does not reserve, and
-  // a second bb daemon on this machine sits on one. CORS only hides a response:
-  // a `no-cors` POST with a simple content type skips the preflight and still
-  // runs `/open-in-target`. The origin must be rejected, not just unanswered.
   it("rejects a foreign browser origin instead of only withholding CORS", async () => {
     const openInTarget = vi.fn(async () => undefined);
     server = await startLocalApiServer({
@@ -69,14 +64,12 @@ describe("local API server", () => {
       return response.status;
     }
 
-    // A blind cross-origin POST: simple content type, so no preflight guards it.
     expect(
       await postOpenInTarget({
         "content-type": "text/plain",
         origin: "http://127.0.0.1:3009",
       }),
     ).toBe(403);
-    // A DNS-rebound page presents its own public origin.
     expect(
       await postOpenInTarget({
         "content-type": "text/plain",
@@ -85,7 +78,6 @@ describe("local API server", () => {
     ).toBe(403);
     expect(openInTarget).not.toHaveBeenCalled();
 
-    // The bb app's own origin still works, as does a caller sending none.
     expect(
       await postOpenInTarget({
         "content-type": "application/json",
@@ -98,10 +90,25 @@ describe("local API server", () => {
     expect(openInTarget).toHaveBeenCalledTimes(2);
   });
 
-  // A rebound page sends a matching Origin and Host pair, which the self-origin
-  // branch previously accepted as the daemon's own origin. This API binds
-  // loopback, so a genuine caller always addresses it by a loopback name or a
-  // bare address.
+  it("allows the exact remote server origin the daemon is enrolled with", async () => {
+    server = await startLocalApiServer({
+      hostId: "host-remote",
+      localApiConfig: createLocalApiConfig(),
+      serverUrl: "https://remote-bb.example.test/projects/proj_1",
+      serverPort: 0,
+      getConnected: () => true,
+    });
+
+    const response = await fetch(`http://localhost:${server.port}/status`, {
+      headers: { Origin: "https://remote-bb.example.test" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).toBe(
+      "https://remote-bb.example.test",
+    );
+  });
+
   it("rejects a DNS-rebound origin that matches its own Host", async () => {
     const openInTarget = vi.fn(async () => undefined);
     server = await startLocalApiServer({
@@ -114,8 +121,6 @@ describe("local API server", () => {
       openInTarget,
     });
     const { port } = server;
-    // Connect to the address the API actually bound: `localhost` resolves to
-    // ::1 on some hosts, so a hardcoded 127.0.0.1 is refused there.
     const { bindHost } = server;
 
     function post(headers: Record<string, string>): Promise<number> {
@@ -154,7 +159,6 @@ describe("local API server", () => {
     ).toBe(403);
     expect(openInTarget).not.toHaveBeenCalled();
 
-    // The loopback authority a real local caller sends still works.
     expect(
       await post({
         origin: `http://${bindHost}:${port}`,
@@ -351,12 +355,7 @@ describe("local API server", () => {
 
       expect(response.status).toBe(200);
       expect(openInTarget).toHaveBeenCalledWith({
-        context: {
-          kind: "remote-ssh",
-          serverOrigin: "https://remote-bb.example.test",
-          hostId: "host_remote",
-          sshAuthority: "devbox",
-        },
+        context: { kind: "remote-ssh", sshAuthority: "devbox" },
         columnNumber: 4,
         lineNumber: 10,
         path: "/home/me/project/src/file.ts",
@@ -456,31 +455,5 @@ describe("local API server", () => {
       path: "/tmp/workspace",
       targetId: "vscode",
     });
-  });
-
-  it("supports health-only mode", async () => {
-    server = await startLocalApiServer({
-      hostId: "host-1",
-      localApiConfig: createLocalApiConfig({
-        bindHost: "127.0.0.1",
-        healthPath: "/ready",
-        healthValue: "bb-host-daemon",
-        mode: "health-only",
-      }),
-      serverUrl: "http://server.test",
-      serverPort: 3334,
-      devAppPort: 5173,
-      getConnected: () => true,
-    });
-
-    const healthResponse = await fetch(`http://127.0.0.1:${server.port}/ready`);
-    expect(healthResponse.status).toBe(200);
-    expect(await healthResponse.text()).toBe("bb-host-daemon");
-
-    const client = createHostDaemonLocalClient(
-      `http://127.0.0.1:${server.port}`,
-    );
-    const statusResponse = await client.status.$get();
-    expect(statusResponse.status).toBe(404);
   });
 });

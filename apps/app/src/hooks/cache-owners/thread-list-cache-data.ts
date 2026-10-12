@@ -4,10 +4,7 @@ import type {
   QueryKey,
 } from "@tanstack/react-query";
 import type { ThreadListEntry } from "@bb/domain";
-
-// Some thread list queries store a flat array (`useThreads`); the paginated
-// archived view stores `InfiniteData<ThreadListEntry[]>`. These helpers let
-// cache mutations and iteration treat both shapes uniformly.
+import { patchCachedQueryData } from "./cache-effect-utils";
 
 export type ThreadListCacheData =
   | ThreadListEntry[]
@@ -47,23 +44,21 @@ export function* iterateThreadListCacheEntries(
   }
 }
 
-export function mapThreadListCacheData<T extends ThreadListCacheData>(
+function mapThreadListCacheData<T extends ThreadListCacheData>(
   data: T,
-  mapper: (list: ThreadListEntry[]) => ThreadListEntry[],
+  mapper: (list: ThreadListEntry[], pageIndex: number) => ThreadListEntry[],
 ): T {
   if (isThreadListEntryArray(data)) {
-    return mapper(data) as T;
+    return mapper(data, 0) as T;
   }
   return { ...data, pages: data.pages.map(mapper) } as T;
 }
 
-export function isThreadListCacheData(
-  value: unknown,
-): value is ThreadListCacheData {
+function isThreadListCacheData(value: unknown): value is ThreadListCacheData {
   return isThreadListEntryArray(value) || isInfiniteThreadListData(value);
 }
 
-export interface CachedThreadList {
+interface CachedThreadList {
   queryKey: QueryKey;
   data: ThreadListCacheData;
 }
@@ -94,20 +89,47 @@ export function getCachedThreadLists(
   return result;
 }
 
-export function snapshotCachedThreadLists(
-  queryClient: QueryClient,
-  options: ThreadListCacheQueryOptions,
-): CachedThreadListSnapshot {
-  return getCachedThreadLists(queryClient, options);
-}
-
 export function restoreCachedThreadLists(
   queryClient: QueryClient,
   snapshot: CachedThreadListSnapshot,
+  threadIds?: ReadonlySet<string>,
 ): void {
   for (const { queryKey, data } of snapshot) {
-    queryClient.setQueryData(queryKey, data);
+    if (threadIds === undefined) {
+      patchCachedQueryData(queryClient, queryKey, data);
+      continue;
+    }
+    patchCachedQueryData<ThreadListCacheData>(
+      queryClient,
+      queryKey,
+      (current) => {
+        if (!current) return current;
+        const pages = isThreadListEntryArray(data) ? [data] : data.pages;
+        return mapThreadListCacheData(current, (list, pageIndex) =>
+          restoreRemovedThreadEntries(list, pages[pageIndex] ?? [], threadIds),
+        );
+      },
+    );
   }
+}
+
+export function restoreRemovedThreadEntries(
+  current: ThreadListEntry[],
+  previous: ThreadListEntry[],
+  threadIds: ReadonlySet<string>,
+): ThreadListEntry[] {
+  const restored = [...current];
+  let insertionIndex = restored.length;
+  for (let index = previous.length - 1; index >= 0; index--) {
+    const thread = previous[index]!;
+    const currentIndex = restored.findIndex((entry) => entry.id === thread.id);
+    if (currentIndex >= 0) {
+      insertionIndex = currentIndex;
+    } else if (threadIds.has(thread.id)) {
+      restored.splice(insertionIndex, 0, thread);
+    }
+  }
+  return restored;
 }
 
 export function applyToCachedThreadLists(
@@ -117,7 +139,8 @@ export function applyToCachedThreadLists(
   for (const { queryKey, data } of getCachedThreadLists(queryClient, {
     queryKey: options.queryKey,
   })) {
-    queryClient.setQueryData(
+    patchCachedQueryData(
+      queryClient,
       queryKey,
       mapThreadListCacheData(data, options.mapper),
     );

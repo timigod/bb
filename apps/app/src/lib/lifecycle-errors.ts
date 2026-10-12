@@ -6,7 +6,7 @@ import {
 } from "@bb/server-contract";
 import { HttpError } from "./api";
 
-export type LifecycleErrorSeverity = "info" | "warning" | "error";
+type LifecycleErrorSeverity = "info" | "warning" | "error";
 export type LifecycleErrorOperation =
   | "archive_thread"
   | "commit"
@@ -22,7 +22,6 @@ export type LifecycleErrorOperation =
   | "send_message"
   | "send_queued_message"
   | "set_queued_message_group_boundary"
-  | "squash_merge"
   | "stop_thread"
   | "update_queued_message"
   | "update_merge_base";
@@ -33,7 +32,7 @@ export interface LifecycleErrorDescription {
   title: string;
 }
 
-export interface DescribeLifecycleErrorOptions {
+interface DescribeLifecycleErrorOptions {
   error: unknown;
   operation?: LifecycleErrorOperation | undefined;
 }
@@ -81,6 +80,16 @@ interface ParentThreadInvalidDescriptionArgs {
   operation?: LifecycleErrorOperation | undefined;
 }
 
+interface DispatchRejectedDescriptionArgs {
+  error: Extract<LifecycleApiError, { code: "dispatch_rejected" }>;
+  operation?: LifecycleErrorOperation | undefined;
+}
+
+interface DispatchHookFailedDescriptionArgs {
+  error: Extract<LifecycleApiError, { code: "dispatch_hook_failed" }>;
+  operation?: LifecycleErrorOperation | undefined;
+}
+
 function operationTitle(operation: LifecycleErrorOperation): string {
   switch (operation) {
     case "archive_thread":
@@ -111,8 +120,6 @@ function operationTitle(operation: LifecycleErrorOperation): string {
       return "Failed to send queued message";
     case "set_queued_message_group_boundary":
       return "Failed to group queued messages";
-    case "squash_merge":
-      return "Squash merge failed";
     case "stop_thread":
       return "Failed to stop thread";
     case "update_queued_message":
@@ -167,6 +174,7 @@ function describeEnvironmentNotReady({
 }: EnvironmentNotReadyDescriptionArgs): LifecycleErrorDescription {
   const { details } = error;
   switch (details.environmentStatus) {
+    case "creating":
     case "provisioning":
       return info({
         operation,
@@ -184,13 +192,6 @@ function describeEnvironmentNotReady({
         operation,
         title: "Workspace setup failed",
         body: "Workspace setup failed.",
-      });
-    case "retiring":
-    case "destroying":
-      return info({
-        operation,
-        title: "Workspace cleaning up",
-        body: "Workspace is being cleaned up.",
       });
     case "destroyed":
       return warning({
@@ -220,12 +221,6 @@ function describeThreadEnvironmentUnavailable({
         operation,
         title: "Workspace unavailable",
         body: "Workspace no longer exists.",
-      });
-    case "destroying":
-      return info({
-        operation,
-        title: "Workspace cleaning up",
-        body: "Workspace is being cleaned up.",
       });
     case "provisioning":
       return info({
@@ -388,12 +383,6 @@ function describeParentThreadInvalid({
           ? "The sender thread was deleted."
           : "That parent thread was deleted.",
       });
-    case "wrong_project":
-      return errorDescription({
-        operation,
-        title,
-        body: "Choose a parent thread from this project.",
-      });
     case "self":
       return errorDescription({
         operation,
@@ -417,6 +406,30 @@ function describeParentThreadInvalid({
   }
 }
 
+function describeDispatchRejected({
+  error,
+  operation,
+}: DispatchRejectedDescriptionArgs): LifecycleErrorDescription {
+  return warning({
+    operation,
+    title: "Blocked by a plugin",
+    body: `Blocked by the "${error.details.pluginId}" plugin: ${error.message}`,
+  });
+}
+
+function describeDispatchHookFailed({
+  error,
+  operation,
+}: DispatchHookFailedDescriptionArgs): LifecycleErrorDescription {
+  const reason = error.message.trim();
+  const sentence = reason.endsWith(".") ? reason : `${reason}.`;
+  return errorDescription({
+    operation,
+    title: "Plugin dispatch hook failed",
+    body: `${sentence} Disable that plugin to continue.`,
+  });
+}
+
 export function parseLifecycleError(error: unknown): LifecycleApiError | null {
   if (!(error instanceof HttpError) && !(error instanceof BbHttpError)) {
     return null;
@@ -424,6 +437,14 @@ export function parseLifecycleError(error: unknown): LifecycleApiError | null {
 
   const result = lifecycleApiErrorSchema.safeParse(error.body);
   return result.success ? result.data : null;
+}
+
+export function isHostDisconnectedError(error: unknown): boolean {
+  const lifecycleError = parseLifecycleError(error);
+  return (
+    lifecycleError?.code === "host_unavailable" &&
+    lifecycleError.details.reason === "disconnected"
+  );
 }
 
 export function formatLifecycleErrorDescription(
@@ -466,6 +487,10 @@ export function describeLifecycleError({
         error: lifecycleError,
         operation,
       });
+    case "dispatch_rejected":
+      return describeDispatchRejected({ error: lifecycleError, operation });
+    case "dispatch_hook_failed":
+      return describeDispatchHookFailed({ error: lifecycleError, operation });
     default:
       return assertNever(lifecycleError);
   }

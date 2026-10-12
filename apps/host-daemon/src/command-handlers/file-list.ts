@@ -1,53 +1,122 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fuzzyMatchPaths } from "@bb/fuzzy-match";
+import { detectGitRepo, runGit } from "@bb/host-workspace";
 import type {
   HostPathEntry,
   HostPathEntryKind,
 } from "@bb/host-daemon-contract";
 
-export interface FinalizeListedFilesArgs {
+interface FinalizeListedFilesArgs {
   filePaths: string[];
   limit: number;
   query?: string;
 }
 
-export interface FinalizedFileList {
+interface FinalizedFileList {
   files: FileListEntry[];
   truncated: boolean;
 }
 
-export interface FileListEntry {
+interface FileListEntry {
   path: string;
   name: string;
 }
 
-export interface ListedPath {
+interface ListedPath {
   kind: HostPathEntryKind;
   path: string;
   name: string;
 }
 
-export interface PathListInclusion {
+interface PathListInclusion {
   includeFiles: boolean;
   includeDirectories: boolean;
 }
 
-export interface FinalizeListedPathsArgs extends PathListInclusion {
+interface FinalizeListedPathsArgs extends PathListInclusion {
   paths: ListedPath[];
   limit: number;
   query?: string;
 }
 
-export interface FinalizedPathList {
+interface FinalizedPathList {
   paths: HostPathEntry[];
   truncated: boolean;
 }
 
-export interface ListPathsRecursivelyArgs extends PathListInclusion {
+interface ListPathsRecursivelyArgs extends PathListInclusion {
   dir: string;
   root: string;
+  includeHidden: boolean;
+  excludeNames: ReadonlySet<string>;
+  ignoredPaths: ReadonlySet<string>;
 }
+
+interface ListWorkspacePathsArgs extends PathListInclusion {
+  root: string;
+  includeHidden: boolean;
+  excludeNames: readonly string[];
+  respectGitIgnore: boolean;
+}
+
+const pendingListings = new Map<string, Promise<ListedPath[]>>();
+
+export function listWorkspacePaths(
+  args: ListWorkspacePathsArgs,
+): Promise<ListedPath[]> {
+  const key = JSON.stringify([
+    args.root,
+    args.includeHidden,
+    [...new Set(args.excludeNames)].sort(),
+    args.respectGitIgnore,
+    args.includeFiles,
+    args.includeDirectories,
+  ]);
+  const existing = pendingListings.get(key);
+  if (existing) return existing;
+  const listing = discoverWorkspacePaths(args).finally(() => {
+    pendingListings.delete(key);
+  });
+  pendingListings.set(key, listing);
+  return listing;
+}
+
+async function discoverWorkspacePaths(
+  args: ListWorkspacePathsArgs,
+): Promise<ListedPath[]> {
+  const ignoredPaths = new Set<string>();
+  if (
+    args.respectGitIgnore &&
+    (await detectGitRepo(args.root, { timeoutMs: 5_000 }))
+  ) {
+    const result = await runGit(
+      [
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+      ],
+      { cwd: args.root, timeoutMs: 5_000 },
+    );
+    for (const entry of result.stdout.split("\0")) {
+      if (entry.length > 0) ignoredPaths.add(entry.replace(/\/$/, ""));
+    }
+  }
+  return listPathsRecursively({
+    dir: args.root,
+    root: args.root,
+    includeHidden: args.includeHidden,
+    excludeNames: new Set(args.excludeNames),
+    ignoredPaths,
+    includeFiles: args.includeFiles,
+    includeDirectories: args.includeDirectories,
+  });
+}
+
+const ALWAYS_EXCLUDED_NAMES: ReadonlySet<string> = new Set([".git"]);
 
 function shouldIncludePath(
   pathKind: HostPathEntryKind,
@@ -134,20 +203,26 @@ export function finalizeListedPaths(
   };
 }
 
-export async function listPathsRecursively(
+async function listPathsRecursively(
   args: ListPathsRecursivelyArgs,
 ): Promise<ListedPath[]> {
   const entries = await fs.readdir(args.dir, { withFileTypes: true });
   const results: ListedPath[] = [];
   for (const entry of entries) {
-    if (entry.name.startsWith(".")) continue;
-    if (entry.name === "node_modules") continue;
+    if (ALWAYS_EXCLUDED_NAMES.has(entry.name)) continue;
+    if (args.excludeNames.has(entry.name)) continue;
+    if (!args.includeHidden && entry.name.startsWith(".")) continue;
     if (entry.isSymbolicLink()) continue;
 
     const fullPath = path.join(args.dir, entry.name);
     const relativePath = normalizeListedPath(
       path.relative(args.root, fullPath),
     );
+    if (
+      args.excludeNames.has(relativePath) ||
+      args.ignoredPaths.has(relativePath)
+    )
+      continue;
     if (entry.isDirectory()) {
       if (args.includeDirectories) {
         results.push({
@@ -156,12 +231,11 @@ export async function listPathsRecursively(
           name: entry.name,
         });
       }
-      results.push(
-        ...(await listPathsRecursively({
-          ...args,
-          dir: fullPath,
-        })),
-      );
+      const childResults = await listPathsRecursively({
+        ...args,
+        dir: fullPath,
+      });
+      for (const childResult of childResults) results.push(childResult);
       continue;
     }
 
@@ -174,17 +248,4 @@ export async function listPathsRecursively(
     }
   }
   return results;
-}
-
-export async function listFilesRecursively(
-  dir: string,
-  root: string,
-): Promise<string[]> {
-  const paths = await listPathsRecursively({
-    dir,
-    root,
-    includeFiles: true,
-    includeDirectories: false,
-  });
-  return paths.map((pathEntry) => pathEntry.path);
 }

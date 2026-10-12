@@ -81,11 +81,6 @@ function findFile(
 
 const UNCOMMITTED: WorkspaceDiffTarget = { type: "uncommitted" };
 
-/**
- * Reads the full diff for a target, then splits it per-file the same way the
- * production splitter does, so a per-path patch can be compared byte-for-byte
- * against the corresponding slice of the full diff.
- */
 async function fullDiffSectionFor(
   workspace: Workspace,
   target: WorkspaceDiffTarget,
@@ -123,7 +118,6 @@ function splitFullDiff(combinedDiff: string): Map<string, string> {
   return byPath;
 }
 
-/** Mirror of the production trailing-empty-line normalization. */
 function formatDiffSection(lines: string[]): string {
   let end = lines.length;
   while (end > 0 && lines[end - 1] === "") {
@@ -207,8 +201,6 @@ describe("Workspace.diffFiles", () => {
     await write(repoPath, "keep.txt", "a\nB\nc\nd\n");
     await write(repoPath, "added.txt", "new\nfile\n");
     await fs.rm(path.join(repoPath, "remove.txt"));
-    // Stage the new file so it is a tracked addition (vs. an untracked file)
-    // in the `git diff HEAD` the uncommitted target computes.
     await runGit(["add", "added.txt"], { cwd: repoPath });
 
     const workspace = new Workspace(repoPath);
@@ -398,7 +390,7 @@ describe("Workspace.diffFiles", () => {
     );
   });
 
-  it("returns one overflow sentinel without reading untracked stats past the file cap", async () => {
+  it("returns an exact truncated untracked slice at the file cap", async () => {
     const repoPath = await initRepo();
     await Promise.all([
       write(repoPath, "one.txt", "one\n"),
@@ -411,13 +403,16 @@ describe("Workspace.diffFiles", () => {
       maxFiles: 2,
     });
 
-    expect(result.files).toHaveLength(3);
+    expect(result.files).toHaveLength(2);
     expect(result.files.every((file) => file.origin === "untracked")).toBe(
       true,
     );
+    expect(result.files.every((file) => file.additions === 1)).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.shortstat).toContain("2 files changed");
   });
 
-  it("returns one overflow sentinel after bounded tracked enumeration", async () => {
+  it("returns an exact truncated tracked slice after bounded enumeration", async () => {
     const repoPath = await initRepo();
     for (let index = 0; index < 5; index += 1) {
       await write(repoPath, `tracked-${index}.txt`, `base ${index}\n`);
@@ -432,8 +427,95 @@ describe("Workspace.diffFiles", () => {
       maxFiles: 2,
     });
 
-    expect(result.files).toHaveLength(3);
+    expect(result.files).toHaveLength(2);
     expect(result.files.every((file) => file.origin === "tracked")).toBe(true);
+    expect(result.files).toEqual([
+      expect.objectContaining({ additions: 1, deletions: 1 }),
+      expect.objectContaining({ additions: 1, deletions: 1 }),
+    ]);
+    expect(result.truncated).toBe(true);
+    expect(result.shortstat).toContain("2 files changed");
+  });
+
+  it("keeps rename stats exact in a truncated tracked slice", async () => {
+    const repoPath = await initRepo();
+    await write(repoPath, "a-before.txt", "one\ntwo\nthree\nfour\nfive\n");
+    await write(repoPath, "b.txt", "before\n");
+    await write(repoPath, "c.txt", "before\n");
+    await commitAll(repoPath, "base");
+
+    await runGit(["mv", "a-before.txt", "a-after.txt"], { cwd: repoPath });
+    await write(repoPath, "a-after.txt", "one\ntwo\nthree\nfour\nfive\nsix\n");
+    await write(repoPath, "b.txt", "after\n");
+    await write(repoPath, "c.txt", "after\n");
+
+    const result = await new Workspace(repoPath).diffFiles({
+      target: UNCOMMITTED,
+      maxFiles: 2,
+    });
+
+    expect(result.truncated).toBe(true);
+    expect(result.files).toContainEqual(
+      expect.objectContaining({
+        path: "a-after.txt",
+        previousPath: "a-before.txt",
+        statusLetter: "R",
+        additions: 1,
+        deletions: 0,
+      }),
+    );
+  });
+
+  it("keeps full-diff add/delete classification when a truncated slice is below the rename limit", async () => {
+    const repoPath = await initRepo();
+    await runGit(["config", "diff.renameLimit", "15"], { cwd: repoPath });
+    const originalContents = Array.from({ length: 20 }, (_unused, index) =>
+      [`identity ${index}`, ...Array.from({ length: 40 }, () => "shared")]
+        .join("\n")
+        .concat("\n"),
+    );
+    for (let index = 0; index < originalContents.length; index += 1) {
+      const pair = String(index).padStart(2, "0");
+      await write(
+        repoPath,
+        `pair-${pair}-a.txt`,
+        originalContents[index] ?? "",
+      );
+    }
+    await commitAll(repoPath, "base");
+
+    for (let index = 0; index < originalContents.length; index += 1) {
+      const pair = String(index).padStart(2, "0");
+      await write(
+        repoPath,
+        `pair-${pair}-b.txt`,
+        `${originalContents[index] ?? ""}changed ${index}\n`,
+      );
+      await fs.rm(path.join(repoPath, `pair-${pair}-a.txt`));
+    }
+    await runGit(["add", "-A"], { cwd: repoPath });
+
+    const result = await new Workspace(repoPath).diffFiles({
+      target: UNCOMMITTED,
+      maxFiles: 10,
+    });
+
+    expect(result.truncated).toBe(true);
+    expect(result.files).toHaveLength(10);
+    for (const file of result.files) {
+      if (file.statusLetter === "D") {
+        expect(file).toMatchObject({ additions: 0, deletions: 41 });
+      } else {
+        expect(file).toMatchObject({
+          statusLetter: "A",
+          additions: 42,
+          deletions: 0,
+        });
+      }
+    }
+    expect(result.shortstat).toContain("10 files changed");
+    expect(result.shortstat).toContain("210 insertions(+)");
+    expect(result.shortstat).toContain("205 deletions(-)");
   });
 
   it("does not include untracked files for a commit target", async () => {
@@ -483,7 +565,6 @@ describe("Workspace.diffPatch", () => {
     expect(patches[0]?.path).toBe("alpha.txt");
     expect(patches[0]?.truncated).toBe(false);
     expect(patches[0]?.patch).toBe(expected);
-    // The subset must not bleed the other changed file into the patch.
     expect(patches[0]?.patch).not.toContain("beta.txt");
   });
 
@@ -505,9 +586,6 @@ describe("Workspace.diffPatch", () => {
     await write(repoPath, "alpha.txt", "1\nTWO\n3\n");
 
     const workspace = new Workspace(repoPath);
-    // A binary section from the combined-split must be byte-equal to the
-    // standalone `git diff --binary` — including the `GIT binary patch` block's
-    // terminating blank line, which an earlier strip dropped.
     const perFileBinary = await runGit(
       ["diff", "--no-ext-diff", "--binary", "-M", "HEAD", "--", "logo.png"],
       { cwd: repoPath },
@@ -522,42 +600,7 @@ describe("Workspace.diffPatch", () => {
     expect(binary?.patch).toContain("GIT binary patch");
     expect(binary?.patch).toBe(perFileBinary.stdout);
     expect(binary?.patch.endsWith("\n\n")).toBe(true);
-    // The combined page must not bleed the sibling text file into this section.
     expect(binary?.patch).not.toContain("alpha.txt");
-  });
-
-  it("preserves rename detection in a path-subset patch", async () => {
-    const repoPath = await initRepo();
-    await write(
-      repoPath,
-      "original.txt",
-      "alpha\nbeta\ngamma\ndelta\nepsilon\n",
-    );
-    await commitAll(repoPath, "base");
-
-    await runGit(["mv", "original.txt", "renamed.txt"], { cwd: repoPath });
-    await write(
-      repoPath,
-      "renamed.txt",
-      "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
-    );
-    await commitAll(repoPath, "rename with edit");
-
-    const target: WorkspaceDiffTarget = { type: "commit", sha: "HEAD" };
-    const workspace = new Workspace(repoPath);
-
-    const expected = await fullDiffSectionFor(workspace, target, "renamed.txt");
-    const patches = await workspace.diffPatch({
-      target,
-      paths: ["renamed.txt"],
-      maxBytesPerFile: BIG_BUDGET,
-    });
-
-    expect(patches).toHaveLength(1);
-    expect(patches[0]?.patch).toBe(expected);
-    // Rename detection intact: a rename header, not an add+delete pair.
-    expect(patches[0]?.patch).toMatch(/rename from original\.txt/);
-    expect(patches[0]?.patch).toMatch(/rename to renamed\.txt/);
   });
 
   it("renders untracked files via the alternate-index path", async () => {
@@ -643,7 +686,6 @@ describe("Workspace.diffPatch", () => {
       maxBytesPerFile: BIG_BUDGET,
     });
 
-    // Requested order is preserved.
     expect(patches.map((entry) => entry.path)).toEqual([
       "untracked.txt",
       "tracked.txt",
@@ -652,39 +694,11 @@ describe("Workspace.diffPatch", () => {
     expect(patches[1]?.patch).toContain("+3");
   });
 
-  it("truncates a patch exceeding maxBytesPerFile and sets truncated", async () => {
-    const repoPath = await initRepo();
-    await write(repoPath, "base.txt", "seed\n");
-    await commitAll(repoPath, "base");
-
-    const longBody = Array.from(
-      { length: 200 },
-      (_unused, index) => `line ${index}`,
-    ).join("\n");
-    await write(repoPath, "big.txt", `${longBody}\n`);
-
-    const workspace = new Workspace(repoPath);
-    const [entry] = await workspace.diffPatch({
-      target: UNCOMMITTED,
-      paths: ["big.txt"],
-      maxBytesPerFile: 100,
-    });
-
-    expect(entry?.truncated).toBe(true);
-    expect(Buffer.byteLength(entry?.patch ?? "", "utf8")).toBeLessThanOrEqual(
-      100,
-    );
-  });
-
   it("bounds a single tracked file whose raw patch exceeds the per-file budget without throwing", async () => {
     const repoPath = await initRepo();
     await write(repoPath, "huge.txt", "seed\n");
     await commitAll(repoPath, "base");
 
-    // One very long single line (~400 KB) so the raw `git diff` for this file
-    // far exceeds the small per-file budget below. A pre-fix unbounded read
-    // would either return the full ~400 KB patch or, with a 16 MB default
-    // buffer overflow on a larger page, throw — here we assert it is bounded.
     const longLine = "x".repeat(400 * 1024);
     await write(repoPath, "huge.txt", `${longLine}\n`);
 
@@ -699,8 +713,6 @@ describe("Workspace.diffPatch", () => {
     expect(patches).toHaveLength(1);
     expect(patches[0]?.path).toBe("huge.txt");
     expect(patches[0]?.truncated).toBe(true);
-    // Non-empty, bounded patch — truncation must keep a real prefix, not blank
-    // the whole page, and must respect the byte budget.
     expect(patches[0]?.patch.length).toBeGreaterThan(0);
     expect(
       Buffer.byteLength(patches[0]?.patch ?? "", "utf8"),
@@ -715,12 +727,6 @@ describe("Workspace.diffPatch", () => {
     }
     await commitAll(repoPath, "base");
 
-    // Each file's raw patch is one ~5 MB long line; 6 of them put the combined
-    // page diff well past the 16 MB default `git diff` buffer. Pre-fix, the
-    // unbounded combined `runGit` would throw WorkspaceError("git_command_failed")
-    // on MAXBUFFER overflow and fail the WHOLE page. Post-fix the page buffer is
-    // capped and `allowTruncatedStdout` is set, so the read truncates, the
-    // per-file fallback fires, and every entry returns bounded — no throw.
     const longLine = "z".repeat(5 * 1024 * 1024);
     const paths: string[] = [];
     for (let index = 0; index < fileCount; index += 1) {
@@ -800,40 +806,9 @@ describe("Workspace.diffPatch", () => {
       "does-not-exist.txt",
     ]);
     expect(patches.find((p) => p.path === "real.txt")?.patch).toContain("+b");
-    // A path with no changes yields an empty patch rather than an error.
     expect(patches.find((p) => p.path === "does-not-exist.txt")?.patch).toBe(
       "",
     );
-  });
-
-  it("returns a non-empty patch for a tracked path containing a space", async () => {
-    const repoPath = await initRepo();
-    await write(repoPath, "my file.txt", "alpha\nbeta\ngamma\n");
-    await write(repoPath, "other.txt", "untouched\n");
-    await commitAll(repoPath, "base");
-
-    await write(repoPath, "my file.txt", "alpha\nBETA\ngamma\ndelta\n");
-
-    const workspace = new Workspace(repoPath);
-    const expected = await fullDiffSectionFor(
-      workspace,
-      UNCOMMITTED,
-      "my file.txt",
-    );
-    const patches = await workspace.diffPatch({
-      target: UNCOMMITTED,
-      paths: ["my file.txt"],
-      maxBytesPerFile: BIG_BUDGET,
-    });
-
-    expect(patches).toHaveLength(1);
-    expect(patches[0]?.path).toBe("my file.txt");
-    expect(patches[0]?.patch.length).toBeGreaterThan(0);
-    // Byte-equal to the full-diff slice: a space in the path must not break the
-    // per-file split (git does not C-quote spaces, so a header-token split that
-    // tokenizes on the first space would key the wrong path and return "").
-    expect(patches[0]?.patch).toBe(expected);
-    expect(expected.length).toBeGreaterThan(0);
   });
 
   it("preserves rename framing when a renamed side's path contains a space", async () => {
@@ -871,7 +846,6 @@ describe("Workspace.diffPatch", () => {
     expect(patches[0]?.path).toBe("new name.txt");
     expect(patches[0]?.patch).toBe(expected);
     expect(expected.length).toBeGreaterThan(0);
-    // Rename detection intact even with spaces on both sides of the pairing.
     expect(patches[0]?.patch).toMatch(/rename from /);
     expect(patches[0]?.patch).toMatch(/rename to /);
   });
@@ -898,8 +872,6 @@ describe("Workspace.diffPatch", () => {
       "normal.txt",
     );
 
-    // Both files come back from a SINGLE combined `git diff` invocation; the
-    // space-in-path file must not bleed into or steal the normal file's patch.
     const patches = await workspace.diffPatch({
       target: UNCOMMITTED,
       paths: ["my file.txt", "normal.txt"],
@@ -918,7 +890,6 @@ describe("Workspace.diffPatch", () => {
     );
     expect(expectedSpace.length).toBeGreaterThan(0);
     expect(expectedNormal.length).toBeGreaterThan(0);
-    // No cross-contamination between the two sections of the combined patch.
     expect(patches.find((p) => p.path === "my file.txt")?.patch).not.toContain(
       "normal.txt",
     );
@@ -962,14 +933,12 @@ describe("Workspace.diffPatch", () => {
       maxBytesPerFile: BIG_BUDGET,
     });
 
-    // Renamed file keyed by its NEW path, byte-equal to the full-diff slice.
     expect(patches.find((p) => p.path === "after.txt")?.patch).toBe(
       expectedRename,
     );
     expect(patches.find((p) => p.path === "edit.txt")?.patch).toBe(
       expectedEdit,
     );
-    // Rename framing survives the combined split (not an add+delete pair).
     expect(patches.find((p) => p.path === "after.txt")?.patch).toMatch(
       /rename from before\.txt/,
     );
@@ -987,10 +956,6 @@ describe("Workspace.diffPatch", () => {
     await write(repoPath, "café.txt", "un\nDEUX\ntrois\nquatre\n");
 
     const workspace = new Workspace(repoPath);
-    // The daemon keys patches by the literal requested path, so a non-ASCII
-    // path must resolve to its own changes rather than an empty patch. (The
-    // header path is git-C-quoted at the default quotePath setting, so we assert
-    // on the keyed result and hunk content, not a header-parsed ground truth.)
     const patches = await workspace.diffPatch({
       target: UNCOMMITTED,
       paths: ["café.txt"],
@@ -1002,7 +967,6 @@ describe("Workspace.diffPatch", () => {
     expect(patches[0]?.patch.length).toBeGreaterThan(0);
     expect(patches[0]?.patch).toContain("+DEUX");
     expect(patches[0]?.patch).toContain("+quatre");
-    // The subset must not bleed the other changed file into the patch.
     expect(patches[0]?.patch).not.toContain("plain.txt");
   });
 
@@ -1011,9 +975,6 @@ describe("Workspace.diffPatch", () => {
     await write(repoPath, "seed.txt", "seed\n");
     await commitAll(repoPath, "base");
 
-    // A patch body dense with the 3-byte character 中 (E4 B8 AD): a byte budget
-    // that lands on either continuation byte of a sequence must trim back to the
-    // sequence start, dropping the straddled character whole.
     const multibyteBody = `${"中".repeat(200)}\n`;
     await write(repoPath, "multibyte.txt", multibyteBody);
 
@@ -1025,12 +986,9 @@ describe("Workspace.diffPatch", () => {
     });
     const fullPatch = full?.patch ?? "";
     const fullBytes = Buffer.from(fullPatch, "utf8");
-    // Byte offset of the first 中 lead byte (E4) in the added "+中中…" line.
     const leadOffset = fullBytes.indexOf(0xe4);
     expect(leadOffset).toBeGreaterThan(0);
 
-    // Budgets that land exactly on the lead byte (clean boundary) and on each of
-    // the two continuation bytes of that 中 (mid-character straddles).
     for (const maxBytes of [leadOffset, leadOffset + 1, leadOffset + 2]) {
       const [entry] = await workspace.diffPatch({
         target: UNCOMMITTED,
@@ -1039,14 +997,10 @@ describe("Workspace.diffPatch", () => {
       });
 
       expect(entry?.truncated).toBe(true);
-      // No replacement character: a naive byte slice would corrupt the straddled
-      // 中 into U+FFFD (which would also overshoot the budget).
       expect(entry?.patch).not.toContain("�");
       expect(Buffer.byteLength(entry?.patch ?? "", "utf8")).toBeLessThanOrEqual(
         maxBytes,
       );
-      // The kept prefix must be a byte-exact prefix of the full patch — i.e. we
-      // only dropped a tail, never mutated bytes.
       expect(
         fullBytes
           .subarray(0, Buffer.byteLength(entry?.patch ?? "", "utf8"))

@@ -1,19 +1,18 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 import type { DiffFileEntry } from "@bb/server-contract";
-import { GIT_DIFF_VIEW_BASE_OPTIONS } from "@/components/git-diff/GitDiffCard";
+import type { DiffPresentation } from "@/components/code/code-rendering";
 import type { RequestDiffFileContents } from "@/components/git-diff/GitDiffCardBody";
 import { DEFAULT_CODE_OVERFLOW_MODE } from "@/lib/code-overflow-mode";
-import { usePreferredTheme } from "@/hooks/useTheme";
 import type { DiffPatchState } from "@/hooks/queries/use-environment-diff-patches";
 import { appToast } from "@/components/ui/app-toast";
 import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
 import { DiffFileCard } from "./DiffFileCard";
+import { makeDiffFileEntry } from "@/test/fixtures/diff-files";
 
 export default {
   title: "right-panel/Diff File Card",
 };
 
-// A one-line modified patch — the card parses this and renders the real diff.
 const MODIFIED_PATCH = [
   "diff --git a/src/file.ts b/src/file.ts",
   "index 1111111..2222222 100644",
@@ -27,8 +26,6 @@ const MODIFIED_PATCH = [
 
 const TALL_ADDED_LINES = 40;
 
-// A taller patch so the sticky header has a body to stay pinned over while the
-// file scrolls underneath it.
 const TALL_PATCH = [
   "diff --git a/src/tall.ts b/src/tall.ts",
   "index 1111111..2222222 100644",
@@ -44,7 +41,6 @@ const TALL_PATCH = [
   "",
 ].join("\n");
 
-// A 1x1 transparent PNG so the image-preview branch has something to render.
 const IMAGE_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/Qo3AAAAAElFTkSuQmCC";
 
@@ -54,18 +50,48 @@ const imageContentsRequester: RequestDiffFileContents = async () => ({
   sizeBytes: 20_480,
 });
 
-function buildEntry(overrides: Partial<DiffFileEntry> = {}): DiffFileEntry {
+const CONTEXT_FILE_LINES = Array.from(
+  { length: 24 },
+  (_, index) => `export const line${index + 1} = ${index + 1};`,
+);
+const CONTEXT_OLD_FILE = `${CONTEXT_FILE_LINES.join("\n")}\n`;
+const CONTEXT_NEW_FILE = CONTEXT_OLD_FILE.replace(
+  "export const line12 = 12;",
+  "export const line12 = 1200;",
+);
+const CONTEXT_PATCH = [
+  "diff --git a/src/context.ts b/src/context.ts",
+  "index 1111111..2222222 100644",
+  "--- a/src/context.ts",
+  "+++ b/src/context.ts",
+  "@@ -11,3 +11,3 @@",
+  " export const line11 = 11;",
+  "-export const line12 = 12;",
+  "+export const line12 = 1200;",
+  " export const line13 = 13;",
+  "",
+].join("\n");
+
+const contextContentsRequester: RequestDiffFileContents = async (
+  path,
+  side,
+) => {
+  await new Promise((resolve) => setTimeout(resolve, 600));
   return {
-    path: "src/file.ts",
-    previousPath: null,
-    changeKind: "modified",
+    kind: "text",
+    file: {
+      name: path,
+      contents: side === "old" ? CONTEXT_OLD_FILE : CONTEXT_NEW_FILE,
+    },
+  };
+};
+
+function buildEntry(overrides: Partial<DiffFileEntry> = {}): DiffFileEntry {
+  return makeDiffFileEntry({
     additions: 1,
     deletions: 1,
-    binary: false,
-    origin: "tracked",
-    loadMode: "auto",
     ...overrides,
-  };
+  });
 }
 
 interface CardStageProps {
@@ -75,24 +101,18 @@ interface CardStageProps {
   onRequestFileContents?: RequestDiffFileContents;
 }
 
-// Mounts a single DiffFileCard at a panel-realistic width with live theme-aware
-// view options, mirroring how DiffFilesPanel renders each row.
+const CARD_PRESENTATION: DiffPresentation = {
+  view: "unified",
+  overflow: DEFAULT_CODE_OVERFLOW_MODE,
+  showLineNumbers: true,
+};
+
 function CardStage({
   entry,
   patchState = { status: "idle" },
   collapsed = false,
   onRequestFileContents,
 }: CardStageProps) {
-  const preferredTheme = usePreferredTheme();
-  const diffViewOptions = useMemo(
-    () => ({
-      ...GIT_DIFF_VIEW_BASE_OPTIONS,
-      diffStyle: "unified",
-      overflow: DEFAULT_CODE_OVERFLOW_MODE,
-      themeType: preferredTheme,
-    }),
-    [preferredTheme],
-  );
   const [isCollapsed, setIsCollapsed] = useState(collapsed);
   const toast = useCallback(
     (label: string) => (path: string) =>
@@ -103,7 +123,7 @@ function CardStage({
     <div className="w-full max-w-[640px] min-w-0">
       <DiffFileCard
         entry={buildEntry(entry)}
-        diffViewOptions={diffViewOptions}
+        presentation={CARD_PRESENTATION}
         isCollapsed={isCollapsed}
         onToggleCollapsed={() => setIsCollapsed((value) => !value)}
         patchState={patchState}
@@ -133,10 +153,26 @@ export function Overview() {
         />
       </StoryRow>
       <StoryRow
+        label="expand context on demand"
+        hint="text card with a contents fetcher: on a fine pointer the full file loads during idle time and pierre's gap buttons appear; on touch the card renders from the patch and offers Expand context under the diff"
+      >
+        <CardStage
+          entry={{ path: "src/context.ts" }}
+          patchState={{
+            status: "loaded",
+            patch: CONTEXT_PATCH,
+            truncated: false,
+          }}
+          onRequestFileContents={contextContentsRequester}
+        />
+      </StoryRow>
+      <StoryRow
         label="load on demand"
         hint="on_demand tier (large or binary): header + a Load diff CTA that triggers the fetch"
       >
-        <CardStage entry={{ loadMode: "on_demand", additions: 820, deletions: 140 }} />
+        <CardStage
+          entry={{ loadMode: "on_demand", additions: 820, deletions: 140 }}
+        />
       </StoryRow>
       <StoryRow
         label="too large"
@@ -226,11 +262,19 @@ export function StickyHeader() {
         >
           <CardStage
             entry={{ path: "src/first.ts" }}
-            patchState={{ status: "loaded", patch: TALL_PATCH, truncated: false }}
+            patchState={{
+              status: "loaded",
+              patch: TALL_PATCH,
+              truncated: false,
+            }}
           />
           <CardStage
             entry={{ path: "src/second.ts" }}
-            patchState={{ status: "loaded", patch: TALL_PATCH, truncated: false }}
+            patchState={{
+              status: "loaded",
+              patch: TALL_PATCH,
+              truncated: false,
+            }}
           />
         </div>
       </StoryRow>

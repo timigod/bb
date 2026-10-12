@@ -1,16 +1,12 @@
 import { useCallback, useMemo, useState } from "react";
 import type { SidebarBootstrapResponse } from "@bb/server-contract";
-import { useDebounceValue } from "usehooks-ts";
-import {
-  buildSectionMentionSuggestions,
-  type SectionMentionCandidate,
-} from "./sectionMentionSuggestions";
-import { buildPathMentionSuggestions } from "./pathMentionSuggestions";
-import { buildPluginMentionSuggestions } from "./pluginMentionSuggestions";
 import {
   buildProjectMentionSuggestions,
-  type ProjectMentionCandidate,
-} from "./projectMentionSuggestions";
+  buildSectionMentionSuggestions,
+  type NamedMentionCandidate,
+} from "./namedMentionSuggestions";
+import { buildPathMentionSuggestions } from "./pathMentionSuggestions";
+import { buildPluginMentionSuggestions } from "./pluginMentionSuggestions";
 import {
   usePluginContributions,
   usePluginMentionSearch,
@@ -18,68 +14,39 @@ import {
 import { useSidebarNavigation } from "./queries/sidebar-navigation-query";
 import { useThreadMentionCandidates } from "./queries/thread-queries";
 import { buildThreadMentionSuggestions } from "./threadMentionSuggestions";
+import { useResolveThreadTitle } from "@/components/thread/ThreadTitleMentions";
 import {
   usePathSuggestions,
   PATH_SUGGESTION_DEBOUNCE_MS,
 } from "./usePathSuggestions";
-import type { PromptMentionSuggestion } from "@/components/promptbox/mentions/types";
+import { useDebouncedValue } from "./useDebouncedValue";
 import {
   DEFAULT_PLUGIN_MENTION_TRIGGER,
   PLUGIN_MENTION_TRIGGER_VALUES,
+  type OrderedMentionSuggestions,
   type PluginMentionTrigger,
-} from "@/lib/plugin-mention-triggers";
+} from "@bb/client-core";
+import { buildPromptMentionResults } from "./promptMentionCandidates";
 
 const PROMPT_MENTION_SOURCE_LIMIT = 8;
 
-export interface UsePromptMentionsOptions {
+interface UsePromptMentionsOptions {
   currentThreadId?: string;
+  threadStorageThreadId?: string;
   environmentId: string | null;
   hostId?: string | null;
 }
 
-export interface UsePromptMentionsResult {
+interface UsePromptMentionsResult {
   query: string | null;
   triggers: readonly PluginMentionTrigger[];
   setQuery: (
     query: string | null,
     trigger: PluginMentionTrigger | null,
   ) => void;
-  suggestions: PromptMentionSuggestion[];
+  results: OrderedMentionSuggestions;
   isLoading: boolean;
   isError: boolean;
-}
-
-interface BuildPromptMentionSuggestionsArgs {
-  pathSuggestions: readonly PromptMentionSuggestion[];
-  threadSuggestions: readonly PromptMentionSuggestion[];
-  projectSuggestions: readonly PromptMentionSuggestion[];
-  sectionSuggestions: readonly PromptMentionSuggestion[];
-  pluginSuggestions: readonly PromptMentionSuggestion[];
-  trimmedQuery: string;
-}
-
-function buildPromptMentionSuggestions(
-  args: BuildPromptMentionSuggestionsArgs,
-): PromptMentionSuggestion[] {
-  // A query containing "/" reads as a file path, so paths lead; otherwise the
-  // named entities (threads then projects) lead and paths trail. Plugin
-  // provider rows always trail the built-in sources (they render in their
-  // own labeled sections at the bottom of the menu).
-  return args.trimmedQuery.includes("/")
-    ? [
-        ...args.pathSuggestions,
-        ...args.threadSuggestions,
-        ...args.projectSuggestions,
-        ...args.sectionSuggestions,
-        ...args.pluginSuggestions,
-      ]
-    : [
-        ...args.threadSuggestions,
-        ...args.projectSuggestions,
-        ...args.sectionSuggestions,
-        ...args.pathSuggestions,
-        ...args.pluginSuggestions,
-      ];
 }
 
 function buildProjectNamesById(
@@ -96,11 +63,9 @@ function buildProjectNamesById(
   return projectNamesById;
 }
 
-// The sidebar bootstrap keeps the personal project separate from the named
-// project list; project mentions offer both so every project is reachable.
 function buildProjectMentionCandidates(
   sidebarNavigation: SidebarBootstrapResponse | undefined,
-): ProjectMentionCandidate[] {
+): NamedMentionCandidate[] {
   if (!sidebarNavigation) {
     return [];
   }
@@ -112,7 +77,7 @@ function buildProjectMentionCandidates(
 
 function buildSectionMentionCandidates(
   sidebarNavigation: SidebarBootstrapResponse | undefined,
-): SectionMentionCandidate[] {
+): NamedMentionCandidate[] {
   return (
     sidebarNavigation?.sections.map((section) => ({
       id: section.id,
@@ -170,7 +135,7 @@ export function usePromptMentions(
     limit: PROMPT_MENTION_SOURCE_LIMIT,
     environmentId: options.environmentId,
     hostId: options.hostId,
-    currentThreadId: options.currentThreadId,
+    currentThreadId: options.threadStorageThreadId,
     includeDirectories: true,
   });
   const projectNamesQuery = useSidebarNavigation({
@@ -179,9 +144,6 @@ export function usePromptMentions(
   const threadsQuery = useThreadMentionCandidates({
     enabled: includeBuiltInSources && hasQuery,
   });
-  // Plugin mention providers (plugin design §4.9): searched server-side on
-  // the debounced query, only when at least one provider is registered for the
-  // active trigger.
   const pluginContributions = usePluginContributions();
   const hasMentionProviders =
     pluginContributions.data?.mentionProviders.some((provider) =>
@@ -194,7 +156,7 @@ export function usePromptMentions(
       ),
     [pluginContributions.data?.mentionProviders],
   );
-  const [debouncedQuery] = useDebounceValue(
+  const debouncedQuery = useDebouncedValue(
     trimmedQuery,
     PATH_SUGGESTION_DEBOUNCE_MS,
   );
@@ -227,6 +189,7 @@ export function usePromptMentions(
   );
 
   const currentThreadId = options.currentThreadId;
+  const resolveTitle = useResolveThreadTitle();
   const pathSuggestions = useMemo(
     () =>
       includeBuiltInSources
@@ -243,14 +206,18 @@ export function usePromptMentions(
       query: trimmedQuery,
       currentProjectId: projectId,
       currentThreadId,
+      currentEnvironmentId: options.environmentId,
       projectNamesById,
       limit: PROMPT_MENTION_SOURCE_LIMIT,
+      resolveTitle,
     });
   }, [
     currentThreadId,
     includeBuiltInSources,
+    options.environmentId,
     projectId,
     projectNamesById,
+    resolveTitle,
     threadsQuery.data,
     trimmedQuery,
   ]);
@@ -277,18 +244,16 @@ export function usePromptMentions(
         : [],
     [hasMentionProviders, pluginSearch.data, pluginSearchMatchesInput],
   );
-  const suggestions = useMemo(
+  const results = useMemo(
     () =>
-      hasQuery
-        ? buildPromptMentionSuggestions({
-            pathSuggestions,
-            threadSuggestions,
-            projectSuggestions,
-            sectionSuggestions,
-            pluginSuggestions,
-            trimmedQuery,
-          })
-        : [],
+      buildPromptMentionResults({
+        query: hasQuery ? trimmedQuery : "",
+        paths: hasQuery ? pathSuggestions : [],
+        threads: hasQuery ? threadSuggestions : [],
+        projects: hasQuery ? projectSuggestions : [],
+        sections: hasQuery ? sectionSuggestions : [],
+        plugins: hasQuery ? pluginSuggestions : [],
+      }),
     [
       hasQuery,
       pathSuggestions,
@@ -300,21 +265,14 @@ export function usePromptMentions(
     ],
   );
 
-  // Loading flips on only when there are zero suggestions to show. Once the
-  // first fetch returns (or placeholderData carries prior results across a
-  // refetch), suggestions stay populated and the menu never collapses back
-  // to the loading state mid-typing.
   const isLoading =
     hasQuery &&
-    suggestions.length === 0 &&
+    results.suggestions.length === 0 &&
     ((includeBuiltInSources &&
       (pathSearch.isDebouncing ||
         pathSearch.isLoading ||
         threadsQuery.isLoading ||
         threadsQuery.isFetching)) ||
-      // Plugin mention search failures fall back to "no plugin results"
-      // (the built-in sources still render), so only its loading state
-      // participates here.
       (hasMentionProviders &&
         (!pluginSearchMatchesInput ||
           pluginSearch.isLoading ||
@@ -332,7 +290,7 @@ export function usePromptMentions(
     query,
     triggers: mentionTriggers,
     setQuery,
-    suggestions,
+    results,
     isLoading,
     isError,
   };

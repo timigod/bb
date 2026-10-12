@@ -1,11 +1,13 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, type ReactNode } from "react";
 import type { GlobalProvider } from "@ladle/react";
 import { ThemeState } from "@ladle/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { WorkerPoolContextProvider } from "@pierre/diffs/react";
 import { Provider as JotaiProvider, createStore } from "jotai";
 import { MemoryRouter } from "react-router-dom";
+import { z } from "zod";
 import { AppToaster } from "../src/components/AppToaster";
+import { RouteNavigationProvider } from "../src/components/ui/app-route-anchor";
 import { TooltipProvider } from "@bb/shared-ui/tooltip";
 import { setPreferredTheme } from "../src/hooks/useTheme";
 import {
@@ -13,13 +15,36 @@ import {
   getDiffWorkerPoolSize,
 } from "../src/lib/diff-worker-pool";
 import { createAppQueryClient } from "../src/lib/query-client";
+import { ModelPickerStoryQueryProvider } from "./model-picker-query-provider";
 import "./ladle.css";
 
-// Ladle drops `?theme` from the URL during sidebar navigation when stories have
-// no controls (modifyParams early-exits on `!controlInitialized`). Without this,
-// a refresh after navigation falls back to ladle's defaultState. Restore the
-// remembered theme into the URL at module load so ladle's globalState picks it
-// up before React mounts.
+const storyModelPickerMetaSchema = z.object({
+  modelPickerCatalog: z.object({
+    environmentIds: z.array(z.string()).readonly(),
+  }),
+});
+
+function StoryModelPickerCatalog({
+  storyMeta,
+  children,
+}: {
+  storyMeta: unknown;
+  children: ReactNode;
+}) {
+  const environmentIds = useMemo(() => {
+    const parsed = storyModelPickerMetaSchema.safeParse(storyMeta);
+    return parsed.success
+      ? parsed.data.modelPickerCatalog.environmentIds
+      : null;
+  }, [storyMeta]);
+  if (environmentIds === null) return children;
+  return (
+    <ModelPickerStoryQueryProvider environmentIds={environmentIds}>
+      {children}
+    </ModelPickerStoryQueryProvider>
+  );
+}
+
 if (typeof window !== "undefined") {
   const params = new URLSearchParams(window.location.search);
   if (!params.has("theme")) {
@@ -32,7 +57,11 @@ if (typeof window !== "undefined") {
   }
 }
 
-export const Provider: GlobalProvider = ({ globalState, children }) => {
+export const Provider: GlobalProvider = ({
+  globalState,
+  storyMeta,
+  children,
+}) => {
   const isDark = globalState.theme === ThemeState.Dark;
   useEffect(() => {
     setPreferredTheme(isDark ? "dark" : "light");
@@ -57,24 +86,28 @@ export const Provider: GlobalProvider = ({ globalState, children }) => {
 
   return (
     <MemoryRouter initialEntries={["/"]}>
-      <JotaiProvider store={store}>
-        <QueryClientProvider client={queryClient}>
-          <WorkerPoolContextProvider
-            poolOptions={{
-              workerFactory: createDiffWorker,
-              poolSize: getDiffWorkerPoolSize(),
-            }}
-            highlighterOptions={{}}
-          >
-            <TooltipProvider delayDuration={300} disableHoverableContent>
-              <div className="min-h-screen text-foreground">
-                {children}
-                <AppToaster position="bottom-right" />
-              </div>
-            </TooltipProvider>
-          </WorkerPoolContextProvider>
-        </QueryClientProvider>
-      </JotaiProvider>
+      <RouteNavigationProvider>
+        <JotaiProvider store={store}>
+          <QueryClientProvider client={queryClient}>
+            <WorkerPoolContextProvider
+              poolOptions={{
+                workerFactory: createDiffWorker,
+                poolSize: getDiffWorkerPoolSize(),
+              }}
+              highlighterOptions={{}}
+            >
+              <TooltipProvider delayDuration={300} disableHoverableContent>
+                <div className="min-h-screen text-foreground">
+                  <StoryModelPickerCatalog storyMeta={storyMeta}>
+                    {children}
+                  </StoryModelPickerCatalog>
+                  <AppToaster />
+                </div>
+              </TooltipProvider>
+            </WorkerPoolContextProvider>
+          </QueryClientProvider>
+        </JotaiProvider>
+      </RouteNavigationProvider>
     </MemoryRouter>
   );
 };

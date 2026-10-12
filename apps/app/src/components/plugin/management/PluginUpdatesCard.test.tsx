@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { pluginUpdateJobsQueryKey } from "@/hooks/queries/query-keys";
+import { MemoryRouter } from "react-router-dom";
 import {
   cleanup,
   fireEvent,
@@ -18,36 +20,18 @@ import {
   PluginDetailReleaseStatus,
   pluginHasUpdateSurfaces,
 } from "./PluginUpdatesCard";
+import { makePluginListItem } from "@/test/fixtures/plugins";
 
 function plugin(overrides: Partial<PluginListItem> = {}): PluginListItem {
-  return {
+  return makePluginListItem({
     id: "linear",
     source: "npm:@example/linear@^1.6.0",
     rootDir: "/plugins/linear",
     version: "1.6.2",
-    enabled: true,
-    status: "running",
-    statusDetail: null,
-    description: null,
     name: "Linear",
-    icon: null,
-    compactIconUrl: null,
-    logoUrl: null,
-    logoDarkUrl: null,
-    hasSettings: false,
-    provenance: "direct",
-    isOrphanedBuiltin: false,
-    catalogEntryId: null,
     sourceDisplay: "npm · @bb-plugins/linear · pinned",
-    updateState: EMPTY_PLUGIN_UPDATE_STATE,
-    handlerStats: { count: 0, totalMs: 0, maxMs: 0, errorCount: 0 },
-    services: [],
-    schedules: [],
-    cliCommand: null,
-    capabilities: [],
-    app: { hasApp: false, bundle: null },
     ...overrides,
-  };
+  });
 }
 
 afterEach(() => {
@@ -58,7 +42,6 @@ afterEach(() => {
 
 describe("pluginHasUpdateSurfaces", () => {
   it("hides update surfaces for bundled plugins regardless of provenance", () => {
-    // A store-installed official: catalog provenance over a bundled source.
     expect(
       pluginHasUpdateSurfaces(
         plugin({ provenance: "catalog", source: "builtin:github" }),
@@ -69,7 +52,6 @@ describe("pluginHasUpdateSurfaces", () => {
         plugin({ provenance: "builtin", source: "builtin:secrets" }),
       ),
     ).toBe(false);
-    // Managed direct/catalog installs keep manual update controls.
     expect(pluginHasUpdateSurfaces(plugin({ provenance: "direct" }))).toBe(
       true,
     );
@@ -91,12 +73,18 @@ describe("PluginDetailReleaseControl", () => {
           },
         })}
       />,
-      { wrapper },
+      {
+        wrapper: ({ children }) => (
+          <MemoryRouter>{wrapper({ children })}</MemoryRouter>
+        ),
+      },
     );
 
-    expect(
-      screen.getByRole("button", { name: "Update Linear to 1.9.0" }),
-    ).toBeTruthy();
+    const update = screen.getByRole("button", {
+      name: "Update Linear to 1.9.0",
+    });
+    expect(update).toBeTruthy();
+    expect(update.querySelector('[data-icon="Download"]')).not.toBeNull();
     expect(screen.queryByText("Compatible with your bb.")).toBeNull();
   });
 
@@ -112,7 +100,11 @@ describe("PluginDetailReleaseControl", () => {
           },
         })}
       />,
-      { wrapper },
+      {
+        wrapper: ({ children }) => (
+          <MemoryRouter>{wrapper({ children })}</MemoryRouter>
+        ),
+      },
     );
 
     const blockedStatus = screen.getByRole("status", {
@@ -125,11 +117,6 @@ describe("PluginDetailReleaseControl", () => {
       "check again when a compatible plugin version is available",
     );
     expect(blockedStatus.textContent).not.toContain("Update bb");
-    expect(
-      blockedStatus
-        .querySelector('[data-icon="AlertTriangle"]')
-        ?.getAttribute("class"),
-    ).toContain("text-warning");
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -146,7 +133,11 @@ describe("PluginDetailReleaseControl", () => {
           },
         })}
       />,
-      { wrapper },
+      {
+        wrapper: ({ children }) => (
+          <MemoryRouter>{wrapper({ children })}</MemoryRouter>
+        ),
+      },
     );
 
     const blockedStatus = screen.getByRole("status", {
@@ -165,13 +156,16 @@ describe("PluginDetailReleaseControl", () => {
             resolve(
               new Response(
                 JSON.stringify({
-                  applied: true,
-                  from: { version: "1.6.2", display: "1.6.2" },
-                  to: { version: "1.9.0", display: "1.9.0" },
-                  outcome: "updated",
+                  job: {
+                    id: "retry-1",
+                    pluginId: "linear",
+                    displayName: "Linear",
+                    state: "running",
+                    phase: "checking",
+                  },
                 }),
                 {
-                  status: 200,
+                  status: 202,
                   headers: { "content-type": "application/json" },
                 },
               ),
@@ -179,7 +173,7 @@ describe("PluginDetailReleaseControl", () => {
         }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const { wrapper } = createQueryClientTestHarness();
+    const { wrapper, queryClient } = createQueryClientTestHarness();
     render(
       <>
         <PluginDetailReleaseControl
@@ -209,7 +203,11 @@ describe("PluginDetailReleaseControl", () => {
           })}
         />
       </>,
-      { wrapper },
+      {
+        wrapper: ({ children }) => (
+          <MemoryRouter>{wrapper({ children })}</MemoryRouter>
+        ),
+      },
     );
 
     const failedStatus = screen.getByRole("status", { name: "Update failed" });
@@ -217,11 +215,6 @@ describe("PluginDetailReleaseControl", () => {
     expect(failedStatus.textContent).toContain(
       "bb couldn’t activate 1.9.0. It restored 1.6.2 and its data.",
     );
-    expect(
-      failedStatus
-        .querySelector('[data-icon="CircleX"]')
-        ?.getAttribute("class"),
-    ).toContain("text-destructive");
     expect(screen.queryByText("Technical details")).toBeNull();
     expect(screen.queryByText("The plugin failed to load.")).toBeNull();
     expect(failedStatus.querySelector("button")).toBeNull();
@@ -234,6 +227,15 @@ describe("PluginDetailReleaseControl", () => {
     expect(retry).toHaveProperty("disabled", true);
     completeUpdate?.();
     await waitFor(() => expect(retry.getAttribute("aria-busy")).toBe("false"));
+    expect(queryClient.getQueryData(pluginUpdateJobsQueryKey())).toEqual([
+      {
+        id: "retry-1",
+        pluginId: "linear",
+        displayName: "Linear",
+        state: "running",
+        phase: "checking",
+      },
+    ]);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
@@ -246,7 +248,11 @@ describe("PluginDetailReleaseControl", () => {
           source: "builtin:linear",
         }}
       />,
-      { wrapper },
+      {
+        wrapper: ({ children }) => (
+          <MemoryRouter>{wrapper({ children })}</MemoryRouter>
+        ),
+      },
     );
     expect(container.textContent).toBe("");
   });

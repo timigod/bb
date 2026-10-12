@@ -1,23 +1,26 @@
-import { Loading03Icon, Mail01Icon } from "@hugeicons/core-free-icons";
+import Loading03Icon from "@hugeicons/core-free-icons/Loading03Icon";
+import Mail01Icon from "@hugeicons/core-free-icons/Mail01Icon";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { createFileRoute } from "@tanstack/react-router";
-import { Fragment, useEffect } from "react";
+import { Fragment } from "react";
 import type { ReactNode } from "react";
 
 import changelogMd from "../../../../CHANGELOG.md?raw";
-import { initAnalytics } from "../landing/analytics";
-import type { Release, ReleaseBlock } from "../landing/changelog";
-import { RELEASE_META, parseChangelog } from "../landing/changelog";
+import { RELEASE_META } from "../../../../changelog-metadata";
+import { useInitAnalytics } from "../landing/analytics";
+import {
+  parseChangelog,
+  type ChangelogBlock,
+  type ChangelogEntry,
+} from "../../../../changelog-parser";
 import { ChangelogInline } from "../landing/changelog-inline";
 import {
-  EmailSignup,
   focusSubscribeEmail,
   SUBSCRIBE_EMAIL_ID,
+  SubscribeSection,
 } from "../landing/cta";
+import { pageMeta, siteHeadLinks } from "../landing/page-head";
 import { SiteFooter, SiteNav } from "../landing/site-chrome";
-import { unfurlMeta } from "../landing/site";
-import interWoff2 from "@fontsource-variable/inter/files/inter-latin-wght-normal.woff2?url";
-import landingCss from "../landing/landing.css?url";
 import changelogCss from "../landing/changelog.css?url";
 
 const PAGE_TITLE = "Changelog — bb";
@@ -26,45 +29,22 @@ const PAGE_DESCRIPTION =
 
 export const Route = createFileRoute("/changelog")({
   head: () => ({
-    meta: [
-      { title: PAGE_TITLE },
-      { name: "description", content: PAGE_DESCRIPTION },
-      ...unfurlMeta(PAGE_TITLE, PAGE_DESCRIPTION, "/changelog"),
-      { name: "theme-color", content: "#ffffff" },
-    ],
-    links: [
-      {
-        rel: "preload",
-        href: interWoff2,
-        as: "font",
-        type: "font/woff2",
-        crossOrigin: "anonymous",
-      },
-      { rel: "stylesheet", href: landingCss },
-      { rel: "stylesheet", href: changelogCss },
-    ],
+    meta: pageMeta(PAGE_TITLE, PAGE_DESCRIPTION, "/changelog"),
+    links: siteHeadLinks(changelogCss),
   }),
   component: ChangelogRoute,
 });
 
 function ChangelogRoute() {
-  useEffect(() => {
-    initAnalytics();
-  }, []);
+  useInitAnalytics();
   return <ChangelogPage />;
 }
 
 const RELEASES = parseChangelog(changelogMd);
 
-/** "0.0.30" → "0-0-30", a fragment id that survives URL parsing. */
 function anchorId(version: string): string {
   return version.replaceAll(".", "-");
 }
-
-/* ── Release media ────────────────────────────────────────────────────
-   A hand-built visual per marquee release, in place of a screenshot: a
-   floating slice of the app sidebar, reusing the hero mock's classes from
-   landing.css so it matches the real app (and the homepage) exactly. */
 
 function ByMachineSidebar() {
   return (
@@ -87,7 +67,9 @@ function ByMachineSidebar() {
             </li>
             <li>
               <div className="trow">
-                <span className="trow-title">Desloppify High-Priority Worker</span>
+                <span className="trow-title">
+                  Desloppify High-Priority Worker
+                </span>
               </div>
               <ul className="threads thread-kids">
                 <li>
@@ -118,9 +100,7 @@ const RELEASE_MEDIA: Record<string, ReactNode> = {
   "0.0.30": <ByMachineSidebar />,
 };
 
-/* ── Page ─────────────────────────────────────────────────────────── */
-
-function Blocks({ blocks }: { blocks: ReleaseBlock[] }) {
+function Blocks({ blocks }: { blocks: ChangelogBlock[] }) {
   return (
     <>
       {blocks.map((block, index) =>
@@ -142,7 +122,7 @@ function Blocks({ blocks }: { blocks: ReleaseBlock[] }) {
   );
 }
 
-function ReleaseEntry({ release }: { release: Release }) {
+function ReleaseEntry({ release }: { release: ChangelogEntry }) {
   const meta = RELEASE_META[release.version];
   const anchor = anchorId(release.version);
   return (
@@ -201,11 +181,10 @@ function ChangelogPage() {
         <ReleaseEntry key={release.version} release={release} />
       ))}
 
-      <section className="subscribe" id="subscribe">
-        <h2 className="subscribe-title">Stay in the loop.</h2>
-        <p>Get release notes in your inbox. No spam.</p>
-        <EmailSignup placement="footer" />
-      </section>
+      <SubscribeSection
+        id="subscribe"
+        blurb="Get release notes in your inbox. No spam."
+      />
 
       <SiteFooter />
     </div>

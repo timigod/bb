@@ -3,7 +3,7 @@ import { z } from "zod";
 export const threadTimelineActivePromptModeSchema = z
   .object({
     mode: z.literal("plan"),
-    providerId: z.enum(["claude-code", "codex"]),
+    providerId: z.string().min(1),
     prompt: z.string(),
   })
   .strict();

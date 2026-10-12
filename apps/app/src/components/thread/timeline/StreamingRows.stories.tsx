@@ -1,24 +1,3 @@
-// Testbed for the full streaming + pinning + height-animation stack. Each
-// variant renders inside a production-mirroring stage (`PageShell` with
-// bottom-anchor scroll wrapping `ConversationTimeline` and
-// `ThreadTimelineRows`) and ticks through a scripted streaming sequence, so
-// changes to the timeline's container height transitions, scroll-pin
-// behavior, or markdown body resize can be evaluated against realistic
-// structural shapes:
-//
-//  - optimistic user message: simulates the optimistic→server row swap.
-//  - working / thinking indicator: HeightTransition enter/exit on a toggling
-//    indicator below a static rows context.
-//  - assistant messages: top-level conversation rows arriving one at a time.
-//  - assistant content streaming: a single assistant row stays mounted while
-//    its markdown body grows sentence-by-sentence through `\n\n` breaks,
-//    bullet lists, and a fenced code block.
-//  - bundle children: tool rows append into the trailing exploration bundle,
-//    exercising both top-level and nested `TimelineRowsList` row insertion
-//    plus the bundle's internal sticky-bottom catch-up.
-//
-// Each variant has its own Pause and Restart so a frame can be held for
-// inspection. All variants are paused by default.
 import { useEffect, useState, type ReactNode } from "react";
 import type { TimelineRow } from "@bb/server-contract";
 import {
@@ -29,6 +8,7 @@ import { ConversationTimeline } from "@/components/ui/conversation.js";
 import { HeightTransition } from "@/components/ui/height-transition.js";
 import { PageShell } from "@/components/ui/page-shell.js";
 import { StoryCard, StoryRow } from "../../../../.ladle/story-card";
+import { explorationRow, type ExplorationStep } from "./streaming-story-rows";
 
 export default {
   title: "thread/timeline/Streaming",
@@ -41,10 +21,6 @@ const baseProps = {
 
 const THREAD_ID = "thr_streaming_rows";
 
-// Mirrors the production ThreadTimelinePane structure so the story exercises
-// the same scroll/pin/spacing path: PageShell with bottom-anchor scroll
-// wrapping ConversationTimeline (gap-1 between rows + ongoing indicator).
-// Fixed-height parent so the scroll area is bounded and the pin is engaged.
 function PinnedTimelineStage({
   rows,
   indicator,
@@ -54,17 +30,9 @@ function PinnedTimelineStage({
   rows: readonly TimelineRow[];
   indicator: ReactNode;
   showIndicator: boolean;
-  // Threaded into the React key so consumers can observe the story
-  // re-mounting the row list each loop cycle if needed.
   cycle?: number;
 }) {
   return (
-    // `overflow-anchor: none` on the stage container so the browser's
-    // page-level scroll anchoring doesn't pick an element inside a tick-
-    // animating story (motion-driven height changes inside a `<p>` or `<li>`)
-    // as its page anchor — otherwise the whole page silently shifts as inner
-    // content settles. Internal sticky-bottom inside `BottomAnchoredScrollBody`
-    // is unaffected; it owns the inner scroll element directly.
     <div
       className="flex h-[360px] w-full max-w-[760px] flex-col rounded-md border border-border bg-background"
       style={{ overflowAnchor: "none" }}
@@ -127,11 +95,6 @@ function StreamingLabel({
   );
 }
 
-// Cycles 0 → totalSteps, holds at totalSteps for `pauseTicks` more intervals,
-// then wraps back to 0 — so the demo replays continuously. `cycle` increments
-// each wrap so consumers can re-key affected subtrees if needed. `isPaused`
-// halts ticking without resetting the counter; resuming continues from the
-// same step. `restartKey` resets the counter to 0 on change.
 function useStreamingTickLoop(
   totalSteps: number,
   intervalMs: number,
@@ -160,15 +123,6 @@ function useStreamingTickLoop(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Variant 0 — optimistic user message swap. Simulates the optimistic →
-// server row swap: an optimistic user row mounts, then the server row
-// replaces it. The two rows have different ids but identical content; the
-// container's height transition absorbs the swap without flicker because
-// per-row mount animations were intentionally removed in favor of a single
-// outer height transition.
-// ---------------------------------------------------------------------------
-
 const OPTIMISTIC_USER_PROMPT_TEXT =
   "Can you also trace the retry policy module?";
 
@@ -179,6 +133,7 @@ function buildOptimisticUserRow(id: string): TimelineRow {
     turnId: `${id}-turn`,
     sourceSeqStart: 1,
     sourceSeqEnd: 1,
+    messageSeq: 1,
     startedAt: 0,
     createdAt: 0,
     kind: "conversation",
@@ -201,9 +156,6 @@ function OptimisticUserMessageFlicker({
   restartKey: number;
   isPaused: boolean;
 }) {
-  // Three phases per cycle: empty → optimistic → real. The interval is short
-  // enough that the optimistic row's mount animation is still in flight when
-  // the real row replaces it, reproducing the visible "animate twice" jank.
   const { step, cycle } = useStreamingTickLoop(
     2,
     200,
@@ -226,12 +178,6 @@ function OptimisticUserMessageFlicker({
     />
   );
 }
-
-// ---------------------------------------------------------------------------
-// Variant 1 — assistant message arrivals. Top-level conversation rows mount
-// one at a time. This is the surface a "grow from 0 height + fade" transition
-// would land on.
-// ---------------------------------------------------------------------------
 
 interface ConversationStep {
   role: "user" | "assistant";
@@ -295,6 +241,7 @@ function conversationRowFromStep(
     turnId: `streaming-rows-turn-${index}`,
     sourceSeqStart: index + 1,
     sourceSeqEnd: index + 1,
+    messageSeq: index + 1,
     startedAt: index,
     createdAt: index,
     kind: "conversation" as const,
@@ -346,15 +293,6 @@ function ConversationRowsArriving({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Variant 2 — working/thinking indicator toggling. The indicator is the
-// other surface that benefits from an enter/exit height transition since it
-// appears and disappears between turns.
-// ---------------------------------------------------------------------------
-
-// A static turn rendered above the toggling indicator so the layout shift is
-// visible when the indicator appears/disappears under bottom-pin. Sized to
-// comfortably overflow the 360px stage so the scroll area is engaged.
 const INDICATOR_CONTEXT_STEPS: readonly ConversationStep[] = [
   {
     role: "user",
@@ -385,23 +323,11 @@ const INDICATOR_CONTEXT_STEPS: readonly ConversationStep[] = [
 const INDICATOR_CONTEXT_ROWS: readonly TimelineRow[] =
   INDICATOR_CONTEXT_STEPS.map(conversationRowFromStep);
 
-// ---------------------------------------------------------------------------
-// Variant 3 — content streaming inside an already-mounted assistant row.
-// The row mounts once with the user prompt above it, then the markdown body
-// grows sentence by sentence — exercising row resize rather than row mount.
-// ---------------------------------------------------------------------------
-
 const ASSISTANT_STREAMING_USER_PROMPT: ConversationStep = {
   role: "user",
   text: "Trace how a command failure surfaces in the timeline — what files are involved?",
 };
 
-// Chunks already carry their own separators (`\n\n`, `\n- `, ` `) so the
-// running body is built by joining with the empty string. Mixes paragraph
-// breaks, an inline bullet list, and a fenced code block so the demo
-// exercises real markdown structure changes — paragraph extensions stay in
-// the same `<p>`, while `\n\n` / lists / code blocks add new top-level
-// blocks that the eye reads as discrete structural events.
 const ASSISTANT_STREAMING_CHUNKS: readonly string[] = [
   "Sure — let me trace it from the daemon up to the UI.",
   "\n\nI started with `services/commands/failure-tracker.ts` to see how the host daemon's exit-code events get turned into thread rows.",
@@ -432,11 +358,6 @@ function AssistantContentStreaming({
     restartKey,
     isPaused,
   );
-  // Shared turn id so the assistant reply is grouped under the user prompt
-  // like a real turn. `sourceSeqEnd` on the assistant row advances each tick
-  // — the row memo's signature comparator (timelineRowSignatures.ts) omits
-  // text/output deliberately and relies on the source sequence advancing to
-  // invalidate the memo on in-place mutations.
   const turnId = "streaming-rows-content-turn";
   const userRow: TimelineRow = {
     id: "streaming-rows-content-user",
@@ -444,6 +365,7 @@ function AssistantContentStreaming({
     turnId,
     sourceSeqStart: 1,
     sourceSeqEnd: 1,
+    messageSeq: 1,
     startedAt: 0,
     createdAt: 0,
     kind: "conversation",
@@ -464,6 +386,7 @@ function AssistantContentStreaming({
     turnId,
     sourceSeqStart: 2,
     sourceSeqEnd: 2 + step,
+    messageSeq: 2 + step,
     startedAt: 1,
     createdAt: 1,
     kind: "conversation",
@@ -485,23 +408,6 @@ function AssistantContentStreaming({
       cycle={cycle}
     />
   );
-}
-
-// ---------------------------------------------------------------------------
-// Variant 4 — bundle children arriving. New tool rows append one at a time
-// into the trailing exploration bundle. Once two or more land in the same
-// run, the projection groups them under a bundle-summary that shimmers as
-// the active-latest frontier.
-// ---------------------------------------------------------------------------
-
-interface ExplorationStep {
-  callId: string;
-  toolName: "Read" | "Grep" | "Glob";
-  toolArgs: Record<string, string | number>;
-  intent:
-    | { type: "read"; name: string; path: string }
-    | { type: "search"; query: string; path: string }
-    | { type: "list_files"; path: string };
 }
 
 const BUNDLE_LEAD_IN_STEPS: readonly ConversationStep[] = [
@@ -530,20 +436,13 @@ const BUNDLE_LEAD_IN_ROWS: readonly TimelineRow[] = BUNDLE_LEAD_IN_STEPS.map(
 const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   {
     callId: "bundle_read_failure_tracker",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "apps/server/src/services/commands/failure-tracker.ts",
-    },
     intent: {
       type: "read",
-      name: "failure-tracker.ts",
       path: "apps/server/src/services/commands/failure-tracker.ts",
     },
   },
   {
     callId: "bundle_grep_command_failure",
-    toolName: "Grep",
-    toolArgs: { pattern: "command_failure", path: "apps/server/src" },
     intent: {
       type: "search",
       query: "command_failure",
@@ -552,29 +451,17 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_recoverable",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "apps/server/src/services/commands/recoverable.ts",
-    },
     intent: {
       type: "read",
-      name: "recoverable.ts",
       path: "apps/server/src/services/commands/recoverable.ts",
     },
   },
   {
     callId: "bundle_glob_retry_tests",
-    toolName: "Glob",
-    toolArgs: { pattern: "apps/server/test/commands/*.test.ts" },
     intent: { type: "list_files", path: "apps/server/test/commands" },
   },
   {
     callId: "bundle_grep_command_failure_exhausted",
-    toolName: "Grep",
-    toolArgs: {
-      pattern: "command_failure_exhausted",
-      path: "packages/thread-view/src",
-    },
     intent: {
       type: "search",
       query: "command_failure_exhausted",
@@ -583,18 +470,13 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_system_row",
-    toolName: "Read",
-    toolArgs: { file_path: "packages/thread-view/src/system-row.ts" },
     intent: {
       type: "read",
-      name: "system-row.ts",
       path: "packages/thread-view/src/system-row.ts",
     },
   },
   {
     callId: "bundle_grep_surface_message",
-    toolName: "Grep",
-    toolArgs: { pattern: "surfaceMessage", path: "apps/server/src" },
     intent: {
       type: "search",
       query: "surfaceMessage",
@@ -603,18 +485,13 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_retry_policy",
-    toolName: "Read",
-    toolArgs: { file_path: "apps/server/src/services/commands/retry.ts" },
     intent: {
       type: "read",
-      name: "retry.ts",
       path: "apps/server/src/services/commands/retry.ts",
     },
   },
   {
     callId: "bundle_glob_failure_renderers",
-    toolName: "Glob",
-    toolArgs: { pattern: "apps/app/src/components/thread/**/Failure*.tsx" },
     intent: {
       type: "list_files",
       path: "apps/app/src/components/thread",
@@ -622,8 +499,6 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_grep_retry_chip",
-    toolName: "Grep",
-    toolArgs: { pattern: "retry count chip", path: "apps/app/src" },
     intent: {
       type: "search",
       query: "retry count chip",
@@ -632,20 +507,13 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_failure_badge",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "apps/app/src/components/thread/FailureBadge.tsx",
-    },
     intent: {
       type: "read",
-      name: "FailureBadge.tsx",
       path: "apps/app/src/components/thread/FailureBadge.tsx",
     },
   },
   {
     callId: "bundle_grep_classifier",
-    toolName: "Grep",
-    toolArgs: { pattern: "classifier", path: "apps/server/src/services" },
     intent: {
       type: "search",
       query: "classifier",
@@ -654,20 +522,13 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_telemetry_sink",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "apps/server/src/services/observability/sink.ts",
-    },
     intent: {
       type: "read",
-      name: "sink.ts",
       path: "apps/server/src/services/observability/sink.ts",
     },
   },
   {
     callId: "bundle_grep_emit_failure",
-    toolName: "Grep",
-    toolArgs: { pattern: "emitFailure", path: "apps/server/src" },
     intent: {
       type: "search",
       query: "emitFailure",
@@ -676,8 +537,6 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_glob_failure_fixtures",
-    toolName: "Glob",
-    toolArgs: { pattern: "apps/server/test/fixtures/command-failures/*.json" },
     intent: {
       type: "list_files",
       path: "apps/server/test/fixtures/command-failures",
@@ -685,20 +544,13 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_thread_view_system_row",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "packages/thread-view/src/system-row-renderer.ts",
-    },
     intent: {
       type: "read",
-      name: "system-row-renderer.ts",
       path: "packages/thread-view/src/system-row-renderer.ts",
     },
   },
   {
     callId: "bundle_grep_failure_badge",
-    toolName: "Grep",
-    toolArgs: { pattern: "FailureBadge", path: "apps/app/src" },
     intent: {
       type: "search",
       query: "FailureBadge",
@@ -707,70 +559,19 @@ const BUNDLE_EXPLORATION_STEPS: readonly ExplorationStep[] = [
   },
   {
     callId: "bundle_read_failure_badge_test",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "apps/app/src/components/thread/FailureBadge.test.tsx",
-    },
     intent: {
       type: "read",
-      name: "FailureBadge.test.tsx",
       path: "apps/app/src/components/thread/FailureBadge.test.tsx",
     },
   },
   {
     callId: "bundle_glob_retry_renderers",
-    toolName: "Glob",
-    toolArgs: {
-      pattern: "apps/app/src/components/thread/**/RetryChip*.tsx",
-    },
     intent: {
       type: "list_files",
       path: "apps/app/src/components/thread",
     },
   },
 ];
-
-function bundleExplorationRow(step: ExplorationStep, seq: number): TimelineRow {
-  return {
-    id: `streaming-rows-bundle:${step.callId}`,
-    threadId: THREAD_ID,
-    turnId: "streaming-rows-bundle-turn",
-    sourceSeqStart: seq,
-    sourceSeqEnd: seq,
-    startedAt: seq,
-    createdAt: seq,
-    kind: "work",
-    workKind: "tool",
-    status: "completed",
-    callId: step.callId,
-    toolName: step.toolName,
-    toolArgs: step.toolArgs,
-    output: "",
-    completedAt: seq,
-    approvalStatus: null,
-    activityIntents: [
-      step.intent.type === "read"
-        ? {
-            type: "read",
-            command: step.toolName,
-            name: step.intent.name,
-            path: step.intent.path,
-          }
-        : step.intent.type === "search"
-          ? {
-              type: "search",
-              command: step.toolName,
-              query: step.intent.query,
-              path: step.intent.path,
-            }
-          : {
-              type: "list_files",
-              command: step.toolName,
-              path: step.intent.path,
-            },
-    ],
-  };
-}
 
 function BundleChildrenArriving({
   restartKey,
@@ -779,8 +580,6 @@ function BundleChildrenArriving({
   restartKey: number;
   isPaused: boolean;
 }) {
-  // Pacing tightened so streaming through ~20 rows lands in a reasonable
-  // demo cycle while still being slow enough to read each new row.
   const { step, cycle } = useStreamingTickLoop(
     BUNDLE_EXPLORATION_STEPS.length,
     800,
@@ -790,7 +589,11 @@ function BundleChildrenArriving({
   );
   const bundleRows = BUNDLE_EXPLORATION_STEPS.slice(0, step).map(
     (stepData, index) =>
-      bundleExplorationRow(stepData, BUNDLE_LEAD_IN_ROWS.length + index + 1),
+      explorationRow(stepData, BUNDLE_LEAD_IN_ROWS.length + index + 1, {
+        idPrefix: "streaming-rows-bundle",
+        threadId: THREAD_ID,
+        turnId: "streaming-rows-bundle-turn",
+      }),
   );
   const rows = [...BUNDLE_LEAD_IN_ROWS, ...bundleRows];
   const isStreaming = step < BUNDLE_EXPLORATION_STEPS.length;
@@ -804,10 +607,6 @@ function BundleChildrenArriving({
   );
 }
 
-// Cycle: none → working → thinking → working → (back to none). Each phase
-// holds for one interval. Captures the realistic shape of a turn: idle
-// before the assistant starts, work + reasoning interleavings, then idle
-// again once the turn settles.
 const INDICATOR_PHASE_SEQUENCE: readonly ("none" | "working" | "thinking")[] = [
   "none",
   "working",
@@ -846,8 +645,6 @@ function WorkingIndicatorToggling({
     />
   );
 }
-
-// ---------------------------------------------------------------------------
 
 export function Rows() {
   const [flickerKey, setFlickerKey] = useState(0);

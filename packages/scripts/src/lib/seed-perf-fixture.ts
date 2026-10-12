@@ -11,22 +11,17 @@ import {
 } from "@bb/db";
 
 export interface SeedPerfFixtureOptions {
-  /** Host id the seeded environments attach to. */
   hostId: string;
-  /** Root directory recorded as each project's workspace path. */
   workspacesRootPath: string;
   projectCount: number;
   threadCount: number;
-  /** Approximate total event rows across all seeded threads. */
   eventCount: number;
-  /** Deterministic RNG seed. The same seed produces the same fixture. */
   randomSeed: number;
   onProgress?: (message: string) => void;
 }
 
 export interface SeedPerfFixtureResult {
   projectIds: string[];
-  /** Workspace directory recorded for each seeded project's root environment. */
   projectWorkspacePaths: string[];
   threadIds: string[];
   eventRowCount: number;
@@ -742,10 +737,6 @@ function buildThreadEvents(args: ThreadEventBuildArgs): void {
   }
 }
 
-/**
- * Thread sizes follow a long tail: most threads stay small while a few
- * grow to thousands of events, which mirrors real usage.
- */
 function buildThreadEventTargets(
   rng: Rng,
   threadCount: number,
@@ -837,14 +828,14 @@ export function seedPerfFixture(
       projectId,
       hostId: options.hostId,
       path: workspacePath,
-      managed: false,
       isGitRepo: true,
-      isWorktree: false,
       branchName: "main",
       baseBranch: null,
       defaultBranch: "main",
       mergeBaseBranch: null,
-      workspaceProvisionType: "unmanaged",
+      environmentProviderId: null,
+      environmentProviderSelection: null,
+      environmentProviderInstanceKey: null,
       status: "ready",
       createdAt,
       updatedAt: now,
@@ -858,8 +849,6 @@ export function seedPerfFixture(
     });
   }
 
-  // Long-tail thread ownership: the first seeded project acts like the main
-  // daily-driver project and owns roughly half of all threads.
   for (let index = 0; index < options.threadCount; index += 1) {
     const roll = rng.next();
     const projectIndex =
@@ -915,10 +904,8 @@ export function seedPerfFixture(
           name: null,
           projectId: project.id,
           hostId: options.hostId,
-          path: `${options.workspacesRootPath}/worktrees/${environmentId}/${project.name}`,
-          managed: true,
+          path: `${options.workspacesRootPath}/plugins/environment-git-worktree/host-data/worktrees/${threadId}/${project.name}`,
           isGitRepo: true,
-          isWorktree: true,
           branchName: `bb/${title
             .toLowerCase()
             .slice(0, 24)
@@ -926,7 +913,11 @@ export function seedPerfFixture(
           baseBranch: "origin/main",
           defaultBranch: "main",
           mergeBaseBranch: null,
-          workspaceProvisionType: "managed-worktree",
+          environmentProviderId: "git-worktree",
+          environmentProviderSelection: {
+            machine: { type: "existing", hostId: options.hostId },
+            inputs: { branch: { kind: "named", name: "origin/main" } },
+          },
           status: archived ? "destroyed" : "ready",
           createdAt: startAt,
           updatedAt: endAt,

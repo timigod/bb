@@ -54,11 +54,6 @@ const defaultExecFile: ExecFileFn = async (file, args = []) => {
   };
 };
 
-// Writes the host ID file. Idempotent: if a value is already persisted and
-// matches, this is a no-op. Callers must only invoke this once the host has
-// been successfully enrolled — persisting earlier strands the daemon if
-// enrollment fails, because the file then conflicts with any subsequent
-// BB_HOST_ID provided on retry.
 export async function persistHostId(options: {
   dataDir: string;
   hostId: string;
@@ -72,9 +67,7 @@ export async function persistHostId(options: {
       mode: 0o600,
     });
     return;
-  } catch {
-    // Fall through to validate any racing write below.
-  }
+  } catch {}
   const racedValue = await readHostIdFile(hostIdPath);
   if (!racedValue) {
     throw new Error(`Failed to initialize host ID at ${hostIdPath}`);
@@ -123,7 +116,6 @@ export async function loadHostIdentity(options: {
   fallbackHostName?: () => string;
   platform?: NodeJS.Platform;
   providedHostId?: string;
-  providedHostName?: string;
 }): Promise<HostIdentity> {
   await fs.mkdir(options.dataDir, { recursive: true });
   const [hostId, hostName] = await Promise.all([
@@ -132,13 +124,11 @@ export async function loadHostIdentity(options: {
       createId: options.createId,
       providedHostId: options.providedHostId,
     }),
-    options.providedHostName
-      ? Promise.resolve(options.providedHostName)
-      : detectHostName({
-          platform: options.platform,
-          execFile: options.execFile,
-          fallbackHostName: options.fallbackHostName,
-        }),
+    detectHostName({
+      platform: options.platform,
+      execFile: options.execFile,
+      fallbackHostName: options.fallbackHostName,
+    }),
   ]);
 
   return { hostId, hostName };

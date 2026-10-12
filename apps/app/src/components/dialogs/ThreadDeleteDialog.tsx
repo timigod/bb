@@ -2,11 +2,10 @@ import type { Thread } from "@bb/domain";
 import {
   ConfirmDeleteDialog,
   ConfirmDeleteDialogContent,
-} from "./ConfirmDeleteDialog";
+} from "@bb/shared-ui/confirm-delete-dialog";
 
 export interface ThreadDeleteDialogTarget {
   thread: Thread;
-  /** Present iff the thread has one or more non-deleted children. */
   childThreadCount?: number;
 }
 
@@ -37,7 +36,7 @@ export function ThreadDeleteDialog({
   );
 }
 
-export interface ThreadDeleteDialogContentProps {
+interface ThreadDeleteDialogContentProps {
   target: ThreadDeleteDialogTarget;
   pending: boolean;
   onOpenChange: (open: boolean) => void;

@@ -1,26 +1,24 @@
 import { extractErrorMessage, toRecord } from "@bb/core-ui";
-import { BbHttpError } from "@bb/sdk/browser";
 import { appToast } from "@/components/ui/app-toast";
-import { HttpError } from "./api";
+import { asHttpError, getHttpErrorMessage } from "./http-error";
 import {
   describeLifecycleError,
   formatLifecycleErrorDescription,
   type LifecycleErrorOperation,
 } from "./lifecycle-errors";
 
-const HTTP_STATUS_PREFIX_PATTERN = /^HTTP \d{3}:\s*/u;
 const NETWORK_TRANSPORT_ERROR_MESSAGE =
   "Could not reach the server. Check that it is running and try again.";
 const GENERIC_REQUEST_FAILED_MESSAGE = "Request failed";
 const TRAILING_PERIOD_PATTERN = /\.$/u;
 
-export interface MutationErrorMessageOptions {
+interface MutationErrorMessageOptions {
   error: unknown;
   fallbackMessage: string;
   lifecycleOperation?: LifecycleErrorOperation | undefined;
 }
 
-export interface MutationErrorMeta {
+interface MutationErrorMeta {
   errorMessage?: string;
   lifecycleOperation?: LifecycleErrorOperation;
   showErrorToast?: boolean;
@@ -32,29 +30,12 @@ function normalizeMessage(message: string): string {
   return message.replace(/\s+/g, " ").trim();
 }
 
-function stripHttpStatusPrefix(message: string): string {
-  return message.replace(HTTP_STATUS_PREFIX_PATTERN, "");
-}
-
-function stripTrailingPeriod(message: string): string {
-  return message.replace(TRAILING_PERIOD_PATTERN, "");
-}
-
-function isAbortLikeError(error: unknown): boolean {
-  if (error instanceof DOMException && error.name === "AbortError") {
-    return true;
-  }
-
-  const record = toRecord(error);
-  return record?.name === "AbortError";
+export function isAbortLikeError(error: unknown): boolean {
+  return toRecord(error)?.name === "AbortError";
 }
 
 function isNetworkTransportError(error: unknown): boolean {
-  if (
-    error instanceof HttpError ||
-    error instanceof BbHttpError ||
-    isAbortLikeError(error)
-  ) {
+  if (asHttpError(error) !== null || isAbortLikeError(error)) {
     return false;
   }
 
@@ -93,7 +74,6 @@ function toLifecycleErrorOperation(
     case "send_message":
     case "send_queued_message":
     case "set_queued_message_group_boundary":
-    case "squash_merge":
     case "stop_thread":
     case "update_queued_message":
     case "update_merge_base":
@@ -101,18 +81,6 @@ function toLifecycleErrorOperation(
     default:
       return undefined;
   }
-}
-
-function getHttpErrorMessage(error: HttpError | BbHttpError): string | null {
-  const bodyMessage = extractErrorMessage(error.body);
-  if (bodyMessage) {
-    return normalizeMessage(bodyMessage);
-  }
-
-  const strippedMessage = stripHttpStatusPrefix(
-    normalizeMessage(error.message),
-  );
-  return strippedMessage.length > 0 ? strippedMessage : null;
 }
 
 export function getMutationErrorMeta(
@@ -154,8 +122,9 @@ export function getMutationErrorMessage({
     return formatLifecycleErrorDescription(lifecycleErrorDescription);
   }
 
-  if (error instanceof HttpError || error instanceof BbHttpError) {
-    return getHttpErrorMessage(error) ?? fallbackMessage;
+  const httpError = asHttpError(error);
+  if (httpError !== null) {
+    return getHttpErrorMessage(httpError) ?? fallbackMessage;
   }
 
   if (isNetworkTransportError(error)) {
@@ -167,9 +136,7 @@ export function getMutationErrorMessage({
     return fallbackMessage;
   }
 
-  const normalizedMessage = stripHttpStatusPrefix(
-    normalizeMessage(extractedMessage),
-  );
+  const normalizedMessage = normalizeMessage(extractedMessage);
   return normalizedMessage.length > 0 ? normalizedMessage : fallbackMessage;
 }
 
@@ -186,13 +153,22 @@ export function showMutationErrorToast({
     return;
   }
 
-  const message = stripTrailingPeriod(
-    getMutationErrorMessage({
-      error,
-      fallbackMessage,
-      lifecycleOperation,
-    }),
-  );
+  const lifecycleDescription = describeLifecycleError({
+    error,
+    operation: lifecycleOperation,
+  });
+  if (lifecycleDescription) {
+    appToast.error(lifecycleDescription.title, {
+      description: lifecycleDescription.body,
+    });
+    return;
+  }
+
+  const message = getMutationErrorMessage({
+    error,
+    fallbackMessage,
+    lifecycleOperation,
+  }).replace(TRAILING_PERIOD_PATTERN, "");
   if (message === GENERIC_REQUEST_FAILED_MESSAGE) {
     appToast.error("Request failed", {
       description: "Please try again",
@@ -200,5 +176,12 @@ export function showMutationErrorToast({
     return;
   }
 
-  appToast.error(message);
+  const title = normalizeMessage(fallbackMessage).replace(
+    TRAILING_PERIOD_PATTERN,
+    "",
+  );
+  appToast.error(
+    title,
+    message === title ? undefined : { description: message },
+  );
 }

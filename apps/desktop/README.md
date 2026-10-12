@@ -1,19 +1,13 @@
 # @bb/desktop
 
-macOS and Linux Electron shell for bb. The desktop app loads the existing bb
+macOS, Linux, and Windows Electron shell for bb. The desktop app loads the existing bb
 web UI and uses the packaged `bb-app` launcher for server and host-daemon
 lifecycle.
 
 ## Development
 
-From the repo root, the full source dev loop is:
-
-```bash
-pnpm dev:desktop
-```
-
-That starts the source dev server and the Electron shell through
-`scripts/bb-dev-app`. To run only the desktop package task directly:
+From the repo root, run `pnpm dev` in one terminal for the source server and
+live UI updates. In a second terminal, start the Electron shell:
 
 ```bash
 pnpm exec turbo run dev --filter=@bb/desktop
@@ -22,7 +16,7 @@ pnpm exec turbo run dev --filter=@bb/desktop
 The dev script builds `bb-app`, compiles the Electron main/preload files, and
 opens Electron directly. By default it uses the same checkout-scoped
 `~/.bb-dev/<checkout-instance>` data directory and deterministic high ports as
-the main repo dev launcher; it prints the resolved data dir, server URL, and
+`pnpm dev`; it prints the resolved data dir, server URL, and
 Electron user-data dir at startup. It intentionally overwrites inherited
 `BB_DATA_DIR`, `BB_SERVER_PORT`, `BB_SERVER_URL`, and `BB_HOST_DAEMON_PORT` so a
 desktop dev run launched from an existing bb session still targets the current
@@ -52,12 +46,39 @@ Node runtime:
 pnpm exec turbo run start --filter=@bb/desktop
 ```
 
-Electron is pinned to `41.7.0`, the highest stable line verified to rebuild the
-packaged native modules with the current dependency set. Electron 42.2.0 was
-tested, but `better-sqlite3@12.10.0` does not compile against Electron ABI 146.
-Revisit the pin when `better-sqlite3` ships support or prebuilds for that ABI.
+Electron is pinned to `44.3.0`. macOS builds require macOS 13 (Ventura) or
+newer. The bundled `bb-app` runtime uses `better-sqlite3@13.0.3`, whose N-API
+binaries work with Electron without an ABI-specific rebuild. The packaging
+hook opens an in-memory database with Electron before accepting the packaged
+SQLite module; older ABI-specific modules still use the prebuild fallback.
+
+macOS notifications require a signed application. Unsigned local and CI artifact
+builds cannot display macOS notifications. Published releases use the existing
+signing and notarization workflow.
+
+The shipped Linux x64 SQLite prebuild requires glibc 2.34 or newer and
+libstdc++ with `GLIBCXX_3.4.29` support (GCC 11 or newer).
+
+The AppImage packaging patch exposes its bundled legacy `libnotify` only as
+`libnotify.so`. Electron first tries the system's versioned library names, so
+libnotify 0.7.10 or newer can supply notification activation tokens on Wayland.
+If no versioned system library loads, Electron can still use the bundled
+unversioned fallback for notifications. Older libraries keep their existing
+notification behavior but cannot forward activation tokens.
+
+Electron downloads its development runtime lazily; the desktop test command
+installs it before starting parallel workers.
+
+The macOS bundle declares macOS 13 as its minimum. The release feed generator
+writes the corresponding Darwin kernel minimum, 22.0.0, into both JSON and YAML
+update feeds. Run it before publishing release artifacts so older Macs reject
+incompatible updates.
 
 ## Validation
+
+The built-in browser allows file downloads using Electron's native save dialog.
+Files are saved on the machine running the desktop app, including downloads
+initiated in desktop browser automation tabs.
 
 ```bash
 pnpm exec turbo run typecheck --filter=@bb/desktop --filter=bb-app
@@ -66,6 +87,10 @@ pnpm exec turbo run test --filter=@bb/desktop --filter=bb-app --force
 pnpm exec turbo run dev --filter=@bb/desktop
 ```
 
+The desktop tests include an Electron startup smoke that opens a real window.
+On Linux it runs only when `DISPLAY` is set; on a headless host, wrap the test
+command in `xvfb-run -a`, as CI does.
+
 ## Packaging
 
 ```bash
@@ -73,9 +98,8 @@ pnpm exec turbo run desktop:build --filter=@bb/desktop
 pnpm exec turbo run smoke:packaged --filter=@bb/desktop
 ```
 
-Artifacts are written under `apps/desktop/release/`. The desktop build is
-macOS-only and produces separate Apple Silicon arm64 and Intel x64 artifacts.
-Without signing secrets, local builds
+Artifacts are written under `apps/desktop/release/`. The macOS build is Apple
+Silicon arm64-only; Intel Macs are not a target. Without signing secrets, local builds
 sign with a code-signing identity auto-discovered from the keychain and skip
 notarization. A valid signature matters even for local builds: macOS
 provenance-tracks unsigned apps, forcing syspolicyd to evaluate every exec in
@@ -83,6 +107,74 @@ the app's process tree, which can stall process launches system-wide. On
 machines with no keychain identity (or with `CSC_IDENTITY_AUTO_DISCOVERY=false`,
 as CI sets for workflow-artifact-only builds), artifacts remain unsigned and
 macOS shows the normal Gatekeeper warning on first launch.
+
+For local verification without publishing, use
+`pnpm exec turbo run package --filter=@bb/desktop` on macOS, or
+`pnpm exec turbo run package:linux --filter=@bb/desktop` on Linux.
+
+npm's bundled dependencies are copied through an explicit `files` entry into
+`node_modules/npm/node_modules`, including nested dependency versions. pnpm's
+dependency listing omits this bundled tree, and electron-builder's dependency
+copier excludes nested `node_modules`. `asarUnpack` alone cannot preserve files
+that the collector never selected. The explicit file set enters both ASAR's
+file index and its unpacked resources before signing.
+
+Packaging runs an offline npm smoke check in `afterPack`, before signing or
+publishing. This requires a native target host (macOS arm64 or Linux x64).
+`smoke:packaged` repeats it against the resulting artifact. To run only npm
+verification without opening a desktop window:
+
+```bash
+pnpm exec turbo run smoke:packaged-npm --filter=@bb/desktop
+pnpm exec turbo run smoke:packaged-npm --filter=@bb/desktop -- /absolute/path/to/bb.app/Contents/MacOS/bb
+```
+
+On Linux, the optional argument is the executable inside `linux-unpacked/` or
+an extracted AppImage. The check resolves npm from packaged `bb-app`, audits
+required dependency edges and version ranges in npm's entire bundled tree using
+both CJS and ESM resolution, rejects paths outside packaged resources, imports npm's ESM display
+dependencies, and verifies its version. It then uses bundled Electron and npm
+to pack, install, and update a disposable plugin's dependency from 1.0.0 to
+2.0.0, verifying the lockfile and importing the plugin's ESM entry after each
+install. It uses the plugin install flags, an empty PATH, offline mode, a fresh
+HOME/cache/config, and disabled lifecycle scripts. No system Node/npm or user
+store is used by the child processes. It also hashes ASAR and unpacked resources
+before and after to reject bundle mutations. Fixtures are removed afterward.
+
+The bb-app tarball smoke covers a different packaging pipeline and cannot
+detect Electron artifact omissions. A source build or `npm --version` alone
+does not verify a desktop plugin dependency install.
+
+### Windows (NSIS, x64)
+
+Windows packaging needs a Windows x64 host; `afterPack` refuses to cross-build
+because it verifies the packaged native modules by loading them. From the repo
+root, install with `pnpm install --frozen-lockfile --ignore-scripts`, then build
+an unpacked app, an installer, or smoke test the current packaged output with:
+
+```powershell
+pnpm exec turbo run package:win --filter=@bb/desktop
+pnpm exec turbo run desktop:build:win --filter=@bb/desktop
+pnpm exec turbo run smoke:packaged --filter=@bb/desktop
+```
+
+`desktop:build:win` writes `release/bb-<version>-x64.exe`, a one-click per-user
+NSIS installer that installs to `%LOCALAPPDATA%\Programs\bb` (`bb-nightly` on
+the nightly channel) without elevation, plus `latest.yml` for electron-updater.
+Without a signing certificate the installer is unsigned, so Windows SmartScreen
+warns before running it. electron-builder signs it when `WIN_CSC_LINK` (a
+base64 `.pfx`) and `WIN_CSC_KEY_PASSWORD` are set; the release workflows pass
+them from the `WINDOWS_CERTIFICATE_PFX` and `WINDOWS_CERTIFICATE_PASSWORD`
+secrets.
+
+`afterPack` copies `@parcel/watcher-win32-x64` into the package when
+electron-builder leaves it out and loads it with the packaged Electron; without
+it the file watcher cannot start.
+
+Windows builds check `desktop-version-windows.json` for new versions and
+install them with electron-updater from `latest.yml` (`nightly.yml` on the
+nightly channel). The update downloads in the background and the installer runs
+silently when the app quits or when the user chooses Relaunch.
 
 ### Linux (AppImage, x64)
 
@@ -93,14 +185,37 @@ From the repo root, build an unpacked app, an AppImage distribution, or smoke
 test the current packaged output with:
 
 ```bash
-pnpm --filter @bb/desktop run package:linux
-pnpm --filter @bb/desktop run dist:linux
-pnpm --filter @bb/desktop run smoke:packaged
+pnpm exec turbo run package:linux --filter=@bb/desktop
+pnpm exec turbo run desktop:build:linux --filter=@bb/desktop
+pnpm exec turbo run smoke:packaged --filter=@bb/desktop
 ```
 
 Running an AppImage normally requires FUSE and, on some distributions, the
 `libfuse2` compatibility package. If FUSE is unavailable, launch it with
 `--appimage-extract-and-run` instead.
+
+Linux users whose window manager supplies all window controls can remove the
+native Electron title bar with `--no-window-frame`:
+
+```bash
+./bb-x86_64.AppImage --no-window-frame
+```
+
+The native frame remains the default. Changing this startup option requires a
+full desktop app restart.
+
+Linux users can opt into a transparent Electron window with
+`--transparent-window`:
+
+```bash
+./bb-x86_64.AppImage --transparent-window
+```
+
+The window remains opaque by default. Transparency also requires a compositor
+that supports it, and Electron documents limitations including unsupported
+window shaping and unreliable resize behavior on some platforms. The flag can
+be combined with `--no-window-frame`, and changing it requires a full desktop
+app restart.
 
 CI builds Linux artifacts on the pinned `ubuntu-22.04` runner. The AppImage
 links against the build machine's glibc, so that pin sets the oldest
@@ -112,7 +227,7 @@ Linux gets both update paths, but they are not equivalent:
   install and reports that a newer release exists.
 - Self-installing auto-update runs only inside an AppImage whose directory the
   app can write to. electron-updater detects the AppImage through the `APPIMAGE`
-  environment variable, and its install step unlinks the running file *before*
+  environment variable, and its install step unlinks the running file _before_
   moving the replacement in — so a read-only directory would delete the app and
   leave nothing behind. Both the startup check and the install handler verify
   write and search access on the parent directory first.
@@ -150,20 +265,22 @@ release; use `scripts/bump-version.mjs` so both files move together.
 The desktop release tag uses the locked version: `desktop-v<version>` for
 immutable releases and `desktop-latest` for the moving pointer.
 
-`build-desktop.yml` builds macOS and Linux in parallel jobs, then publishes
-both from one job. The moving release resets all of its assets on each publish,
-so a single publisher is what keeps one platform from deleting the other's
-binaries. Each platform has its own update feed file inside the same release
+`build-desktop.yml` builds macOS, Linux, and Windows in parallel jobs, then
+publishes all three from one job. The moving release resets all of its assets
+on each publish, so a single publisher is what keeps one platform from deleting
+another's binaries. Each platform has its own update feed file inside the same release
 tag:
 
-| Platform | Artifacts               | electron-updater metadata | Version feed                 |
-| -------- | ----------------------- | ------------------------- | ---------------------------- |
-| macOS    | `.dmg`, `.zip` (2 arch) | `latest-mac.yml`          | `desktop-version.json`       |
-| Linux    | `.AppImage` (x64)       | `latest-linux.yml`        | `desktop-version-linux.json` |
+| Platform | Artifacts              | electron-updater metadata | Version feed                   |
+| -------- | ---------------------- | ------------------------- | ------------------------------ |
+| macOS    | `.dmg`, `.zip` (arm64) | `latest-mac.yml`          | `desktop-version.json`         |
+| Linux    | `.AppImage` (x64)      | `latest-linux.yml`        | `desktop-version-linux.json`   |
+| Windows  | `.exe` installer (x64) | `latest.yml`              | `desktop-version-windows.json` |
 
 macOS keeps the unsuffixed feed name because released macOS builds already
-request it. Linux artifacts are unsigned; only the macOS binaries wait on the
-Apple signing secrets.
+request it. Linux artifacts are unsigned, and the Windows installer is unsigned
+unless the Windows certificate secrets are configured; only the macOS binaries
+wait on the Apple signing secrets.
 
 ## Nightly channel
 
@@ -177,15 +294,23 @@ To publish or dry-run the channel manually from `main`, dispatch the same
 workflow with `npm_tag=nightly`. A non-dry run publishes both npm and desktop;
 a dry run validates only the npm package path.
 
+A stable release also refreshes the channel. A non-dry `npm_tag=latest` run
+publishes the release, then derives the next nightly version from the release
+commit and publishes npm and desktop nightly again. Without this step the
+nightly channel stays below `latest` until the next scheduled run.
+
 The nightly desktop is a separate installation:
 
 - product name: `bb Nightly`
 - bundle identifier: `dev.bb.desktop.nightly`
 - Linux binary name: `bb-nightly`, so it never shadows stable `bb` on PATH
 - app/update release: `desktop-nightly`
-- update metadata: `nightly-mac.yml` and `nightly-linux.yml`
-- version feeds: `desktop-version.json` (macOS) and
-  `desktop-version-linux.json` (Linux)
+- Windows install directory: `%LOCALAPPDATA%\Programs\bb-nightly`
+- update metadata: `nightly-mac.yml`, `nightly-linux.yml`, and `nightly.yml`
+  (Windows)
+- version feeds: `desktop-version.json` (macOS),
+  `desktop-version-linux.json` (Linux), and `desktop-version-windows.json`
+  (Windows)
 - icon: `assets/icon-nightly.icns` and `assets/icon-nightly.png`
 
 Download it from
@@ -206,6 +331,27 @@ Nightly builds set `BB_DESKTOP_RELEASE_CHANNEL=nightly` at build time. The value
 is baked into the Electron main/preload bundles and selects the nightly product
 identity, yellow icon, and update URLs. Omit the variable (or set it to
 `latest`) for stable and local builds.
+
+## About panel
+
+The app menu's About item opens a message box listing the facts a bug report
+needs: version, build type, commit, build date and how old that build is
+("3 days old"), plugin SDK version, Electron version, and OS. Its **Copy**
+button puts that whole block on the clipboard. The age is computed when the
+dialog opens, so a long-running session still reports it correctly.
+
+The native About panel is populated too, minus the age, since Electron takes
+those options once at startup. `scripts/build.mjs` bakes the build-time half of
+the facts into the bundles:
+
+| Variable                | Default when unset                                    |
+| ----------------------- | ----------------------------------------------------- |
+| `BB_DESKTOP_COMMIT`     | `GITHUB_SHA`, else `git rev-parse HEAD`, else unknown |
+| `BB_DESKTOP_BUILD_DATE` | The build's own timestamp, ISO 8601                   |
+
+The plugin SDK version is read from `packages/plugin-sdk/package.json` at build
+time. A checkout with no git metadata reports `Commit: unknown` rather than
+failing the build.
 
 ## macOS signing + notarization
 
@@ -280,3 +426,75 @@ writes a PID file so the next launch can reap a stale Electron-owned `bb-app`
 launcher. Hard crashes such as process aborts, segfaults, or kernel-level kills
 cannot run cleanup in the crashing process; the startup PID-file reap is the
 recovery path for those cases.
+
+### Saved servers
+
+Use **bb → Desktop Settings → Server → Add Server…** to save and switch to
+another machine's HTTP(S) bb server URL. **Window → Server** opens the same
+menu. Saved URLs remain in the menu across restarts; adding an existing URL
+selects it without creating a duplicate. **This Mac** on macOS or **This
+Computer** on Linux switches back to the built-in server without removing
+saved entries.
+
+**Set Server URL…** edits the last selected custom server. Clearing its URL removes
+that entry and switches an active custom target to the built-in server. Other
+saved servers and Connect discovery remain available. Existing single-server preferences are
+loaded automatically into the saved list in `<userData>/server-target.json`.
+
+The app command palette lists **Switch to <server>** for each inactive choice
+from this same Server menu, including Connect discovery. Palette list requests
+use the menu's discovery refresh policy (at most once per minute, with the
+existing ten-minute background refresh). The optional `window.bbDesktop`
+`getServerChoices`, `onServerChoicesChange`, and `selectServer` methods expose
+only `{id, name, active}`; custom server IDs are opaque hashes. Selection is
+validated against native choices and runs the menu's existing authentication,
+window navigation, and runtime lifecycle. Older desktop shells omit these actions.
+
+### Server moves
+
+After `bb server move`, the old computer's data dir (`~/.bb` or
+`$BB_DATA_DIR`) contains `server-moved.json`. The desktop app reads it at
+startup, whenever the built-in server target loads, and while that target is active.
+While the target is active, the app watches the data dir. If `fs.watch` fails,
+for example with `ENOSPC`, the app checks the file every 2 seconds instead
+(`src/server-moved.ts`). The server writes the lock before the new machine
+takes over and removes it if the move is rolled back, so the app acts only on a
+committed move. A move is committed when the local server address answers
+`/health` with 410 `code: "server_moved"`, or when nothing listens there and no
+launcher process is alive. The app checks once when it starts or loads the
+built-in server. When a move finishes while the app is open, the app checks every
+second for up to 120 seconds. It stops if the lock disappears. The first time the app
+sees a committed lock for a `moveId`, it switches the server target once:
+
+- `mode: "connect"` selects `connectHandle` with `serverUrl`.
+- `mode: "direct"` sets the custom server URL. When a move finishes while
+  the app is open, the app waits up to 60 seconds for the new `/health`
+  endpoint before it switches the window.
+
+The app shows "Your bb server moved to <toHostName>" once for each `moveId`
+(`<userData>/server-move-notice.json`). It still starts its own `bb-app`
+launcher unless another bb process answers the local server port. The launcher
+runs this computer as a regular machine, and quitting the app stops it. If the
+app has no stored bb Connect credential, it signs in to a connect target with
+the `x-bb-connect-machine` header that the move wrote to the data dir's
+`config.json`. The app logs a warning and ignores an invalid lock.
+
+On startup, a saved built-in server choice also switches to the moved server;
+it never starts the old copy automatically. A different saved remote server
+choice remains selected. Explicitly picking the built-in server while the move
+lock exists shows "bb moved to <toHostName>" with **Open <toHostName>** and
+**Choose server…**. The screen explains whether the old copy is locked or was
+deleted. Selecting the built-in server does not unlock the old copy or remove
+its background machine service.
+
+Startup error screens list their actions as buttons. Any screen where
+retrying can help shows **Try again**. **Choose server…** opens the Server menu,
+where the user can select the built-in server if needed. A bb Connect
+`unauthorized` error has no **Try again**, because the same credential fails
+the same way. **Reconnect** opens account sign-in in a desktop
+window. The app clears its old account sign-in, waits for a new session, then
+retries the selected server. A valid account session can mint and renew the
+desktop session when a machine credential is rejected. Closing the sign-in
+window leaves the error screen available. Fatal errors have no buttons. The renderer sends the chosen
+action on `bb-desktop:startup-action`. The main process accepts only actions
+from the error page that is currently loaded in an app window's main frame.

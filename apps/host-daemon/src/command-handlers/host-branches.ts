@@ -1,19 +1,28 @@
 import path from "node:path";
-import type { GitBranchRefClassification } from "@bb/domain";
+import type {
+  GitBranchRefClassification,
+  WorkspaceGitOperation,
+} from "@bb/domain";
 import {
-  detectGitRepo,
+  detectGitRepoKind,
+  detectLinkedWorktree,
   fetchRemoteBranches,
   getCheckoutRef,
   getGitCommonDir,
   getWorkspaceGitOperation,
   hasUncommittedChanges,
-  listBranches,
-  listRemoteBranches,
+  listBranchRefsWithDefaults,
   readDefaultBranchRefs,
+  type GitProcessOptions,
+  withGitRefMutationLock,
 } from "@bb/host-workspace";
 import type { HostDaemonOnlineRpcResult } from "@bb/host-daemon-contract";
 import { CommandDispatchError } from "../command-dispatch-support.js";
-import type { CommandOf } from "../command-dispatch-support.js";
+import type {
+  CommandDispatchOptions,
+  CommandOf,
+} from "../command-dispatch-support.js";
+import { userExecutableProcessOptions } from "../user-executable-env.js";
 
 interface LimitBranchListArgs {
   branches: readonly string[];
@@ -28,7 +37,7 @@ interface LimitedBranchList {
 
 interface PinBranchArgs {
   branches: readonly string[];
-  branch: string | null | undefined;
+  branch: string | undefined;
 }
 
 interface ClassifySelectedBranchArgs {
@@ -37,12 +46,26 @@ interface ClassifySelectedBranchArgs {
   selectedBranch?: string;
 }
 
+interface ReadBranchOptionsArgs extends GitProcessOptions {
+  path: string;
+  limit: number;
+  query?: string;
+  selectedBranch?: string;
+}
+
 const REMOTE_BRANCH_FETCH_THROTTLE_MS = 30_000;
 const REMOTE_BRANCH_FETCH_TIMEOUT_MS = 5_000;
+const NO_GIT_OPERATION: WorkspaceGitOperation = { kind: "none" };
+
+type RemoteRefreshMode = "background" | "blocking";
 
 const remoteBranchFetchStateByCommonDir = new Map<
   string,
-  { fetchedAt: number; inFlight: Promise<void> | null }
+  {
+    fetchedAt: number;
+    inFlight: Promise<void> | null;
+    needsInteractiveRetry: boolean;
+  }
 >();
 
 function limitBranchList({
@@ -91,62 +114,116 @@ function classifySelectedBranch({
   return { name: selectedBranch, kind: "missing" };
 }
 
-async function refreshRemoteBranches(cwd: string): Promise<void> {
-  const commonDir = await getGitCommonDir(cwd);
-  const now = Date.now();
+async function refreshRemoteBranches(
+  cwd: string,
+  options: GitProcessOptions,
+  mode: RemoteRefreshMode,
+): Promise<void> {
+  const commonDir = await getGitCommonDir(cwd, options);
+  const interactive = mode === "blocking";
   const existingState = remoteBranchFetchStateByCommonDir.get(commonDir);
-  if (
-    existingState &&
-    now - existingState.fetchedAt < REMOTE_BRANCH_FETCH_THROTTLE_MS
-  ) {
-    if (existingState.inFlight) {
-      await existingState.inFlight;
-    }
-    return;
-  }
-
   if (existingState?.inFlight) {
     await existingState.inFlight;
+  }
+
+  const settledState = remoteBranchFetchStateByCommonDir.get(commonDir);
+  if (settledState?.inFlight) {
+    await settledState.inFlight;
+    return;
+  }
+  const throttled =
+    settledState !== undefined &&
+    Date.now() - settledState.fetchedAt < REMOTE_BRANCH_FETCH_THROTTLE_MS;
+  if (throttled && !(interactive && settledState.needsInteractiveRetry)) {
     return;
   }
 
-  const inFlight = fetchRemoteBranches(cwd, {
-    timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS,
-  })
-    .catch(() => undefined)
-    .then(() => undefined)
-    .finally(() => {
+  const refreshDeadline = Date.now() + REMOTE_BRANCH_FETCH_TIMEOUT_MS;
+  const inFlight = withGitRefMutationLock(
+    commonDir,
+    () => {
+      const remainingTimeoutMs = Math.max(1, refreshDeadline - Date.now());
+      return fetchRemoteBranches(cwd, {
+        ...options,
+        interactive,
+        timeoutMs: remainingTimeoutMs,
+      });
+    },
+    { timeoutMs: REMOTE_BRANCH_FETCH_TIMEOUT_MS },
+  )
+    .then(
+      (result) => !interactive && result.status === "failed",
+      () => false,
+    )
+    .then((needsInteractiveRetry) => {
       remoteBranchFetchStateByCommonDir.set(commonDir, {
         fetchedAt: Date.now(),
         inFlight: null,
+        needsInteractiveRetry,
       });
     });
 
   remoteBranchFetchStateByCommonDir.set(commonDir, {
-    fetchedAt: now,
+    fetchedAt: Date.now(),
     inFlight,
+    needsInteractiveRetry: false,
   });
 
   await inFlight;
 }
 
-export async function listHostBranches(
-  command: CommandOf<"host.list_branches">,
-): Promise<HostDaemonOnlineRpcResult<"host.list_branches">> {
+async function readBranchOptions({
+  path: cwd,
+  limit,
+  query,
+  selectedBranch: requestedBranch,
+  ...gitProcessOptions
+}: ReadBranchOptionsArgs): Promise<
+  HostDaemonOnlineRpcResult<"host.list_branch_options">
+> {
+  const { branches, defaultBranch, originDefaultBranch, remoteBranches } =
+    await listBranchRefsWithDefaults(cwd, gitProcessOptions);
+  const limitedBranches = limitBranchList({
+    branches: pinBranch({ branches, branch: defaultBranch }),
+    limit,
+    query,
+  });
+  const limitedRemoteBranches = limitBranchList({
+    branches: pinBranch({
+      branches: remoteBranches,
+      branch: originDefaultBranch,
+    }),
+    limit,
+    query,
+  });
+  return {
+    branches: limitedBranches.branches,
+    branchesTruncated: limitedBranches.truncated,
+    remoteBranches: limitedRemoteBranches.branches,
+    remoteBranchesTruncated: limitedRemoteBranches.truncated,
+    selectedBranch: classifySelectedBranch({
+      branches,
+      remoteBranches,
+      selectedBranch: requestedBranch,
+    }),
+  };
+}
+
+export async function listHostBranchOptions(
+  command: CommandOf<"host.list_branch_options">,
+  options?: Pick<CommandDispatchOptions, "runtimeManager">,
+): Promise<HostDaemonOnlineRpcResult<"host.list_branch_options">> {
   if (!path.isAbsolute(command.path)) {
     throw new CommandDispatchError("invalid_path", "Path must be absolute");
   }
 
-  if (!(await detectGitRepo(command.path))) {
+  const gitProcessOptions = userExecutableProcessOptions(
+    options?.runtimeManager.getShellEnv() ?? {},
+  );
+  if ((await detectGitRepoKind(command.path, gitProcessOptions)) === "none") {
     return {
       branches: [],
       branchesTruncated: false,
-      checkout: { kind: "unknown", reason: "Path is not a git repository" },
-      defaultBranch: null,
-      defaultBranchRelation: null,
-      hasUncommittedChanges: false,
-      operation: { kind: "none" },
-      originDefaultBranch: null,
       remoteBranches: [],
       remoteBranchesTruncated: false,
       selectedBranch: classifySelectedBranch({
@@ -157,53 +234,74 @@ export async function listHostBranches(
     };
   }
 
-  await refreshRemoteBranches(command.path);
+  if (command.remoteRefresh === "background") {
+    void refreshRemoteBranches(
+      command.path,
+      gitProcessOptions,
+      "background",
+    ).catch(() => undefined);
+  }
 
-  const [branches, remoteBranches, checkout, defaultRefs, dirty, operation] =
+  return readBranchOptions({ ...command, ...gitProcessOptions });
+}
+
+export async function inspectHostGitSource(
+  command: CommandOf<"host.inspect_git_source">,
+  options?: Pick<CommandDispatchOptions, "runtimeManager">,
+): Promise<HostDaemonOnlineRpcResult<"host.inspect_git_source">> {
+  if (!path.isAbsolute(command.path)) {
+    throw new CommandDispatchError("invalid_path", "Path must be absolute");
+  }
+
+  const gitProcessOptions = userExecutableProcessOptions(
+    options?.runtimeManager.getShellEnv() ?? {},
+  );
+  const repoKind = await detectGitRepoKind(command.path, gitProcessOptions);
+  if (repoKind === "none") {
+    return {
+      checkout: { kind: "unknown", reason: "Path is not a git repository" },
+      defaultBranch: null,
+      defaultBranchRelation: null,
+      isWorktree: false,
+      hasUncommittedChanges: false,
+      operation: { kind: "none" },
+      originDefaultBranch: null,
+    };
+  }
+
+  if (command.remoteRefresh === "blocking") {
+    await refreshRemoteBranches(command.path, gitProcessOptions, "blocking");
+  } else {
+    void refreshRemoteBranches(
+      command.path,
+      gitProcessOptions,
+      "background",
+    ).catch(() => undefined);
+  }
+
+  const [checkout, defaultRefs, dirty, operation, isWorktree] =
     await Promise.all([
-      listBranches(command.path),
-      listRemoteBranches(command.path),
-      getCheckoutRef(command.path),
-      readDefaultBranchRefs(command.path),
-      hasUncommittedChanges(command.path),
-      getWorkspaceGitOperation(command.path),
+      getCheckoutRef(command.path, gitProcessOptions),
+      readDefaultBranchRefs(command.path, gitProcessOptions),
+      repoKind === "work-tree"
+        ? hasUncommittedChanges(command.path, gitProcessOptions)
+        : false,
+      repoKind === "work-tree"
+        ? getWorkspaceGitOperation(command.path, gitProcessOptions)
+        : NO_GIT_OPERATION,
+      repoKind === "work-tree"
+        ? detectLinkedWorktree(command.path, gitProcessOptions)
+        : false,
     ]);
   const defaultBranch = defaultRefs.defaultBranch;
   const originDefaultBranch = defaultRefs.originDefaultBranch;
-  // Pin default refs to the first page so common picks like main and
-  // origin/main are available before the user searches.
-  const sorted = pinBranch({ branches, branch: defaultBranch });
-  const sortedRemoteBranches = pinBranch({
-    branches: remoteBranches,
-    branch:
-      originDefaultBranch ?? (defaultBranch ? `origin/${defaultBranch}` : null),
-  });
-  const limitedBranches = limitBranchList({
-    branches: sorted,
-    limit: command.limit,
-    query: command.query,
-  });
-  const limitedRemoteBranches = limitBranchList({
-    branches: sortedRemoteBranches,
-    limit: command.limit,
-    query: command.query,
-  });
-  const selectedBranch = classifySelectedBranch({
-    branches,
-    remoteBranches,
-    selectedBranch: command.selectedBranch,
-  });
   return {
-    branches: limitedBranches.branches,
-    branchesTruncated: limitedBranches.truncated,
     checkout,
     defaultBranch: defaultBranch ?? null,
     defaultBranchRelation: defaultRefs.defaultBranchRelation ?? null,
+    isWorktree,
     hasUncommittedChanges: dirty,
     operation,
     originDefaultBranch: originDefaultBranch ?? null,
-    remoteBranches: limitedRemoteBranches.branches,
-    remoteBranchesTruncated: limitedRemoteBranches.truncated,
-    selectedBranch,
   };
 }

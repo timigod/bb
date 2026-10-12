@@ -1,9 +1,10 @@
 export type DesktopReleaseChannel = "latest" | "nightly";
-export type DesktopBuildPlatform = "macos" | "linux";
+export type DesktopBuildPlatform = "macos" | "linux" | "windows";
 
 export interface DesktopUpdateMetadataFileNames {
   linux: "latest-linux.yml" | "nightly-linux.yml";
   macos: "latest-mac.yml" | "nightly-mac.yml";
+  windows: "latest.yml" | "nightly.yml";
 }
 
 export interface DesktopReleaseConfig {
@@ -15,9 +16,8 @@ export interface DesktopReleaseConfig {
   macIconPath: "assets/icon.icns" | "assets/icon-nightly.icns";
   releaseTag: "desktop-latest" | "desktop-nightly";
   updateMetadataFileNames: DesktopUpdateMetadataFileNames;
+  windowsInstallName: "bb" | "bb-nightly";
 }
-
-export const DESKTOP_RELEASE_CHANNEL_ENV_NAME: "BB_DESKTOP_RELEASE_CHANNEL";
 
 export function resolveDesktopReleaseChannel(
   env: NodeJS.ProcessEnv,

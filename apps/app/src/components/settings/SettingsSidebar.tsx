@@ -1,54 +1,48 @@
-import type { MouseEvent as ReactMouseEvent } from "react";
+import { type MouseEvent as ReactMouseEvent } from "react";
 import { PluginIcon } from "@/components/plugin/PluginIcon";
 import {
   SectionSidebar,
   SectionSidebarIcon,
   SectionSidebarLabel,
+  SectionSidebarActionRow,
   SectionSidebarRow,
 } from "@/components/sidebar/SectionSidebar";
-import { COARSE_POINTER_ICON_SIZE_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
-import {
-  SETTINGS_ROUTE_PATH,
-  getPluginConfigurationRoutePath,
-  getSettingsProviderRoutePath,
-  getSettingsRoutePath,
-} from "@/lib/route-paths";
-import { getProviderIconInfo } from "@/lib/provider-icon";
+import { canOpenNativeScreen, shellOpenNative } from "@/lib/native-shell";
+import { getPluginConfigurationRoutePath } from "@/lib/route-paths";
 import { useSettingsNavState } from "./settings-nav";
+import type { SettingsNavState } from "./settings-nav";
+import { getSettingsSectionRoutePath } from "./settings-sections";
 
 interface SettingsSidebarProps {
   onResizeMouseDown: (event: ReactMouseEvent<HTMLDivElement>) => void;
   isResizing: boolean;
-  showTopReserve: boolean;
-  appRoutePath: string;
 }
 
-/** Focused Settings navigation using the shared section-sidebar shell. */
-export function SettingsSidebar({
+type SettingsSidebarNavigation = Pick<
+  SettingsNavState,
+  "activePluginId" | "activeSection" | "pluginEntries" | "sections"
+>;
+
+interface SettingsSidebarContentProps extends SettingsSidebarProps {
+  navigation: SettingsSidebarNavigation;
+  testIdPrefix?: string;
+}
+
+export function SettingsSidebarContent({
   onResizeMouseDown,
   isResizing,
-  showTopReserve,
-  appRoutePath,
-}: SettingsSidebarProps) {
-  const {
-    activePluginId,
-    activeProviderId,
-    activeSection,
-    pluginEntries,
-    providerEntries,
-    sections,
-  } = useSettingsNavState();
+  navigation,
+  testIdPrefix = "settings",
+}: SettingsSidebarContentProps) {
+  const { activePluginId, activeSection, pluginEntries, sections } = navigation;
+  const hasPlugins = pluginEntries.length > 0;
 
   return (
     <SectionSidebar
-      backLabel="Back to app"
-      backTo={appRoutePath}
       isResizing={isResizing}
       onResizeMouseDown={onResizeMouseDown}
-      showTopReserve={showTopReserve}
-      testIdPrefix="settings"
+      testIdPrefix={testIdPrefix}
     >
-      <SectionSidebarLabel>Settings</SectionSidebarLabel>
       <div className="mt-1 space-y-0.5">
         {sections
           .filter((section) => section.id !== "archived")
@@ -57,39 +51,13 @@ export function SettingsSidebar({
               key={section.id}
               active={activeSection === section.id}
               label={section.label}
-              to={
-                section.id === "general"
-                  ? SETTINGS_ROUTE_PATH
-                  : getSettingsRoutePath(section.id)
-              }
+              to={getSettingsSectionRoutePath(section.id)}
             >
               <SectionSidebarIcon name={section.icon} />
             </SectionSidebarRow>
           ))}
       </div>
-      <div className="mt-4">
-        <SectionSidebarLabel>Providers</SectionSidebarLabel>
-      </div>
-      <div className="mt-1 space-y-0.5">
-        {providerEntries.map((provider) => {
-          const ProviderIcon = getProviderIconInfo(provider.id)?.icon;
-          return (
-            <SectionSidebarRow
-              key={provider.id}
-              active={activeProviderId === provider.id}
-              label={provider.label}
-              to={getSettingsProviderRoutePath(provider.id)}
-            >
-              {ProviderIcon ? (
-                <ProviderIcon className={COARSE_POINTER_ICON_SIZE_CLASS} />
-              ) : (
-                <SectionSidebarIcon name="Code" />
-              )}
-            </SectionSidebarRow>
-          );
-        })}
-      </div>
-      {pluginEntries.length > 0 ? (
+      {hasPlugins ? (
         <>
           <div className="mt-4">
             <SectionSidebarLabel>Plugins</SectionSidebarLabel>
@@ -112,6 +80,22 @@ export function SettingsSidebar({
           </div>
         </>
       ) : null}
+      {canOpenNativeScreen() ? (
+        <>
+          <div className="mt-4">
+            <SectionSidebarLabel>This phone</SectionSidebarLabel>
+          </div>
+          <div className="mt-1 space-y-0.5">
+            <SectionSidebarActionRow
+              label="This device"
+              testId="settings-nav-native-device"
+              onClick={() => shellOpenNative("device-settings")}
+            >
+              <SectionSidebarIcon name="Smartphone" />
+            </SectionSidebarActionRow>
+          </div>
+        </>
+      ) : null}
       {sections.some((section) => section.id === "archived") ? (
         <>
           <div className="mt-4">
@@ -125,7 +109,7 @@ export function SettingsSidebar({
                   key={section.id}
                   active={activeSection === section.id}
                   label={section.label}
-                  to={getSettingsRoutePath(section.id)}
+                  to={getSettingsSectionRoutePath(section.id)}
                 >
                   <SectionSidebarIcon name={section.icon} />
                 </SectionSidebarRow>
@@ -134,5 +118,20 @@ export function SettingsSidebar({
         </>
       ) : null}
     </SectionSidebar>
+  );
+}
+
+export function SettingsSidebar({
+  onResizeMouseDown,
+  isResizing,
+}: SettingsSidebarProps) {
+  const navigation = useSettingsNavState();
+
+  return (
+    <SettingsSidebarContent
+      isResizing={isResizing}
+      navigation={navigation}
+      onResizeMouseDown={onResizeMouseDown}
+    />
   );
 }

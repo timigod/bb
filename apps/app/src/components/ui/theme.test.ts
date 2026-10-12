@@ -3,33 +3,16 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-/**
- * Guards the relational structure of the neutral ramp. The whole light/dark
- * palette is derived from two anchors per mode (`--canvas`, `--ink`) by mixing
- * ink into the canvas; each token's mix percentage is its *contrast from the
- * canvas*. These tests fail if someone reintroduces a hand-set literal, inverts
- * a state relationship, or adds a token to only one mode — the regressions that
- * the flat token set used to hide.
- */
-
 const css = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "theme.css"),
   "utf8",
 );
-/** Declarations of the rule whose body contains `color-scheme: <scheme>;`. */
 function modeBlock(scheme: "light" | "dark", source = css): string {
   const at = source.indexOf(`color-scheme: ${scheme};`);
   if (at === -1) throw new Error(`no ${scheme} block in theme.css`);
   return source.slice(source.lastIndexOf("{", at) + 1, source.indexOf("}", at));
 }
 
-/**
- * token -> ink mix percentage, for tokens derived from the anchors. The base is
- * either the canvas (opaque steps, mixed in oklch) or `transparent` (translucent
- * interactive/overlay steps, mixed in oklab — see the guard below); over the
- * canvas both resolve to the same step, so the mix percentage is the comparable
- * "contrast from canvas" either way.
- */
 function rampSteps(block: string): Map<string, number> {
   const re =
     /--([a-z-]+):\s*color-mix\(in okl(?:ch|ab), var\(--ink\) ([\d.]+)%, (?:var\(--canvas\)|transparent)\);/g;
@@ -40,7 +23,6 @@ function rampSteps(block: string): Map<string, number> {
   return steps;
 }
 
-// Every neutral surface/line must be derived from the anchors, not hand-set.
 const REQUIRED_RAMP_TOKENS = [
   "secondary",
   "accent",
@@ -133,6 +115,14 @@ function contrastRatio(foreground: OklchColor, background: OklchColor): number {
 }
 
 describe("theme.css neutral ramp", () => {
+  it("keeps touch sidebar titles stable under hover and open action states", () => {
+    const mobileRules = css.slice(css.indexOf("@media (hover: none)"));
+
+    expect(mobileRules).toMatch(
+      /\.bb-sidebar-hover-actions-row:is\(:hover, :has\(:focus-visible\)\)\s+\.bb-sidebar-hover-actions-inset,\s+\.bb-sidebar-hover-actions-row:has\(\s+\.bb-sidebar-hover-actions\[data-sidebar-hover-actions-open="true"\]\s+\)\s+\.bb-sidebar-hover-actions-inset\s*\{\s*padding-right:\s*0;/,
+    );
+  });
+
   it("backs selected sticky sidebar rows with an opaque sidebar layer", () => {
     const rule = css.match(
       /\[data-sidebar-sticky-tier\]\.bb-sidebar-selected-row\s*\{([^}]*)\}/s,
@@ -141,8 +131,73 @@ describe("theme.css neutral ramp", () => {
     expect(rule).toContain(
       "linear-gradient(var(--state-active), var(--state-active))",
     );
+    expect(rule).toContain("linear-gradient(var(--sidebar), var(--sidebar))");
+  });
+
+  it("backs accent-tinted sticky sidebar rows with an opaque sidebar layer", () => {
+    const rule = css.match(
+      /\[data-sidebar-sticky-tier\]\.bb-sidebar-accent-row:is\([^{]+\)\s*\{([^}]*)\}/s,
+    )?.[1];
+
     expect(rule).toContain(
-      "linear-gradient(var(--sidebar), var(--sidebar))",
+      "linear-gradient(var(--sidebar-accent), var(--sidebar-accent))",
+    );
+    expect(rule).toContain("linear-gradient(var(--sidebar), var(--sidebar))");
+  });
+
+  it("caps the scrollport strip above pinned sidebar rows", () => {
+    const rule = css
+      .replace(/\s+/g, " ")
+      .match(/\[data-sidebar-sticky-stack\]::before \{([^}]*)\}/)?.[1];
+
+    expect(rule).toContain("position: sticky");
+    expect(rule).toContain("top: 0");
+    expect(rule).toContain("background-color: var(--sidebar)");
+    expect(rule).toContain(
+      "height: var(--bb-sidebar-sticky-stack-padding-top)",
+    );
+    expect(rule).toContain(
+      "margin-top: calc(-1 * var(--bb-sidebar-sticky-stack-padding-top))",
+    );
+  });
+
+  it("keeps the scrollport cap below label controls but above project rows", () => {
+    const cap = Number(
+      css.match(
+        /\[data-sidebar-sticky-stack\]::before\s*\{[^}]*z-index:\s*(\d+)/,
+      )?.[1],
+    );
+    const tier = (name: string) =>
+      Number(
+        css.match(
+          new RegExp(
+            `\\[data-sidebar-sticky-tier="${name}"\\]\\s*\\{[^}]*--bb-sidebar-sticky-tier-z-index:\\s*(\\d+)`,
+          ),
+        )?.[1],
+      );
+
+    expect(cap).toBeLessThan(tier("label"));
+    expect(cap).toBeGreaterThan(tier("project"));
+  });
+
+  it("collapses the label slot when a section header is not sticky", () => {
+    const compact = css.replace(/\s+/g, " ");
+    const declarations = (selector: string): string | undefined =>
+      compact.match(new RegExp(`${selector} \\{([^}]*)\\}`))?.[1];
+
+    expect(
+      declarations(
+        '\\[data-sidebar-sticky-stack\\] \\[data-sidebar-sticky-header="false"\\]',
+      ),
+    ).toContain(
+      "--bb-sidebar-sticky-project-top: var(--bb-sidebar-sticky-stack-padding-top)",
+    );
+    expect(
+      declarations(
+        "\\[data-sidebar-sticky-stack\\] \\[data-sidebar-sticky-section\\]",
+      ),
+    ).toContain(
+      "--bb-sidebar-sticky-parent-base-top: var(--bb-sidebar-sticky-project-top)",
     );
   });
 
@@ -164,12 +219,6 @@ describe("theme.css neutral ramp", () => {
     expect(
       stickyRule?.match(/var\(--bb-sidebar-open-in-split-background\)/g),
     ).toHaveLength(2);
-
-    const interactiveRule = css.match(
-      /\[data-sidebar-sticky-tier\]\.bb-sidebar-open-in-split-row:is\([^{]+\)\s*\{([^}]*)\}/s,
-    )?.[1];
-    expect(interactiveRule).toContain("background-image: linear-gradient(");
-    expect(interactiveRule?.match(/var\(--sidebar-accent\)/g)).toHaveLength(2);
   });
 
   for (const mode of MODES) {
@@ -203,10 +252,6 @@ describe("theme.css neutral ramp", () => {
       });
 
       it("keeps card and popover flush with the background", () => {
-        // Elevation is conveyed by border + shadow, not a surface tint, so card
-        // and popover share the page's canvas value instead of sitting on the
-        // lift ramp. Guards against anyone reintroducing a fill tint (the change
-        // that silently broke sticky overlay headers).
         expect(steps.has("card")).toBe(false);
         expect(steps.has("popover")).toBe(false);
         expect(block).toMatch(/--card:\s*var\(--canvas\);/);
@@ -226,11 +271,6 @@ describe("theme.css neutral ramp", () => {
       });
 
       it("keeps the sidebar a quiet chrome lift below the fills", () => {
-        // Sidebar is chrome adjacent to the page, so it should be the faintest
-        // lift — below the secondary/accent fills — and never compete with
-        // content surfaces. This must hold in light and dark (the lift used to
-        // invert between modes). Cards are now flush with the page, so the floor
-        // this is measured against is the lowest fill rather than the card.
         expect(step("sidebar")).toBeLessThan(step("secondary"));
       });
     });
@@ -243,15 +283,6 @@ describe("theme.css neutral ramp", () => {
   });
 
   it("derives translucent (transparent-mixed) tokens in oklab, not oklch", () => {
-    // Mixing a color with `transparent` in a *polar* space (oklch) drops the
-    // result hue to `none`, which renders as hue 0 (red). The chroma survives,
-    // so any palette whose canvas/ink/primary isn't pure gray got a pink-tinted
-    // header (--surface-scrim), hover, and selection — the default palette only
-    // escaped because its anchors are chroma-0. Rectangular spaces (oklab) carry
-    // the hue through, so translucency must mix in oklab. Opaque color->canvas
-    // mixes can stay oklch. This guard keeps every future palette correct by
-    // construction, since palettes only set opaque anchors and never touch these
-    // derived tokens.
     const offenders = [
       ...css.matchAll(/color-mix\(\s*in oklch\b[^;]*?\btransparent\b/g),
     ].map((match) => match[0].replace(/\s+/g, " "));
@@ -297,6 +328,15 @@ describe("theme.css Cadence text tokens", () => {
   }
 });
 
+describe("theme.css terminal font token", () => {
+  it("provides the existing terminal font stack as the default", () => {
+    const fontFamily = variableValue(modeBlock("light"), "font-terminal");
+
+    expect(fontFamily).toContain('"JetBrainsMono Nerd Font Mono"');
+    expect(fontFamily).toContain('"Courier New", monospace');
+  });
+});
+
 describe("theme.css semantic update surfaces", () => {
   it("registers the attention surface utility with Tailwind", () => {
     expect(css).toMatch(
@@ -320,5 +360,118 @@ describe("theme.css desktop portal hit testing", () => {
     expect(rule).toBeDefined();
     expect(rule).toMatch(/(?:^|\s)app-region:\s*no-drag;/);
     expect(rule).toMatch(/-webkit-app-region:\s*no-drag;/);
+  });
+});
+
+describe("theme.css sidebar width registration", () => {
+  it("registers --sidebar-width as a non-inherited length", () => {
+    const rule = css.match(/@property --sidebar-width\s*\{([^}]*)\}/)?.[1];
+
+    expect(rule).toBeDefined();
+    expect(rule).toMatch(/syntax:\s*"<length>";/);
+    expect(rule).toMatch(/inherits:\s*false;/);
+    expect(rule).toMatch(/initial-value:\s*\d+px;/);
+  });
+});
+
+describe("theme.css shimmer and scroll-anchor paint scope", () => {
+  function ruleBody(selector: string, source = css): string {
+    const at = source.indexOf(`${selector} {`);
+    if (at === -1) throw new Error(`no ${selector} rule in theme.css`);
+    return source.slice(at, source.indexOf("}", at));
+  }
+
+  const sweepPng = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "shine-sweep.png"),
+  );
+
+  function sweepChunks(png: Buffer): { type: string; data: Buffer }[] {
+    const chunks: { type: string; data: Buffer }[] = [];
+    let at = 8;
+    while (at < png.length) {
+      const length = png.readUInt32BE(at);
+      chunks.push({
+        type: png.toString("ascii", at + 4, at + 8),
+        data: png.subarray(at + 8, at + 8 + length),
+      });
+      at += length + 12;
+    }
+    return chunks;
+  }
+
+  it("promotes shimmering elements to their own layer only while active", () => {
+    expect(ruleBody("  .animate-shine-icon")).toMatch(
+      /will-change:\s*transform;/,
+    );
+  });
+
+  it("sweeps with the animated mask image instead of a CSS animation", () => {
+    const shared = ruleBody("  .animate-shine-icon");
+
+    expect(css).toMatch(/ {2}\.animate-shine,\n {2}\.animate-shine-icon \{/);
+    expect(shared).toMatch(
+      /-webkit-mask-image:\s*url\("\.\/shine-sweep\.png"\);/,
+    );
+    expect(shared).toMatch(
+      /(?<!-)mask-image:\s*url\("\.\/shine-sweep\.png"\);/,
+    );
+    expect(shared).toMatch(/(?<!-)mask-size:\s*100% 100%;/);
+    expect(shared).toMatch(/(?<!-)mask-repeat:\s*no-repeat;/);
+    expect(shared).not.toMatch(/animation/);
+    expect(ruleBody("  .animate-shine")).not.toMatch(/animation|background/);
+    expect(css).not.toMatch(/@keyframes shine/);
+  });
+
+  it("ships a looping one-second sweep small enough for Vite to inline", () => {
+    const chunks = sweepChunks(sweepPng);
+    const control = chunks.find((chunk) => chunk.type === "acTL")?.data;
+    const frames = chunks.filter((chunk) => chunk.type === "fcTL");
+    const seconds = frames.reduce(
+      (total, frame) =>
+        total + frame.data.readUInt16BE(20) / frame.data.readUInt16BE(22),
+      0,
+    );
+
+    expect(sweepPng.length).toBeLessThan(4096);
+    expect(control?.readUInt32BE(0)).toBe(frames.length);
+    expect(control?.readUInt32BE(4)).toBe(0);
+    expect(frames.length).toBeGreaterThanOrEqual(20);
+    expect(seconds).toBeCloseTo(1, 5);
+  });
+
+  it("drops the mask and releases the layer under inert or aria-hidden hosts", () => {
+    const rule = css.match(
+      /\[inert\] \.animate-shine,\s*\[inert\] \.animate-shine-icon,\s*\[aria-hidden="true"\] \.animate-shine,\s*\[aria-hidden="true"\] \.animate-shine-icon \{([^}]*)\}/,
+    )?.[1];
+    expect(rule).toBeDefined();
+    expect(rule).toMatch(/(?<!-)mask-image:\s*none;/);
+    expect(rule).toMatch(/-webkit-mask-image:\s*none;/);
+    expect(rule).toMatch(/will-change:\s*auto;/);
+  });
+
+  it("drops the sweep under reduced motion", () => {
+    const reduced = css.slice(
+      css.lastIndexOf(
+        "@media (prefers-reduced-motion: reduce)",
+        css.indexOf("-webkit-text-fill-color: currentColor;"),
+      ),
+    );
+    const rule = reduced.match(
+      /\.animate-shine,\s*\.animate-shine-icon \{([^}]*)\}/,
+    )?.[1];
+
+    expect(rule).toBeDefined();
+    expect(rule).toMatch(/(?<!-)mask-image:\s*none;/);
+    expect(rule).toMatch(/-webkit-mask-image:\s*none;/);
+  });
+
+  it("excludes the bottom-anchored wrapper without a universal descendant rule", () => {
+    expect(css).not.toMatch(/\.scroll-bottom-anchor-content\s*\*/);
+    expect(ruleBody(".scroll-bottom-anchor-content")).toMatch(
+      /overflow-anchor:\s*none;/,
+    );
+    expect(ruleBody(".scroll-bottom-anchor")).toMatch(
+      /overflow-anchor:\s*auto;/,
+    );
   });
 });

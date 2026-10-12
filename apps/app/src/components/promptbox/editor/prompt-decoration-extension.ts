@@ -2,10 +2,15 @@ import type {
   ComposerRichTextSpec,
   ComposerStructuredDraft,
   ComposerView,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import { Extension, type Editor } from "@tiptap/core";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
-import { Plugin, PluginKey, type EditorState } from "@tiptap/pm/state";
+import {
+  Plugin,
+  PluginKey,
+  type EditorState,
+  type Transaction,
+} from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { PromptTextMention } from "@bb/domain";
 import {
@@ -15,21 +20,15 @@ import {
 
 export const ULTRACODE_HIGHLIGHT_CLASS = "prompt-ultracode-highlight";
 
-export interface PromptDecorationRange {
+interface PromptDecorationRange {
   from: number;
   to: number;
 }
 
-/** One public ComposerRichTextSpec content-derived effect entry. */
-export type PromptDecorationRule = NonNullable<
+type PromptDecorationRule = NonNullable<
   ComposerRichTextSpec["effects"]
 >[number];
 
-/**
- * One host or plugin contribution to the decoration engine. Generations must
- * change when a plugin registration is replaced so a rule disabled after a
- * thrown match can be retried for the new registration.
- */
 export interface PromptDecorationSource {
   id: string;
   generation: string | number;
@@ -44,33 +43,26 @@ export interface PromptDraftObserver {
 }
 
 export interface PromptDecorationExtensionOptions {
-  /**
-   * Returns current sources in composition order. Call
-   * refreshPromptDecorations after generations or state effects change
-   * without a document edit.
-   */
   getDecorationSources?: () => readonly PromptDecorationSource[];
-  /**
-   * Returns the currently registered richText.onDraftChange callbacks and
-   * their latest ComposerView snapshots. Callback order is preserved.
-   */
   getDraftObservers?: () => readonly PromptDraftObserver[];
-  /** Draft observation debounce; defaults to 100 ms. */
   draftObserverDebounceMs?: number;
-  /** Optional host logger for an isolated rich-text match failure. */
   onRuleError?: (sourceId: string, ruleId: string, error: unknown) => void;
-  /** Optional host logger for an isolated draft observer failure. */
-  onDraftObserverError?: (observerId: string, error: unknown) => void;
 }
 
 interface PromptDecorationPluginState {
   decorations: DecorationSet | null;
   revision: number;
+  rebuildPending: boolean;
 }
 
 const promptDecorationPluginKey = new PluginKey<PromptDecorationPluginState>(
   "promptDecorations",
 );
+
+type PromptDecorationMeta = "refresh" | "deferred-rebuild";
+
+export const PROMPT_DECORATION_LARGE_DOC_SIZE = 100_000;
+export const PROMPT_DECORATION_LARGE_DOC_REBUILD_DELAY_MS = 200;
 
 const EMPTY_SOURCES: readonly PromptDecorationSource[] = [];
 const EMPTY_OBSERVERS: readonly PromptDraftObserver[] = [];
@@ -89,8 +81,7 @@ export function findUltracodeRanges(text: string): PromptDecorationRange[] {
   return ranges;
 }
 
-/** Built-in host rule, intentionally shaped exactly like a public effect. */
-export const PROMPT_ULTRACODE_DECORATION_RULE: PromptDecorationRule = {
+const PROMPT_ULTRACODE_DECORATION_RULE: PromptDecorationRule = {
   id: "ultracode",
   match: findUltracodeRanges,
   className: ULTRACODE_HIGHLIGHT_CLASS,
@@ -266,7 +257,8 @@ function structuredMention(
   if (resource.kind === "thread") id = resource.threadId;
   else if (resource.kind === "project") id = resource.projectId;
   else if (resource.kind === "section") id = resource.sectionId;
-  else if (resource.kind === "path") id = resource.path;
+  else if (resource.kind === "path" || resource.kind === "attachment")
+    id = resource.path;
   else id = `${resource.trigger}${resource.name}`;
   return {
     from: mention.start,
@@ -277,7 +269,7 @@ function structuredMention(
   };
 }
 
-export function composerStructuredDraftFromDoc(
+function composerStructuredDraftFromDoc(
   doc: ProseMirrorNode,
 ): ComposerStructuredDraft {
   const value = promptEditorSerializationFromDoc(doc);
@@ -289,11 +281,20 @@ export function composerStructuredDraftFromDoc(
 
 export function refreshPromptDecorations(editor: Editor): void {
   editor.view.dispatch(
-    editor.state.tr.setMeta(promptDecorationPluginKey, true),
+    editor.state.tr.setMeta(
+      promptDecorationPluginKey,
+      "refresh" satisfies PromptDecorationMeta,
+    ),
   );
 }
 
-/** Testing/diagnostic access to this extension's current decoration set. */
+function promptDecorationMeta(
+  transaction: Transaction,
+): PromptDecorationMeta | null {
+  const meta: unknown = transaction.getMeta(promptDecorationPluginKey);
+  return meta === "refresh" || meta === "deferred-rebuild" ? meta : null;
+}
+
 export function getPromptDecorationSet(
   state: EditorState,
 ): DecorationSet | null {
@@ -325,11 +326,26 @@ export const PromptDecorationExtension =
                 options.onRuleError,
               ),
               revision: 0,
+              rebuildPending: false,
             }),
             apply(transaction, previous, _oldState, newState) {
-              const refreshed =
-                transaction.getMeta(promptDecorationPluginKey) === true;
-              if (!refreshed && !transaction.docChanged) return previous;
+              const meta = promptDecorationMeta(transaction);
+              const refreshed = meta === "refresh";
+              if (meta === null && !transaction.docChanged) return previous;
+              if (
+                meta === null &&
+                newState.doc.content.size > PROMPT_DECORATION_LARGE_DOC_SIZE
+              ) {
+                return {
+                  decorations:
+                    previous.decorations?.map(
+                      transaction.mapping,
+                      newState.doc,
+                    ) ?? null,
+                  revision: previous.revision,
+                  rebuildPending: true,
+                };
+              }
               return {
                 decorations: buildDecorations(
                   newState.doc,
@@ -338,6 +354,7 @@ export const PromptDecorationExtension =
                   options.onRuleError,
                 ),
                 revision: refreshed ? previous.revision + 1 : previous.revision,
+                rebuildPending: false,
               };
             },
           },
@@ -350,21 +367,35 @@ export const PromptDecorationExtension =
           },
           view(initialView) {
             let timeout: ReturnType<typeof setTimeout> | null = null;
+            let rebuildTimeout: ReturnType<typeof setTimeout> | null = null;
             let latestDoc = initialView.state.doc;
+            const scheduleDeferredRebuild = (view: typeof initialView) => {
+              if (rebuildTimeout !== null) return;
+              rebuildTimeout = setTimeout(() => {
+                rebuildTimeout = null;
+                if (view.isDestroyed) return;
+                view.dispatch(
+                  view.state.tr.setMeta(
+                    promptDecorationPluginKey,
+                    "deferred-rebuild" satisfies PromptDecorationMeta,
+                  ),
+                );
+              }, PROMPT_DECORATION_LARGE_DOC_REBUILD_DELAY_MS);
+            };
             const schedule = (doc: ProseMirrorNode) => {
               latestDoc = doc;
               if (timeout !== null) clearTimeout(timeout);
               timeout = setTimeout(() => {
                 timeout = null;
+                const observers =
+                  options.getDraftObservers?.() ?? EMPTY_OBSERVERS;
+                if (observers.length === 0) return;
                 const draft = composerStructuredDraftFromDoc(latestDoc);
-                for (const observer of options.getDraftObservers?.() ??
-                  EMPTY_OBSERVERS) {
+                for (const observer of observers) {
                   try {
                     observer.onDraftChange(draft, observer.getView());
                   } catch (error) {
-                    (
-                      options.onDraftObserverError ?? defaultObserverErrorLogger
-                    )(observer.id, error);
+                    defaultObserverErrorLogger(observer.id, error);
                   }
                 }
               }, options.draftObserverDebounceMs ?? 100);
@@ -373,20 +404,27 @@ export const PromptDecorationExtension =
             return {
               update(updatedView, previousState) {
                 latestDoc = updatedView.state.doc;
-                const previousRevision =
-                  promptDecorationPluginKey.getState(previousState)?.revision;
-                const nextRevision = promptDecorationPluginKey.getState(
+                const previousPluginState =
+                  promptDecorationPluginKey.getState(previousState);
+                const nextPluginState = promptDecorationPluginKey.getState(
                   updatedView.state,
-                )?.revision;
+                );
                 if (
                   !updatedView.state.doc.eq(previousState.doc) ||
-                  previousRevision !== nextRevision
+                  previousPluginState?.revision !== nextPluginState?.revision
                 ) {
                   schedule(updatedView.state.doc);
+                }
+                if (nextPluginState?.rebuildPending) {
+                  scheduleDeferredRebuild(updatedView);
+                } else if (rebuildTimeout !== null) {
+                  clearTimeout(rebuildTimeout);
+                  rebuildTimeout = null;
                 }
               },
               destroy() {
                 if (timeout !== null) clearTimeout(timeout);
+                if (rebuildTimeout !== null) clearTimeout(rebuildTimeout);
               },
             };
           },

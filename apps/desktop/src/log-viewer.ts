@@ -2,7 +2,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readdir, stat } from "node:fs/promises";
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
-import { escapeHtmlText } from "@bb/domain";
+import { escapeHtmlText } from "@bb/text-utils";
+import { z } from "zod";
+import {
+  createLogFileFollower,
+  type LogFileFollower,
+} from "./log-file-follower.js";
 import {
   LOG_VIEWER_VISIBLE_LINE_LIMIT,
   type LogViewerComponent,
@@ -15,17 +20,87 @@ export const LOG_VIEWER_IPC_BATCH_LINE_LIMIT = 250;
 const LOG_VIEWER_INITIAL_TAIL_LINES = 400;
 const LOG_VIEWER_ROTATION_POLL_INTERVAL_MS = 2_000;
 const LOG_VIEWER_COMPONENTS: LogViewerComponent[] = ["server", "host-daemon"];
+const PINO_LEVEL_LABELS = new Map<number, string>([
+  [10, "trace"],
+  [20, "debug"],
+  [30, "info"],
+  [40, "warn"],
+  [50, "error"],
+  [60, "fatal"],
+]);
 
-export interface CreateLogViewerViewUrlArgs {
+const pinoLogRecordSchema = z
+  .object({
+    component: z.string().optional(),
+    level: z.number(),
+    msg: z.string().optional(),
+    time: z.number(),
+  })
+  .loose();
+
+interface FormatLogLineArgs {
+  component: LogViewerComponent;
+  line: string;
+}
+
+function padNumber(value: number, length: number): string {
+  return String(value).padStart(length, "0");
+}
+
+function formatLogTimestamp(timeMs: number): string {
+  const date = new Date(timeMs);
+  const datePart = `${date.getFullYear()}-${padNumber(date.getMonth() + 1, 2)}-${padNumber(date.getDate(), 2)}`;
+  const timePart = `${padNumber(date.getHours(), 2)}:${padNumber(date.getMinutes(), 2)}:${padNumber(date.getSeconds(), 2)}.${padNumber(date.getMilliseconds(), 3)}`;
+  return `${datePart} ${timePart}`;
+}
+
+function parseJsonObject(line: string): unknown {
+  if (!line.startsWith("{")) {
+    return null;
+  }
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+export function formatLogLine(args: FormatLogLineArgs): string {
+  const parsed = pinoLogRecordSchema.safeParse(parseJsonObject(args.line));
+  if (!parsed.success) {
+    return `[${args.component}] ${args.line}`;
+  }
+
+  const { component, level, msg, time, ...fields } = parsed.data;
+  const levelLabel = PINO_LEVEL_LABELS.get(level) ?? `level ${level}`;
+  const sourceLabel =
+    component === undefined || component === args.component
+      ? args.component
+      : `${args.component}:${component}`;
+  const parts = [
+    formatLogTimestamp(time),
+    `[${levelLabel}]`,
+    `[${sourceLabel}]`,
+  ];
+  if (msg !== undefined && msg.length > 0) {
+    parts.push(msg);
+  }
+  if (Object.keys(fields).length > 0) {
+    parts.push(JSON.stringify(fields));
+  }
+  return parts.join(" ");
+}
+
+interface CreateLogViewerViewUrlArgs {
   logDir: string;
 }
 
-export interface ResolveCurrentLogFileArgs {
+interface ResolveCurrentLogFileArgs {
   component: LogViewerComponent;
   logDir: string;
 }
 
-export interface CreateLogTailerArgs {
+interface CreateLogTailerArgs {
   logDir: string;
   onLines(lines: LogViewerLine[]): void;
 }
@@ -36,7 +111,7 @@ export interface LogTailer {
   stop(): void;
 }
 
-export interface CreateLogLineBufferArgs {
+interface CreateLogLineBufferArgs {
   flushIntervalMs: number;
   flushLineCount: number;
   maxLines: number;
@@ -45,8 +120,6 @@ export interface CreateLogLineBufferArgs {
 
 export interface LogLineBuffer {
   append(lines: LogViewerLine[]): void;
-  clear(): void;
-  flush(): void;
   lines(): LogViewerLine[];
   stop(): void;
 }
@@ -63,8 +136,8 @@ interface LogFileCandidate {
 }
 
 interface TailProcess {
-  childProcess: ChildProcess;
-  filePath: string;
+  childProcess: ChildProcess | null;
+  follower: LogFileFollower | null;
 }
 
 interface ComponentTailState {
@@ -172,12 +245,6 @@ export function createLogLineBuffer(
       }
       scheduleBufferFlush({ buffer: state });
     },
-    clear() {
-      clearFlushTimer();
-      state.pendingLines = [];
-      state.visibleLines = [];
-    },
-    flush,
     lines() {
       return [...state.visibleLines];
     },
@@ -497,7 +564,7 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
   let stopped = false;
 
   function emitSystemLine(emitArgs: EmitSystemLineArgs): void {
-    args.onLines([{ source: "system", text: `[system] ${emitArgs.text}` }]);
+    args.onLines([{ text: `[system] ${emitArgs.text}` }]);
   }
 
   function emitComponentLines(emitArgs: EmitComponentLinesArgs): void {
@@ -505,8 +572,7 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
       emitArgs.lines
         .filter((line) => line.length > 0)
         .map((line) => ({
-          source: emitArgs.component,
-          text: `[${emitArgs.component}] ${line}`,
+          text: formatLogLine({ component: emitArgs.component, line }),
         })),
     );
   }
@@ -538,7 +604,8 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
     if (tailProcess === null) {
       return;
     }
-    tailProcess.childProcess.kill("SIGTERM");
+    tailProcess.follower?.stop();
+    tailProcess.childProcess?.kill("SIGTERM");
   }
 
   function handleDirectoryWatchError(
@@ -561,6 +628,25 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
     stopTailProcess({ state: restartArgs.state });
     restartArgs.state.currentFilePath = restartArgs.filePath;
 
+    if (process.platform === "win32") {
+      restartArgs.state.tailProcess = {
+        childProcess: null,
+        follower: createLogFileFollower({
+          filePath: restartArgs.filePath,
+          initialLines: LOG_VIEWER_INITIAL_TAIL_LINES,
+          onChunk: (chunk) => {
+            handleTailChunk({ chunk, state: restartArgs.state });
+          },
+          onError: (error) => {
+            emitSystemLine({
+              text: `${restartArgs.state.component} tail failed: ${error.message}`,
+            });
+          },
+        }),
+      };
+      return;
+    }
+
     const childProcess = spawn(
       "tail",
       ["-n", String(LOG_VIEWER_INITIAL_TAIL_LINES), "-F", restartArgs.filePath],
@@ -570,7 +656,7 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
     );
     const tailProcess: TailProcess = {
       childProcess,
-      filePath: restartArgs.filePath,
+      follower: null,
     };
     restartArgs.state.tailProcess = tailProcess;
 
@@ -664,7 +750,7 @@ export function createLogTailer(args: CreateLogTailerArgs): LogTailer {
   return {
     processIds() {
       return componentStates.flatMap((state) => {
-        const pid = state.tailProcess?.childProcess.pid;
+        const pid = state.tailProcess?.childProcess?.pid;
         return pid === undefined ? [] : [pid];
       });
     },

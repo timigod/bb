@@ -4,23 +4,43 @@ import {
   type BaseWindow,
   type MenuItemConstructorOptions,
 } from "electron";
+import type { BbDesktopZoomCommand } from "@bb/desktop-contract";
 import type { ApplicationMenuAccelerators } from "./desktop-menu-shortcuts.js";
+import type { ConnectServerSyncSkipReason } from "./connect-server-sync.js";
+import { BUILTIN_SERVER_NAME } from "./server-target.js";
 
-export const SERVER_DAEMON_LOGS_MENU_LABEL = "Server & Daemon Logs";
-export const OPEN_NEW_TAB_MENU_LABEL = "New Tab";
-export const NEW_THREAD_MENU_LABEL = "New Thread";
-export const NEW_WINDOW_MENU_LABEL = "New Window";
-export const CLOSE_WINDOW_MENU_LABEL = "Close Window";
-export const OPEN_SETTINGS_MENU_LABEL = "Settings…";
-export const TOGGLE_DEVELOPER_TOOLS_MENU_LABEL = "Toggle Developer Tools";
-export const TOGGLE_DEVELOPER_TOOLS_ACCELERATOR = "Command+Option+I";
-export const RELOAD_ACCELERATOR = "CommandOrControl+R";
-export const FORCE_RELOAD_ACCELERATOR = "CommandOrControl+Shift+R";
-export const SERVER_MENU_LABEL = "Server";
-export const SERVER_MENU_ITEM_ID = "bb-server-menu";
+const SERVER_DAEMON_LOGS_MENU_LABEL = "Server & Daemon Logs";
+const OPEN_NEW_TAB_MENU_LABEL = "New Tab";
+const REOPEN_CLOSED_TAB_MENU_LABEL = "Reopen Closed Tab";
+const NEW_THREAD_MENU_LABEL = "New Thread";
+const NEW_WINDOW_MENU_LABEL = "New Window";
+const CLOSE_WINDOW_MENU_LABEL = "Close Window";
+const OPEN_SETTINGS_MENU_LABEL = "Settings…";
+const TOGGLE_DEVELOPER_TOOLS_MENU_LABEL = "Toggle Developer Tools";
+const TOGGLE_DEVELOPER_TOOLS_ACCELERATOR = "Command+Option+I";
+const RELOAD_ACCELERATOR = "CommandOrControl+R";
+const FORCE_RELOAD_ACCELERATOR = "CommandOrControl+Shift+R";
+const DESKTOP_SETTINGS_MENU_LABEL = "Desktop Settings";
+const SERVER_MENU_LABEL = "Server";
+const DESKTOP_SETTINGS_SERVER_MENU_ITEM_ID = "bb-desktop-settings-server-menu";
+const WINDOW_SERVER_MENU_ITEM_ID = "bb-server-menu";
+const SERVER_MENU_ITEM_IDS = [
+  DESKTOP_SETTINGS_SERVER_MENU_ITEM_ID,
+  WINDOW_SERVER_MENU_ITEM_ID,
+];
 export const SET_SERVER_URL_MENU_LABEL = "Set Server URL…";
+export const CONNECT_SERVERS_SKIPPED_MENU_LABELS: Record<
+  ConnectServerSyncSkipReason,
+  string
+> = {
+  "no-credential": "No Connect servers — sign in to bb Connect",
+  "not-paired": `No Connect servers — Connect not paired on ${BUILTIN_SERVER_NAME}`,
+  "plugin-disabled": "No Connect servers — Connect plugin disabled",
+  unauthorized: "No Connect servers — sign in to bb Connect again",
+  unavailable: "No Connect servers — could not reach bb Connect",
+};
 
-export interface ApplicationMenuServerItem {
+interface ApplicationMenuServerItem {
   checked: boolean;
   id: string;
   name: string;
@@ -29,22 +49,26 @@ export interface ApplicationMenuServerItem {
 export interface InstallApplicationMenuArgs {
   accelerators: ApplicationMenuAccelerators;
   isMac: boolean;
+  openAbout(): void;
   openNewTab(): void;
   openNewThread(): void;
   openSettings(): void;
+  reopenClosedTab(): void;
   reloadWindow(
     browserWindow: BaseWindow | undefined,
     ignoreCache: boolean,
   ): void;
+  zoomFocusedPage(command: BbDesktopZoomCommand): void;
   closeWindowOrSideTab(browserWindow: BaseWindow | undefined): void;
   createNewWindow(): void;
   openServerDaemonLogs(): void;
   selectServer(serverId: string): void;
   setServerUrl(): void;
-  /** Fired when the Window ▸ Server submenu opens (freshness trigger). */
+  addServer(): void;
   onServerMenuWillShow?: () => void;
   serverDaemonLogsMenuEnabled: boolean;
   servers: ApplicationMenuServerItem[];
+  connectServersSkipReason: ConnectServerSyncSkipReason | null;
 }
 
 function createServerDaemonLogsMenuItems(
@@ -62,8 +86,17 @@ function createServerDaemonLogsMenuItems(
   ];
 }
 
-function createServerMenuItems(
-  args: InstallApplicationMenuArgs,
+export type ServerMenuArgs = Pick<
+  InstallApplicationMenuArgs,
+  | "addServer"
+  | "connectServersSkipReason"
+  | "selectServer"
+  | "servers"
+  | "setServerUrl"
+>;
+
+export function createServerMenuItems(
+  args: ServerMenuArgs,
 ): MenuItemConstructorOptions[] {
   const serverItems: MenuItemConstructorOptions[] = args.servers.map(
     (server) => ({
@@ -75,9 +108,24 @@ function createServerMenuItems(
       type: "radio" as const,
     }),
   );
+  const skipReason = args.connectServersSkipReason;
   return [
     ...serverItems,
+    ...(skipReason === null
+      ? []
+      : [
+          {
+            enabled: false,
+            label: CONNECT_SERVERS_SKIPPED_MENU_LABELS[skipReason],
+          },
+        ]),
     { type: "separator" },
+    {
+      label: "Add Server…",
+      click() {
+        args.addServer();
+      },
+    },
     {
       label: SET_SERVER_URL_MENU_LABEL,
       click() {
@@ -94,7 +142,12 @@ export function buildApplicationMenuTemplate(
     {
       label: app.name,
       submenu: [
-        { role: "about" },
+        {
+          label: `About ${app.name}`,
+          click() {
+            args.openAbout();
+          },
+        },
         { type: "separator" },
         {
           accelerator: args.accelerators.openSettings,
@@ -102,6 +155,16 @@ export function buildApplicationMenuTemplate(
             args.openSettings();
           },
           label: OPEN_SETTINGS_MENU_LABEL,
+        },
+        {
+          label: DESKTOP_SETTINGS_MENU_LABEL,
+          submenu: [
+            {
+              id: DESKTOP_SETTINGS_SERVER_MENU_ITEM_ID,
+              label: SERVER_MENU_LABEL,
+              submenu: createServerMenuItems(args),
+            },
+          ],
         },
         { type: "separator" },
         ...(args.isMac
@@ -128,6 +191,13 @@ export function buildApplicationMenuTemplate(
           label: OPEN_NEW_TAB_MENU_LABEL,
         },
         {
+          accelerator: args.accelerators.reopenClosedTab,
+          click() {
+            args.reopenClosedTab();
+          },
+          label: REOPEN_CLOSED_TAB_MENU_LABEL,
+        },
+        {
           accelerator: args.accelerators.openNewThread,
           click() {
             args.openNewThread();
@@ -145,10 +215,6 @@ export function buildApplicationMenuTemplate(
         {
           accelerator: args.accelerators.closeWindowOrSideTab,
           click(_menuItem, browserWindow) {
-            // Electron sends null here for native panels such as the About
-            // window. Its type defines only BaseWindow | undefined.
-            // These panels have no Electron BaseWindow, so use the native
-            // close action.
             if (browserWindow === null) {
               if (args.isMac) {
                 Menu.sendActionToFirstResponder("performClose:");
@@ -200,9 +266,27 @@ export function buildApplicationMenuTemplate(
           role: "toggleDevTools",
         },
         { type: "separator" },
-        { role: "resetZoom" },
-        { role: "zoomIn" },
-        { role: "zoomOut" },
+        {
+          accelerator: "CommandOrControl+0",
+          label: "Actual Size",
+          click() {
+            args.zoomFocusedPage("reset");
+          },
+        },
+        {
+          accelerator: "CommandOrControl+Plus",
+          label: "Zoom In",
+          click() {
+            args.zoomFocusedPage("in");
+          },
+        },
+        {
+          accelerator: "CommandOrControl+-",
+          label: "Zoom Out",
+          click() {
+            args.zoomFocusedPage("out");
+          },
+        },
         ...createServerDaemonLogsMenuItems(args),
       ],
     },
@@ -213,15 +297,12 @@ export function buildApplicationMenuTemplate(
         ...(args.isMac ? [{ role: "zoom" as const }] : []),
         { type: "separator" },
         {
-          id: SERVER_MENU_ITEM_ID,
+          id: WINDOW_SERVER_MENU_ITEM_ID,
           label: SERVER_MENU_LABEL,
           submenu: createServerMenuItems(args),
         },
         ...(args.isMac
-          ? [
-              { type: "separator" as const },
-              { role: "front" as const },
-            ]
+          ? [{ type: "separator" as const }, { role: "front" as const }]
           : []),
       ],
     },
@@ -232,11 +313,11 @@ export function installApplicationMenu(args: InstallApplicationMenuArgs): void {
   const menu = Menu.buildFromTemplate(buildApplicationMenuTemplate(args));
   const onServerMenuWillShow = args.onServerMenuWillShow;
   if (onServerMenuWillShow !== undefined) {
-    menu
-      .getMenuItemById(SERVER_MENU_ITEM_ID)
-      ?.submenu?.on("menu-will-show", () => {
+    for (const id of SERVER_MENU_ITEM_IDS) {
+      menu.getMenuItemById(id)?.submenu?.on("menu-will-show", () => {
         onServerMenuWillShow();
       });
+    }
   }
   Menu.setApplicationMenu(menu);
 }

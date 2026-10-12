@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { SmilePlusIcon } from "@hugeicons/core-free-icons";
+import SmilePlusIcon from "@hugeicons/core-free-icons/SmilePlusIcon";
 import type { Task } from "../../shared/contract.js";
-import { useBbNavigate } from "@bb/plugin-sdk/app";
+import { errorMessage } from "../../shared/errors.js";
+import type { DelegationRpcContract } from "../../delegate/contract.js";
+import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import {
   listAllTasks,
   useMentionItems,
@@ -11,13 +13,14 @@ import {
 } from "../../shell/data.js";
 import { useTasksNavigation } from "../../shell/routes.js";
 import { TasksEditor } from "../../editor/tasks-editor.js";
-import { TaskActivity } from "../activity/index.js";
+import { TaskActivity } from "../activity/task-activity.js";
 import { AttachmentsGrid, uploadAttachment } from "./attachments.js";
 import {
   createDescriptionSaver,
   type DescriptionSaver,
 } from "./description-save.js";
-import { STATUS_LABELS, StatusIcon } from "./meta.js";
+import { StatusIcon } from "./meta.js";
+import { STATUS_LABELS } from "../list/lib.js";
 import {
   InlineProperties,
   PropertiesRail,
@@ -25,16 +28,16 @@ import {
 } from "./rail.js";
 import { ThreadsSection } from "./threads.js";
 import { DetailToasts, useDetailToasts } from "./toast.js";
-import { Icon } from "@bb/shared-ui/icon";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
+import { Icon } from "@/components/ui/icon";
+import { Skeleton } from "@/components/ui/skeleton";
 
-export interface DetailViewProps {
-  /** Task key like TSK-4 (not the ULID). */
+interface DetailViewProps {
   taskKey: string;
+  onCanonicalKey?: (taskKey: string) => void;
 }
 
 const DESCRIPTION_SAVE_DELAY_MS = 800;
-/** Poll cadence for PR state while any attached PR is still open or draft. */
 const ACTIVE_PULL_REQUEST_REFRESH_MS = 60_000;
 
 function SubTaskDonut({
@@ -75,8 +78,6 @@ function EditableTitle({
 }) {
   return (
     <h1
-      // Remount when another client renames the task; while focused the vdom
-      // children stay constant so React never clobbers in-progress edits.
       key={`${task.id}:${task.title}`}
       contentEditable
       suppressContentEditableWarning
@@ -181,25 +182,25 @@ function SubTasksSection({
 
 function DetailSkeleton() {
   return (
-    <div className="mx-auto w-full max-w-3xl px-8 py-12">
-      <Skeleton className="mb-4 h-7 w-2/3" />
-      <Skeleton className="mb-2 h-4 w-full" />
-      <Skeleton className="mb-2 h-4 w-5/6" />
-      <Skeleton className="h-4 w-1/2" />
-    </div>
+    <DelayedLoading>
+      <div className="mx-auto w-full max-w-3xl px-8 py-12">
+        <Skeleton className="mb-4 h-7 w-2/3" />
+        <Skeleton className="mb-2 h-4 w-full" />
+        <Skeleton className="mb-2 h-4 w-5/6" />
+        <Skeleton className="h-4 w-1/2" />
+      </div>
+    </DelayedLoading>
   );
 }
 
 function TaskDetail({ task }: { task: Task }) {
   const rpc = useTasksRpc();
+  const delegationRpc = useRpc<DelegationRpcContract>();
   const navigation = useTasksNavigation();
   const { toasts, push, dismiss } = useDetailToasts();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const subtasksRef = useRef<HTMLElement>(null);
 
-  // Local description draft: while the user types, the server still holds the
-  // previous markdown, so passing the server value straight through would
-  // reset the editor on every unrelated realtime refresh.
   const [draft, setDraft] = useState<{ taskId: string; markdown: string }>();
   const rpcRef = useRef(rpc);
   rpcRef.current = rpc;
@@ -216,7 +217,7 @@ function TaskDetail({ task }: { task: Task }) {
         ? { ok: true }
         : { ok: false, errorMessage: result.error.message };
     },
-    onError: (message) => pushRef.current("error", message),
+    onError: (message) => pushRef.current(message),
     delayMs: DESCRIPTION_SAVE_DELAY_MS,
   });
 
@@ -233,6 +234,7 @@ function TaskDetail({ task }: { task: Task }) {
         : null,
     ["tasks:changed"],
     [task.parentTaskId],
+    { relevantTaskIds: task.parentTaskId ? [task.parentTaskId] : [] },
   );
   const subtasks = useTasksQuery(
     async (query) => listAllTasks(query, { parentTaskId: task.id }),
@@ -250,28 +252,25 @@ function TaskDetail({ task }: { task: Task }) {
       (await query.call("listAttachments", { taskId: task.id })).attachments,
     ["tasks:changed"],
     [task.id],
+    { relevantTaskIds: [task.id] },
   );
   const threads = useTasksQuery(
     async (query) =>
       (await query.call("listTaskThreads", { taskId: task.id })).taskThreads,
     ["threads:changed"],
     [task.id],
+    { relevantTaskIds: [task.id] },
   );
   const presets = useTasksQuery(
     async (query) => (await query.call("listPresets")).presets,
     ["projects:changed"],
   );
-  // Quiet by design: while loading (or if the lookup errors) thread cards
-  // simply render without PR pills.
   const pullRequests = useTasksQuery(
     async (query) => query.call("listTaskPullRequests", { taskId: task.id }),
     ["threads:changed"],
     [task.id],
+    { relevantTaskIds: [task.id] },
   );
-  // GitHub-side transitions (draft→open→merged) never emit a Tasks realtime
-  // event, so revalidate the way the main app's PR query does: always on
-  // window focus, plus a slow poll while any PR is still active. The poll
-  // stays bounded — each round costs one gh lookup per distinct environment.
   const refreshPullRequests = pullRequests.refresh;
   const hasActivePullRequest = (pullRequests.data?.pullRequests ?? []).some(
     (pullRequest) =>
@@ -283,10 +282,9 @@ function TaskDetail({ task }: { task: Task }) {
   }, [refreshPullRequests]);
   useEffect(() => {
     if (!hasActivePullRequest) return;
-    const timer = window.setInterval(
-      refreshPullRequests,
-      ACTIVE_PULL_REQUEST_REFRESH_MS,
-    );
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") refreshPullRequests();
+    }, ACTIVE_PULL_REQUEST_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [hasActivePullRequest, refreshPullRequests]);
 
@@ -298,9 +296,29 @@ function TaskDetail({ task }: { task: Task }) {
         taskId: task.id,
         ...input,
       });
-      if (!result.ok) push("error", result.error.message);
+      if (!result.ok) push(result.error.message);
     } catch (error) {
-      push("error", error instanceof Error ? error.message : String(error));
+      push(errorMessage(error));
+    }
+  };
+
+  const moveToProject = async (projectId: string) => {
+    saverRef.current?.flush(task.id);
+    try {
+      const result = await rpc.call("moveTaskToProject", {
+        taskId: task.id,
+        projectId,
+      });
+      if (!result.ok) {
+        push(result.error.message);
+        return;
+      }
+      navigation.go(
+        { kind: "task", taskKey: result.task.key },
+        { replace: true },
+      );
+    } catch (error) {
+      push(errorMessage(error));
     }
   };
 
@@ -309,7 +327,6 @@ function TaskDetail({ task }: { task: Task }) {
     saverRef.current?.onChange(task.id, markdown);
   };
 
-  // Flush a pending description save when leaving the page or switching task.
   useEffect(() => {
     return () => saverRef.current?.flush(task.id);
   }, [task.id]);
@@ -325,7 +342,7 @@ function TaskDetail({ task }: { task: Task }) {
       try {
         await uploadAttachment(file, { taskId: task.id });
       } catch (error) {
-        push("error", error instanceof Error ? error.message : String(error));
+        push(errorMessage(error));
       }
     }
     attachments.refresh();
@@ -340,13 +357,13 @@ function TaskDetail({ task }: { task: Task }) {
         status: "todo",
       });
       if (!result.ok) {
-        push("error", result.error.message);
+        push(result.error.message);
         return false;
       }
       subtasks.refresh();
       return true;
     } catch (error) {
-      push("error", error instanceof Error ? error.message : String(error));
+      push(errorMessage(error));
       return false;
     }
   };
@@ -399,10 +416,13 @@ function TaskDetail({ task }: { task: Task }) {
 
           <InlineProperties
             task={task}
+            project={project}
+            projects={projects.data}
             labels={labels.data}
             presets={presets.data}
             onUpdate={(update) => void updateTask(update)}
-            onError={(message) => push("error", message)}
+            onMoveToProject={(projectId) => void moveToProject(projectId)}
+            onError={(message) => push(message)}
             className="mb-4 @[45rem]:hidden"
           />
 
@@ -458,7 +478,7 @@ function TaskDetail({ task }: { task: Task }) {
               if (!result.ok) throw new Error(result.error.message);
               attachments.refresh();
             }}
-            onError={(message) => push("error", message)}
+            onError={(message) => push(message)}
           />
 
           <SubTasksSection
@@ -468,8 +488,6 @@ function TaskDetail({ task }: { task: Task }) {
             onCreate={createSubtask}
           />
 
-          {/* With no attached threads the section disappears entirely; the
-              rail's Dispatch button is the entry point. */}
           {(threads.data ?? []).length > 0 ? (
             <div className="mt-6">
               <ThreadsSection
@@ -478,25 +496,34 @@ function TaskDetail({ task }: { task: Task }) {
                 unavailableThreadIds={
                   pullRequests.data?.unavailableThreadIds ?? []
                 }
+                onDetach={async (thread) => {
+                  await delegationRpc.call("taskThreadsDetach", {
+                    taskId: task.id,
+                    threadId: thread.threadId,
+                  });
+                  threads.refresh();
+                  pullRequests.refresh();
+                }}
+                onError={(message) => push(message)}
               />
             </div>
           ) : null}
 
-          {/* TaskActivity draws its own top hairline; adding one here would
-              stack two dividers above the Activity header. */}
           <div className="mt-1">
-            <TaskActivity taskId={task.id} taskKey={task.key} />
+            <TaskActivity taskId={task.id} />
           </div>
         </div>
 
         <PropertiesRail
           task={task}
           project={project}
+          projects={projects.data}
           labels={labels.data}
           threads={threads.data ?? []}
           presets={presets.data}
           onUpdate={(update) => void updateTask(update)}
-          onError={(message) => push("error", message)}
+          onMoveToProject={(projectId) => void moveToProject(projectId)}
+          onError={(message) => push(message)}
           className="hidden @[45rem]:block"
         />
       </div>
@@ -505,12 +532,16 @@ function TaskDetail({ task }: { task: Task }) {
   );
 }
 
-export function DetailView({ taskKey }: DetailViewProps) {
+export function DetailView({ taskKey, onCanonicalKey }: DetailViewProps) {
   const query = useTasksQuery(
     async (rpc) => (await rpc.call("getTaskByKey", { taskKey })).task,
     ["tasks:changed"],
     [taskKey],
   );
+  const canonicalKey = query.data?.key;
+  useEffect(() => {
+    if (canonicalKey) onCanonicalKey?.(canonicalKey);
+  }, [canonicalKey, onCanonicalKey]);
 
   if (query.data === undefined) {
     return query.error ? (

@@ -1,14 +1,13 @@
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { createFakePluginHost } from "@bb/plugin-sdk/testing";
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { createTasksStore } from "../db";
 import {
-  buildAttachmentUrl,
-  deleteAttachmentById,
+  attachmentDownloadUrl,
   MAX_ATTACHMENT_SIZE_BYTES,
-  registerAttachments,
-} from ".";
+} from "../shared/attachments";
+import { registerAttachments } from ".";
 
 function setup(options?: Parameters<typeof registerAttachments>[2]) {
   const { bb, harness } = createFakePluginHost({ pluginId: "tasks" });
@@ -29,7 +28,7 @@ function setup(options?: Parameters<typeof registerAttachments>[2]) {
     .all()
     .find((entry) => entry.name === "main");
   if (!database) throw new Error("test database path is missing");
-  return { bb, harness, store, task, root: dirname(database.file) };
+  return { harness, store, task, root: dirname(database.file) };
 }
 
 async function upload(
@@ -63,7 +62,7 @@ describe("task attachments", () => {
       };
       const attachment = store.getAttachment(result.attachmentId);
 
-      expect(result.url).toBe(buildAttachmentUrl(result.attachmentId));
+      expect(result.url).toBe(attachmentDownloadUrl(result.attachmentId));
       expect(attachment).toMatchObject({
         taskId: task.id,
         commentId: null,
@@ -164,6 +163,98 @@ describe("task attachments", () => {
     }
   });
 
+  it("downloads a non-Latin-1 file name with an ASCII fallback in filename= (issue #1621)", async () => {
+    const { harness, store, task } = setup();
+    try {
+      const emDashName = "report \u2014 final.txt";
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode("hello"),
+        emDashName,
+        "text/plain",
+      );
+      expect(uploaded.status).toBe(201);
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      expect(store.getAttachment(attachmentId)?.fileName).toBe(emDashName);
+
+      const response = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-disposition")).toBe(
+        `attachment; filename="report - final.txt"; filename*=UTF-8''report%20%E2%80%94%20final.txt`,
+      );
+      await expect(response.text()).resolves.toBe("hello");
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("percent-encodes every non attr-char in filename* (RFC 5987)", async () => {
+    const { harness, task } = setup();
+    try {
+      const name = "\u5831\u544a (final)'.txt";
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode("hello"),
+        name,
+        "text/plain",
+      );
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      const response = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(response.status).toBe(200);
+      const disposition = response.headers.get("content-disposition");
+      expect(disposition).toBe(
+        `attachment; filename="-- (final)'.txt"; filename*=UTF-8''%E5%A0%B1%E5%91%8A%20%28final%29%27.txt`,
+      );
+      const extValue = disposition?.split("filename*=UTF-8''")[1] ?? "";
+      expect(extValue).toMatch(/^(?:[A-Za-z0-9!#$&+\-.^_`|~]|%[0-9A-F]{2})*$/);
+      expect(decodeURIComponent(extValue)).toBe(name);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("strips Unicode bidirectional controls that could spoof the extension", async () => {
+    const { harness, store, task } = setup();
+    try {
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode("hello"),
+        "photo\u202egnp.exe",
+        "application/octet-stream",
+      );
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      expect(store.getAttachment(attachmentId)?.fileName).toBe("photo_gnp.exe");
+      const response = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-disposition")).toBe(
+        `attachment; filename="photo_gnp.exe"; filename*=UTF-8''photo_gnp.exe`,
+      );
+    } finally {
+      await harness.dispose();
+    }
+  });
+
   it("forces SVG downloads and never marks them as embeddable images", async () => {
     const { harness, store, task } = setup();
     try {
@@ -241,34 +332,6 @@ describe("task attachments", () => {
     }
   });
 
-  it("deleteAttachmentById removes the row and blob and returns the attachment", async () => {
-    const { bb, harness, root, store, task } = setup();
-    try {
-      const uploaded = await upload(
-        harness,
-        task.id,
-        "document",
-        "note.txt",
-        "text/plain",
-      );
-      const { attachmentId } = (await uploaded.json()) as {
-        attachmentId: string;
-      };
-      const attachment = store.getAttachment(attachmentId);
-      if (!attachment) throw new Error("attachment row was not created");
-      const blobDirectory = dirname(join(root, attachment.blobPath));
-
-      const deleted = await deleteAttachmentById(bb, store, attachmentId);
-      expect(deleted).toMatchObject({ id: attachmentId });
-      expect(store.getAttachment(attachmentId)).toBeUndefined();
-      await expect(stat(blobDirectory)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-    } finally {
-      await harness.dispose();
-    }
-  });
-
   it("keeps the row and blob reachable and publishes nothing when cleanup fails", async () => {
     const { harness, root, store, task } = setup({
       removeBlobs: async () => {
@@ -282,7 +345,7 @@ describe("task attachments", () => {
       };
       const attachment = store.getAttachment(attachmentId);
       if (!attachment) throw new Error("attachment row was not created");
-      const description = `![diagram](${buildAttachmentUrl(attachmentId)})`;
+      const description = `![diagram](${attachmentDownloadUrl(attachmentId)})`;
       store.updateTask(task.id, { description });
       const signalsBeforeDelete = harness.realtimeSignals.length;
 
@@ -317,7 +380,7 @@ describe("task attachments", () => {
       const attachment = store.getAttachment(attachmentId);
       if (!attachment) throw new Error("attachment row was not created");
       store.updateTask(task.id, {
-        description: `![diagram](${buildAttachmentUrl(attachmentId)})`,
+        description: `![diagram](${attachmentDownloadUrl(attachmentId)})`,
       });
       const signalsBeforeDelete = harness.realtimeSignals.length;
 
@@ -350,17 +413,6 @@ describe("task attachments", () => {
         stat(dirname(join(root, attachment.blobPath))),
       ).rejects.toMatchObject({ code: "ENOENT" });
       expect(harness.realtimeSignals).toHaveLength(signalsBeforeDelete + 1);
-    } finally {
-      await harness.dispose();
-    }
-  });
-
-  it("deleteAttachmentById is a safe no-op for an unknown id", async () => {
-    const { bb, harness, store } = setup();
-    try {
-      await expect(
-        deleteAttachmentById(bb, store, "01JZZZZZZZZZZZZZZZZZZZZZZZ"),
-      ).resolves.toBeNull();
     } finally {
       await harness.dispose();
     }

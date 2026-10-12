@@ -1,4 +1,3 @@
-// Shared real-provider end-to-end test helpers.
 import { execFile as execFileCb } from "node:child_process";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
@@ -10,7 +9,6 @@ import {
   type ThreadEventRow,
   type ThreadExecutionOptions,
 } from "@bb/domain";
-import type { ThreadTimelineResponse } from "@bb/server-contract";
 import { resolvePreferredTestModel } from "@bb/test-helpers";
 import {
   getAvailableModels,
@@ -29,16 +27,13 @@ import {
   loadProjectEnvFile,
 } from "../helpers/harness.js";
 import {
-  describeThreadEvent,
   previewThreadText,
+  summarizeThreadEventTail,
 } from "../helpers/thread-diagnostics.js";
 import { scaleTimeoutMs } from "../helpers/time.js";
-import {
-  formatTimelineRowKindsForDiagnostics,
-  timelineHasAssistantConversation,
-} from "../helpers/timeline-response.js";
+import { formatTimelineRowKindsForDiagnostics } from "../helpers/timeline-response.js";
 
-export type RealProviderId = "codex" | "claude-code" | "pi";
+type RealProviderId = "codex" | "claude-code" | "pi";
 
 export const REAL_PROVIDER_IDS: ReadonlyArray<RealProviderId> = [
   "codex",
@@ -57,7 +52,7 @@ type RealProviderExecutionTemplate = Omit<
   "model"
 >;
 
-export type ProviderSmokeHarness = Awaited<
+type ProviderSmokeHarness = Awaited<
   ReturnType<typeof createIntegrationHarness>
 >;
 
@@ -67,12 +62,12 @@ interface WaitForThreadEventArgs {
   threadId: string;
 }
 
-export interface WaitForTurnStartedResult {
+interface WaitForTurnStartedResult {
   sequence: number;
   turnId: string;
 }
 
-export interface WaitForInputAcceptedResult {
+interface WaitForInputAcceptedResult {
   clientRequestId: ClientTurnRequestId;
   sequence: number;
   turnId: string;
@@ -114,17 +109,12 @@ interface ResolveExecutionOptionsArgs {
   providerId: RealProviderId;
 }
 
-// Active-turn waits: enough time to confirm the provider has started a long-running turn.
 export const ACTIVE_TIMEOUT_MS = scaleTimeoutMs(15_000);
 export const REAL_POLL_INTERVAL_MS = 200;
-// Whole-turn waits: real providers can take much longer than the fake adapter to respond.
 export const TURN_TIMEOUT_MS = scaleTimeoutMs(60_000);
-// Stop waits: give the daemon time to interrupt an in-flight real-provider turn cleanly.
 export const STOP_TIMEOUT_MS = scaleTimeoutMs(30_000);
-// Per-test budget: end-to-end provider checks include real network and provider startup latency.
 export const TEST_TIMEOUT_MS = scaleTimeoutMs(120_000);
 
-// Concurrent real-provider harnesses each install daemon shutdown handlers.
 process.setMaxListeners(Math.max(process.getMaxListeners(), 64));
 
 const providerPrerequisitePromises = new Map<RealProviderId, Promise<void>>();
@@ -148,13 +138,6 @@ const FAST_EXECUTION_BY_PROVIDER: Record<
     reasoningLevel: "low",
   },
 };
-
-export function countTurnEvents(
-  events: ThreadEventRow[],
-  type: "turn/completed" | "turn/started",
-): number {
-  return events.filter((event) => event.type === type).length;
-}
 
 interface ClientTurnRequestAfterBaseline {
   requestId: ClientTurnRequestId;
@@ -253,6 +236,10 @@ function hasTurnCompletedAfter(
   );
 }
 
+function latestEventSequence(events: ThreadEventRow[]): number {
+  return Math.max(0, ...events.map((event) => event.seq));
+}
+
 async function buildThreadDiagnostics(
   args: WaitForThreadEventArgs,
 ): Promise<string> {
@@ -261,91 +248,69 @@ async function buildThreadDiagnostics(
     getThreadEvents(args.harness.api, args.threadId),
     getThreadOutput(args.harness.api, args.threadId).catch(() => null),
   ]);
-  const recentEvents = events.slice(-12).map(describeThreadEvent).join(" | ");
-  const lastError = [...events]
-    .reverse()
-    .find(
-      (event) =>
-        event.type === "provider/error" || event.type === "system/error",
-    );
-  const lastTurnStarted = [...events]
-    .reverse()
-    .find((event) => event.type === "turn/started");
-  const lastTurnCompleted = [...events]
-    .reverse()
-    .find((event) => event.type === "turn/completed");
+  const { lastError, lastTurnCompleted, lastTurnStarted, recentEvents } =
+    summarizeThreadEventTail(events, 12);
   return `status=${thread.status}; events=${events.length}; recentEvents=[${recentEvents || "none"}]; lastError=${JSON.stringify(lastError?.data ?? null)}; lastTurnStarted=${JSON.stringify(lastTurnStarted?.data ?? null)}; lastTurnCompleted=${JSON.stringify(lastTurnCompleted?.data ?? null)}; outputPreview=${JSON.stringify(previewThreadText(output))}`;
+}
+
+async function pollForEventAfter<T>(
+  args: WaitForThreadEventArgs,
+  options: {
+    find: (events: ThreadEventRow[], sequence: number) => T | null;
+    label: string;
+  },
+): Promise<T> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= ACTIVE_TIMEOUT_MS) {
+    const [thread, events] = await Promise.all([
+      getThread(args.harness.api, args.threadId),
+      getThreadEvents(args.harness.api, args.threadId),
+    ]);
+    const found = options.find(events, args.baselineSequence);
+    if (found) {
+      return found;
+    }
+    const errorEvent = findErrorAfter(events, args.baselineSequence);
+    if (thread.status === "error" || errorEvent) {
+      throw new Error(
+        `Thread failed before ${options.label}. Diagnostics: ${await buildThreadDiagnostics(args)}`,
+      );
+    }
+    if (hasTurnCompletedAfter(events, args.baselineSequence)) {
+      throw new Error(
+        `Turn completed before ${options.label} was observed. Diagnostics: ${await buildThreadDiagnostics(args)}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, REAL_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `Timed out waiting for ${options.label}. Diagnostics: ${await buildThreadDiagnostics(args)}`,
+  );
 }
 
 async function waitForTurnStartedAfter(
   args: WaitForThreadEventArgs,
 ): Promise<WaitForTurnStartedResult> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt <= ACTIVE_TIMEOUT_MS) {
-    const [thread, events] = await Promise.all([
-      getThread(args.harness.api, args.threadId),
-      getThreadEvents(args.harness.api, args.threadId),
-    ]);
-    const turnStarted = findTurnStartedAfter(events, args.baselineSequence);
-    if (turnStarted) {
-      return turnStarted;
-    }
-    const errorEvent = findErrorAfter(events, args.baselineSequence);
-    if (thread.status === "error" || errorEvent) {
-      throw new Error(
-        `Thread failed before turn/started. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-      );
-    }
-    if (hasTurnCompletedAfter(events, args.baselineSequence)) {
-      throw new Error(
-        `Turn completed before turn/started was observed. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, REAL_POLL_INTERVAL_MS));
-  }
-  throw new Error(
-    `Timed out waiting for turn/started. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-  );
+  return pollForEventAfter(args, {
+    find: findTurnStartedAfter,
+    label: "turn/started",
+  });
 }
 
 export async function waitForInputAcceptedAfter(
   args: WaitForThreadEventArgs,
 ): Promise<WaitForInputAcceptedResult> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt <= ACTIVE_TIMEOUT_MS) {
-    const [thread, events] = await Promise.all([
-      getThread(args.harness.api, args.threadId),
-      getThreadEvents(args.harness.api, args.threadId),
-    ]);
-    const inputAccepted = findInputAcceptedAfter(events, args.baselineSequence);
-    if (inputAccepted) {
-      return inputAccepted;
-    }
-    const errorEvent = findErrorAfter(events, args.baselineSequence);
-    if (thread.status === "error" || errorEvent) {
-      throw new Error(
-        `Thread failed before turn/input/accepted. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-      );
-    }
-    if (hasTurnCompletedAfter(events, args.baselineSequence)) {
-      throw new Error(
-        `Turn completed before turn/input/accepted. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, REAL_POLL_INTERVAL_MS));
-  }
-  throw new Error(
-    `Timed out waiting for turn/input/accepted. Diagnostics: ${await buildThreadDiagnostics(args)}`,
-  );
+  return pollForEventAfter(args, {
+    find: findInputAcceptedAfter,
+    label: "turn/input/accepted",
+  });
 }
 
 export async function sendLongRunningTurnAndWaitStarted(
   args: SendLongRunningTurnArgs,
 ): Promise<WaitForTurnStartedResult> {
-  const baselineEvents = await getThreadEvents(args.harness.api, args.threadId);
-  const baselineSequence = Math.max(
-    0,
-    ...baselineEvents.map((event) => event.seq),
+  const baselineSequence = latestEventSequence(
+    await getThreadEvents(args.harness.api, args.threadId),
   );
   await sendTextMessage(args.harness.api, args.threadId, {
     execution: await resolveExecutionOptions({
@@ -457,7 +422,6 @@ async function assertCliInstalled(command: string): Promise<void> {
     if (isErrnoException(error) && error.code === "ENOENT") {
       throw new Error(`${command} CLI is not installed or not on PATH`);
     }
-    // --help returned non-zero but the binary exists - that's fine.
   }
 }
 
@@ -468,15 +432,13 @@ export function expectNonEmptyOutput(
   expect(output?.trim().length ?? 0, context).toBeGreaterThan(0);
 }
 
-export function hasAssistantTimelineMessage(
-  timeline: ThreadTimelineResponse,
-): boolean {
-  return timelineHasAssistantConversation(timeline);
-}
-
 export async function createRealThread(args: CreateRealThreadArgs) {
   await assertProviderPrerequisites(args.providerId);
-  const harness = await createIntegrationHarness({ adapterFactory: undefined });
+  const harness = await createIntegrationHarness(
+    args.workspace.type === "managed-worktree"
+      ? { builtinPlugins: ["environment-git-worktree"] }
+      : {},
+  );
   const project = await createProjectFixture(harness, {
     name: `Real Provider ${args.providerId}`,
   });
@@ -485,9 +447,7 @@ export async function createRealThread(args: CreateRealThreadArgs) {
       harness,
       providerId: args.providerId,
     }),
-    input: [
-      { type: "text", text: REAL_PROVIDER_BOOTSTRAP_TEXT, mentions: [] },
-    ],
+    input: [{ type: "text", text: REAL_PROVIDER_BOOTSTRAP_TEXT, mentions: [] }],
     projectId: project.id,
     providerId: args.providerId,
     timeoutMs: TURN_TIMEOUT_MS,
@@ -501,10 +461,8 @@ export async function createRealThread(args: CreateRealThreadArgs) {
 }
 
 export async function sendAndWaitForIdle(args: SendAndWaitForIdleArgs) {
-  const baselineEvents = await getThreadEvents(args.harness.api, args.threadId);
-  const baselineSequence = Math.max(
-    0,
-    ...baselineEvents.map((event) => event.seq),
+  const baselineSequence = latestEventSequence(
+    await getThreadEvents(args.harness.api, args.threadId),
   );
   await sendTextMessage(args.harness.api, args.threadId, {
     execution: await resolveExecutionOptions({
@@ -563,20 +521,12 @@ export async function sendAndWaitForIdle(args: SendAndWaitForIdleArgs) {
       getThreadOutput(args.harness.api, args.threadId),
       getThreadTimeline(args.harness.api, args.threadId).catch(() => null),
     ]);
-    const recentEvents = events.slice(-10).map(describeThreadEvent).join(" | ");
+    const { lastError, lastTurnCompleted, recentEvents } =
+      summarizeThreadEventTail(events, 10);
     const timelineKinds = timeline
       ? formatTimelineRowKindsForDiagnostics(timeline)
       : "unavailable";
     const outputPreview = output?.trim().slice(0, 160) ?? "";
-    const lastError = [...events]
-      .reverse()
-      .find(
-        (event) =>
-          event.type === "provider/error" || event.type === "system/error",
-      );
-    const lastTurnCompleted = [...events]
-      .reverse()
-      .find((event) => event.type === "turn/completed");
     const message = error instanceof Error ? error.message : String(error);
 
     throw new Error(

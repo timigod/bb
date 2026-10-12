@@ -8,8 +8,6 @@ const healthResponseSchema = z
 
 const systemConfigResponseSchema = z
   .object({
-    // Optional on purpose: the probed server can be an older bb that predates
-    // this field, and it is still compatible enough to attach to.
     dataDir: z.string().min(1).optional(),
     hostDaemonPort: z.number().int().min(1).max(65_535),
     voiceTranscriptionEnabled: z.boolean(),
@@ -27,31 +25,31 @@ export type ServerProbeFetch = (
 ) => Promise<Response>;
 
 export interface CompatibleServerProbeResult {
-  /** Data directory the probed server reports, or null on an older bb. */
   dataDir: string | null;
   kind: "compatible";
   serverUrl: string;
 }
 
-export interface IncompatibleServerProbeResult {
+interface IncompatibleServerProbeResult {
   kind: "incompatible";
   reason: string;
   serverUrl: string;
 }
 
-export interface UnavailableServerProbeResult {
+interface UnavailableServerProbeResult {
   kind: "unavailable";
   reason: string;
   serverUrl: string;
 }
 
-export interface ProbeBbServerArgs {
+interface ProbeBbServerArgs {
   fetchImpl?: ServerProbeFetch;
   serverUrl: string;
   timeoutMs: number;
 }
 
-export interface WaitForCompatibleServerArgs {
+interface WaitForCompatibleServerArgs {
+  fetchImpl?: ServerProbeFetch;
   intervalMs: number;
   serverUrl: string;
   timeoutMs: number;
@@ -200,6 +198,14 @@ export async function probeBbServer(
     url: endpointUrl(args.serverUrl, "/api/v1/system/config"),
   });
 
+  if (configResult.kind === "network-error") {
+    return {
+      kind: "unavailable",
+      reason: `/api/v1/system/config returned ${formatFetchFailure(configResult)}`,
+      serverUrl: args.serverUrl,
+    };
+  }
+
   if (configResult.kind !== "success") {
     return {
       kind: "incompatible",
@@ -227,6 +233,7 @@ export async function waitForCompatibleServer(
 
   while (Date.now() <= deadline) {
     lastResult = await probeBbServer({
+      ...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
       serverUrl: args.serverUrl,
       timeoutMs: Math.min(args.intervalMs, 1_000),
     });

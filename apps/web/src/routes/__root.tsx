@@ -1,11 +1,15 @@
-import { HeadContent, Scripts, createRootRoute } from "@tanstack/react-router";
+import {
+  HeadContent,
+  Scripts,
+  createRootRoute,
+  useRouterState,
+} from "@tanstack/react-router";
+import { useEffect } from "react";
 
-// Route-level stylesheets are deliberate: the marketing page (/) imports
-// landing.css and the dashboard (/dashboard) imports styles.css (Tailwind +
-// theme.css). Both define :root tokens (e.g. --ink), so they must never load
-// into the same document — navigation between the two areas is always a
-// full-page load (plain <a>, window.location, OAuth redirects), never a
-// client-side router transition.
+import { carryUtmToDownloadLinks } from "../landing/download-utm";
+import { canonicalHref } from "../lib/canonical";
+import { THEME_INIT, watchSystemTheme } from "../lib/theme";
+
 export const Route = createRootRoute({
   head: () => ({
     meta: [
@@ -42,28 +46,42 @@ export const Route = createRootRoute({
         href: "/favicon-16x16-dark.png",
         media: "(prefers-color-scheme: dark)",
       },
-      { rel: "apple-touch-icon", sizes: "180x180", href: "/apple-touch-icon.png" },
+      {
+        rel: "apple-touch-icon",
+        sizes: "180x180",
+        href: "/apple-touch-icon.png",
+      },
     ],
   }),
   shellComponent: RootDocument,
 });
 
-// Set the dark class before first paint so a stored/system dark preference
-// doesn't flash light on the dashboard (mirrors the bb app's pre-paint
-// script). The marketing page is light-only and has no .dark rules, so the
-// class is inert there.
-const THEME_INIT = `try{var t=localStorage.getItem("bb.theme");if(t==="dark"||(t!=="light"&&matchMedia("(prefers-color-scheme: dark)").matches))document.documentElement.classList.add("dark")}catch(e){}`;
-
-// Mark JS as available before first paint so the marketing page's app mock can
-// start hidden and construct itself in. No-JS keeps it visible.
 const JS_INIT = `document.documentElement.classList.add("js")`;
 
 function RootDocument({ children }: { children: React.ReactNode }) {
+  useEffect(() => watchSystemTheme(), []);
+  useEffect(() => carryUtmToDownloadLinks(), []);
+  const canonical = useRouterState({
+    select: (state) => canonicalHref(state.matches),
+  });
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
+        {}
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
         <script dangerouslySetInnerHTML={{ __html: JS_INIT }} />
+        {}
+        <meta
+          name="theme-color"
+          media="(prefers-color-scheme: light)"
+          content="#ffffff"
+        />
+        <meta
+          name="theme-color"
+          media="(prefers-color-scheme: dark)"
+          content="#151515"
+        />
+        {canonical === null ? null : <link rel="canonical" href={canonical} />}
         <HeadContent />
       </head>
       <body>

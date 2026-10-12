@@ -4,16 +4,25 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { InstalledPlugin } from "@bb/server-contract";
 import { resetPluginSlotStoreForTest } from "@/lib/plugin-slots";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
+import { pluginListQueryKey } from "@/hooks/queries/query-keys";
 import { useSettingsNavState } from "./settings-nav";
+import { makeInstalledPlugin } from "@/test/fixtures/plugins";
+
+const mocks = vi.hoisted(() => ({
+  accessState: "unavailable",
+}));
 
 vi.mock("@/hooks/useHostDaemon", () => ({
   useHostDaemon: () => ({ hasDaemon: false }),
+  useLocalHostDaemonAccess: () => ({ accessState: mocks.accessState }),
 }));
 
-function wrapperFor(path: string) {
-  const { wrapper: QueryWrapper } = createQueryClientTestHarness();
+function wrapperFor(path: string, plugins: readonly InstalledPlugin[] = []) {
+  const { queryClient, wrapper: QueryWrapper } = createQueryClientTestHarness();
+  queryClient.setQueryData(pluginListQueryKey(true), plugins);
   return function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryWrapper>
@@ -23,22 +32,33 @@ function wrapperFor(path: string) {
   };
 }
 
+function disabledPlugin(): InstalledPlugin {
+  return makeInstalledPlugin({
+    id: "linear",
+    source: "path:/plugins/linear",
+    rootDir: "/plugins/linear",
+    enabled: false,
+    status: "disabled",
+    description: "Linear integration",
+    name: "Linear",
+    sourceDisplay: "path · /plugins/linear",
+  });
+}
+
 afterEach(() => {
   cleanup();
   resetPluginSlotStoreForTest();
+  mocks.accessState = "unavailable";
 });
 
 describe("useSettingsNavState", () => {
-  it("resolves Codex and Claude Code as separate provider pages", () => {
+  it("resolves the Providers bucket from its section route", () => {
     const { result } = renderHook(() => useSettingsNavState(), {
-      wrapper: wrapperFor("/settings/providers/claude-code"),
+      wrapper: wrapperFor("/settings/providers"),
     });
 
-    expect(result.current.activeProviderId).toBe("claude-code");
-    expect(result.current.activeSection).toBeNull();
-    expect(
-      result.current.providerEntries.map((provider) => provider.id),
-    ).toEqual(["codex", "claude-code"]);
+    expect(result.current.activeSection).toBe("providers");
+    expect(result.current.hasUnknownSection).toBe(false);
   });
 
   it("shows the Machines section", () => {
@@ -48,6 +68,17 @@ describe("useSettingsNavState", () => {
 
     expect(result.current.sections.map((section) => section.id)).toContain(
       "machines",
+    );
+  });
+
+  it("shows Files when local helper access can be enabled", () => {
+    mocks.accessState = "permission-required";
+    const { result } = renderHook(() => useSettingsNavState(), {
+      wrapper: wrapperFor("/settings/files"),
+    });
+
+    expect(result.current.sections).toContainEqual(
+      expect.objectContaining({ icon: "File", id: "files" }),
     );
   });
 
@@ -62,13 +93,22 @@ describe("useSettingsNavState", () => {
     );
   });
 
-  it("keeps plugin management out of Settings", () => {
+  it("recognizes installed plugins as a settings section", () => {
     const { result } = renderHook(() => useSettingsNavState(), {
-      wrapper: wrapperFor("/settings"),
+      wrapper: wrapperFor("/settings/plugins"),
     });
 
-    expect(result.current.sections.map((section) => section.id)).not.toContain(
+    expect(result.current.hasUnknownSection).toBe(false);
+    expect(result.current.sections.map((section) => section.id)).toContain(
       "plugins",
     );
+  });
+
+  it("omits disabled plugins from individual settings entries", () => {
+    const { result } = renderHook(() => useSettingsNavState(), {
+      wrapper: wrapperFor("/settings", [disabledPlugin()]),
+    });
+
+    expect(result.current.pluginEntries).toEqual([]);
   });
 });

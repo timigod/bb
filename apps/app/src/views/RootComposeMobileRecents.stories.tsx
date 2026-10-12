@@ -4,9 +4,11 @@ import { StoryCard, StoryRow } from "../../.ladle/story-card";
 import {
   PROJECT_IDS,
   PROJECT_NAMES,
+  STORY_PROVIDERS_BY_ID,
   makeThreadListEntry,
 } from "../../.ladle/story-fixtures";
 import { RootComposeMobileRecents } from "./RootComposeMobileRecents";
+import { ThreadActionsProvider } from "@/components/thread/ThreadActionsProvider";
 
 export default {
   title: "views/Mobile Recents",
@@ -30,7 +32,7 @@ function MobileStage({ children }: MobileStageProps) {
           }
         }
       `}</style>
-      {children}
+      <ThreadActionsProvider>{children}</ThreadActionsProvider>
     </div>
   );
 }
@@ -48,6 +50,7 @@ const recentThreads: ThreadListEntry[] = [
   makeRecentThread({
     overrides: {
       id: "thr_mobile_just_starting",
+      providerId: "claude-code",
       title: "Trace mobile thread creation feedback",
       titleFallback: "Trace mobile thread creation feedback",
       status: "starting",
@@ -55,7 +58,6 @@ const recentThreads: ThreadListEntry[] = [
       latestAttentionAt: 300,
       runtime: {
         displayStatus: "starting",
-        hostReconnectGraceExpiresAt: null,
       },
     },
   }),
@@ -70,7 +72,6 @@ const recentThreads: ThreadListEntry[] = [
       latestAttentionAt: 250,
       runtime: {
         displayStatus: "active",
-        hostReconnectGraceExpiresAt: null,
       },
     },
   }),
@@ -97,22 +98,20 @@ const statusThreads: ThreadListEntry[] = [
       latestAttentionAt: 500,
       runtime: {
         displayStatus: "active",
-        hostReconnectGraceExpiresAt: null,
       },
     },
   }),
   makeRecentThread({
     overrides: {
-      id: "thr_mobile_reconnecting",
+      id: "thr_mobile_host_disconnected",
       projectId: PROJECT_IDS.pierre,
-      title: "Host reconnecting after sleep",
-      titleFallback: "Host reconnecting after sleep",
+      title: "Host disconnected after sleep",
+      titleFallback: "Host disconnected after sleep",
       status: "active",
       createdAt: 450,
       latestAttentionAt: 450,
       runtime: {
-        displayStatus: "host-reconnecting",
-        hostReconnectGraceExpiresAt: 600,
+        displayStatus: "waiting-for-host",
       },
     },
   }),
@@ -126,8 +125,104 @@ const statusThreads: ThreadListEntry[] = [
       latestAttentionAt: 400,
       runtime: {
         displayStatus: "error",
-        hostReconnectGraceExpiresAt: null,
       },
+    },
+  }),
+];
+
+const metadataThreads: ThreadListEntry[] = [
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_worktree",
+      title: "Anchor the mobile prompt box",
+      titleFallback: "Anchor the mobile prompt box",
+      environmentName: "mobile-home",
+      environmentBranchName: "bb/mobile-home",
+      environmentProviderId: "git-worktree",
+      createdAt: 700,
+      latestAttentionAt: 700,
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_unread",
+      projectId: PROJECT_IDS.pierre,
+      title: "Finished while you were away",
+      titleFallback: "Finished while you were away",
+      status: "idle",
+      lastReadAt: 100,
+      createdAt: 650,
+      latestAttentionAt: 650,
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_long_title",
+      title:
+        "A deliberately long thread title that has to truncate on a narrow mobile row",
+      titleFallback: "A deliberately long thread title",
+      environmentBranchName: "bb/very-long-branch-name-for-truncation",
+      environmentProviderId: "git-worktree",
+      createdAt: 600,
+      latestAttentionAt: 600,
+    },
+  }),
+];
+
+const hierarchyThreads: ThreadListEntry[] = [
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_parent",
+      title: "Rework folder model",
+      titleFallback: "Rework folder model",
+      status: "active",
+      createdAt: 900,
+      latestAttentionAt: 900,
+      runtime: { displayStatus: "active" },
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_child_a",
+      providerId: "claude-code",
+      parentThreadId: "thr_mobile_parent",
+      title: "Audit folder query paths",
+      titleFallback: "Audit folder query paths",
+      status: "active",
+      createdAt: 880,
+      latestAttentionAt: 880,
+      runtime: { displayStatus: "active" },
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_child_b",
+      parentThreadId: "thr_mobile_parent",
+      title: "Migrate folder fixtures",
+      titleFallback: "Migrate folder fixtures",
+      createdAt: 860,
+      latestAttentionAt: 860,
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_grandchild",
+      providerId: "acp-cursor",
+      parentThreadId: "thr_mobile_child_a",
+      title: "Backfill folder migration tests",
+      titleFallback: "Backfill folder migration tests",
+      createdAt: 850,
+      latestAttentionAt: 850,
+    },
+  }),
+  makeRecentThread({
+    overrides: {
+      id: "thr_mobile_sibling",
+      projectId: PROJECT_IDS.pierre,
+      title: "Unrelated top-level thread",
+      titleFallback: "Unrelated top-level thread",
+      createdAt: 840,
+      latestAttentionAt: 840,
     },
   }),
 ];
@@ -137,6 +232,8 @@ const projectNamesById = new Map<string, string>([
   [PROJECT_IDS.pierre, PROJECT_NAMES.pierre],
 ]);
 
+const providersById = STORY_PROVIDERS_BY_ID;
+
 export function Overview() {
   return (
     <StoryCard labelWidth="170px">
@@ -145,6 +242,7 @@ export function Overview() {
           <RootComposeMobileRecents
             highlightedThreadId="thr_mobile_just_starting"
             projectNamesById={projectNamesById}
+            providersById={providersById}
             showCreatingRow={false}
             threads={recentThreads}
           />
@@ -155,8 +253,31 @@ export function Overview() {
           <RootComposeMobileRecents
             highlightedThreadId={null}
             projectNamesById={projectNamesById}
+            providersById={providersById}
             showCreatingRow
             threads={recentThreads.slice(1)}
+          />
+        </MobileStage>
+      </StoryRow>
+      <StoryRow label="parent / child">
+        <MobileStage>
+          <RootComposeMobileRecents
+            highlightedThreadId={null}
+            projectNamesById={projectNamesById}
+            providersById={providersById}
+            showCreatingRow={false}
+            threads={hierarchyThreads}
+          />
+        </MobileStage>
+      </StoryRow>
+      <StoryRow label="row metadata">
+        <MobileStage>
+          <RootComposeMobileRecents
+            highlightedThreadId={null}
+            projectNamesById={projectNamesById}
+            providersById={providersById}
+            showCreatingRow={false}
+            threads={metadataThreads}
           />
         </MobileStage>
       </StoryRow>
@@ -165,6 +286,7 @@ export function Overview() {
           <RootComposeMobileRecents
             highlightedThreadId={null}
             projectNamesById={projectNamesById}
+            providersById={providersById}
             showCreatingRow={false}
             threads={statusThreads}
           />

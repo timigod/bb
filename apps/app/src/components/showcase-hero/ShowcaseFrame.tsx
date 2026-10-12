@@ -3,23 +3,6 @@ import { cn } from "@bb/shared-ui/lib/utils";
 import type { ShowcaseArchetype, ShowcaseScenes } from "./showcase-archetype";
 import { accentInk, accentTint, neutral } from "./showcase-tokens";
 
-/**
- * The hero's stage: one mini bb window whose chrome never re-mounts.
- *
- * The transformation reads as a single window changing rather than images
- * swapping because the frame, title bar, and rail are *shared* across every
- * archetype — only the title text, the rail's highlighted slot, and the content
- * region change, and the content region cross-fades between stacked scenes
- * rather than sliding a new pane over the old one.
- *
- * All scene layers stay mounted and are hidden with opacity so the cross-fade
- * has something to fade between; `aria-hidden` and pointer suppression keep the
- * inactive layers out of the accessibility tree.
- *
- * `rail` is optional because it carries meaning, not decoration: a plugin adds
- * a nav entry to bb, so the plugins hero shows the rail gaining one. A skill
- * adds no surface, so the skills hero omits it rather than implying otherwise.
- */
 export function ShowcaseFrame({
   archetypes,
   activeIndex,
@@ -27,19 +10,16 @@ export function ShowcaseFrame({
   titlePrefix,
   badge,
   rail,
-  reducedMotion = false,
+  reducedMotion,
   className,
 }: {
   archetypes: readonly ShowcaseArchetype[];
   activeIndex: number;
   scenes: ShowcaseScenes;
-  /** Prefixes the window title, e.g. "bb — ". */
   titlePrefix: string;
-  /** Title-bar badge naming what is being shown, e.g. "Plugin". */
   badge: string;
-  /** Static rail glyphs. Omit to render the window without a nav rail. */
-  rail?: readonly IconName[];
-  reducedMotion?: boolean;
+  rail: readonly IconName[];
+  reducedMotion: boolean;
   className?: string;
 }) {
   const active = archetypes[activeIndex] ?? archetypes[0];
@@ -89,41 +69,38 @@ export function ShowcaseFrame({
       </div>
 
       <div className="flex min-h-0 flex-1">
-        {rail !== undefined ? (
-          <div
-            className="flex w-8 shrink-0 flex-col items-center gap-1.5 border-r py-2"
-            style={{ borderColor: neutral(10), background: neutral(2) }}
-            aria-hidden="true"
-          >
-            {rail.map((name) => (
-              <span
-                key={name}
-                className="flex size-5 items-center justify-center rounded-md"
-                style={{ color: neutral(30) }}
-              >
-                <Icon name={name} className="size-3" />
-              </span>
-            ))}
+        <div
+          className="flex w-8 shrink-0 flex-col items-center gap-1.5 border-r py-2"
+          style={{ borderColor: neutral(10), background: neutral(2) }}
+          aria-hidden="true"
+        >
+          {rail.map((name) => (
             <span
-              className="my-0.5 h-px w-4"
-              style={{ background: neutral(12) }}
-            />
-            {/* The archetype's own rail entry: the slot that changes identity. */}
-            <span
-              className={cn(
-                "flex size-5 items-center justify-center rounded-md border",
-                !reducedMotion && "transition-all duration-500",
-              )}
-              style={{
-                background: accentTint(accent, 16),
-                borderColor: accentTint(accent, 42),
-                color: accentInk(accent, 62),
-              }}
+              key={name}
+              className="flex size-5 items-center justify-center rounded-md"
+              style={{ color: neutral(30) }}
             >
-              <Icon name={active.icon} className="size-3" />
+              <Icon name={name} className="size-3" />
             </span>
-          </div>
-        ) : null}
+          ))}
+          <span
+            className="my-0.5 h-px w-4"
+            style={{ background: neutral(12) }}
+          />
+          <span
+            className={cn(
+              "flex size-5 items-center justify-center rounded-md border",
+              !reducedMotion && "transition-all duration-500",
+            )}
+            style={{
+              background: accentTint(accent, 16),
+              borderColor: accentTint(accent, 42),
+              color: accentInk(accent, 62),
+            }}
+          >
+            <Icon name={active.icon} className="size-3" />
+          </span>
+        </div>
 
         <div className="relative min-w-0 flex-1">
           {archetypes.map((archetype, index) => {

@@ -6,6 +6,7 @@ export type ThemeGetResult = AppTheme;
 export type ThemeCatalogResult = ThemeCatalogResponse;
 export type ThemeSetInput = AppThemeSelection;
 export type ThemeSetResult = AppTheme;
+export type ThemeResolveResult = AppTheme;
 
 export interface ThemeCatalogArgs {
   signal?: AbortSignal;
@@ -15,18 +16,16 @@ export interface ThemeGetArgs {
   signal?: AbortSignal;
 }
 
+export interface ThemeResolveArgs {
+  themeId: string;
+  signal?: AbortSignal;
+}
+
 export interface ThemeArea {
-  /** The active app palette, resolved server-side (built-in id or custom CSS). */
   get(args?: ThemeGetArgs): Promise<ThemeGetResult>;
-  /** The custom-theme directory plus discovered themes and the active palette. */
   catalog(args?: ThemeCatalogArgs): Promise<ThemeCatalogResult>;
-  /** Set the complete app appearance selection in one request. */
+  resolve(args: ThemeResolveArgs): Promise<ThemeResolveResult>;
   set(selection: ThemeSetInput): Promise<ThemeSetResult>;
-  /**
-   * Activate a palette by id while preserving the active favicon color. This
-   * compatibility shorthand reads the active appearance before writing the
-   * complete selection; prefer the object form when both values are known.
-   */
   set(themeId: string): Promise<ThemeSetResult>;
 }
 
@@ -46,6 +45,14 @@ export function createThemeArea(args: CreateSdkAreaArgs): ThemeArea {
       return transport.readJson(
         transport.api.v1.settings.themes.$get(
           {},
+          ...signalRequestArgs(input.signal),
+        ),
+      );
+    },
+    async resolve(input) {
+      return transport.readJson(
+        transport.api.v1.settings.themes[":id"].$get(
+          { param: { id: input.themeId } },
           ...signalRequestArgs(input.signal),
         ),
       );

@@ -1,19 +1,43 @@
 import { useEffect } from "react";
+import {
+  PLUGIN_FRONTEND_BOOT_TIMEOUT_MS,
+  requestBrowserIdle,
+  scheduleDeferredPluginFrontendBoot,
+} from "../lib/plugin-frontend-boot-schedule";
+import { markPluginFrontendSettleFloorReached } from "../lib/plugin-frontend-boot-state";
 import { bootPluginFrontends } from "../lib/plugin-frontend-lazy";
+import { whenRouteContentPainted } from "../lib/route-content-paint";
+import { getPluginPanelRoutePluginId } from "../lib/route-paths";
 import { useSystemConfig } from "./queries/system-queries";
 
-/**
- * Load plugin frontend bundles (plugin design §5.1) once per page load,
- * after system config resolves — the loading never delays first paint.
- * The server inventory already filters to running, loadable plugins.
- * After boot, the realtime
- * `plugins-changed` broadcast keeps bundles live via
- * schedulePluginFrontendReconcile (no page refresh needed).
- */
+export const PLUGIN_FRONTEND_SETTLE_FLOOR_MS = 15_000;
+
 export function usePluginFrontendBoot(): void {
   const systemConfig = useSystemConfig();
   const resolved = systemConfig.data !== undefined;
   useEffect(() => {
-    if (resolved) void bootPluginFrontends();
+    if (!resolved) return;
+    const routePluginId = getPluginPanelRoutePluginId(window.location.pathname);
+    if (routePluginId !== null) {
+      void bootPluginFrontends();
+      return;
+    }
+    return scheduleDeferredPluginFrontendBoot(
+      () => void bootPluginFrontends(),
+      {
+        whenRoutePainted: whenRouteContentPainted,
+        requestIdle: requestBrowserIdle,
+        setTimeout: (callback, ms) => window.setTimeout(callback, ms),
+        clearTimeout: (id) => window.clearTimeout(id),
+        timeoutMs: PLUGIN_FRONTEND_BOOT_TIMEOUT_MS,
+      },
+    );
   }, [resolved]);
+  useEffect(() => {
+    const timeout = window.setTimeout(
+      markPluginFrontendSettleFloorReached,
+      PLUGIN_FRONTEND_SETTLE_FLOOR_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, []);
 }

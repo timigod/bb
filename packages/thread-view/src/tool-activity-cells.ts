@@ -1,8 +1,13 @@
 import type {
   EventProjectionCommandMessage,
   EventProjectionDelegationMessage,
+  EventProjectionExtensionMessage,
+  EventProjectionFileReadMessage,
+  EventProjectionImageGenerationMessage,
   EventProjectionImageViewMessage,
   EventProjectionMessage,
+  EventProjectionPlanStepsMessage,
+  EventProjectionSearchMessage,
   EventProjectionToolCallMessage,
   EventProjectionWebFetchMessage,
   EventProjectionWebSearchMessage,
@@ -15,7 +20,12 @@ export type ViewProviderExecutionMessage =
 export type ViewWebActivityMessage =
   | EventProjectionWebSearchMessage
   | EventProjectionWebFetchMessage
-  | EventProjectionImageViewMessage;
+  | EventProjectionImageGenerationMessage
+  | EventProjectionImageViewMessage
+  | EventProjectionFileReadMessage
+  | EventProjectionSearchMessage
+  | EventProjectionPlanStepsMessage
+  | EventProjectionExtensionMessage;
 export type ToolActivityCell =
   | ViewProviderExecutionMessage
   | ViewWebActivityMessage;
@@ -65,7 +75,12 @@ export function isWebActivityMessage(
   return (
     cell?.kind === "web-search" ||
     cell?.kind === "web-fetch" ||
-    cell?.kind === "image-view"
+    cell?.kind === "image-generation" ||
+    cell?.kind === "image-view" ||
+    cell?.kind === "file-read" ||
+    cell?.kind === "search" ||
+    cell?.kind === "plan-steps" ||
+    cell?.kind === "extension"
   );
 }
 

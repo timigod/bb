@@ -1,4 +1,15 @@
 import { spawnSync } from "node:child_process";
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   ensureNativeModules,
@@ -10,7 +21,10 @@ const scriptUrl = new URL(
   import.meta.url,
 ).href;
 
-function createBetterSqliteRequire(initialError) {
+function createBetterSqliteRequire(
+  initialError,
+  packageJsonPath = "/tmp/fake-node-modules/better-sqlite3/package.json",
+) {
   const state = {
     constructorError: initialError,
     constructorCalls: 0,
@@ -35,7 +49,7 @@ function createBetterSqliteRequire(initialError) {
 
   requireModule.resolve = (request) => {
     if (request === "better-sqlite3/package.json") {
-      return "/tmp/fake-node-modules/better-sqlite3/package.json";
+      return packageJsonPath;
     }
 
     if (request === "prebuild-install/bin.js") {
@@ -120,6 +134,100 @@ describe("ensure-native-modules", () => {
     );
     expect(execFileSync).toHaveBeenCalledTimes(1);
     expect(fake.state.constructorCalls).toBe(2);
+  });
+
+  it("detaches a hardlinked native binary before verification", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "bb-native-repair-"));
+    try {
+      const packageJsonPath = join(tempRoot, "better-sqlite3", "package.json");
+      const binaryPath = join(
+        dirname(packageJsonPath),
+        "build",
+        "Release",
+        "better_sqlite3.node",
+      );
+      const otherCheckoutBinaryPath = join(tempRoot, "other-checkout.node");
+      mkdirSync(dirname(binaryPath), { recursive: true });
+      writeFileSync(packageJsonPath, "{}");
+      writeFileSync(otherCheckoutBinaryPath, "abi-137");
+      linkSync(otherCheckoutBinaryPath, binaryPath);
+      expect(statSync(binaryPath).ino).toBe(
+        statSync(otherCheckoutBinaryPath).ino,
+      );
+
+      const abiError = new Error(
+        "The module was compiled against a different NODE_MODULE_VERSION",
+      );
+      const fake = createBetterSqliteRequire(abiError, packageJsonPath);
+      const execFileSync = vi.fn(() => {
+        writeFileSync(binaryPath, "abi-127");
+        fake.clearConstructorError();
+      });
+      const options = createEnsureOptions(fake.requireModule, execFileSync);
+      options.modules = [
+        {
+          name: "better-sqlite3",
+          resolveFrom: "packages/db/package.json",
+          binaryPath: "build/Release/better_sqlite3.node",
+        },
+      ];
+
+      expect(() => ensureNativeModules(options)).not.toThrow();
+
+      expect(readFileSync(binaryPath, "utf8")).toBe("abi-127");
+      expect(readFileSync(otherCheckoutBinaryPath, "utf8")).toBe("abi-137");
+      expect(statSync(binaryPath).ino).not.toBe(
+        statSync(otherCheckoutBinaryPath).ino,
+      );
+      expect(options.log).toHaveBeenCalledWith(
+        "[ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification",
+      );
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("detaches a matching native binary without a repair", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "bb-native-verify-"));
+    try {
+      const packageJsonPath = join(tempRoot, "better-sqlite3", "package.json");
+      const binaryPath = join(
+        dirname(packageJsonPath),
+        "build",
+        "Release",
+        "better_sqlite3.node",
+      );
+      const otherCheckoutBinaryPath = join(tempRoot, "other-checkout.node");
+      mkdirSync(dirname(binaryPath), { recursive: true });
+      writeFileSync(packageJsonPath, "{}");
+      writeFileSync(otherCheckoutBinaryPath, "abi-137");
+      linkSync(otherCheckoutBinaryPath, binaryPath);
+
+      const fake = createBetterSqliteRequire(null, packageJsonPath);
+      const execFileSync = vi.fn();
+      const options = createEnsureOptions(fake.requireModule, execFileSync);
+      options.modules = [
+        {
+          name: "better-sqlite3",
+          resolveFrom: "packages/db/package.json",
+          binaryPath: "build/Release/better_sqlite3.node",
+        },
+      ];
+
+      expect(() => ensureNativeModules(options)).not.toThrow();
+
+      expect(statSync(binaryPath).ino).not.toBe(
+        statSync(otherCheckoutBinaryPath).ino,
+      );
+      expect(readFileSync(binaryPath, "utf8")).toBe("abi-137");
+      expect(readFileSync(otherCheckoutBinaryPath, "utf8")).toBe("abi-137");
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(options.log).toHaveBeenCalledWith(
+        "[ensure-native-modules] Detached hardlinked better-sqlite3 binary before verification",
+      );
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("accepts a prebuilt binary that loads after the installer exits non-zero", () => {
@@ -322,4 +430,47 @@ describe("ensure-native-modules", () => {
       "better-sqlite3 still failed to load after rebuild",
     );
   });
+});
+
+it("validates a broken native binding without installing, rebuilding, or detaching it", async () => {
+  const { createRequire } = await import("node:module");
+  const root = mkdtempSync(join(tmpdir(), "bb-native-check-only-"));
+  try {
+    const packageDir = join(root, "node_modules", "broken-native-fixture");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      join(packageDir, "package.json"),
+      JSON.stringify({ name: "broken-native-fixture", main: "index.cjs" }),
+    );
+    writeFileSync(
+      join(packageDir, "index.cjs"),
+      'module.exports = require("./binding.node");',
+    );
+    const binary = join(packageDir, "binding.node");
+    writeFileSync(binary, "invalid native binary");
+    linkSync(binary, join(root, "shared-binding.node"));
+    const before = statSync(binary);
+    const run = vi.fn();
+    expect(() =>
+      ensureNativeModules({
+        repoRoot: root,
+        checkOnly: true,
+        modules: [
+          {
+            name: "broken-native-fixture",
+            resolveFrom: "package.json",
+            binaryPath: "binding.node",
+          },
+        ],
+        createRequire,
+        execFileSync: run,
+      }),
+    ).toThrow("Run pnpm start --dryrun");
+    expect(run).not.toHaveBeenCalled();
+    expect(statSync(binary).ino).toBe(before.ino);
+    expect(statSync(binary).nlink).toBe(before.nlink);
+    expect(readFileSync(binary, "utf8")).toBe("invalid native binary");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

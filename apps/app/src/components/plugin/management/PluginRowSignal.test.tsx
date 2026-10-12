@@ -4,10 +4,29 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PluginRowSignalView } from "./PluginRowSignal";
 import { displayPluginVersion } from "./plugin-ui";
+import { focusWithKeyboard } from "@/test/keyboard-focus";
 
 afterEach(cleanup);
 
 describe("PluginRowSignalView", () => {
+  it("uses the shared update-action icon", () => {
+    render(
+      <PluginRowSignalView
+        signal={{ kind: "update", version: "1.9.0" }}
+        onUpdateClick={vi.fn()}
+        onStatusClick={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen
+        .getByRole("button", {
+          name: "Update to 1.9.0",
+        })
+        .querySelector('[data-icon="Download"]'),
+    ).not.toBeNull();
+  });
+
   it("keeps runtime health icon-only until hover or focus and opens details", async () => {
     const onStatusClick = vi.fn();
     render(
@@ -29,7 +48,7 @@ describe("PluginRowSignalView", () => {
     });
     expect(screen.queryByText("Degraded")).toBeNull();
 
-    fireEvent.focus(statusButton);
+    focusWithKeyboard(statusButton);
     expect((await screen.findByRole("tooltip")).textContent).toBe(
       "Degraded: One background service failed.",
     );
@@ -47,9 +66,8 @@ describe("PluginRowSignalView", () => {
       />,
     );
     expect(
-      screen.getByRole("button", { name: "Update available: version 1.2.0" })
-        .textContent,
-    ).toBe("Update to 1.2.0");
+      screen.getByRole("button", { name: "Update to 1.2.0" }),
+    ).toBeTruthy();
 
     rerender(
       <PluginRowSignalView
@@ -62,8 +80,7 @@ describe("PluginRowSignalView", () => {
       />,
     );
     const button = screen.getByRole("button", { name: "Update available" });
-    expect(button.textContent).toBe("Update");
-    expect(button.textContent).not.toContain("a985e1d");
+    expect(button.getAttribute("aria-label")).not.toContain("a985e1d");
   });
 });
 
@@ -74,8 +91,6 @@ describe("displayPluginVersion", () => {
     ).toBe("a985e1d");
     expect(displayPluginVersion("1.2.0")).toBe("1.2.0");
     expect(displayPluginVersion("v1.2.0-rc.1")).toBe("v1.2.0-rc.1");
-    // Short hex-looking strings and branch names pass through untouched: a
-    // ref named "main" or a 7-char hex tag is already human-scale.
     expect(displayPluginVersion("main")).toBe("main");
     expect(displayPluginVersion("deadbee")).toBe("deadbee");
   });

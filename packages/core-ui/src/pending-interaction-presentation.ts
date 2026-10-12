@@ -2,18 +2,18 @@ import type {
   PendingInteraction,
   PendingInteractionUserQuestionQuestion,
 } from "@bb/domain";
-import { isApprovalPendingInteractionPayload } from "@bb/domain";
+import {
+  isApprovalPendingInteractionPayload,
+  isUserQuestionPendingInteractionPayload,
+} from "@bb/domain";
 import { assertNever } from "./assert-never.js";
-import { summarizePendingInteractionRequestedPermissions } from "./pending-interaction-formatting.js";
+import { describePendingInteractionToolUse } from "./pending-interaction-tool-use.js";
 
-export type PendingInteractionPresentationSurface = "app" | "cli";
-
-export interface FormatPendingInteractionSummaryArgs {
+interface FormatPendingInteractionSummaryArgs {
   interaction: PendingInteraction;
-  surface: PendingInteractionPresentationSurface;
 }
 
-export interface FormatPendingInteractionUserQuestionOptionLabelArgs {
+interface FormatPendingInteractionUserQuestionOptionLabelArgs {
   question: PendingInteractionUserQuestionQuestion;
   value: string;
 }
@@ -30,14 +30,14 @@ export function formatPendingInteractionUserQuestionOptionLabel({
 export function formatPendingInteractionSummary(
   args: FormatPendingInteractionSummaryArgs,
 ): string {
-  const { interaction, surface } = args;
+  const { interaction } = args;
 
-  if (interaction.payload.kind === "plugin") {
-    return interaction.payload.title;
+  if (isUserQuestionPendingInteractionPayload(interaction.payload)) {
+    return interaction.payload.questions[0]?.prompt ?? "User answer requested";
   }
 
   if (!isApprovalPendingInteractionPayload(interaction.payload)) {
-    return interaction.payload.questions[0]?.prompt ?? "User answer requested";
+    return interaction.payload.title;
   }
 
   if (interaction.payload.reason) {
@@ -51,21 +51,15 @@ export function formatPendingInteractionSummary(
       return "File changes pending approval";
     case "plan":
       return "Plan ready for review";
+    case "tool_use":
+      return describePendingInteractionToolUse({
+        ...interaction.payload,
+        subject: interaction.payload.subject,
+      }).title;
     case "permission_grant":
       break;
     default:
       return assertNever(interaction.payload.subject);
-  }
-
-  if (surface === "app") {
-    const requestedPermissionSummary =
-      summarizePendingInteractionRequestedPermissions(
-        interaction.payload.subject.permissions,
-      );
-    if (requestedPermissionSummary.length > 0) {
-      return requestedPermissionSummary.join(" . ");
-    }
-    return "Review requested permissions";
   }
 
   return interaction.payload.subject.toolName ?? "Permission request";

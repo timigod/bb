@@ -6,6 +6,8 @@ import {
   useTasksRpc,
 } from "../../shell/data.js";
 import { useTasksNavigation } from "../../shell/routes.js";
+import { PROJECT_PREFIX_PATTERN } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   Dialog,
   DialogContent,
@@ -13,7 +15,7 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from "@bb/shared-ui/dialog";
+} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -21,34 +23,31 @@ import {
   SelectSeparator,
   SelectTrigger,
   SelectValue,
-} from "@bb/shared-ui/select";
-import { Button } from "@bb/shared-ui/button";
-import { Input } from "@bb/shared-ui/input";
-import { Icon } from "@bb/shared-ui/icon";
+} from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Icon } from "@/components/ui/icon";
 import {
   ColorSwatchPicker,
   DEFAULT_COLOR,
   describeCreateProjectError,
   derivePrefix,
   Field,
-  PROJECT_PREFIX_PATTERN,
 } from "./shared.js";
-import {
-  BbProjectLinkPicker,
-  emptyBbProjectLinkState,
-  resolveBbProjectLink,
-  type BbProjectLinkState,
-} from "./bb-project-link.js";
+import { BbProjectLinkPicker } from "./bb-project-link.js";
 
 const NO_FOLDER = "__none__";
 const NEW_FOLDER = "__new__";
 
-export interface NewProjectDialogProps {
+interface NewProjectDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
-export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) {
+export function NewProjectDialog({
+  open,
+  onOpenChange,
+}: NewProjectDialogProps) {
   const rpc = useTasksRpc();
   const navigation = useTasksNavigation();
   const projects = useProjects();
@@ -61,13 +60,12 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
   const [folderId, setFolderId] = useState<string | null>(null);
   const [newFolderMode, setNewFolderMode] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
-  const [linkState, setLinkState] = useState<BbProjectLinkState>(
-    emptyBbProjectLinkState,
+  const [linkedBbProjectId, setLinkedBbProjectId] = useState<string | null>(
+    null,
   );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // BB workspace projects, including Personal, for the linked-project picker.
   const bbProjects = useTasksQuery(
     async (rpc) => (await rpc.call("listBbProjects")).bbProjects,
     [],
@@ -83,7 +81,7 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
     setFolderId(null);
     setNewFolderMode(false);
     setNewFolderName("");
-    setLinkState(emptyBbProjectLinkState());
+    setLinkedBbProjectId(null);
     setError(null);
   }, [open]);
 
@@ -97,8 +95,6 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
     );
     return clash ? `Already used by ${clash.name}.` : null;
   }, [prefix, projects.data]);
-
-  const linkedTrimmed = resolveBbProjectLink(linkState);
 
   const canSubmit =
     name.trim().length > 0 &&
@@ -129,11 +125,7 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
       setNewFolderMode(false);
       setNewFolderName("");
     } catch (folderError) {
-      setError(
-        folderError instanceof Error
-          ? folderError.message
-          : String(folderError),
-      );
+      setError(errorMessage(folderError));
     }
   };
 
@@ -147,10 +139,10 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
         prefix,
         color,
         folderId,
-        linkedBbProjectId: linkedTrimmed === "" ? null : linkedTrimmed,
+        linkedBbProjectId,
       });
       onOpenChange(false);
-      navigation.go({ kind: "project", projectId: project.id, view: "list" });
+      navigation.go({ kind: "project", projectId: project.id, view: null });
     } catch (submitError) {
       setError(describeCreateProjectError(submitError));
     } finally {
@@ -278,8 +270,8 @@ export function NewProjectDialog({ open, onOpenChange }: NewProjectDialogProps) 
             hint="Optional. Linking a bb project enables dispatching to agents."
           >
             <BbProjectLinkPicker
-              state={linkState}
-              onStateChange={setLinkState}
+              value={linkedBbProjectId}
+              onChange={setLinkedBbProjectId}
               bbProjects={bbProjectList}
             />
           </Field>

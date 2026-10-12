@@ -20,7 +20,7 @@ interface ProviderCliInstallLogDialogProps {
   onClose: () => void;
 }
 
-export interface ProviderCliInstallLogDialogContentProps {
+interface ProviderCliInstallLogDialogContentProps {
   state: ProviderCliInstallLogDialogState;
 }
 
@@ -28,8 +28,9 @@ export function ProviderCliInstallLogDialog({
   state,
   onClose,
 }: ProviderCliInstallLogDialogProps) {
-  const renderedStateRef =
-    useRef<ProviderCliInstallLogDialogState | null>(state);
+  const renderedStateRef = useRef<ProviderCliInstallLogDialogState | null>(
+    state,
+  );
   const isOpen = state !== null;
 
   if (state !== null) {

@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { createPortal } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PluginSlotMount,
   resetAllCrashedPluginSlotsForTest,
   resetCrashedPluginSlots,
 } from "./PluginSlotMount";
+import { applyPluginCss, resetPluginCssForTest } from "@/lib/plugin-css";
 
 function Bomb(): never {
   throw new Error("kaboom");
@@ -19,13 +21,15 @@ function Healthy() {
 describe("PluginSlotMount", () => {
   beforeEach(() => {
     resetAllCrashedPluginSlotsForTest();
-    // React logs boundary-caught errors; keep test output quiet.
+    resetPluginCssForTest();
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
   afterEach(() => {
     cleanup();
+    resetPluginCssForTest();
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -49,6 +53,66 @@ describe("PluginSlotMount", () => {
     expect(screen.getByText("healthy slot")).toBeDefined();
   });
 
+  it("renders nothing after a crash when the fallback is explicitly null", () => {
+    render(
+      <PluginSlotMount
+        pluginId="broken"
+        slotKind="appOverlay"
+        slotId="widget"
+        crashFallback={null}
+      >
+        <Bomb />
+      </PluginSlotMount>,
+    );
+
+    expect(screen.queryByText("plugin broken crashed")).toBeNull();
+  });
+
+  it("keeps one sheet through simultaneous mounts and a portal until the final route unmount", async () => {
+    vi.useFakeTimers();
+    applyPluginCss("demo", "/demo.css?h=v1");
+    function PortalContent() {
+      return createPortal(<div>portalled plugin content</div>, document.body);
+    }
+    const view = render(
+      <>
+        <PluginSlotMount pluginId="demo" slotKind="navPanel" slotId="main">
+          <Healthy />
+        </PluginSlotMount>
+        <PluginSlotMount
+          pluginId="demo"
+          slotKind="threadPanelAction"
+          slotId="details"
+        >
+          <PortalContent />
+        </PluginSlotMount>
+      </>,
+    );
+    const pluginSheets = () =>
+      document.head.querySelectorAll('link[data-bb-plugin-css="demo"]');
+    expect(pluginSheets()).toHaveLength(1);
+    expect(screen.getByText("portalled plugin content")).toBeDefined();
+
+    view.rerender(
+      <PluginSlotMount
+        pluginId="demo"
+        slotKind="threadPanelAction"
+        slotId="details"
+      >
+        <PortalContent />
+      </PluginSlotMount>,
+    );
+    expect(pluginSheets()).toHaveLength(1);
+
+    view.unmount();
+    await act(async () => {});
+    expect(pluginSheets()).toHaveLength(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(pluginSheets()).toHaveLength(0);
+  });
+
   it("keeps a crashed slot instance disabled for the session across remounts", () => {
     const first = render(
       <PluginSlotMount pluginId="broken" slotKind="navPanel" slotId="board">
@@ -57,8 +121,6 @@ describe("PluginSlotMount", () => {
     );
     first.unmount();
 
-    // Fresh mount of the same instance: the healthy child never renders
-    // because the instance is session-disabled.
     const childRender = vi.fn(() => <div>should not render</div>);
     function Child() {
       return childRender();

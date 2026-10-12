@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
-import { COMPACT_VIEWPORT_QUERY } from "@bb/shared-ui/hooks/use-compact-viewport";
-import type { Task, TaskMutationResult } from "../../shared/contract.js";
+import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import { COMPACT_VIEWPORT_QUERY } from "@/components/ui/hooks/use-compact-viewport";
+import type {
+  Project,
+  Task,
+  TaskMutationResult,
+} from "../../shared/contract.js";
+import { makeTask, rpcInput } from "../../test-fixtures.js";
 
-// jsdom lacks matchMedia/ResizeObserver. Reporting the compact query as
-// matching renders the inline pickers as their mobile drawers, whose plain
-// buttons are clickable in jsdom (unlike Radix menu items). The desktop Radix
-// path and right-click context menu are exercised in live product QA.
 window.matchMedia = (query: string) => ({
   matches: query === COMPACT_VIEWPORT_QUERY,
   media: query,
@@ -51,29 +52,19 @@ const label = {
 };
 
 function task(overrides: Partial<Task> & Pick<Task, "id" | "number">): Task {
-  return {
+  return makeTask({
     projectId: PROJECT_ID,
     key: `TSK-${overrides.number}`,
     title: `Task ${overrides.number}`,
-    description: "",
-    status: "todo",
-    priority: "none",
-    dueDate: null,
-    parentTaskId: null,
     position: overrides.number,
-    createdAt: "2026-07-15T00:00:00.000Z",
-    updatedAt: "2026-07-15T00:00:00.000Z",
-    labelIds: [],
     ...overrides,
-  };
+  });
 }
 
 interface Options {
-  updateTask?: (input: {
-    taskId: string;
-    status?: Task["status"];
-    priority?: Task["priority"];
-  }) => TaskMutationResult;
+  projects?: Project[];
+  moveTaskToProject?: (input: Record<string, unknown>) => TaskMutationResult;
+  updateTask?: (input: Record<string, unknown>) => TaskMutationResult;
 }
 
 function renderList(tasks: Task[], options: Options = {}) {
@@ -82,7 +73,7 @@ function renderList(tasks: Task[], options: Options = {}) {
     { subPath: PROJECT_ID },
     {
       rpc: {
-        listProjects: () => ({ projects: [project] }),
+        listProjects: () => ({ projects: options.projects ?? [project] }),
         listFolders: () => ({ folders: [] }),
         listPresets: () => ({ presets: [] }),
         sidebarSummary: () => ({ projects: [] }),
@@ -91,7 +82,12 @@ function renderList(tasks: Task[], options: Options = {}) {
         listTaskThreads: () => ({ taskThreads: [] }),
         listComments: () => ({ comments: [] }),
         listAttachments: () => ({ attachments: [] }),
-        updateTask: (input) => {
+        moveTaskToProject: (raw) => {
+          if (!options.moveTaskToProject) throw new Error("Unexpected move");
+          return options.moveTaskToProject(rpcInput(raw));
+        },
+        updateTask: (raw) => {
+          const input = rpcInput(raw);
           if (options.updateTask) return options.updateTask(input);
           const current = tasks.find((entry) => entry.id === input.taskId)!;
           return { ok: true, task: { ...current, ...input } };
@@ -109,6 +105,48 @@ async function rowFor(slot: ReturnType<typeof renderList>, key: string) {
 }
 
 describe("inline row editing", () => {
+  it("opens a windowed row using its task key", async () => {
+    const slot = renderList([task({ id: "01HZT1", number: 1 })]);
+    const row = await rowFor(slot, "TSK-1");
+    fireEvent.click(
+      within(row).getByRole("button", { name: "Open TSK-1: Task 1" }),
+    );
+    expect(slot.navigateCalls).toContainEqual({
+      method: "toPluginPanel",
+      path: "tasks",
+      options: { subPath: "task/TSK-1" },
+    });
+  });
+
+  it("moves a windowed row through its project context menu", async () => {
+    const current = task({ id: "01HZT1", number: 1 });
+    const target = {
+      ...project,
+      id: "01HZZZZZZZZZZZZZZZZZZZZZP2",
+      name: "Personal",
+      prefix: "HOME",
+    };
+    const slot = renderList([current], {
+      projects: [project, target],
+      moveTaskToProject: () => ({
+        ok: true,
+        task: { ...current, projectId: target.id, key: "HOME-5", number: 5 },
+      }),
+    });
+    const row = await rowFor(slot, "TSK-1");
+    fireEvent.contextMenu(row);
+    fireEvent.click(
+      await slot.findByRole("menuitem", { name: "Move to project" }),
+    );
+    fireEvent.click(await slot.findByRole("menuitem", { name: /Personal/ }));
+    await waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "moveTaskToProject",
+        input: { taskId: current.id, projectId: target.id },
+      }),
+    );
+  });
+
   it("optimistically applies a status change and persists it", async () => {
     const slot = renderList([task({ id: "01HZT1", number: 1 })]);
     const row = await rowFor(slot, "TSK-1");
@@ -123,7 +161,6 @@ describe("inline row editing", () => {
       await within(drawer).findByRole("menuitem", { name: /Done/ }),
     );
 
-    // Persisted with exactly the changed field...
     await waitFor(() =>
       expect(
         slot.rpcCalls.some(
@@ -133,7 +170,6 @@ describe("inline row editing", () => {
         ),
       ).toBe(true),
     );
-    // ...and the row reflects the new status immediately (optimistically).
     await waitFor(() =>
       expect(
         within(
@@ -194,9 +230,7 @@ describe("inline row editing", () => {
       await within(drawer).findByRole("menuitem", { name: /Done/ }),
     );
 
-    // The error is surfaced...
     await slot.findByText("Server rejected it");
-    // ...and the row reverts to its original status (truthful rollback).
     await waitFor(() =>
       expect(
         within(
@@ -218,7 +252,6 @@ describe("inline row editing", () => {
       }),
     );
     const drawer = await slot.findByRole("dialog", { name: "Change status" });
-    // Re-selecting the current status is a no-op.
     fireEvent.click(
       await within(drawer).findByRole("menuitem", { name: /Todo/ }),
     );

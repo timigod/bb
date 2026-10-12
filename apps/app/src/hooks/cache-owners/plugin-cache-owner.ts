@@ -1,21 +1,22 @@
+import type { PluginUpdateJob } from "@bb/server-contract";
+import { trackPluginUpdate } from "@/lib/plugin-update-tracking";
 import type { QueryClient } from "@tanstack/react-query";
 import {
-  allPluginListQueryKeyPrefix,
-  pluginListQueryKey,
-  pluginSettingsViewQueryKey,
-  toPluginListItem,
-  type PluginListResult,
+  pluginListQueryOptions,
   type PluginSettingsView,
 } from "../queries/plugin-settings-queries";
-import type { InstalledPlugin } from "@bb/server-contract";
-import { allPluginCatalogSearchQueryKeyPrefix } from "../queries/plugin-catalog-queries";
+import type { InstalledPlugin, PluginInstallJob } from "@bb/server-contract";
+import {
+  allPluginCatalogSearchQueryKeyPrefix,
+  allPluginListQueryKeyPrefix,
+  pluginInstallJobsQueryKey,
+  pluginUpdateJobsQueryKey,
+  pluginListQueryKey,
+  pluginMarketplacesQueryKey,
+  pluginSafeModeQueryKey,
+  pluginSettingsViewQueryKey,
+} from "../queries/query-keys";
 
-/**
- * Cache owner for plugin management data. The PUT /plugins/:id/settings
- * response is the refreshed settings view, so the mutation seeds it directly
- * instead of refetching; realtime `plugins-changed` invalidation (the
- * registry) covers every other writer.
- */
 export function applyPluginSettingsView(args: {
   queryClient: QueryClient;
   pluginId: string;
@@ -27,40 +28,51 @@ export function applyPluginSettingsView(args: {
   );
 }
 
-/**
- * Seed the canonical installed-plugin response before a post-install route
- * transition. The detail route reads this list, so waiting for invalidation to
- * refetch can otherwise flash a false "Plugin not found" state.
- */
 export function applyInstalledPlugin(args: {
   queryClient: QueryClient;
   plugin: InstalledPlugin;
 }): void {
-  const installed = toPluginListItem(args.plugin);
-  args.queryClient.setQueryData<PluginListResult>(
+  args.queryClient.setQueryData<InstalledPlugin[]>(
     pluginListQueryKey(true),
     (current) => {
-      const plugins = current?.plugins ?? [];
+      const plugins = current ?? [];
       const existingIndex = plugins.findIndex(
-        (candidate) => candidate.id === installed.id,
+        (candidate) => candidate.id === args.plugin.id,
       );
       if (existingIndex === -1) {
-        return { plugins: [...plugins, installed] };
+        return [...plugins, args.plugin];
       }
-      return {
-        plugins: plugins.map((candidate, index) =>
-          index === existingIndex ? installed : candidate,
-        ),
-      };
+      return plugins.map((candidate, index) =>
+        index === existingIndex ? args.plugin : candidate,
+      );
     },
   );
 }
 
-/**
- * Refetch the installed-plugin list after an enable/disable POST. The
- * realtime `plugins-changed` broadcast covers other windows; this gives the
- * acting window an immediate refresh.
- */
+export function applyPluginInstallJob(args: {
+  queryClient: QueryClient;
+  job: PluginInstallJob;
+}): void {
+  args.queryClient.setQueryData<PluginInstallJob[]>(
+    pluginInstallJobsQueryKey(),
+    (current) => {
+      const jobs = current ?? [];
+      return jobs.some((candidate) => candidate.id === args.job.id)
+        ? jobs.map((candidate) =>
+            candidate.id === args.job.id ? args.job : candidate,
+          )
+        : [...jobs, args.job];
+    },
+  );
+}
+
+export function applyPluginSafeMode(args: {
+  queryClient: QueryClient;
+  enabled: boolean;
+}): void {
+  args.queryClient.setQueryData(pluginSafeModeQueryKey(), args.enabled);
+}
+
 export function invalidatePluginList(args: {
   queryClient: QueryClient;
 }): Promise<void> {
@@ -69,15 +81,53 @@ export function invalidatePluginList(args: {
   });
 }
 
-/**
- * Refetch catalog results after an install. Search rows carry installed and
- * compatibility state, so plugin lifecycle changes also invalidate this
- * prefix.
- */
+export async function markEnabledPluginListStale(args: {
+  queryClient: QueryClient;
+}): Promise<void> {
+  const queryKey = pluginListQueryKey(true);
+  if (args.queryClient.getQueryState(queryKey)?.fetchStatus === "fetching") {
+    try {
+      await args.queryClient.fetchQuery(
+        pluginListQueryOptions({ enabled: true }),
+      );
+    } catch {}
+  }
+  await args.queryClient.invalidateQueries({
+    exact: true,
+    queryKey,
+    refetchType: "none",
+  });
+}
+
 export function invalidatePluginCatalogSearch(args: {
   queryClient: QueryClient;
 }): void {
   void args.queryClient.invalidateQueries({
     queryKey: allPluginCatalogSearchQueryKeyPrefix(),
   });
+}
+
+export function invalidatePluginMarketplaces(args: {
+  queryClient: QueryClient;
+}): void {
+  void args.queryClient.invalidateQueries({
+    queryKey: pluginMarketplacesQueryKey(),
+  });
+  invalidatePluginCatalogSearch(args);
+}
+
+export function applyPluginUpdateJob(args: {
+  queryClient: QueryClient;
+  job: PluginUpdateJob;
+}): void {
+  trackPluginUpdate(args.job.id, true);
+  args.queryClient.setQueryData<PluginUpdateJob[]>(
+    pluginUpdateJobsQueryKey(),
+    (current) => {
+      const jobs = current ?? [];
+      return jobs.some((job) => job.id === args.job.id)
+        ? jobs.map((job) => (job.id === args.job.id ? args.job : job))
+        : [...jobs, args.job];
+    },
+  );
 }

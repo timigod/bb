@@ -5,30 +5,36 @@ import {
 import {
   createFilePreviewLineRange,
   type FilePreviewLineRange,
-} from "@/lib/file-preview";
+} from "@bb/client-core";
+import type { WorkspaceOpenTargetId } from "@bb/host-daemon-contract";
 
 export interface MarkdownPreviewLocalFileLink {
   lineRange: FilePreviewLineRange | null;
-  /**
-   * Absolute local path. Callers own workspace containment checks so
-   * MarkdownPreview can stay reusable.
-   */
+  openTargetId: WorkspaceOpenTargetId | null;
   path: string;
 }
 
-/**
- * Return `true` when the link was handled and anchor navigation should be
- * prevented. Return `false` to leave the link as a normal anchor.
- */
+const EDITOR_FILE_URL_OPEN_TARGET_IDS = new Map<string, WorkspaceOpenTargetId>([
+  ["cursor", "cursor"],
+  ["devin", "devin-desktop"],
+  ["vscode", "vscode"],
+  ["vscode-insiders", "vscode-insiders"],
+  ["windsurf", "devin-desktop"],
+]);
+
+export const EDITOR_FILE_URL_SCHEMES = [
+  ...EDITOR_FILE_URL_OPEN_TARGET_IDS.keys(),
+];
+
 export type MarkdownPreviewLocalFileLinkHandler = (
   link: MarkdownPreviewLocalFileLink,
 ) => boolean;
 
-export interface MarkdownTrustedAbsoluteLocalFileLinkRouting {
+interface MarkdownTrustedAbsoluteLocalFileLinkRouting {
   kind: "trusted-host";
 }
 
-export interface MarkdownContainedAbsoluteLocalFileLinkRouting {
+interface MarkdownContainedAbsoluteLocalFileLinkRouting {
   kind: "contained";
   rootPath: string;
 }
@@ -38,20 +44,17 @@ export type MarkdownAbsoluteLocalFileLinkRouting =
   | MarkdownContainedAbsoluteLocalFileLinkRouting;
 
 export interface MarkdownRelativeLocalFileLinkRouting {
-  /**
-   * Absolute directory of the previewed markdown file. Relative links resolve
-   * against this directory before root containment is checked.
-   */
   baseDir: string;
-  /**
-   * Absolute containing root for preview-relative links. Targets outside this
-   * root are left as ordinary markdown links.
-   */
   rootPath: string;
 }
 
 interface LocalFileHrefParts {
   lineRange: FilePreviewLineRange | null;
+  path: string;
+}
+
+interface LocalFileUrlParts {
+  openTargetId: WorkspaceOpenTargetId | null;
   path: string;
 }
 
@@ -65,12 +68,11 @@ interface ParseLineRangeArgs {
   startValue: string;
 }
 
-export interface ResolveRelativeLocalFileHrefArgs
-  extends MarkdownRelativeLocalFileLinkRouting {
+interface ResolveRelativeLocalFileHrefArgs extends MarkdownRelativeLocalFileLinkRouting {
   href: string | undefined;
 }
 
-export interface ParseLocalFileHrefArgs {
+interface ParseLocalFileHrefArgs {
   absoluteLinks: MarkdownAbsoluteLocalFileLinkRouting;
   href: string | undefined;
 }
@@ -207,8 +209,24 @@ function parseLineSuffix(value: string): LocalFileHrefParts | null {
   };
 }
 
+const WINDOWS_DRIVE_PATH_PATTERN = /^[A-Za-z]:[\\/]/u;
+const FILE_URL_WINDOWS_DRIVE_PATHNAME_PATTERN = /^\/[A-Za-z]:\//u;
+
+export function isWindowsDriveLocalFilePath(path: string): boolean {
+  return WINDOWS_DRIVE_PATH_PATTERN.test(path);
+}
+
+function isAbsoluteLocalFilePathStart(path: string): boolean {
+  return (
+    (path.startsWith("/") && !path.startsWith("//")) ||
+    isWindowsDriveLocalFilePath(path)
+  );
+}
+
 function hasLikelyFileBasename(path: string): boolean {
-  const segments = path.split("/");
+  const segments = isWindowsDriveLocalFilePath(path)
+    ? path.split(/[\\/]/u)
+    : path.split("/");
   const basename = segments[segments.length - 1] ?? "";
   return basename.startsWith(".") || basename.includes(".");
 }
@@ -229,10 +247,10 @@ function isValidAbsoluteLocalFilePath({
   requireLikelyFileBasename,
 }: LocalFilePathValidationArgs): boolean {
   return (
-    path.startsWith("/") &&
-    !path.startsWith("//") &&
+    isAbsoluteLocalFilePathStart(path) &&
     path !== "/" &&
     !path.endsWith("/") &&
+    !(isWindowsDriveLocalFilePath(path) && path.endsWith("\\")) &&
     !path.includes("\n") &&
     !path.includes("\r") &&
     !path.includes("?") &&
@@ -245,12 +263,11 @@ function isValidAbsoluteLocalFilePath({
 function parseAbsoluteLocalFileHref(
   href: string,
   requireLikelyFileBasename: boolean,
-): MarkdownPreviewLocalFileLink | null {
+): LocalFileHrefParts | null {
   if (
     href.length === 0 ||
     href.trim() !== href ||
-    !href.startsWith("/") ||
-    href.startsWith("//")
+    !isAbsoluteLocalFilePathStart(href)
   ) {
     return null;
   }
@@ -269,17 +286,10 @@ function parseAbsoluteLocalFileHref(
   return parsed;
 }
 
-// Apply scheme detection after file line suffix parsing so references such as
-// `Cargo.lock:14:33` and `foo.md:5` remain relative file links.
 const URI_SCHEME_PATTERN = /^[a-zA-Z][a-zA-Z0-9+.-]*:/u;
 
-/**
- * Resolves a relative markdown link against the previewed file's directory so
- * links authored relative to a file on disk become absolute paths the local
- * file link machinery understands. Returns `null` for links that are not
- * relative file references (absolute paths, schemes, in-document fragments,
- * queries), leaving them to default anchor handling.
- */
+const HOME_RELATIVE_PATH_PATTERN = /^~(?:[^/]*\/|$)/u;
+
 export function resolveRelativeLocalFileHref({
   baseDir,
   href,
@@ -297,6 +307,7 @@ export function resolveRelativeLocalFileHref({
     parsedHref === null ||
     parsedHref.path.length === 0 ||
     parsedHref.path.startsWith("/") ||
+    HOME_RELATIVE_PATH_PATTERN.test(parsedHref.path) ||
     parsedHref.path.startsWith("#") ||
     parsedHref.path.startsWith("?") ||
     URI_SCHEME_PATTERN.test(parsedHref.path)
@@ -359,37 +370,61 @@ function isLinkContainedInRoot({
   };
 }
 
+function parseLocalFileUrl(href: string): LocalFileUrlParts | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.search.length > 0) {
+    return null;
+  }
+  const pathname = FILE_URL_WINDOWS_DRIVE_PATHNAME_PATTERN.test(url.pathname)
+    ? url.pathname.slice(1)
+    : url.pathname;
+  if (url.protocol === "file:") {
+    return url.host.length > 0
+      ? null
+      : { openTargetId: null, path: pathname + url.hash };
+  }
+  const openTargetId = EDITOR_FILE_URL_OPEN_TARGET_IDS.get(
+    url.protocol.slice(0, -1),
+  );
+  if (
+    openTargetId === undefined ||
+    url.host !== "file" ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.hash.length > 0
+  ) {
+    return null;
+  }
+  return { openTargetId, path: pathname };
+}
+
 export function parseLocalFileHref({
   absoluteLinks,
   href,
-}: ParseLocalFileHrefArgs,
-): MarkdownPreviewLocalFileLink | null {
+}: ParseLocalFileHrefArgs): MarkdownPreviewLocalFileLink | null {
   if (!href) {
     return null;
   }
 
-  const requireLikelyFileBasename =
-    absoluteLinks.kind === "trusted-host" && !href.startsWith("file://");
-  let link: MarkdownPreviewLocalFileLink | null;
-  if (href.startsWith("file://")) {
-    try {
-      const url = new URL(href);
-      if (url.host.length > 0) {
-        return null;
-      }
-      if (url.search.length > 0) {
-        return null;
-      }
-      link = parseAbsoluteLocalFileHref(
-        url.pathname + url.hash,
-        requireLikelyFileBasename,
-      );
-    } catch {
-      return null;
-    }
-  } else {
-    link = parseAbsoluteLocalFileHref(href, requireLikelyFileBasename);
+  const isUrl =
+    URI_SCHEME_PATTERN.test(href) && !isWindowsDriveLocalFilePath(href);
+  const urlParts = isUrl ? parseLocalFileUrl(href) : null;
+  if (isUrl && urlParts === null) {
+    return null;
   }
+  const parts = parseAbsoluteLocalFileHref(
+    urlParts?.path ?? href,
+    absoluteLinks.kind === "trusted-host" && !isUrl,
+  );
+  const link =
+    parts === null
+      ? null
+      : { ...parts, openTargetId: urlParts?.openTargetId ?? null };
 
   if (link === null || absoluteLinks.kind === "trusted-host") {
     return link;
@@ -421,6 +456,12 @@ export function buildLocalFileAnchorHref(
   link: MarkdownPreviewLocalFileLink | null,
   originalHref: string | undefined,
 ): string | undefined {
+  if (link && isWindowsDriveLocalFilePath(link.path)) {
+    const [drive = "", ...segments] = link.path.split(/[\\/]+/u);
+    return `file:///${drive}/${segments
+      .map(encodeURIComponent)
+      .join("/")}${buildLineRangeAnchorFragment(link.lineRange)}`;
+  }
   if (!link || !link.path.startsWith("/")) {
     return originalHref;
   }

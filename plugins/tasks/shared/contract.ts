@@ -1,4 +1,4 @@
-import { defineRpcContract } from "@bb/plugin-sdk";
+import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   TASK_SORTS,
@@ -36,19 +36,16 @@ export const PRESET_ENVIRONMENT_KINDS = [
   "new-worktree",
 ] as const;
 
-const ULID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
-const PROJECT_PREFIX_PATTERN = /^[A-Z][A-Z0-9]{0,9}$/;
-const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+export const ULID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+export const PROJECT_PREFIX_PATTERN = /^[A-Z][A-Z0-9]{0,9}$/;
+export const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
-const idSchema = z.string().regex(ULID_PATTERN, "must be a ULID");
+export const idSchema = z.string().regex(ULID_PATTERN, "must be a ULID");
 const nonBlankStringSchema = z.string().trim().min(1, "must not be blank");
-const presetReasoningLevelSchema = z.enum([
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-]);
+export const presetReasoningLevelSchema = nonBlankStringSchema;
+export type PresetReasoningLevel = z.infer<typeof presetReasoningLevelSchema>;
+export const presetServiceTierSchema = nonBlankStringSchema;
+export type PresetServiceTier = z.infer<typeof presetServiceTierSchema>;
 export const PRESET_PERMISSION_MODES = [
   "accept-edits",
   "auto",
@@ -78,6 +75,7 @@ const taskStatusSchema = z.enum(TASK_STATUSES);
 const taskPrioritySchema = z.enum(TASK_PRIORITIES);
 const taskSortSchema = z.enum(TASK_SORTS);
 const threadSearchStatusSchema = z.enum([
+  "pending",
   "idle",
   "starting",
   "active",
@@ -85,7 +83,7 @@ const threadSearchStatusSchema = z.enum([
   "error",
 ]);
 
-export const folderSchema = z
+const folderSchema = z
   .object({
     id: idSchema,
     name: z.string(),
@@ -94,7 +92,7 @@ export const folderSchema = z
   })
   .strict();
 
-export const projectSchema = z
+const projectSchema = z
   .object({
     id: idSchema,
     name: z.string(),
@@ -107,7 +105,7 @@ export const projectSchema = z
   })
   .strict();
 
-export const taskSchema = z
+const taskSchema = z
   .object({
     id: idSchema,
     projectId: idSchema,
@@ -126,7 +124,7 @@ export const taskSchema = z
   })
   .strict();
 
-export const labelSchema = z
+const labelSchema = z
   .object({
     id: idSchema,
     projectId: idSchema,
@@ -135,7 +133,7 @@ export const labelSchema = z
   })
   .strict();
 
-export const commentSchema = z
+const commentSchema = z
   .object({
     id: idSchema,
     taskId: idSchema,
@@ -149,42 +147,31 @@ export const commentSchema = z
   })
   .strict();
 
-/**
- * Identity of the provider (agent) that authored an agent comment, resolved at
- * read time from the authoring thread's live `providerId`. `name` and
- * `logoUrl` come from the host provider list; `logoUrl` is populated only for
- * providers that serve a logo asset (custom ACP agents) — built-in providers
- * carry a null `logoUrl` and the UI renders a bundled brand glyph keyed by
- * `id`. `name` falls back to the raw provider id when the provider is no longer
- * installed. See `commentProviderSchema` usages in `displayCommentSchema`.
- */
-export const commentProviderSchema = z
+const commentProviderSchema = z
   .object({
     id: z.string(),
     name: z.string(),
     logoUrl: z.string().nullable(),
+    icon: z.object({ glyph: z.string() }).strict().nullable(),
+    strings: z
+      .object({
+        iconTint: z
+          .object({ light: z.string(), dark: z.string() })
+          .strict()
+          .nullable(),
+      })
+      .strict(),
   })
   .strict();
 
-/**
- * A comment enriched for display with (a) the current human title of the agent
- * thread that authored it and (b) the authoring provider. Both are resolved at
- * read time against the live thread. `threadTitle` is null for user/system
- * comments, legacy agent comments that carry no `threadId`, and threads that
- * are deleted, hidden, side chats, or otherwise inaccessible — callers fall
- * back to `authorName` and render no link. `provider` is null for user/system
- * comments, legacy agent comments with no `threadId`, and threads that are
- * deleted/hidden/inaccessible; it is present (and drives the comment's logo)
- * whenever the authoring thread resolves, including side chats.
- */
-export const displayCommentSchema = commentSchema
+const displayCommentSchema = commentSchema
   .extend({
     threadTitle: z.string().nullable(),
     provider: commentProviderSchema.nullable(),
   })
   .strict();
 
-export const attachmentSchema = z
+const attachmentSchema = z
   .object({
     id: idSchema,
     taskId: idSchema.nullable(),
@@ -197,7 +184,7 @@ export const attachmentSchema = z
   })
   .strict();
 
-export const taskThreadSchema = z
+const taskThreadSchema = z
   .object({
     id: idSchema,
     taskId: idSchema,
@@ -210,32 +197,25 @@ export const taskThreadSchema = z
   })
   .strict();
 
-/**
- * A GitHub pull request associated with a task through an attached thread's
- * environment (the branch the delegated agent pushed). Assembled server-side
- * from environment pull-request metadata — never scraped from comments.
- * `state` matches the server's product-facing PR state, which already folds
- * GitHub's isDraft flag into a single enum.
- */
-export const taskPullRequestSchema = z
+const taskPullRequestSchema = z
   .object({
     url: z.string().url(),
     number: z.number().int().positive(),
     title: z.string(),
     state: z.enum(["open", "draft", "merged", "closed"]),
     updatedAt: z.string(),
-    /** Task threads whose environment resolved to this pull request. */
     threadIds: z.array(z.string().startsWith("thr_")).min(1),
   })
   .strict();
 
-export const presetSchema = z
+const presetSchema = z
   .object({
     id: idSchema,
     name: z.string(),
     providerId: z.string(),
     modelId: z.string(),
-    reasoningLevel: z.string(),
+    reasoningLevel: presetReasoningLevelSchema,
+    serviceTier: presetServiceTierSchema.nullable(),
     permissionMode: presetPermissionModeSchema,
     environmentKind: presetEnvironmentKindSchema,
     baseBranch: nullablePresetTargetSchema,
@@ -246,7 +226,7 @@ export const presetSchema = z
   })
   .strict();
 
-export const tasksDomainErrorSchema = z
+const tasksDomainErrorSchema = z
   .object({
     code: z.enum([
       "task_parent_invalid",
@@ -363,6 +343,7 @@ const updatePresetInputSchema = z
     providerId: nonBlankStringSchema.optional(),
     modelId: nonBlankStringSchema.optional(),
     reasoningLevel: presetReasoningLevelSchema.optional(),
+    serviceTier: presetServiceTierSchema.nullable().optional(),
     permissionMode: presetPermissionModeSchema.optional(),
     environmentKind: presetEnvironmentKindSchema.optional(),
     baseBranch: nullablePresetTargetSchema.optional(),
@@ -376,6 +357,7 @@ const updatePresetInputSchema = z
       input.providerId !== undefined ||
       input.modelId !== undefined ||
       input.reasoningLevel !== undefined ||
+      input.serviceTier !== undefined ||
       input.permissionMode !== undefined ||
       input.environmentKind !== undefined ||
       input.baseBranch !== undefined ||
@@ -432,7 +414,13 @@ export const tasksRpcContract = defineRpcContract({
   },
   deleteFolder: {
     input: z.object({ folderId: idSchema }).strict(),
-    output: z.object({ deleted: z.boolean() }).strict(),
+    output: z
+      .object({
+        deleted: z.boolean(),
+        movedProjectIds: z.array(idSchema),
+        movedFolderIds: z.array(idSchema),
+      })
+      .strict(),
   },
   listFolders: {
     input: z.null(),
@@ -493,11 +481,6 @@ export const tasksRpcContract = defineRpcContract({
     input: z.object({ taskId: idSchema }).strict(),
     output: z.object({ task: taskSchema.nullable() }).strict(),
   },
-  /**
-   * Resolve a task key like "TSK-4" with one targeted query. The prefix is
-   * matched case-insensitively; a malformed key resolves to null rather than
-   * erroring so stale chat references degrade to the card's not-found state.
-   */
   getTaskByKey: {
     input: z.object({ taskKey: nonBlankStringSchema }).strict(),
     output: z.object({ task: taskSchema.nullable() }).strict(),
@@ -510,11 +493,6 @@ export const tasksRpcContract = defineRpcContract({
     input: z.object({ taskId: idSchema }).strict(),
     output: z.object({ deleted: z.boolean() }).strict(),
   },
-  /**
-   * Stable keyset page in the requested database sort. `nextCursor` is opaque
-   * and bound to the filters, sort, and task-list revision; any list-affecting
-   * mutation makes it stale so callers restart instead of mixing snapshots.
-   */
   listTasks: {
     input: z
       .object({
@@ -554,6 +532,16 @@ export const tasksRpcContract = defineRpcContract({
       .strict(),
     output: taskMutationResultSchema,
   },
+  moveTaskToProject: {
+    input: z
+      .object({
+        taskId: idSchema,
+        projectId: idSchema,
+        authorName: nonBlankStringSchema.default("You"),
+      })
+      .strict(),
+    output: taskMutationResultSchema,
+  },
   createLabel: {
     input: z
       .object({
@@ -582,8 +570,6 @@ export const tasksRpcContract = defineRpcContract({
         taskId: idSchema,
         body: z.string(),
         notify: z.boolean(),
-        // Attachment-only comments opt in explicitly so existing text-only
-        // callers retain the non-empty body invariant.
         allowEmptyBody: z.boolean().default(false),
       })
       .strict()
@@ -601,6 +587,7 @@ export const tasksRpcContract = defineRpcContract({
     input: z.union([
       z.object({ taskId: idSchema }).strict(),
       z.object({ commentId: idSchema }).strict(),
+      z.object({ commentsOfTaskId: idSchema }).strict(),
     ]),
     output: z.object({ attachments: z.array(attachmentSchema) }).strict(),
   },
@@ -617,12 +604,6 @@ export const tasksRpcContract = defineRpcContract({
     input: z.object({ taskId: idSchema }).strict(),
     output: z.object({ taskThreads: z.array(taskThreadSchema) }).strict(),
   },
-  // Pull requests reached through the task's attached threads, deduplicated
-  // by URL. Threads whose PR lookup failed (deleted thread, gh missing or
-  // unauthenticated, unreachable workspace) are reported in
-  // `unavailableThreadIds` rather than failing the whole call — distinct from
-  // threads with no environment or a genuinely absent PR, which produce
-  // nothing.
   listTaskPullRequests: {
     input: z.object({ taskId: idSchema }).strict(),
     output: z
@@ -639,6 +620,7 @@ export const tasksRpcContract = defineRpcContract({
         providerId: nonBlankStringSchema,
         modelId: nonBlankStringSchema,
         reasoningLevel: presetReasoningLevelSchema,
+        serviceTier: presetServiceTierSchema.nullable().default(null),
         permissionMode: presetPermissionModeSchema,
         environmentKind: presetEnvironmentKindSchema.default("project-default"),
         baseBranch: nullablePresetTargetSchema.default(null),
@@ -682,39 +664,6 @@ export const tasksRpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ presets: z.array(presetSchema) }).strict(),
   },
-  listProviders: {
-    input: z.object({}).strict(),
-    output: z
-      .object({
-        providers: z.array(
-          z
-            .object({
-              id: z.string(),
-              name: z.string(),
-              supportedPermissionModes: z.array(presetPermissionModeSchema),
-            })
-            .strict(),
-        ),
-      })
-      .strict(),
-  },
-  listProviderModels: {
-    input: z.object({ providerId: nonBlankStringSchema }).strict(),
-    output: z
-      .object({
-        models: z.array(
-          z
-            .object({
-              id: z.string(),
-              name: z.string(),
-              isDefault: z.boolean(),
-            })
-            .strict(),
-        ),
-        reasoningLevels: z.array(z.string()),
-      })
-      .strict(),
-  },
   listMachines: {
     input: z.object({}).strict(),
     output: z
@@ -746,8 +695,6 @@ export const tasksRpcContract = defineRpcContract({
       })
       .strict(),
   },
-  // BB workspace projects (proj_…) for the linked-project picker; distinct
-  // from this plugin's own task projects.
   listBbProjects: {
     input: z.null(),
     output: z
@@ -800,7 +747,6 @@ export type TaskPullRequest = z.infer<typeof taskPullRequestSchema>;
 export type Preset = z.infer<typeof presetSchema>;
 export type TasksDomainError = z.infer<typeof tasksDomainErrorSchema>;
 export type TaskMutationResult = z.infer<typeof taskMutationResultSchema>;
-export type ProjectMutationResult = z.infer<typeof projectMutationResultSchema>;
 export type BbProjectOption = z.infer<
   (typeof tasksRpcContract)["listBbProjects"]["output"]
 >["bbProjects"][number];
@@ -819,7 +765,6 @@ export interface ProjectsChangedEvent {
 
 export interface CommentsChangedEvent {
   taskId: string;
-  notifiedCount?: number;
 }
 
 export interface ThreadsChangedEvent {

@@ -1,107 +1,199 @@
-import {
-  ArrowDown01Icon,
-  ArrowExpand01Icon,
-  ArrowLeft01Icon,
-  ArrowMoveDownLeftIcon,
-  ArrowRight01Icon,
-  AttachmentIcon,
-  BubbleChatAddIcon,
-  CheckmarkCircle02Icon,
-  Clock01Icon,
-  FolderGitTwoIcon,
-  FolderIcon as HiFolderIcon,
-  GitBranchIcon as HiGitBranchIcon,
-  GitMergeIcon as HiGitMergeIcon,
-  LaptopIcon as HiLaptopIcon,
-  Loading03Icon,
-  MessageQuestionIcon,
-  Mic02Icon,
-  MoreHorizontalIcon,
-  PauseIcon,
-  PlayIcon,
-  PlusMinusSquare01Icon,
-  SentIcon,
-  Settings01Icon,
-  SidebarLeftIcon,
-  SidebarRightIcon,
-  Tick02Icon,
-} from "@hugeicons/core-free-icons";
-import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
+import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
+import ArrowExpand01Icon from "@hugeicons/core-free-icons/ArrowExpand01Icon";
+import ArrowLeft01Icon from "@hugeicons/core-free-icons/ArrowLeft01Icon";
+import ArrowMoveDownLeftIcon from "@hugeicons/core-free-icons/ArrowMoveDownLeftIcon";
+import ArrowRight01Icon from "@hugeicons/core-free-icons/ArrowRight01Icon";
+import AttachmentIcon from "@hugeicons/core-free-icons/AttachmentIcon";
+import BubbleChatAddIcon from "@hugeicons/core-free-icons/BubbleChatAddIcon";
+import CheckmarkCircle02Icon from "@hugeicons/core-free-icons/CheckmarkCircle02Icon";
+import Clock01Icon from "@hugeicons/core-free-icons/Clock01Icon";
+import FolderGitTwoIcon from "@hugeicons/core-free-icons/FolderGit2Icon";
+import HiFolderIcon from "@hugeicons/core-free-icons/Folder01Icon";
+import HiGitBranchIcon from "@hugeicons/core-free-icons/GitBranchIcon";
+import HiGitMergeIcon from "@hugeicons/core-free-icons/GitMergeIcon";
+import HiLaptopIcon from "@hugeicons/core-free-icons/LaptopIcon";
+import Loading03Icon from "@hugeicons/core-free-icons/Loading03Icon";
+import MessageQuestionIcon from "@hugeicons/core-free-icons/MessageQuestionIcon";
+import Mic02Icon from "@hugeicons/core-free-icons/Mic02Icon";
+import MoreHorizontalIcon from "@hugeicons/core-free-icons/MoreHorizontalIcon";
+import PauseIcon from "@hugeicons/core-free-icons/PauseIcon";
+import PlayIcon from "@hugeicons/core-free-icons/PlayIcon";
+import PlusMinusSquare01Icon from "@hugeicons/core-free-icons/PlusMinusSquare01Icon";
+import SentIcon from "@hugeicons/core-free-icons/SentIcon";
+import Settings01Icon from "@hugeicons/core-free-icons/Settings01Icon";
+import SidebarLeftIcon from "@hugeicons/core-free-icons/SidebarLeftIcon";
+import SidebarRightIcon from "@hugeicons/core-free-icons/SidebarRightIcon";
+import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
+import { HugeiconsIcon } from "@hugeicons/react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import changelogMd from "../../../../CHANGELOG.md?raw";
-import { initAnalytics, trackLandingEvent } from "../landing/analytics";
-import bbIcon from "../assets/bb-icon.png";
+import { RELEASE_META } from "../../../../changelog-metadata";
+import { useInitAnalytics } from "../landing/analytics";
+import adobeLogo from "../assets/company-logos/adobe.svg";
+import atlassianLogo from "../assets/company-logos/atlassian.svg";
 import blackstoneLogo from "../assets/company-logos/blackstone.png";
+import browserbaseLogo from "../assets/company-logos/browserbase.png";
+import bytedanceLogo from "../assets/company-logos/bytedance.svg";
+import customerIoLogo from "../assets/company-logos/customer-io.png";
 import datadogLogo from "../assets/company-logos/datadog.svg";
 import figmaLogo from "../assets/company-logos/figma.svg";
+import gustoLogo from "../assets/company-logos/gusto.png";
+import hubspotLogo from "../assets/company-logos/hubspot.svg";
+import jetbrainsLogo from "../assets/company-logos/jetbrains.svg";
+import justEatTakeawayLogo from "../assets/company-logos/just-eat-takeaway.svg";
+import kernelLogo from "../assets/company-logos/kernel.png";
+import linearLogo from "../assets/company-logos/linear.svg";
 import metaLogo from "../assets/company-logos/meta.svg";
+import microsoftLogo from "../assets/company-logos/microsoft.svg";
 import moodysLogo from "../assets/company-logos/moodys.png";
 import notionLogo from "../assets/company-logos/notion.png";
+import oracleLogo from "../assets/company-logos/oracle.svg";
 import ownerLogo from "../assets/company-logos/owner.png";
 import pendoLogo from "../assets/company-logos/pendo.svg";
 import renderLogo from "../assets/company-logos/render.svg";
+import shopifyLogo from "../assets/company-logos/shopify.svg";
 import shortcutLogo from "../assets/company-logos/shortcut.svg";
 import simileLogo from "../assets/company-logos/simile.svg";
+import statsigLogo from "../assets/company-logos/statsig.svg";
+import stitchFixLogo from "../assets/company-logos/stitch-fix.png";
+import tencentLogo from "../assets/company-logos/tencent.png";
+import vercelLogo from "../assets/company-logos/vercel.svg";
+import zooxLogo from "../assets/company-logos/zoox.png";
 import hermesAvatar from "../assets/hermes-avatar.jpg";
 import vscodeIcon from "../assets/vscode.png";
-import { RELEASE_META, parseChangelog } from "../landing/changelog";
-import {
-  DiscordLink,
-  DownloadLink,
-  EmailSignup,
-  GitHubLink,
-  ProductHuntCallout,
-} from "../landing/cta";
+import { parseChangelog } from "../../../../changelog-parser";
+import { DiscordLink, GitHubLink, SubscribeSection } from "../landing/cta";
+import { siteHeadLinks } from "../landing/page-head";
 import { SiteFooter, SiteNav } from "../landing/site-chrome";
+import { ClaudeIcon } from "../landing/icons";
 import {
-  ClaudeIcon,
-  CursorIcon,
-  GrokIcon,
-  HermesAgentIcon,
-  OmpIcon,
-  OpenAiIcon,
-  OpencodeIcon,
-  PiIcon,
-} from "../landing/icons";
-import type { CtaPlacement } from "../landing/site";
+  Band,
+  InstallOptions,
+  ProviderChips,
+  CustomizeBuild,
+  SpawnSidebar,
+  useCycle,
+  useScrollReveal,
+} from "../landing/landing-visuals";
 import {
-  CLI_COMMAND,
   OG_DESCRIPTION,
-  PRODUCT_HUNT_LAUNCH_ACTIVE,
   SITE_DESCRIPTION,
   SITE_TITLE,
   unfurlMeta,
 } from "../landing/site";
-import interWoff2 from "@fontsource-variable/inter/files/inter-latin-wght-normal.woff2?url";
-import landingCss from "../landing/landing.css?url";
 
 const COMPANY_PROOF = [
-  ["Meta", metaLogo],
-  ["Figma", figmaLogo],
-  ["Notion", notionLogo],
-  ["Datadog", datadogLogo],
-  ["Owner.com", ownerLogo],
-  ["Pendo", pendoLogo],
-  ["Blackstone", blackstoneLogo],
-  ["Moody's", moodysLogo],
-  ["Shortcut", shortcutLogo],
-  ["Render", renderLogo],
-  ["Simile", simileLogo],
+  ["Meta", metaLogo, "glyph"],
+  ["Microsoft", microsoftLogo, "glyph"],
+  ["Figma", figmaLogo, "glyph"],
+  ["Notion", notionLogo, "tile"],
+  ["Vercel", vercelLogo, "glyph"],
+  ["Shopify", shopifyLogo, "glyph"],
+  ["Adobe", adobeLogo, "glyph"],
+  ["Linear", linearLogo, "glyph"],
+  ["Datadog", datadogLogo, "glyph"],
+  ["HubSpot", hubspotLogo, "glyph"],
+  ["Atlassian", atlassianLogo, "glyph"],
+  ["JetBrains", jetbrainsLogo, "glyph"],
+  ["Owner.com", ownerLogo, "tile"],
+  ["Pendo", pendoLogo, "glyph"],
+  ["ByteDance", bytedanceLogo, "glyph"],
+  ["Blackstone", blackstoneLogo, "tile"],
+  ["Moody's", moodysLogo, "tile"],
+  ["Shortcut", shortcutLogo, "tile"],
+  ["Oracle", oracleLogo, "glyph"],
+  ["Render", renderLogo, "glyph"],
+  ["Tencent", tencentLogo, "glyph"],
+  ["Gusto", gustoLogo, "tile"],
+  ["Simile", simileLogo, "glyph"],
+  ["Browserbase", browserbaseLogo, "tile"],
+  ["Kernel", kernelLogo, "tile"],
+  ["Customer.io", customerIoLogo, "tile"],
+  ["Statsig", statsigLogo, "glyph"],
+  ["Zoox", zooxLogo, "tile"],
+  ["Stitch Fix", stitchFixLogo, "glyph"],
+  ["Just Eat Takeaway", justEatTakeawayLogo, "glyph"],
 ] as const;
 
-function CompanyProofLogos({ duplicate = false }: { duplicate?: boolean }) {
+type CompanyProofEntry = (typeof COMPANY_PROOF)[number];
+
+const COMPANY_PROOF_ROWS = [
+  COMPANY_PROOF.filter((_, index) => index % 2 === 0),
+  COMPANY_PROOF.filter((_, index) => index % 2 === 1),
+];
+
+function CompanyProofLogos({
+  companies,
+  duplicate = false,
+}: {
+  companies: readonly CompanyProofEntry[];
+  duplicate?: boolean;
+}) {
   return (
     <ul className="company-proof-logos" aria-hidden={duplicate || undefined}>
-      {COMPANY_PROOF.map(([name, logo]) => (
+      {companies.map(([name, logo, kind]) => (
         <li key={name} className="company-proof-company">
-          <img src={logo} alt={duplicate ? "" : name} width={20} height={20} />
+          <img
+            src={logo}
+            alt={duplicate ? "" : name}
+            width={20}
+            height={20}
+            className={kind === "tile" ? "company-proof-tile" : undefined}
+          />
           <span aria-hidden="true">{name}</span>
         </li>
       ))}
     </ul>
+  );
+}
+
+function CompanyProofMarquee({
+  companies,
+  reverse,
+}: {
+  companies: readonly CompanyProofEntry[];
+  reverse: boolean;
+}) {
+  const [copies, setCopies] = useState(5);
+  const marqueeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const marquee = marqueeRef.current;
+    const firstCopy = marquee?.querySelector(".company-proof-logos");
+    if (!marquee || !firstCopy) return;
+
+    const measure = () => {
+      const copyWidth = firstCopy.getBoundingClientRect().width;
+      if (copyWidth === 0) return;
+      setCopies(Math.max(2, Math.ceil(marquee.clientWidth / copyWidth) + 1));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(marquee);
+    observer.observe(firstCopy);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div className="company-proof-marquee" ref={marqueeRef}>
+      <div
+        className={`company-proof-track${reverse ? " is-reverse" : ""}`}
+        style={
+          {
+            "--company-proof-copies": copies,
+            "--company-proof-logos": companies.length,
+          } as CSSProperties
+        }
+      >
+        <CompanyProofLogos companies={companies} />
+        {Array.from({ length: copies - 1 }, (_, i) => (
+          <CompanyProofLogos key={i} companies={companies} duplicate />
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -122,162 +214,18 @@ export const Route = createFileRoute("/")({
     meta: [
       { title: SITE_TITLE },
       { name: "description", content: SITE_DESCRIPTION },
-      // Unfurl title is just "bb": the card image already carries the
-      // tagline, and platforms print the title right next to the image.
       ...unfurlMeta("bb", OG_DESCRIPTION, "/"),
-      { name: "theme-color", content: "#ffffff" },
     ],
-    links: [
-      {
-        rel: "preload",
-        href: interWoff2,
-        as: "font",
-        type: "font/woff2",
-        crossOrigin: "anonymous",
-      },
-      { rel: "stylesheet", href: landingCss },
-    ],
+    links: siteHeadLinks(),
   }),
   component: LandingRoute,
 });
 
 function LandingRoute() {
-  useEffect(() => {
-    initAnalytics();
-  }, []);
+  useInitAnalytics();
   return <LandingPage />;
 }
 
-// Filled (solid) variant of the Hugeicons apple — same silhouette as their
-// stroke AppleIcon, but rendered as a fill so the macOS CTA reads as a solid
-// glyph (the free icon set ships outline variants only).
-const AppleSolidIcon: IconSvgElement = [
-  [
-    "path",
-    {
-      d: "M12 5.75C12 3.75 13.5 1.75 15.5 1.75C15.5 3.75 14 5.75 12 5.75Z",
-      fill: "currentColor",
-      key: "0",
-    },
-  ],
-  [
-    "path",
-    {
-      d: "M12.5 8.09001C11.9851 8.09001 11.5867 7.92646 11.1414 7.74368C10.5776 7.51225 9.93875 7.25 8.89334 7.25C7.02235 7.25 4 8.74945 4 12.7495C4 17.4016 7.10471 22.25 9.10471 22.25C9.77426 22.25 10.3775 21.9871 10.954 21.7359C11.4815 21.5059 11.9868 21.2857 12.5 21.2857C13.0132 21.2857 13.5185 21.5059 14.046 21.7359C14.6225 21.9871 15.2257 22.25 15.8953 22.25C17.2879 22.25 18.9573 19.8992 20 16.9008C18.3793 16.2202 17.338 14.618 17.338 12.75C17.338 11.121 18.2036 10.0398 19.5 9.25C18.5 7.75 17.0134 7.25 15.9447 7.25C14.8993 7.25 14.2604 7.51225 13.6966 7.74368C13.2514 7.92646 13.0149 8.09001 12.5 8.09001Z",
-      fill: "currentColor",
-      key: "1",
-    },
-  ],
-];
-
-/* ── CTAs ─────────────────────────────────────────────────────────── */
-
-// The browser install path, rendered as an outline button whose body is the
-// run command. Clicking anywhere copies it (there's no hosted URL to open —
-// the command starts bb locally and opens it in the browser).
-function RunCommandButton({ placement }: { placement: CtaPlacement }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    // Track and show feedback first; the clipboard write can reject (no user
-    // activation, permissions) and must not swallow the event.
-    trackLandingEvent({
-      name: "landing_cli_command_copied",
-      properties: { placement, command: CLI_COMMAND },
-    });
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-    navigator.clipboard.writeText(CLI_COMMAND).catch(() => {});
-  };
-  return (
-    <button
-      type="button"
-      className={
-        copied
-          ? "btn btn-ghost btn-install cmd-btn copied"
-          : "btn btn-ghost btn-install cmd-btn"
-      }
-      onClick={copy}
-      aria-label={`Copy browser install command: ${CLI_COMMAND}`}
-    >
-      <span className="cmd-dollar">$</span>
-      <span className="cmd-text">{CLI_COMMAND}</span>
-      <span className="cmd-copy">Copy</span>
-      {/* Toast floats above the button (absolute) so confirming the copy never
-          reflows the centered CTA row — the label stays a fixed width. */}
-      <span
-        className={copied ? "cmd-toast show" : "cmd-toast"}
-        aria-hidden="true"
-      >
-        Copied to clipboard
-      </span>
-    </button>
-  );
-}
-
-function InstallOptions({ placement }: { placement: CtaPlacement }) {
-  return (
-    <div className="install-options">
-      <div className="install-actions">
-        <span className="install-choice">
-          <DownloadLink
-            placement={placement}
-            className="btn btn-primary btn-install"
-          >
-            <HugeiconsIcon icon={AppleSolidIcon} className="btn-ic" />
-            Download for macOS
-          </DownloadLink>
-          <span className="install-note">One-click, no terminal</span>
-        </span>
-        <span className="install-choice">
-          <RunCommandButton placement={placement} />
-          <span className="install-note">
-            Windows (via WSL), Linux &amp; remote machines
-          </span>
-        </span>
-      </div>
-    </div>
-  );
-}
-
-/* ── Scroll reveal ────────────────────────────────────────────────── */
-
-/** Fade-up sections as they scroll into view. No-JS and prerender stay fully visible. */
-function useScrollReveal() {
-  useEffect(() => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      return;
-    }
-    const targets = Array.from(document.querySelectorAll("[data-reveal]"));
-    for (const target of targets) {
-      if (target.getBoundingClientRect().top > window.innerHeight * 0.9) {
-        target.classList.add("reveal-pending");
-      }
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting) {
-            entry.target.classList.remove("reveal-pending");
-            observer.unobserve(entry.target);
-          }
-        }
-      },
-      { rootMargin: "0px 0px -12% 0px" },
-    );
-    for (const target of targets) {
-      observer.observe(target);
-    }
-    return () => observer.disconnect();
-  }, []);
-}
-
-/** The app mock assembles itself the first time it scrolls into view: window
- *  frame, then title bar, sidebar rows, conversation, and composer in sequence.
- *  The mock is held hidden from first paint by CSS (`html.js` + `:not(.constructing)`)
- *  so it never flashes finished before it builds. Once the entrance finishes the
- *  class is swapped to `.constructed` so later re-renders (switching threads,
- *  opening the diff) don't replay it. Prerender/no-JS/reduced-motion render the
- *  finished mock with no animation. */
 function useConstructMock() {
   useEffect(() => {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
@@ -302,8 +250,6 @@ function useConstructMock() {
           }
         }
       },
-      // Threshold 0 (not a ratio) so a mock taller than a small mobile viewport
-      // still triggers; the bottom margin holds it until it is meaningfully in view.
       { threshold: 0, rootMargin: "0px 0px -20% 0px" },
     );
     observer.observe(mock);
@@ -316,13 +262,6 @@ function useConstructMock() {
   }, []);
 }
 
-/** Scale the desktop app mock for narrow viewports. Below the mobile breakpoint
- *  the mock keeps its full desktop layout and is shrunk with `zoom` so a fixed
- *  left slice of the app (`--mock-visible-width`) fills the available width; the
- *  rest bleeds off the right edge, clipped by `.mockup-wrap`'s overflow. This
- *  stays legible instead of shrinking the whole app to fit. `--mock-visible-width`
- *  is defined only inside that breakpoint, so above it the variable is unset and
- *  the mock renders unscaled at its natural width. */
 function useFitMock() {
   useEffect(() => {
     const mock = document.querySelector<HTMLElement>(".mock");
@@ -336,13 +275,9 @@ function useFitMock() {
         getComputedStyle(mock).getPropertyValue("--mock-visible-width"),
       );
       if (!visibleWidth) {
-        // Desktop layout (variable unset above the breakpoint): no scaling.
         mock.style.removeProperty("--mock-scale");
         return;
       }
-      // The card is inset by the wrap's side padding (its left gutter holds the
-      // drop shadow), so its on-screen width is the content box — clientWidth
-      // minus the padding — not clientWidth itself.
       const slice =
         wrap.clientWidth -
         Number.parseFloat(wrapStyle.paddingLeft) -
@@ -356,52 +291,8 @@ function useFitMock() {
   }, []);
 }
 
-/* ── Shared bits ──────────────────────────────────────────────────── */
-
-const PROVIDER_ICONS = [
-  ClaudeIcon,
-  OpenAiIcon,
-  CursorIcon,
-  PiIcon,
-  OpencodeIcon,
-  GrokIcon,
-  OmpIcon,
-  HermesAgentIcon,
-] as const;
-
-/** How many provider logos stay visible on narrow screens before "+N more". */
-const PROVIDER_ICONS_MOBILE_VISIBLE = 3;
-
-function ProviderChips() {
-  const extra = PROVIDER_ICONS.length - PROVIDER_ICONS_MOBILE_VISIBLE;
-  return (
-    <>
-      {PROVIDER_ICONS.map((Icon, i) => (
-        <Icon
-          key={i}
-          className={
-            i >= PROVIDER_ICONS_MOBILE_VISIBLE ? "plogo plogo-more" : "plogo"
-          }
-        />
-      ))}
-      {extra > 0 ? (
-        <span className="pmore" aria-label={`${extra} more providers`}>
-          +{extra} more
-        </span>
-      ) : null}
-    </>
-  );
-}
-
-/* ── Hero: interactive bb app mock ────────────────────────────────── */
-// A faithful recreation of the bb app: icon rail + thread sidebar + a markdown
-// conversation + the real composer (PR/diff bar, model picker, worktree row).
-// Clicking a thread in the sidebar swaps the conversation and composer.
-
 type IconProps = { className?: string };
 
-// Real bb app icons (Hugeicons), matched to the app's own Icon map in
-// apps/app/src/components/ui/icon.tsx — same glyphs the desktop app renders.
 const PanelIcon = ({ className }: IconProps) => (
   <HugeiconsIcon icon={SidebarLeftIcon} className={className} />
 );
@@ -432,8 +323,6 @@ const GearIcon = ({ className }: IconProps) => (
 const CheckIcon = ({ className }: IconProps) => (
   <HugeiconsIcon icon={Tick02Icon} className={className} />
 );
-// Sidebar thread-status glyphs, matching the real app's muted glyphs
-// (CheckmarkCircle02 for done, MessageQuestion for needs-input).
 const CircleCheckIcon = ({ className }: IconProps) => (
   <HugeiconsIcon icon={CheckmarkCircle02Icon} className={className} />
 );
@@ -482,8 +371,6 @@ type Step =
   | { kind: "user"; text: string }
   | { kind: "step"; text: ReactNode }
   | { kind: "say"; text: ReactNode }
-  // A "spawn" step prints a tool line in the feed and, the first time it
-  // streams in, adds a nested child thread to the sidebar (like the real app).
   | { kind: "spawn"; text: ReactNode; child: MockThread };
 type Ask = {
   question: string;
@@ -498,14 +385,10 @@ type MockThread = {
   pr?: number;
   change: { files: number; add: number; del: number };
   transcript: Step[];
-  /** Endlessly-cycled work a running thread streams in after its transcript. */
   stream?: Step[];
-  /** A pending AskUserQuestion that replaces the prompt box (like the app). */
   ask?: Ask;
 };
 
-// The subagent the Sentry thread spawns mid-run. It lands as a nested child row
-// in the sidebar and, if opened, streams its own work like any running thread.
 const SENTRY_SUBAGENT: MockThread = {
   id: "sentry-sub",
   title: "Reproduce the null cart",
@@ -532,8 +415,6 @@ const SENTRY_SUBAGENT: MockThread = {
   ],
 };
 
-// Endless "work" each running thread streams in after its transcript. The pool
-// loops, so a glance at the hero always shows tool calls and messages arriving.
 const SENTRY_STREAM: Step[] = [
   { kind: "step", text: "Ran 48 tests" },
   {
@@ -725,7 +606,6 @@ const HERO_THREADS: MockThread[] = [
   },
 ];
 
-// The pinned dispatcher thread, kept out of "All Threads".
 const CHIEF: MockThread = {
   id: "chief",
   title: "Chief",
@@ -763,18 +643,11 @@ function ThreadStatus({ status }: { status: Status }) {
   );
 }
 
-// Cadence + rolling-window size for a running thread's live feed. The window is
-// generously larger than what fits, so the oldest rows are dropped well above
-// the (clipped) top edge and never cause a visible jump.
 const STREAM_INTERVAL_MS = 1600;
 const STREAM_WINDOW = 16;
 
 type FeedItem = { id: string; step: Step; live: boolean };
 
-/** The conversation pane. A running thread streams tool calls and messages in
- *  endlessly after its seed transcript; everything else renders statically.
- *  The first time a `spawn` step streams in, it calls `onSpawn` so the sidebar
- *  can add the nested child thread. Reduced-motion and no-JS render the seed. */
 function ThreadFeed({
   thread,
   onSpawn,
@@ -793,8 +666,6 @@ function ThreadFeed({
       })),
     [thread.transcript],
   );
-  // ThreadFeed is keyed by thread id, so switching threads remounts it and
-  // resets the stream — no in-effect reset needed.
   const [items, setItems] = useState<FeedItem[]>(seedItems);
 
   useEffect(() => {
@@ -827,7 +698,6 @@ function ThreadFeed({
   return (
     <div className={isLive ? "feed feed-live" : "feed"}>
       {items.map(({ id, step, live }, index) => {
-        // Live rows ease in as they arrive; seed rows keep the construct cascade.
         const style: CSSProperties = live
           ? { animation: "c-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) both" }
           : { animationDelay: `${0.66 + index * 0.09}s` };
@@ -864,9 +734,6 @@ function ThreadFeed({
   );
 }
 
-// The AskUserQuestion tool. Like the app, it REPLACES the prompt box: a
-// recessed card in the composer slot with the prompt, single-select option
-// rows, and Cancel / Submit answer actions.
 function AskQuestion({ ask }: { ask: Ask }) {
   const [selected, setSelected] = useState(ask.selected);
   return (
@@ -916,9 +783,6 @@ const DIFF_LINES: DiffLine[] = [
   { t: "add", text: "});" },
 ];
 
-// The prompt box — used for follow-ups (with a thread) and the new-thread page
-// (no thread). Carries the full button set: expand, model picker, attach, mic,
-// send, plus the project / environment / branch / permission context row.
 function Composer({ thread }: { thread?: MockThread }) {
   const isNew = !thread;
   return (
@@ -1001,7 +865,6 @@ function Composer({ thread }: { thread?: MockThread }) {
   );
 }
 
-// The diff / secondary panel that opens on the right.
 function DiffPanel({
   thread,
   onClose,
@@ -1047,8 +910,6 @@ function HeroAppMock() {
   const [activeId, setActiveId] = useState(HERO_THREADS[0].id);
   const [view, setView] = useState<"thread" | "new">("thread");
   const [diffOpen, setDiffOpen] = useState(false);
-  // Subagents a running thread spawns, keyed by parent id. They persist once
-  // spawned and render as nested child rows in the sidebar.
   const [spawned, setSpawned] = useState<Record<string, MockThread[]>>({});
   const spawnedChildren = useMemo(
     () => Object.values(spawned).flat(),
@@ -1232,73 +1093,6 @@ function HeroAppMock() {
   );
 }
 
-/* ── Band layout ──────────────────────────────────────────────────── */
-
-function Band({
-  title,
-  flip,
-  visual,
-  children,
-}: {
-  title: string;
-  flip?: boolean;
-  visual: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <section className={flip ? "band band-flip" : "band"} data-reveal>
-      <div className="band-grid">
-        <div className="band-copy">
-          <h2>{title}</h2>
-          {children}
-        </div>
-        <div className="band-visual">{visual}</div>
-      </div>
-    </section>
-  );
-}
-
-/* ── Looping visual cycle ─────────────────────────────────────────── */
-
-/** Drives a looping visual: hold the current item, fade it out, then swap to the
- *  next and replay its entrance. Returns a monotonic `cycle` (use as the remount
- *  key; mod by item count for content) and whether it is currently fading out, so
- *  the outgoing content can ease away before the next appears. Inert under reduced
- *  motion — the first item just stays shown. */
-function useCycle(holdMs: number, fadeMs: number) {
-  const [cycle, setCycle] = useState(0);
-  const [leaving, setLeaving] = useState(false);
-  useEffect(() => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      return;
-    }
-    let holdTimer = 0;
-    let fadeTimer = 0;
-    const schedule = () => {
-      holdTimer = window.setTimeout(() => {
-        setLeaving(true);
-        fadeTimer = window.setTimeout(() => {
-          setCycle((c) => c + 1);
-          setLeaving(false);
-          schedule();
-        }, fadeMs);
-      }, holdMs);
-    };
-    schedule();
-    return () => {
-      window.clearTimeout(holdTimer);
-      window.clearTimeout(fadeTimer);
-    };
-  }, [holdMs, fadeMs]);
-  return { cycle, leaving };
-}
-
-/* ── Band visual: text the bot, bb spawns the thread ──────────────── */
-
-// A Telegram-style chat with the bb bot. The user texts a request; the bot acks
-// and a bb thread card appears, its status going spawning → running. The chat
-// shell and wallpaper stay put; only the messages cycle — they fade in, hold,
-// then fade out together before the conversation replays. CSS-only transitions.
 function AgentChat() {
   const { cycle, leaving } = useCycle(6000, 600);
   return (
@@ -1333,7 +1127,7 @@ function AgentChat() {
           <div className="tg-msg tg-in" style={{ animationDelay: "2.4s" }}>
             <div className="tg-thread">
               <div className="tg-thread-top">
-                <img src={bbIcon} alt="" className="tg-thread-mark" />
+                <span aria-hidden="true" className="bb-mark tg-thread-mark" />
                 <span className="tg-thread-eyebrow">Worker thread</span>
                 <span className="tg-stat" aria-hidden>
                   <span
@@ -1369,362 +1163,10 @@ function AgentChat() {
   );
 }
 
-/* ── Band visual: bb builds itself a plugin ───────────────────────── */
-
-type CustomizeMessage = {
-  role: "user" | "agent" | "tool";
-  text: string;
-};
-
-type CustomizeTask = {
-  key: string;
-  title: string;
-  status: "in_progress" | "todo" | "backlog";
-  priority: "urgent" | "high" | "medium" | "low";
-};
-
-type CustomizeScenario = {
-  title: string;
-  prompt: string;
-  promptWidth: string;
-  branch: string;
-  messages: CustomizeMessage[];
-  /** The panel the agent just built, revealed once the thread lands. */
-  panel: {
-    name: string;
-    tasks: CustomizeTask[];
-  };
-};
-
-const CUSTOMIZE_SCENARIO: CustomizeScenario = {
-  title: "Build a tasks plugin",
-  prompt: "Add a task management system",
-  // Measured width of the prompt at the composer's 13.5px Inter, plus a few px
-  // of slack for the metric-adjusted fallback face. Too small clips the tail.
-  promptWidth: "210px",
-  branch: "bb/tasks-plugin",
-  messages: [
-    { role: "user", text: "Add a task management system" },
-    {
-      role: "agent",
-      text: "I'll build it as a bb plugin and mount it in your sidebar.",
-    },
-    { role: "tool", text: "wrote plugin: tasks" },
-    { role: "tool", text: "registered panel + bb tasks CLI" },
-    { role: "agent", text: "Done. Tasks is live, and your agents can use it." },
-  ],
-  panel: {
-    name: "Tasks",
-    tasks: [
-      {
-        key: "BB-1",
-        title: "Ship task delegation",
-        status: "in_progress",
-        priority: "high",
-      },
-      {
-        key: "BB-2",
-        title: "Wire up the tasks CLI",
-        status: "todo",
-        priority: "medium",
-      },
-      {
-        key: "BB-3",
-        title: "Add label filters",
-        status: "todo",
-        priority: "low",
-      },
-      {
-        key: "BB-4",
-        title: "Nightly changelog draft",
-        status: "in_progress",
-        priority: "medium",
-      },
-      {
-        key: "BB-5",
-        title: "Triage flaky integration tests",
-        status: "backlog",
-        priority: "high",
-      },
-      {
-        key: "BB-6",
-        title: "Port the settings panel",
-        status: "backlog",
-        priority: "low",
-      },
-      {
-        key: "BB-7",
-        title: "Document the plugin API",
-        status: "backlog",
-        priority: "medium",
-      },
-    ],
-  },
-};
-
-// A phone-sized bb thread preview: the prompt types into the composer, sends,
-// the build transcript streams into the feed, and the panel the agent just
-// wrote slides up over the thread — bb extending itself, on screen.
-function CustomizeBuild() {
-  const { cycle, leaving } = useCycle(10600, 500);
-  const run = CUSTOMIZE_SCENARIO;
-  const promptStyle = {
-    "--customize-prompt-width": run.promptWidth,
-  } as CSSProperties;
-  return (
-    <div className="mockup-wrap mockup-wrap-customize">
-      <div
-        className="mock mock-customize-mobile"
-        aria-label="Mobile bb preview: a prompt asks for a task management system, and the agent builds it as a plugin"
-      >
-        <div className="mock-bar">
-          <div className="bar-left">
-            <span className="bar-menu" aria-hidden>
-              <PanelIcon className="ri bar-ic" />
-            </span>
-          </div>
-          <div className="bar-main">
-            <span className="bar-title">{run.title}</span>
-          </div>
-        </div>
-
-        <div
-          className={
-            leaving
-              ? "mock-body customize-body leaving"
-              : "mock-body customize-body"
-          }
-          key={cycle}
-        >
-          <div className="main">
-            <div className="feed feed-live customize-feed">
-              {run.messages.map((message, i) => {
-                const style = { animationDelay: `${3.2 + i * 0.68}s` };
-                if (message.role === "user") {
-                  return (
-                    <div
-                      className="msg-user customize-msg"
-                      key={`${message.role}-${message.text}`}
-                      style={style}
-                    >
-                      {message.text}
-                    </div>
-                  );
-                }
-                if (message.role === "tool") {
-                  return (
-                    <div
-                      className="msg-step customize-msg customize-tool"
-                      key={`${message.role}-${message.text}`}
-                      style={style}
-                    >
-                      <ChevronRight className="step-chev" />
-                      {message.text}
-                    </div>
-                  );
-                }
-                return (
-                  <div
-                    className="msg-say customize-msg"
-                    key={`${message.role}-${message.text}`}
-                    style={style}
-                  >
-                    {message.text}
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="composer customize-composer">
-              <div className="composer-box customize-composer-box">
-                <div className="composer-top">
-                  <span className="composer-input customize-typeahead">
-                    <span className="customize-type-text" style={promptStyle}>
-                      {run.prompt}
-                    </span>
-                    <span className="customize-caret" aria-hidden />
-                  </span>
-                  <Maximize2 className="cb-expand" />
-                </div>
-                <div className="composer-row">
-                  <span className="model">
-                    <OpenAiIcon className="model-ic" />
-                    Codex
-                    <ChevronDown className="chev-sm" />
-                  </span>
-                  <span className="composer-actions" aria-hidden>
-                    <Paperclip className="composer-clip" />
-                    <span className="send-btn customize-send">
-                      <SendIcon className="send-ic" />
-                    </span>
-                  </span>
-                </div>
-              </div>
-              <div className="context-row customize-context">
-                <span className="ctx">
-                  <GitBranchIcon className="ctx-ic" />
-                  <span className="ctx-branch">{run.branch}</span>
-                </span>
-                <Spinner className="ctx-spin" />
-              </div>
-            </div>
-          </div>
-
-          {/* The panel the agent just wrote, sliding up over the thread it was
-              built in. Purely decorative — the transcript above already states
-              the outcome for assistive tech. */}
-          <div className="plugin-panel" aria-hidden>
-            <div className="plugin-panel-bar">
-              <span className="plugin-panel-name">{run.panel.name}</span>
-              <span className="plugin-panel-badge">Plugin</span>
-            </div>
-            <div className="plugin-panel-rows">
-              {run.panel.tasks.map((task, i) => (
-                <div
-                  className="plugin-task"
-                  key={task.key}
-                  style={{ animationDelay: `${8.3 + i * 0.14}s` }}
-                >
-                  <span
-                    className={`plugin-task-status is-${task.status}`}
-                    aria-hidden
-                  />
-                  <span className="plugin-task-key">{task.key}</span>
-                  <span className="plugin-task-title">{task.title}</span>
-                  <span className={`plugin-task-prio is-${task.priority}`}>
-                    {task.priority}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Band visual: one agent spawns and manages a thread per provider ── */
-
-// A bb sidebar mock: a parent Claude thread with three worker threads nested
-// beneath it on a connector rail, one per provider. Each worker's status flips
-// running → done; the parent manages until they all land, then ships. Mirrors
-// the run-receipt pill and reveal timing — the list replays each cycle.
-function SpawnRow({
-  icon,
-  name,
-  task,
-  status,
-  at,
-  doneAt,
-  parent,
-}: {
-  icon: ReactNode;
-  name: string;
-  task: string;
-  status: string;
-  at: number;
-  doneAt: number;
-  parent?: boolean;
-}) {
-  return (
-    <div
-      className={parent ? "sb-thread sb-parent" : "sb-thread"}
-      style={{ animationDelay: `${at}s` }}
-    >
-      <span className="sb-prov" aria-hidden>
-        {icon}
-      </span>
-      <span className="sb-body">
-        <span className="sb-name">{name}</span>
-        <span className="sb-task">{task}</span>
-      </span>
-      <span className="sb-stat" aria-hidden>
-        <span className="sb-run" style={{ animationDelay: `${doneAt}s` }}>
-          <span className="sb-dot" />
-          {status}
-        </span>
-        <span className="sb-done" style={{ animationDelay: `${doneAt}s` }}>
-          <CheckIcon className="sb-check" />
-          done
-        </span>
-      </span>
-    </div>
-  );
-}
-
-function SpawnSidebar() {
-  const { cycle, leaving } = useCycle(5600, 500);
-  return (
-    <div
-      className="spawnbar"
-      aria-label="bb spawns and manages a worker thread for each provider"
-    >
-      <div className="sb-head">
-        <img src={bbIcon} alt="" className="sb-mark" />
-        <span className="sb-title">Threads</span>
-        <span className="sb-active">5 active</span>
-      </div>
-      <div className={leaving ? "sb-list leaving" : "sb-list"} key={cycle}>
-        <SpawnRow
-          parent
-          icon={<ClaudeIcon className="sb-ic" />}
-          name="Claude Code"
-          task="Ship the release"
-          status="managing"
-          at={0.1}
-          doneAt={4}
-        />
-        <div className="sb-kids">
-          <SpawnRow
-            icon={<OpenAiIcon className="sb-ic" />}
-            name="Codex"
-            task="Port module to TS"
-            status="running"
-            at={0.6}
-            doneAt={2.3}
-          />
-          <SpawnRow
-            icon={<CursorIcon className="sb-ic" />}
-            name="Cursor"
-            task="Refactor the auth flow"
-            status="running"
-            at={1}
-            doneAt={3}
-          />
-          <SpawnRow
-            icon={<PiIcon className="sb-ic" />}
-            name="Pi"
-            task="Write release notes"
-            status="running"
-            at={1.4}
-            doneAt={3.7}
-          />
-          <SpawnRow
-            icon={<OpencodeIcon className="sb-ic" />}
-            name="OpenCode"
-            task="Add integration tests"
-            status="running"
-            at={1.8}
-            doneAt={3.4}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Page ─────────────────────────────────────────────────────────── */
-
 function LandingPage() {
   const [companyProofPaused, setCompanyProofPaused] = useState(false);
   const [companyProofInView, setCompanyProofInView] = useState(false);
-  // Start with enough copies to cover a 5K display before hydration: one
-  // copy is ~1300px, and coverage needs (copies - 1) * copyWidth >= viewport.
-  // The measurement below trims the count once JavaScript runs.
-  const [companyProofCopies, setCompanyProofCopies] = useState(5);
   const companyProofRef = useRef<HTMLElement>(null);
-  const companyProofMarqueeRef = useRef<HTMLDivElement>(null);
   useScrollReveal();
   useConstructMock();
   useFitMock();
@@ -1740,43 +1182,16 @@ function LandingPage() {
     return () => observer.disconnect();
   }, []);
 
-  // The track scrolls left by one logo-list copy per animation cycle, so the
-  // copies after the first must cover the full marquee width or the viewport
-  // runs out of content near the end of each cycle on wide screens.
-  useEffect(() => {
-    const marquee = companyProofMarqueeRef.current;
-    const firstCopy = marquee?.querySelector(".company-proof-logos");
-    if (!marquee || !firstCopy) return;
-
-    const measure = () => {
-      const copyWidth = firstCopy.getBoundingClientRect().width;
-      if (copyWidth === 0) return;
-      setCompanyProofCopies(
-        Math.max(2, Math.ceil(marquee.clientWidth / copyWidth) + 1),
-      );
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(marquee);
-    observer.observe(firstCopy);
-    return () => observer.disconnect();
-  }, []);
   return (
     <div className="wrap">
       <SiteNav />
 
       <header className="hero">
-        {PRODUCT_HUNT_LAUNCH_ACTIVE ? (
-          <ProductHuntCallout placement="hero" />
-        ) : (
-          <a className="updates-callout" href={LATEST_RELEASE_URL}>
-            <span className="updates-label">New</span>
-            <span className="updates-title">
-              {LATEST_RELEASE_META.headline}
-            </span>
-            <ChevronRight className="updates-arrow" />
-          </a>
-        )}
+        <a className="updates-callout" href={LATEST_RELEASE_URL}>
+          <span className="updates-label">New</span>
+          <span className="updates-title">{LATEST_RELEASE_META.headline}</span>
+          <ChevronRight className="updates-arrow" />
+        </a>
         <h1>The IDE that builds itself</h1>
         <p className="sub">
           bb can control, customize, and automate itself, laying the groundwork
@@ -1816,27 +1231,23 @@ function LandingPage() {
             />
           </button>
         </div>
-        <div className="company-proof-marquee" ref={companyProofMarqueeRef}>
-          <div
-            className="company-proof-track"
-            style={
-              { "--company-proof-copies": companyProofCopies } as CSSProperties
-            }
-          >
-            <CompanyProofLogos />
-            {Array.from({ length: companyProofCopies - 1 }, (_, i) => (
-              <CompanyProofLogos key={i} duplicate />
-            ))}
-          </div>
+        <div className="company-proof-rows">
+          {COMPANY_PROOF_ROWS.map((companies, index) => (
+            <CompanyProofMarquee
+              key={index}
+              companies={companies}
+              reverse={index === 1}
+            />
+          ))}
         </div>
       </section>
 
       <Band title="Fully customizable." flip visual={<CustomizeBuild />}>
         <p>
-          Almost anything in bb can be changed in a single prompt. Ask for a
-          task tracker and one appears: a panel in your sidebar, a{" "}
-          <code>bb tasks</code> command, and a skill that teaches every agent to
-          use it.
+          Almost anything in bb can be changed in a single prompt. Ask for your
+          Linear issues and they appear: a panel in your sidebar, a{" "}
+          <code>bb linear</code> command, and a skill that teaches every agent
+          to use it.
         </p>
         <p>
           Many of bb&rsquo;s own features are built with the same tools you
@@ -1900,11 +1311,12 @@ function LandingPage() {
         </div>
       </section>
 
-      <section className="subscribe" data-reveal>
-        <h2 className="subscribe-title">Stay in the loop.</h2>
-        <p>Product updates and what we&rsquo;re building next. No spam.</p>
-        <EmailSignup placement="footer" />
-      </section>
+      <SubscribeSection
+        reveal
+        blurb={
+          <>Product updates and what we&rsquo;re building next. No spam.</>
+        }
+      />
 
       <SiteFooter />
     </div>

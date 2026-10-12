@@ -1,11 +1,18 @@
-import { toPositiveNumber } from "@bb/domain";
+import {
+  toPositiveNumber,
+  type ContextSnapshot,
+  type ThreadUsageCost,
+} from "@bb/domain";
 import type { ThreadContextWindowUsage } from "@bb/server-contract";
 import type { ThreadEventWithMeta } from "./build-event-projection.js";
 
 interface ThreadContextWindowSignal {
+  providerThreadId: string | null;
+  snapshot: ContextSnapshot | undefined;
   estimated: boolean;
   modelContextWindow: number | null;
   usedTokens: number | null;
+  cost: ThreadUsageCost | undefined;
 }
 
 function toNonNegativeNumber(value: number): number | null {
@@ -24,6 +31,8 @@ function decodeContextWindowSignal(
   }
   const { contextWindowUsage } = event;
   return {
+    providerThreadId: event.providerThreadId,
+    snapshot: contextWindowUsage.snapshot,
     usedTokens:
       contextWindowUsage.usedTokens === null
         ? null
@@ -33,6 +42,7 @@ function decodeContextWindowSignal(
         ? null
         : (toPositiveNumber(contextWindowUsage.modelContextWindow) ?? null),
     estimated: contextWindowUsage.estimated,
+    cost: contextWindowUsage.cost,
   };
 }
 
@@ -50,17 +60,48 @@ function getOrderedContextWindowEvents(
 export function extractThreadContextWindowUsage(
   events: readonly ThreadEventWithMeta[],
 ): ThreadContextWindowUsage | null {
+  let snapshot: ContextSnapshot | undefined;
   let estimated: boolean | undefined;
   let modelContextWindow: number | undefined;
   let usedTokens: number | undefined;
   let usageIsUnknown = false;
+  let retainedWindow: number | undefined;
+  let windowResolved = false;
+  let providerThreadId: string | null | undefined;
+  let cost: ThreadUsageCost | undefined;
   const orderedEvents = getOrderedContextWindowEvents(events);
 
   for (let index = orderedEvents.length - 1; index >= 0; index -= 1) {
     const signal = decodeContextWindowSignal(orderedEvents[index]);
     if (!signal) continue;
 
+    if (providerThreadId === undefined) {
+      providerThreadId = signal.providerThreadId;
+    }
+    if (
+      cost === undefined &&
+      signal.cost !== undefined &&
+      signal.providerThreadId === providerThreadId
+    ) {
+      cost = signal.cost;
+    }
+    if (!windowResolved) {
+      if (
+        signal.providerThreadId !== providerThreadId ||
+        signal.usedTokens === null ||
+        !signal.estimated
+      ) {
+        windowResolved = true;
+      } else if (signal.snapshot) {
+        if (signal.snapshot.autoCompactAtTokens !== null) {
+          retainedWindow = signal.snapshot.contextWindowTokens;
+        }
+        windowResolved = true;
+      }
+    }
+
     if (usedTokens === undefined && !usageIsUnknown) {
+      snapshot = signal.snapshot;
       if (signal.usedTokens === null) {
         usageIsUnknown = true;
         estimated = signal.estimated;
@@ -79,7 +120,8 @@ export function extractThreadContextWindowUsage(
 
     if (
       (usedTokens !== undefined || usageIsUnknown) &&
-      modelContextWindow !== undefined
+      modelContextWindow !== undefined &&
+      windowResolved
     ) {
       break;
     }
@@ -89,9 +131,17 @@ export function extractThreadContextWindowUsage(
     return null;
   }
 
+  modelContextWindow = retainedWindow ?? modelContextWindow;
+
   return {
+    ...(snapshot &&
+    snapshot.usedTokens === usedTokens &&
+    snapshot.contextWindowTokens === modelContextWindow
+      ? { snapshot }
+      : {}),
     estimated: estimated ?? false,
     modelContextWindow,
     usedTokens,
+    ...(cost === undefined ? {} : { cost }),
   };
 }

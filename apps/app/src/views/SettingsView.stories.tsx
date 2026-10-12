@@ -1,33 +1,57 @@
-import { useState, type ReactNode } from "react";
+import { MobileAppSection } from "@/components/settings/MobileAppSection";
+import { CliSkillsSettingsSectionContent } from "@/components/settings/CliSkillsSettingsSection";
+import { useEffect, useRef, useState } from "react";
+import { Route, Routes, useNavigate } from "react-router-dom";
 import {
   defaultAppTheme,
   defaultExperiments,
   type AppTheme,
   type Experiments,
-  type Host,
+  defaultAppSettings,
+  type AppSettings,
 } from "@bb/domain";
 import type {
-  ProviderUsage,
   WorkspaceOpenTarget,
   WorkspaceOpenTargetId,
 } from "@bb/host-daemon-contract";
-import { UsageLimitsSettingsSectionContent } from "@/components/settings/UsageLimitsSettingsSection";
 import { VoiceInputSettingsSectionContent } from "@/components/settings/VoiceInputSettingsSection";
-import { PageShell } from "@/components/ui/page-shell";
+import { ArchivedThreadsSettingsSection } from "@/components/settings/ArchivedThreadsSettingsSection";
+import { CommunitySettingsSection } from "@/components/settings/CommunitySettingsSection";
+import { KeyboardSettingsSection } from "@/components/settings/KeyboardSettingsSection";
+import { MarketplacesSettingsSection } from "@/components/settings/MarketplacesSettingsSection";
+import { MachineEnvironmentSettings } from "@/components/settings/MachineEnvironmentSettings";
+import { MachinesSettingsSection } from "@/components/settings/MachinesSettingsSection";
+import { ProjectsSettingsSection } from "@/components/settings/ProjectsSettingsSection";
+import {
+  SettingsStoryChrome,
+  type SettingsStoryRoute,
+  useSettingsStoryRoute,
+} from "../../.ladle/story-settings-chrome";
+import {
+  SettingsStoryFixtures,
+  SettingsUpdatesStory,
+} from "../../.ladle/settings-story-fixtures";
 import type { ThemePreference } from "@/hooks/useTheme";
 import type { AudioInputDeviceOption } from "@/hooks/useAudioInputDevices";
-import type { PreferredAudioInputDeviceId } from "@/lib/audio-input-device-preference";
+import { useAudioInputDevicePreferenceValue } from "@/lib/audio-input-device-preference";
+import {
+  SETTINGS_MACHINE_ROUTE_PATH,
+  SETTINGS_PROJECT_ROUTE_PATH,
+} from "@/lib/route-paths";
 import {
   AppearanceSettingsSection,
-  DebugSettingsSection,
+  PrivacySettingsSection,
   ExperimentsSettingsSection,
   GeneralSettingsSection,
   LocalOpenTargetSettingsSection,
   type LocalOpenTargetSettingsSectionProps,
 } from "./SettingsView";
+import { MachineSettingsView } from "./MachineSettingsView";
+import { ProjectDetailSettingsView } from "./ProjectDetailSettingsView";
+import { ProvidersSettingsSection } from "@/components/settings/ProvidersSettingsSection";
 
 export default {
-  title: "settings/Settings Page",
+  title: "settings/Settings",
 };
 
 type StoredTargetId = LocalOpenTargetSettingsSectionProps["directoryTargetId"];
@@ -84,94 +108,6 @@ const connectedTargets: WorkspaceOpenTarget[] = [
   defaultAppTarget,
 ];
 
-function futureIso(minutesFromNow: number): string {
-  return new Date(Date.now() + minutesFromNow * 60_000).toISOString();
-}
-
-const usageFixture: {
-  codex: ProviderUsage;
-  claudeCode: ProviderUsage;
-  cursor: ProviderUsage;
-} = {
-  codex: {
-    status: "ok",
-    accountEmail: "sawyer@example.com",
-    planLabel: "Pro",
-    windows: [
-      {
-        label: "Current session",
-        resetsAt: futureIso(136),
-        usedPercent: 35,
-      },
-      {
-        label: "Weekly limit",
-        resetsAt: futureIso(48),
-        usedPercent: 74,
-      },
-    ],
-  },
-  claudeCode: {
-    status: "ok",
-    accountEmail: "sawyer@example.com",
-    planLabel: "Max (20x)",
-    windows: [
-      {
-        label: "Current session",
-        resetsAt: futureIso(179),
-        usedPercent: 3,
-      },
-      {
-        label: "Weekly limit",
-        resetsAt: futureIso(4 * 24 * 60),
-        usedPercent: 26,
-      },
-    ],
-  },
-  cursor: {
-    status: "ok",
-    accountEmail: "sawyer@example.com",
-    planLabel: "Pro",
-    windows: [
-      {
-        label: "Plan usage",
-        resetsAt: futureIso(14 * 24 * 60),
-        usedPercent: 72,
-      },
-      {
-        label: "On-demand spend",
-        resetsAt: futureIso(14 * 24 * 60),
-        usedPercent: 25,
-        cost: { usedUsdCents: 1_250, limitUsdCents: 5_000 },
-      },
-    ],
-  },
-};
-
-const usageHosts: Host[] = [
-  {
-    id: "host-macbook",
-    name: "MacBook Pro",
-    type: "persistent",
-    status: "connected",
-    lastSeenAt: Date.now(),
-    maxPermissionMode: "full",
-    lastRejectedProtocolVersion: null,
-    createdAt: 1,
-    updatedAt: 1,
-  },
-  {
-    id: "host-studio",
-    name: "Mac Studio",
-    type: "persistent",
-    status: "connected",
-    lastSeenAt: Date.now(),
-    maxPermissionMode: "full",
-    lastRejectedProtocolVersion: null,
-    createdAt: 1,
-    updatedAt: 1,
-  },
-];
-
 function useSettingsStoryState() {
   const [themePreference, setThemePreference] =
     useState<ThemePreference>("system");
@@ -183,14 +119,18 @@ function useSettingsStoryState() {
     useState(false);
   const [openLinksInAppBrowser, setOpenLinksInAppBrowser] = useState(false);
   const [rewriteLocalhostLinks, setRewriteLocalhostLinks] = useState(true);
-  const [richTextEditing, setRichTextEditing] = useState(false);
   const [steerActiveThreadOnEnter, setSteerActiveThreadOnEnter] =
     useState(false);
-  const [caffeinate, setCaffeinate] = useState(false);
-  const [showUnhandledProviderEvents, setShowUnhandledProviderEvents] =
+  const [confirmThreadArchive, setConfirmThreadArchive] = useState(true);
+  const [keepHistoryAfterContextClear, setKeepHistoryAfterContextClear] =
     useState(false);
-  const [preferredAudioInputDeviceId, setPreferredAudioInputDeviceId] =
-    useState<PreferredAudioInputDeviceId>("studio-mic");
+  const [showGitChanges, setShowGitChanges] = useState(true);
+  const [streamerMode, setStreamerMode] = useState(false);
+  const [telemetryEnabled, setTelemetryEnabled] = useState(true);
+  const [managedBranchPrefix, setManagedBranchPrefix] = useState(
+    defaultAppSettings.managedBranchPrefix,
+  );
+  const [showDiagnosticEvents, setShowDiagnosticEvents] = useState(false);
   const [directoryTargetId, setDirectoryTargetId] =
     useState<StoredTargetId>("finder");
   const [fileTargetId, setFileTargetId] =
@@ -200,36 +140,42 @@ function useSettingsStoryState() {
 
   return {
     appearance,
-    caffeinate,
     directoryTargetId,
     experiments,
     fileTargetId,
+    managedBranchPrefix,
     navigateToThreadAfterCreate,
     openLinksInAppBrowser,
-    preferredAudioInputDeviceId,
     rewriteLocalhostLinks,
-    richTextEditing,
     steerActiveThreadOnEnter,
-    showUnhandledProviderEvents,
+    showGitChanges,
+    setShowGitChanges,
+    confirmThreadArchive,
+    setConfirmThreadArchive,
+    keepHistoryAfterContextClear,
+    setKeepHistoryAfterContextClear,
+    streamerMode,
+    telemetryEnabled,
+    setTelemetryEnabled,
+    showDiagnosticEvents,
     setAppearance,
-    setCaffeinate,
     setDirectoryTargetId,
     setExperiments,
     setFileTargetId,
+    setManagedBranchPrefix,
     setNavigateToThreadAfterCreate,
     setOpenLinksInAppBrowser,
-    setPreferredAudioInputDeviceId,
     setRewriteLocalhostLinks,
-    setRichTextEditing,
     setSteerActiveThreadOnEnter,
-    setShowUnhandledProviderEvents,
+    setStreamerMode,
+    setShowDiagnosticEvents,
     setThemePreference,
     themePreference,
   };
 }
 
 function VoiceInputStory() {
-  const state = useSettingsStoryState();
+  const preferredDeviceId = useAudioInputDevicePreferenceValue();
 
   return (
     <VoiceInputSettingsSectionContent
@@ -237,18 +183,15 @@ function VoiceInputStory() {
       errorMessage={null}
       isLoading={false}
       isSupported={true}
-      onDeviceChange={state.setPreferredAudioInputDeviceId}
       onRefresh={() => undefined}
-      preferredDeviceId={state.preferredAudioInputDeviceId}
+      preferredDeviceId={preferredDeviceId}
     />
   );
 }
 
 function GeneralSettingsStory({
-  caffeinateAvailable = false,
   desktopBrowserAvailable = false,
 }: {
-  caffeinateAvailable?: boolean;
   desktopBrowserAvailable?: boolean;
 }) {
   const state = useSettingsStoryState();
@@ -256,31 +199,45 @@ function GeneralSettingsStory({
   return (
     <>
       <GeneralSettingsSection
-        caffeinateAvailable={caffeinateAvailable}
-        caffeinateDisabled={false}
-        caffeinateEnabled={state.caffeinate}
+        showGitChanges={state.showGitChanges}
+        onShowGitChangesChange={state.setShowGitChanges}
+        confirmThreadArchive={state.confirmThreadArchive}
+        onConfirmThreadArchiveChange={state.setConfirmThreadArchive}
+        keepHistoryAfterContextClear={state.keepHistoryAfterContextClear}
+        onKeepHistoryAfterContextClearChange={
+          state.setKeepHistoryAfterContextClear
+        }
         desktopBrowserAvailable={desktopBrowserAvailable}
+        generalSettingsDisabled={false}
+        managedBranchPrefix={state.managedBranchPrefix}
+        onManagedBranchPrefixChange={state.setManagedBranchPrefix}
         navigateToThreadAfterCreate={state.navigateToThreadAfterCreate}
-        onCaffeinateChange={state.setCaffeinate}
         onNavigateToThreadAfterCreateChange={
           state.setNavigateToThreadAfterCreate
         }
         onOpenLinksInAppBrowserChange={state.setOpenLinksInAppBrowser}
-        onReplayOnboarding={() => {}}
+        onReplaySetupGuide={() => {}}
         onRewriteLocalhostLinksChange={state.setRewriteLocalhostLinks}
-        onRichTextEditingChange={state.setRichTextEditing}
         onSteerActiveThreadOnEnterChange={state.setSteerActiveThreadOnEnter}
         openLinksInAppBrowser={state.openLinksInAppBrowser}
         rewriteLocalhostLinks={state.rewriteLocalhostLinks}
-        richTextEditing={state.richTextEditing}
-        replayOnboardingAvailable={state.experiments.newOnboarding}
         steerActiveThreadOnEnter={state.steerActiveThreadOnEnter}
-        steerActiveThreadOnEnterDisabled={false}
       />
-      <DebugSettingsSection
+      <CliSkillsSettingsSectionContent
+        hasConnectedMachine={false}
+        onOpenPicker={() => {}}
+        pending={false}
+        statusBadge={null}
+      />
+      <VoiceInputStory />
+      <PrivacySettingsSection
+        onStreamerModeChange={state.setStreamerMode}
+        telemetryEnabled={state.telemetryEnabled}
+        onTelemetryEnabledChange={state.setTelemetryEnabled}
+        streamerMode={state.streamerMode}
         disabled={false}
-        enabled={state.showUnhandledProviderEvents}
-        onEnabledChange={state.setShowUnhandledProviderEvents}
+        enabled={state.showDiagnosticEvents}
+        onEnabledChange={state.setShowDiagnosticEvents}
       />
     </>
   );
@@ -299,6 +256,8 @@ function AppearanceSettingsStory() {
       onAppearanceThemeChange={(themeId) =>
         state.setAppearance((current) => ({ ...current, themeId }))
       }
+      onAppearanceThemePrefetch={() => undefined}
+      onAppearanceThemePreview={() => undefined}
       onCreatePalette={() => undefined}
       onFaviconColorChange={(faviconColor) =>
         state.setAppearance((current) => ({ ...current, faviconColor }))
@@ -322,11 +281,13 @@ function FilePreferencesStory() {
 
   return (
     <LocalOpenTargetSettingsSection
+      accessState="available"
       directoryTargetId={state.directoryTargetId}
       fileTargetId={state.fileTargetId}
       hasDaemon={true}
       onDirectoryTargetChange={handleDirectoryTargetChange}
       onFileTargetChange={handleFileTargetChange}
+      onRequestAccess={async () => true}
       targets={connectedTargets}
     />
   );
@@ -337,121 +298,108 @@ function ExperimentsStory() {
 
   return (
     <ExperimentsSettingsSection
-      claudeCodeMockCliTrafficEnabled={
-        state.experiments.claudeCodeMockCliTraffic
-      }
       disabled={false}
-      editMessagesEnabled={state.experiments.editMessages}
-      newOnboardingEnabled={state.experiments.newOnboarding}
-      onClaudeCodeMockCliTrafficEnabledChange={(enabled) =>
-        state.setExperiments((current) => ({
-          ...current,
-          claudeCodeMockCliTraffic: enabled,
-        }))
-      }
-      onEditMessagesEnabledChange={(enabled) =>
-        state.setExperiments((current) => ({
-          ...current,
-          editMessages: enabled,
-        }))
-      }
-      onNewOnboardingEnabledChange={(enabled) =>
-        state.setExperiments((current) => ({
-          ...current,
-          newOnboarding: enabled,
-        }))
+      experiments={state.experiments}
+      performanceDiagnosticsAvailable={true}
+      onExperimentChange={(key, enabled) =>
+        state.setExperiments((current) => ({ ...current, [key]: enabled }))
       }
     />
   );
 }
 
-function UsageLimitsStory() {
-  const [isFetching, setIsFetching] = useState(false);
-  const [selectedHostId, setSelectedHostId] = useState("host-macbook");
-
+function ProvidersSettingsStory() {
+  const [generalSettings, setGeneralSettings] =
+    useState<AppSettings>(defaultAppSettings);
   return (
-    <UsageLimitsSettingsSectionContent
-      usage={usageFixture}
-      isLoading={false}
-      isError={false}
-      isFetching={isFetching}
-      onRefresh={() => {
-        setIsFetching(true);
-        window.setTimeout(() => setIsFetching(false), 500);
-      }}
-      hosts={usageHosts}
-      selectedHostId={selectedHostId}
-      onSelectHost={setSelectedHostId}
+    <ProvidersSettingsSection
+      disabled={false}
+      generalSettings={generalSettings}
+      onGeneralSettingsChange={(patch) =>
+        setGeneralSettings((current) => ({ ...current, ...patch }))
+      }
     />
   );
 }
 
-function SettingsStoryFrame({
-  children,
-  useShell = false,
-}: {
-  children: ReactNode;
-  useShell?: boolean;
-}) {
-  if (useShell) {
+function SettingsStoryContent({ route }: { route: SettingsStoryRoute }) {
+  if (route.kind === "machine") {
     return (
-      <div className="h-[1120px] bg-background p-4 md:p-5">
-        <PageShell contentClassName="pt-4 md:pt-5">
-          <div className="mx-auto w-full max-w-3xl space-y-6">{children}</div>
-        </PageShell>
-      </div>
+      <Routes>
+        <Route
+          path={SETTINGS_MACHINE_ROUTE_PATH}
+          element={<MachineSettingsView />}
+        />
+      </Routes>
+    );
+  }
+  if (route.kind === "project") {
+    return (
+      <Routes>
+        <Route
+          path={SETTINGS_PROJECT_ROUTE_PATH}
+          element={<ProjectDetailSettingsView />}
+        />
+      </Routes>
     );
   }
 
-  return (
-    <div className="bg-background p-4 md:p-6">
-      <div className="mx-auto w-full max-w-3xl space-y-6">{children}</div>
-    </div>
-  );
+  switch (route.id) {
+    case "providers":
+      return <ProvidersSettingsStory />;
+    case "appearance":
+      return <AppearanceSettingsStory />;
+    case "keyboard":
+      return <KeyboardSettingsSection />;
+    case "files":
+      return <FilePreferencesStory />;
+    case "projects":
+      return <ProjectsSettingsSection />;
+    case "machines":
+      return <MachinesSettingsSection />;
+    case "environment-variables":
+      return <MachineEnvironmentSettings />;
+    case "updates":
+      return <SettingsUpdatesStory />;
+    case "mobile":
+      return <MobileAppSection />;
+    case "experiments":
+      return <ExperimentsStory />;
+    case "marketplaces":
+      return <MarketplacesSettingsSection />;
+    case "community":
+      return <CommunitySettingsSection />;
+    case "archived":
+      return <ArchivedThreadsSettingsSection />;
+    case "general":
+      return (
+        <>
+          <GeneralSettingsStory desktopBrowserAvailable />
+        </>
+      );
+  }
 }
 
-export function Overview() {
-  return (
-    <SettingsStoryFrame useShell>
-      <GeneralSettingsStory />
-      <AppearanceSettingsStory />
-      <UsageLimitsStory />
-      <VoiceInputStory />
-      <FilePreferencesStory />
-      <ExperimentsStory />
-    </SettingsStoryFrame>
-  );
-}
+export function FullPage() {
+  const navigate = useNavigate();
+  const route = useSettingsStoryRoute();
+  const initializedFromStoryPath = useRef(false);
+  useEffect(() => {
+    if (initializedFromStoryPath.current) return;
+    initializedFromStoryPath.current = true;
+    const storyPath =
+      new URLSearchParams(window.location.hash.slice(1)).get("settingsPath") ??
+      new URLSearchParams(window.location.search).get("settingsPath");
+    if (storyPath?.startsWith("/settings") === true) {
+      navigate(storyPath, { replace: true });
+    }
+  }, [navigate]);
 
-export function General() {
   return (
-    <SettingsStoryFrame>
-      <GeneralSettingsStory caffeinateAvailable desktopBrowserAvailable />
-      <VoiceInputStory />
-    </SettingsStoryFrame>
-  );
-}
-
-export function Appearance() {
-  return (
-    <SettingsStoryFrame>
-      <AppearanceSettingsStory />
-    </SettingsStoryFrame>
-  );
-}
-
-export function Files() {
-  return (
-    <SettingsStoryFrame>
-      <FilePreferencesStory />
-    </SettingsStoryFrame>
-  );
-}
-
-export function Experiments() {
-  return (
-    <SettingsStoryFrame>
-      <ExperimentsStory />
-    </SettingsStoryFrame>
+    <SettingsStoryFixtures>
+      <SettingsStoryChrome contentOwnsPageShell={route.kind !== "section"}>
+        <SettingsStoryContent route={route} />
+      </SettingsStoryChrome>
+    </SettingsStoryFixtures>
   );
 }

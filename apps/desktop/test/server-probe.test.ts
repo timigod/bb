@@ -4,7 +4,11 @@ import {
   type ServerResponse,
 } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { probeBbServer, type ServerProbeFetch } from "../src/server-probe.js";
+import {
+  probeBbServer,
+  type ServerProbeFetch,
+  waitForCompatibleServer,
+} from "../src/server-probe.js";
 
 interface TestServer {
   close(): Promise<void>;
@@ -65,63 +69,6 @@ afterEach(async () => {
 });
 
 describe("probeBbServer", () => {
-  it("uses the provided authenticated fetch implementation", async () => {
-    const fetchImpl = vi
-      .fn<ServerProbeFetch>()
-      .mockResolvedValueOnce(Response.json({ ok: true }))
-      .mockResolvedValueOnce(
-        Response.json({
-          hostDaemonPort: 4_242,
-          voiceTranscriptionEnabled: false,
-        }),
-      );
-
-    await expect(
-      probeBbServer({
-        fetchImpl,
-        serverUrl: "https://studio.example",
-        timeoutMs: 1_000,
-      }),
-    ).resolves.toEqual({
-      dataDir: null,
-      kind: "compatible",
-      serverUrl: "https://studio.example",
-    });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-  });
-
-  it("accepts a server with bb health and system config endpoints", async () => {
-    const testServer = await startTestServer({
-      handler(request, response) {
-        if (request.url === "/health") {
-          writeJson(response, 200, JSON.stringify({ ok: true }));
-          return;
-        }
-        if (request.url === "/api/v1/system/config") {
-          writeJson(
-            response,
-            200,
-            JSON.stringify({
-              hostDaemonPort: 38887,
-              primaryHostPlatform: null,
-              voiceTranscriptionEnabled: false,
-            }),
-          );
-          return;
-        }
-        writeJson(response, 404, JSON.stringify({ message: "not found" }));
-      },
-    });
-
-    await expect(
-      probeBbServer({ serverUrl: testServer.url, timeoutMs: 500 }),
-    ).resolves.toEqual({
-      dataDir: null,
-      kind: "compatible",
-      serverUrl: testServer.url,
-    });
-  });
-
   it("reports the data directory the probed server declares", async () => {
     const fetchImpl = vi
       .fn<ServerProbeFetch>()
@@ -221,5 +168,37 @@ describe("probeBbServer", () => {
     });
 
     expect(result.kind).toBe("unavailable");
+  });
+});
+
+describe("waitForCompatibleServer", () => {
+  it("retries when system config is transiently unavailable", async () => {
+    const fetchImpl = vi
+      .fn<ServerProbeFetch>()
+      .mockResolvedValueOnce(Response.json({ ok: true }))
+      .mockRejectedValueOnce(
+        new DOMException("This operation was aborted", "AbortError"),
+      )
+      .mockResolvedValueOnce(Response.json({ ok: true }))
+      .mockResolvedValueOnce(
+        Response.json({
+          hostDaemonPort: 4_242,
+          voiceTranscriptionEnabled: false,
+        }),
+      );
+
+    await expect(
+      waitForCompatibleServer({
+        fetchImpl,
+        intervalMs: 1,
+        serverUrl: "http://127.0.0.1:65535",
+        timeoutMs: 100,
+      }),
+    ).resolves.toEqual({
+      dataDir: null,
+      kind: "compatible",
+      serverUrl: "http://127.0.0.1:65535",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 });

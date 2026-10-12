@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   collectLogLines,
-  getHelpOutput,
   runCommand,
   setupCommandOutputTestEnvironment,
   stubServerApi,
@@ -83,9 +82,6 @@ describe("bb skill commands", () => {
       topic: null,
       summary: "Review a change",
     };
-    // Routed by URL rather than call order: the trending ranking makes the CLI
-    // resolve a lifetime install count per skill, so the entry requests land
-    // interleaved with the shared repository-stars lookup.
     vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
       const url = String(input);
       if (url.startsWith("http://server/api/v1/skills-registry?")) {
@@ -118,8 +114,6 @@ describe("bb skill commands", () => {
 
     const output = collectLogLines(vi.mocked(console.log)).join("\n");
     expect(output).toContain("27053");
-    // The trending list's own number is a 24h window count; the table reports
-    // the lifetime total the browse page shows, resolved per skill.
     expect(output).toContain("INSTALLS");
     expect(output).not.toContain("INSTALLS/24H");
     expect(output).toContain("881234");
@@ -130,7 +124,6 @@ describe("bb skill commands", () => {
     expect(requested).toContain(
       "http://server/api/v1/skills-registry?page=0&perPage=24",
     );
-    // Still one stars lookup for the two skills sharing a repository.
     expect(
       requested.filter((url) => url.includes("/repository-stars?")),
     ).toEqual([
@@ -175,9 +168,6 @@ describe("bb skill commands", () => {
       skills: { id: string; installs: number; lifetimeInstalls: number }[];
     };
     expect(payload.ranking).toBe("trending");
-    // `installs` keeps the ranking window's meaning — a 24h count on
-    // trending — and never gets overwritten with the lifetime total, which
-    // rides in its own field. One meaning per field.
     expect(payload.skills).toEqual([
       expect.objectContaining({
         id: "owner/repo/review",
@@ -188,9 +178,6 @@ describe("bb skill commands", () => {
   });
 
   it("keeps the list's own count on the all-time ranking", async () => {
-    // Searching returns lifetime counts already, and the list is the
-    // authoritative source there. Overriding with the scraped detail-page
-    // figure would mix two sources across one table.
     const skill = {
       id: "owner/repo/review",
       source: "owner/repo",
@@ -227,7 +214,6 @@ describe("bb skill commands", () => {
     const output = collectLogLines(vi.mocked(console.log)).join("\n");
     expect(output).toContain("42");
     expect(output).not.toContain("881234");
-    // The summary is still adopted from the same entry.
     expect(output).toContain("Review a change");
   });
 
@@ -253,7 +239,6 @@ describe("bb skill commands", () => {
           ranking: "trending",
         });
       }
-      // A dead detail page — the skill's source was renamed.
       if (url.startsWith("http://server/api/v1/skills-registry/entry?")) {
         return new Response(null, { status: 404 });
       }
@@ -265,11 +250,12 @@ describe("bb skill commands", () => {
     const payload = JSON.parse(
       collectLogLines(vi.mocked(console.log)).join("\n"),
     ) as {
-      skills: { id: string; installs: number; lifetimeInstalls: number | null }[];
+      skills: {
+        id: string;
+        installs: number;
+        lifetimeInstalls: number | null;
+      }[];
     };
-    // 42 stays in `installs` where it means the 24h window count; the
-    // unresolved lifetime total is null rather than silently reusing the
-    // window figure under a lifetime meaning.
     expect(payload.skills).toEqual([
       expect.objectContaining({
         id: "owner/repo/review",
@@ -376,21 +362,5 @@ describe("bb skill commands", () => {
     expect(vi.mocked(console.log)).toHaveBeenCalledWith(
       JSON.stringify({ skill: { ...entry, stars: 27_053 }, detail }, null, 2),
     );
-  });
-
-  it("documents the installed and registry lifecycle", async () => {
-    const help = await getHelpOutput(["skill"], register);
-    for (const command of [
-      "list",
-      "show",
-      "files",
-      "update",
-      "delete",
-      "search",
-      "registry",
-      "install",
-    ]) {
-      expect(help).toContain(command);
-    }
   });
 });

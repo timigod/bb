@@ -33,13 +33,19 @@ threads, reports cache and result state, and can stop an active run. It may also
 be opened directly from the thread panel action, in which case it shows that
 thread's latest run.
 
-Both surfaces are implemented by the plugin app with `@bb/shared-ui` controls
+Both surfaces are implemented by the plugin app with bb's registry components
 and BB theme tokens. Directive attributes and restored panel parameters are
 treated as untrusted input. The backend additionally binds every requested run
 to the directive message or panel thread, so a run ID from another thread
-cannot be inspected or stopped through these UI RPCs. The composer status
-surface checks once per second while mounted so newly started runs appear;
-active message cards and panels poll once per second, then stop when terminal.
+cannot be inspected or stopped through these UI RPCs. The service publishes a
+`workflow-runs` realtime signal for the origin thread when a run starts, is
+claimed, settles, or is cancelled, and whenever its phase or one of its agent
+calls changes, so the composer status surface and the message cards follow a
+run from signals instead of a standing poll. While the page is visible they
+refresh on each signal (a burst folds into one follow-up request), refresh once
+when the page or the realtime connection comes back, and keep only a 15-second
+fallback poll while a run is active. A failing refresh retries with backoff from
+2 seconds up to one minute, and everything stops when the run is terminal.
 
 The security boundary is the QuickJS context: workflow code has JSON data and
 explicit orchestration capabilities, but no Node, filesystem, shell, network,
@@ -103,7 +109,9 @@ corrective retries after their initial invalid attempt.
 
 Workflow workers use BB's generic hidden-thread visibility. They remain
 out of sidebar organization without contributing unread/pending favicon
-attention. Ordinary search, prompt history,
+attention. Retention archives them when it deletes their run, because a
+stopped worker keeps its thread row and no server cascade reaches a root
+hidden thread. Ordinary search, prompt history,
 lifecycle, and direct operations remain available. Workers are root threads,
 so no parent notification applies; a hidden thread that does have a parent
 still reports its turns and blockers to it. Workflows does not create a
@@ -127,7 +135,9 @@ Workflows declares six plugin settings:
 - `maxAgentCalls` bounds the shared parent/child call count.
 - `totalRunTimeoutMs` fails a run independently of explicit cancellation.
 - `retentionDays` controls terminal-run cleanup while preserving active runs
-  and retained resume ancestors.
+  and retained resume ancestors. The sweep archives each expired run's worker
+  threads before it deletes the run, and keeps the run for a later sweep when a
+  worker does not archive.
 - `maxNotificationBytes` bounds completion messages by UTF-8 byte length.
 
 `maxActiveRuns` is live plugin-global dispatch policy: changing it immediately
@@ -170,6 +180,11 @@ bb workflows stop <run-id>
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json
 bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json
 ```
+
+Every command accepts `--help` (printed from the declarative CLI spec, exit 0)
+and `--json`. Output is JSON either way; `--json` additionally reports failures
+as `{"ok":false,"error":{code,message,hint?}}` on stdout while stderr keeps the
+readable message.
 
 `status` is deliberately bounded: it returns run state, phase, call counts,
 notification state, and only a small final result. It omits source, arguments,
@@ -235,3 +250,37 @@ Resume requires a terminal prior run from the same project and environment
 workspace. Another origin thread may resume it only when that thread uses the
 same environment. Successful writer calls are cached just like read-only calls;
 their effects are not copied into another workspace.
+
+## Worker lifecycle and upgrades
+
+Each worker attempt has durable workflow ownership, including attempts replaced
+by provider retries. New workers also carry ownership metadata in their core
+thread record so maintenance can recover a successful creation whose response
+was lost. Workers stay hidden and reuse the origin environment without a core
+parent-thread relationship; this avoids core child routing and completion
+notifications in addition to the workflow's own notification.
+
+Maintenance stops and archives finished, replaced, cancelled, and unattached
+workers independently of workflow history retention. Cleanup retries after
+stop/archive failures and server restarts, with persisted exponential delays
+from one second up to one minute. Recovery discovery scans every 30 seconds
+(one page per second during a scan), and checks outstanding spawn attempts
+promptly. Completed notification retries do not cause extra origin polling.
+Transient origin lookups retry within the run timeout instead of failing the
+run immediately. Pending worker cleanup survives
+expiry of the run's history. Archiving or deleting an origin cancels its
+outstanding runs and retires all owned attempts; retained history remains
+available until its usual expiry. Missed origin events are reconciled from
+current thread state. A worker being spawned when cancellation occurs is
+recorded and retired when it returns or is rediscovered.
+
+Notifications to archived or deleted origins are settled as abandoned. Other
+send failures remain retryable, including unrelated HTTP 409 conflicts.
+
+The upgrade backfills workers still referenced by `workflow_calls`. Older
+replaced or unattached workers whose IDs were already lost have no ownership
+metadata and cannot be safely attributed automatically. Recovering those
+requires a separate evidence-based audit of historical records; this migration
+does not guess ownership from titles or modify those threads. Discovery and
+cleanup require a running plugin and available thread APIs; unavailable hosts
+leave durable cleanup pending.

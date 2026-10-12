@@ -2,12 +2,14 @@ import { atom, useAtom, useStore } from "jotai";
 import { atomWithStorage } from "jotai/utils";
 import { atomFamily } from "jotai-family";
 import { useCallback } from "react";
-import type { PermissionMode, ReasoningLevel, ServiceTier } from "@bb/domain";
 import {
-  createLocalStorageEnumStorage,
-  createLocalStorageSyncStorage,
-  rawStringLocalStorage,
-} from "@/lib/browser-storage";
+  sessionOptionSelectionsSchema,
+  type PermissionMode,
+  type ReasoningLevel,
+  type ServiceTier,
+  type SessionOptionSelections,
+} from "@bb/domain";
+import { createTabScopedStorage } from "@/lib/browser-storage";
 import { getProjectScopedStorageKey } from "@/lib/project-scoped-storage";
 
 const MODEL_STORAGE_KEY = "bb.promptbox.model";
@@ -15,7 +17,9 @@ const SERVICE_TIER_STORAGE_KEY = "bb.promptbox.service-tier";
 const REASONING_STORAGE_KEY = "bb.promptbox.reasoning";
 const PERMISSION_MODE_STORAGE_KEY = "bb.promptbox.permission-mode";
 const ENVIRONMENT_STORAGE_KEY = "bb.promptbox.environment";
+const MACHINE_STORAGE_KEY = "bb.promptbox.machine";
 const PROVIDER_STORAGE_KEY = "bb.promptbox.provider";
+const SESSION_OPTIONS_STORAGE_KEY = "bb.promptbox.session-options";
 const PROVIDER_SELECTION_STORAGE_VERSION = "1";
 
 export type StoredServiceTier = "" | ServiceTier;
@@ -27,55 +31,38 @@ type StoredServiceTierSetter = (value: StoredServiceTier) => void;
 type StoredReasoningLevelSetter = (value: StoredReasoningLevel) => void;
 type StoredPermissionModeSetter = (value: StoredPermissionMode) => void;
 
-export interface PersistedStringSelectionField {
+interface PersistedStringSelectionField {
   setValue: StringSelectionSetter;
   value: string;
 }
 
-export interface PersistedServiceTierSelectionField {
+interface PersistedServiceTierSelectionField {
   setValue: StoredServiceTierSetter;
   value: StoredServiceTier;
 }
 
-export interface PersistedReasoningLevelSelectionField {
+interface PersistedReasoningLevelSelectionField {
   setValue: StoredReasoningLevelSetter;
   value: StoredReasoningLevel;
 }
 
-export interface PersistedPermissionModeSelectionField {
+interface PersistedPermissionModeSelectionField {
   setValue: StoredPermissionModeSetter;
   value: StoredPermissionMode;
 }
 
-export interface PromptBoxProviderModelReasoningPreference {
+interface PromptBoxProviderModelReasoningPreference {
   providerId: string;
   model: string;
   reasoningLevel: ReasoningLevel;
 }
 
 function isReasoningLevel(value: string): value is ReasoningLevel {
-  return (
-    value === "none" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "ultracode" ||
-    value === "max" ||
-    value === "ultra"
-  );
+  return value !== "";
 }
 
 function isPermissionMode(value: string): value is PermissionMode {
   return value === "accept-edits" || value === "auto" || value === "full";
-}
-
-function isServiceTier(value: string): value is ServiceTier {
-  return value === "fast" || value === "default";
-}
-
-function isStoredServiceTier(value: string): value is StoredServiceTier {
-  return value === "" || isServiceTier(value);
 }
 
 function isStoredReasoningLevel(value: string): value is StoredReasoningLevel {
@@ -86,10 +73,18 @@ function isStoredPermissionMode(value: string): value is StoredPermissionMode {
   return value === "" || isPermissionMode(value);
 }
 
+const stringSelectionStorage = createTabScopedStorage<string>(
+  {
+    parse: (value, initialValue) => value ?? initialValue,
+    serialize: (value) => value,
+  },
+  { persistInitialValue: true },
+);
+
 const providerIdAtom = atomWithStorage<string>(
   PROVIDER_STORAGE_KEY,
   "",
-  rawStringLocalStorage,
+  stringSelectionStorage,
   { getOnInit: true },
 );
 const emptyModelAtom = atom("");
@@ -102,80 +97,106 @@ function getProviderSelectionStorageKey(
   return `${storageKey}-${encodeURIComponent(providerId.trim())}-${PROVIDER_SELECTION_STORAGE_VERSION}`;
 }
 
-function getLegacyProviderSelection(
-  providerId: string,
-  storageKey: string,
-): string | null {
-  if (typeof window === "undefined") return null;
-  if (window.localStorage.getItem(PROVIDER_STORAGE_KEY) !== providerId) {
-    return null;
-  }
-  return window.localStorage.getItem(storageKey);
-}
-
-function createProviderModelStorage(providerId: string) {
-  return createLocalStorageSyncStorage<string>({
-    parse: (storedValue, initialValue) =>
-      storedValue ??
-      getLegacyProviderSelection(providerId, MODEL_STORAGE_KEY) ??
-      initialValue,
+const providerReasoningStorage = createTabScopedStorage<StoredReasoningLevel>(
+  {
+    parse: (value, initialValue) =>
+      value !== null && isStoredReasoningLevel(value) ? value : initialValue,
     serialize: (value) => value,
-  });
-}
-
-function createProviderReasoningStorage(providerId: string) {
-  return createLocalStorageSyncStorage<StoredReasoningLevel>({
-    parse: (storedValue, initialValue) => {
-      const value =
-        storedValue ??
-        getLegacyProviderSelection(providerId, REASONING_STORAGE_KEY);
-      return value !== null && isStoredReasoningLevel(value)
-        ? value
-        : initialValue;
-    },
-    serialize: (value) => value,
-  });
-}
+  },
+  { persistInitialValue: true },
+);
 
 const modelAtomFamily = atomFamily((providerId: string) =>
   atomWithStorage<string>(
     getProviderSelectionStorageKey(MODEL_STORAGE_KEY, providerId),
     "",
-    createProviderModelStorage(providerId),
+    stringSelectionStorage,
     { getOnInit: true },
   ),
 );
 const serviceTierAtom = atomWithStorage<StoredServiceTier>(
   SERVICE_TIER_STORAGE_KEY,
   "",
-  createLocalStorageEnumStorage(isStoredServiceTier),
+  createTabScopedStorage<StoredServiceTier>(
+    {
+      parse: (value, initialValue) => value ?? initialValue,
+      serialize: (value) => value,
+    },
+    { persistInitialValue: true },
+  ),
   { getOnInit: true },
 );
 const reasoningLevelAtomFamily = atomFamily((providerId: string) =>
   atomWithStorage<StoredReasoningLevel>(
     getProviderSelectionStorageKey(REASONING_STORAGE_KEY, providerId),
     "",
-    createProviderReasoningStorage(providerId),
+    providerReasoningStorage,
     { getOnInit: true },
   ),
 );
-// Legacy preference migration: "workspace-write" maps onto the same workspace
-// sandbox as "accept-edits", so the user's stored intent carries forward.
-// Legacy "readonly" (and any other unknown value) is dropped rather than
-// reinterpreted — localStorage is untrusted, and a read-only preference must
-// never silently become a writable mode.
-const permissionModePreferenceStorage =
-  createLocalStorageSyncStorage<StoredPermissionMode>({
-    parse: (storedValue, initialValue) => {
-      if (storedValue === "workspace-write") {
-        return "accept-edits";
+const NO_SESSION_OPTION_SELECTIONS: SessionOptionSelections = {};
+const sessionOptionsStorage = createTabScopedStorage<SessionOptionSelections>(
+  {
+    parse: (value, initialValue) => {
+      if (value === null) {
+        return initialValue;
       }
-      return storedValue !== null && isStoredPermissionMode(storedValue)
-        ? storedValue
-        : initialValue;
+      try {
+        const parsed = sessionOptionSelectionsSchema.safeParse(
+          JSON.parse(value),
+        );
+        return parsed.success ? parsed.data : initialValue;
+      } catch {
+        return initialValue;
+      }
     },
-    serialize: (value) => value,
-  });
+    serialize: (value) => JSON.stringify(value),
+  },
+  { persistInitialValue: false },
+);
+const sessionOptionsAtomFamily = atomFamily((providerId: string) =>
+  atomWithStorage<SessionOptionSelections>(
+    getProviderSelectionStorageKey(SESSION_OPTIONS_STORAGE_KEY, providerId),
+    NO_SESSION_OPTION_SELECTIONS,
+    sessionOptionsStorage,
+    { getOnInit: true },
+  ),
+);
+const emptySessionOptionsAtom = atom<SessionOptionSelections>(
+  NO_SESSION_OPTION_SELECTIONS,
+);
+
+export function usePromptBoxSessionOptionsPreference(providerId: string): {
+  value: SessionOptionSelections;
+  setValue: (value: SessionOptionSelections) => void;
+} {
+  const [value, setAtomValue] = useAtom(
+    providerId ? sessionOptionsAtomFamily(providerId) : emptySessionOptionsAtom,
+  );
+  const setValue = useCallback(
+    (nextValue: SessionOptionSelections) => {
+      setAtomValue(nextValue);
+    },
+    [setAtomValue],
+  );
+  return { setValue, value };
+}
+
+const permissionModePreferenceStorage =
+  createTabScopedStorage<StoredPermissionMode>(
+    {
+      parse: (storedValue, initialValue) => {
+        if (storedValue === "workspace-write") {
+          return "accept-edits";
+        }
+        return storedValue !== null && isStoredPermissionMode(storedValue)
+          ? storedValue
+          : initialValue;
+      },
+      serialize: (value) => value,
+    },
+    { persistInitialValue: true },
+  );
 
 const permissionModeAtom = atomWithStorage<StoredPermissionMode>(
   PERMISSION_MODE_STORAGE_KEY,
@@ -186,32 +207,43 @@ const permissionModeAtom = atomWithStorage<StoredPermissionMode>(
 const environmentSelectionAtom = atomWithStorage<string>(
   ENVIRONMENT_STORAGE_KEY,
   "",
-  rawStringLocalStorage,
+  stringSelectionStorage,
   { getOnInit: true },
 );
 const projectEnvironmentSelectionAtomFamily = atomFamily((projectId: string) =>
   atomWithStorage<string>(
     getProjectScopedStorageKey(ENVIRONMENT_STORAGE_KEY, projectId),
     "",
-    rawStringLocalStorage,
+    stringSelectionStorage,
     { getOnInit: true },
   ),
 );
 
+const machineSelectionAtomFamily = atomFamily((projectId: string) =>
+  atomWithStorage<string>(
+    getProjectScopedStorageKey(MACHINE_STORAGE_KEY, projectId),
+    "",
+    stringSelectionStorage,
+    { getOnInit: true },
+  ),
+);
+
+export function usePromptBoxMachinePreference(
+  projectId: string,
+): PersistedStringSelectionField {
+  const [value, setAtomValue] = useAtom(machineSelectionAtomFamily(projectId));
+  const setValue = useCallback(
+    (nextValue: string) => setAtomValue(nextValue),
+    [setAtomValue],
+  );
+  return { value, setValue };
+}
+
 export function usePromptBoxProviderPreference(): PersistedStringSelectionField {
   const [value, setAtomValue] = useAtom(providerIdAtom);
   const setValue = useCallback(
-    (nextValue: string) => {
-      if (nextValue !== value && typeof window !== "undefined") {
-        // Once the provider changes, the legacy unscoped values no longer have
-        // a trustworthy owner. The caller saves the current pair under its
-        // provider-scoped keys before changing this value.
-        window.localStorage.removeItem(MODEL_STORAGE_KEY);
-        window.localStorage.removeItem(REASONING_STORAGE_KEY);
-      }
-      setAtomValue(nextValue);
-    },
-    [setAtomValue, value],
+    (nextValue: string) => setAtomValue(nextValue),
+    [setAtomValue],
   );
   return { setValue, value };
 }

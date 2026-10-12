@@ -5,9 +5,10 @@
  * stop intent is now the `stopping` *status*, not a `stopRequestedAt`
  * side-field. The two axes are:
  *
- * - Execution status (one column): idle → starting → active → stopping →
+ * - Execution status (one column): pending → starting → active → stopping →
  *   idle | error. Both the "working" intent (`active`) and the "stopping"
- *   intent (`stopping`) are real states here.
+ *   intent (`stopping`) are real states here. `pending` sits before all of
+ *   them: a thread that exists but has never cleared a dispatch attempt.
  * - Record fields (orthogonal): deletedAt, archivedAt — surfaced as the only
  *   supersession predicates (`notDeleted`, `notArchived`).
  *
@@ -27,10 +28,7 @@ import {
   type ThreadLifecycleEventType,
   type ThreadLifecycleRowState,
 } from "../src/thread-lifecycle.js";
-import {
-  threadStatusValues,
-  type ThreadStatus,
-} from "../src/thread-status.js";
+import { threadStatusValues, type ThreadStatus } from "../src/thread-status.js";
 
 const allEventTypes: readonly ThreadLifecycleEventType[] = [
   "run.preparing",
@@ -78,6 +76,9 @@ describe("THREAD_LIFECYCLE table", () => {
 
   it("matches the designed two-axis transitions exactly", () => {
     expect(THREAD_LIFECYCLE).toEqual({
+      pending: {
+        "run.preparing": "starting",
+      },
       idle: {
         "run.preparing": "starting",
         "run.started": "active",
@@ -190,7 +191,6 @@ describe("evaluateThreadLifecycleEvent", () => {
             detail: signal.detail,
           });
         } else {
-          // Behavior parity: undeclared signals must not block the event.
           expect(evaluation).toEqual({
             to: THREAD_LIFECYCLE[status][eventType],
           });
@@ -199,29 +199,7 @@ describe("evaluateThreadLifecycleEvent", () => {
     }
   });
 
-  it("settles a stopping thread to idle when its work completes on its own", () => {
-    expect(
-      evaluateThreadLifecycleEvent({
-        event: { type: "run.succeeded" },
-        thread: rowState("stopping"),
-      }),
-    ).toEqual({ to: "idle" });
-  });
-
-  it("does not reactivate a stopping thread on dispatched/started work", () => {
-    expect(
-      evaluateThreadLifecycleEvent({
-        event: { type: "run.started" },
-        thread: rowState("stopping"),
-      }),
-    ).toEqual({
-      noop: "illegal-transition",
-      detail: "no transition for run.started from status stopping",
-    });
-  });
-
   it("reports superseded before illegal-transition", () => {
-    // run.started has no cell for "active", but the deleted row must win.
     expect(
       evaluateThreadLifecycleEvent({
         event: { type: "run.started" },

@@ -31,18 +31,17 @@ export interface ProviderCliActionableIssue extends ProviderCliIssue {
   action: ProviderCliInstallAction;
 }
 
-const PROVIDER_CLI_MANAGED_PROVIDERS = [
-  "codex",
-  "claudeCode",
-] as const satisfies readonly ProviderCliKey[];
-
 export function providerCliEntries(
   status: ProviderCliStatusResponse,
 ): ProviderCliStatusEntry[] {
-  return PROVIDER_CLI_MANAGED_PROVIDERS.map((provider) => ({
+  return Object.entries(status).map(([provider, providerStatus]) => ({
     provider,
-    status: status[provider],
+    status: providerStatus,
   }));
+}
+
+export function isProviderCliUpdateIssue(issue: ProviderCliIssue): boolean {
+  return issue.status.installed;
 }
 
 export function buildProviderCliIssue(
@@ -122,12 +121,6 @@ export function hasProviderCliAction(
   return issue.action !== null;
 }
 
-/**
- * Mirror the module-level install store into React. The store — not this hook —
- * owns the running job and its queue, so an install started from Settings →
- * Updates keeps running and keeps draining its queue after the user navigates
- * away and this hook unmounts.
- */
 export function useProviderCliInstallRunner() {
   const snapshot = useSyncExternalStore(
     subscribeProviderCliInstalls,
@@ -142,11 +135,6 @@ export function useProviderCliInstallRunner() {
   };
 }
 
-/**
- * Renders the install failure log for whichever install failed, wherever the
- * user happens to be. Mounted once by the app shell because the failing install
- * may well have outlived the page that started it.
- */
 export function ProviderCliInstallLogDialogHost() {
   const snapshot = useSyncExternalStore(
     subscribeProviderCliInstalls,

@@ -8,14 +8,15 @@ import {
   listPublicHosts,
   type HostDaemonSessionRow,
 } from "@bb/db";
-import type { Environment, Host } from "@bb/domain";
+import type { EnvironmentRow, HostRow } from "@bb/db";
+import type { Host, HostType } from "@bb/domain";
 import type { DbConnection } from "@bb/db";
 import type { NotificationHub } from "../../ws/hub.js";
 import { ApiError } from "../../errors.js";
 import {
   destroyedHostUnavailableDetails,
   destroyedThreadEnvironmentDetails,
-  disconnectedHostUnavailableDetails,
+  inactiveHostUnavailableDetails,
   throwEnvironmentNotReady,
   throwHostUnavailable,
   throwProjectUnavailable,
@@ -23,7 +24,6 @@ import {
   threadEnvironmentUnavailableDetails,
 } from "./lifecycle-api-errors.js";
 
-type HostRow = NonNullable<ReturnType<typeof getHost>>;
 type ProjectRow = NonNullable<ReturnType<typeof getProject>>;
 type ThreadRow = NonNullable<ReturnType<typeof getThread>>;
 type StandardProject = ProjectRow & { kind: "standard" };
@@ -34,17 +34,11 @@ interface HostLookupDeps {
   hub: HostLookupHub;
 }
 
-export interface ThreadEnvironmentLookupResult {
-  environment: Environment;
+interface ThreadEnvironmentLookupResult {
+  environment: EnvironmentRow;
   thread: ThreadRow;
 }
 
-/**
- * The host's data directory, or null when no daemon session is open. Callers
- * that only want to recognize bb-owned paths use this instead of
- * {@link requireConnectedHostSession}, so an offline host degrades the check
- * rather than failing the request.
- */
 export function findHostDataDir(
   deps: HostLookupDeps,
   hostId: string,
@@ -68,23 +62,33 @@ function getOpenDaemonSessionForHost(
   return session;
 }
 
-function toHostStatus(deps: HostLookupDeps, hostId: string): Host["status"] {
-  const host = getNonDestroyedHost(deps.db, hostId);
-  if (!host) {
-    return "disconnected";
-  }
-
-  return getOpenDaemonSessionForHost(deps, hostId)
-    ? "connected"
-    : "disconnected";
+export function toHostWithStatus(deps: HostLookupDeps, row: HostRow): Host {
+  return toHostRecord(
+    row,
+    getOpenDaemonSessionForHost(deps, row.id) ? "connected" : "disconnected",
+  );
 }
 
-function toHostRecord(row: HostRow, status: Host["status"]): Host {
+export function toHostRecord(row: HostRow, status: Host["status"]): Host {
   return {
     id: row.id,
     name: row.name,
     type: row.type,
     status,
+    machineProviderId: row.machineProviderId,
+    lifecycle: {
+      phase: row.phase,
+      suspendedAt: row.suspendedAt,
+      message: row.statusMessage,
+      pendingLog: row.pendingLog,
+      teardown:
+        row.teardownStatus === null
+          ? null
+          : {
+              status: row.teardownStatus,
+              attempt: row.teardownAttempt,
+            },
+    },
     maxPermissionMode: row.maxPermissionMode,
     lastSeenAt: row.lastSeenAt,
     lastRejectedProtocolVersion: row.lastRejectedProtocolVersion,
@@ -101,14 +105,12 @@ function isStandardProject(project: ProjectRow): project is StandardProject {
   return project.kind === "standard";
 }
 
-export function listPublicHostsWithStatus(deps: HostLookupDeps): Host[] {
-  const rows = listPublicHosts(deps.db);
-
-  return rows.map((row) =>
-    toHostRecord(
-      row,
-      getOpenDaemonSessionForHost(deps, row.id) ? "connected" : "disconnected",
-    ),
+export function listPublicHostsWithStatus(
+  deps: HostLookupDeps,
+  options?: { includeCreating?: boolean; type?: HostType },
+): Host[] {
+  return listPublicHosts(deps.db, options).map((row) =>
+    toHostWithStatus(deps, row),
   );
 }
 
@@ -127,7 +129,7 @@ export function requireNonDestroyedHostWithStatus(
       destroyedHostUnavailableDetails(host.destroyedAt),
     );
   }
-  return toHostRecord(host, toHostStatus(deps, host.id));
+  return toHostWithStatus(deps, host);
 }
 
 export function getNonDestroyedHostWithStatus(
@@ -138,32 +140,34 @@ export function getNonDestroyedHostWithStatus(
   if (!host) {
     return null;
   }
-  return toHostRecord(host, toHostStatus(deps, host.id));
+  return toHostWithStatus(deps, host);
 }
 
 export function requireConnectedHostSession(
   deps: HostLookupDeps,
   hostId: string,
 ) {
-  const session = getOpenDaemonSessionForHost(deps, hostId);
-  if (!session) {
-    const host = getHost(deps.db, hostId);
-    if (!host) {
-      throwHostNotFound();
-    }
-    if (host.destroyedAt !== null) {
-      throwHostUnavailable(
-        404,
-        "Host is unavailable",
-        destroyedHostUnavailableDetails(host.destroyedAt),
-      );
-    }
-    const hostStatus = toHostStatus(deps, hostId);
+  const host = getHost(deps.db, hostId);
+  if (!host) {
+    throwHostNotFound();
+  }
+  if (host.destroyedAt !== null) {
     throwHostUnavailable(
-      502,
-      "Host is not connected",
-      disconnectedHostUnavailableDetails(hostStatus),
+      404,
+      "Host is unavailable",
+      destroyedHostUnavailableDetails(host.destroyedAt),
     );
+  }
+  const session = getOpenDaemonSessionForHost(deps, hostId);
+  const details = inactiveHostUnavailableDetails(
+    session ? "connected" : "disconnected",
+    host,
+  );
+  if (details.reason === "suspended") {
+    throwHostUnavailable(502, "Host is suspended", details);
+  }
+  if (!session) {
+    throwHostUnavailable(502, "Host is not connected", details);
   }
   return session;
 }
@@ -227,7 +231,7 @@ export function requirePublicThread(
 export function requireEnvironment(
   db: DbConnection,
   environmentId: string,
-): Environment {
+): EnvironmentRow {
   const environment = getEnvironment(db, environmentId);
   if (!environment) {
     throw new ApiError(404, "environment_not_found", "Environment not found");
@@ -238,7 +242,7 @@ export function requireEnvironment(
 export function requireReadyEnvironment(
   db: DbConnection,
   environmentId: string,
-): Environment & { path: string; status: "ready" } {
+): EnvironmentRow & { path: string; status: "ready" } {
   const environment = requireEnvironment(db, environmentId);
   if (environment.status !== "ready" || !environment.path) {
     throwEnvironmentNotReady(environment);
@@ -253,7 +257,7 @@ export function requireReadyEnvironment(
 function requireEnvironmentForThread(
   db: DbConnection,
   thread: ThreadRow,
-): Environment {
+): EnvironmentRow {
   if (!thread.environmentId) {
     throwThreadEnvironmentUnavailable(
       threadEnvironmentUnavailableDetails("never_attached", null),
@@ -262,7 +266,7 @@ function requireEnvironmentForThread(
   return requireEnvironment(db, thread.environmentId);
 }
 
-function ensureThreadEnvironmentAvailable(environment: Environment): void {
+function ensureThreadEnvironmentAvailable(environment: EnvironmentRow): void {
   const unavailableDetails = destroyedThreadEnvironmentDetails(environment);
   if (unavailableDetails) {
     throwThreadEnvironmentUnavailable(unavailableDetails);
@@ -289,7 +293,7 @@ export function requireThreadEnvironment(
   return result;
 }
 
-export function requirePublicThreadEnvironmentAllowingDestroyed(
+function requirePublicThreadEnvironmentAllowingDestroyed(
   db: DbConnection,
   threadId: string,
 ): ThreadEnvironmentLookupResult {

@@ -2,35 +2,27 @@ import { useCallback, useMemo } from "react";
 import type { Project, Task } from "../shared/contract.js";
 import { groupTasksByStatus } from "../views/list/lib.js";
 import { listAllTasks, useTasksQuery } from "./data.js";
-import type { TaskViewMode, TasksRoute } from "./routes.js";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+import type { ResolvedTasksRoute, TaskViewMode, TasksRoute } from "./routes.js";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
+} from "@/components/ui/tooltip";
 import { useTasksRefresh } from "./refresh.js";
 
-/** Accessible name + tooltip for the header refresh control. */
-export const REFRESH_TASKS_LABEL = "Refresh tasks";
+const REFRESH_TASKS_LABEL = "Refresh tasks";
 
-export interface PagerPosition {
-  /** 1-based position of the task within its sibling list. */
+interface PagerPosition {
   index: number;
   total: number;
   prevKey: string | null;
   nextKey: string | null;
 }
 
-/**
- * Position of `taskKey` within its sibling tasks, mirroring the list view's
- * visual order: canonical status groups, board position within each group
- * (the order `listTasks` returns). Sub-tasks aren't list rows, so a sub-task
- * (or unknown key) has no pager position.
- */
 export function pagerPosition(
   tasks: readonly Task[],
   taskKey: string,
@@ -53,13 +45,9 @@ function TaskPager({
   onNavigate,
 }: {
   taskKey: string;
-  /** Scope from the list/board the user came from; null = All tasks. */
   projectId: string | null;
   onNavigate: (route: TasksRoute) => void;
 }) {
-  // Same query the list view issues (unfiltered): top-level tasks in the
-  // browse scope. The pager ignores the list's transient filter state — it
-  // steps through the full sibling list.
   const siblings = useTasksQuery(
     async (rpc) =>
       listAllTasks(rpc, {
@@ -78,12 +66,7 @@ function TaskPager({
     if (key !== null) onNavigate({ kind: "task", taskKey: key });
   };
   return (
-    // The pager yields entirely below @sm so the task key — the row's
-    // identity — keeps the width; the in-page task content carries its own
-    // navigation on the smallest phones.
     <div className="hidden shrink-0 items-center gap-0.5 text-xs tabular-nums text-muted-foreground @sm:flex">
-      {/* The position readout yields to the task key in narrow containers;
-          the step buttons remain. */}
       <span className="hidden px-1 @md:inline">
         {position.index} / {position.total}
       </span>
@@ -141,12 +124,6 @@ function ViewToggle({
   );
 }
 
-/**
- * Subtle icon-only refresh control. Shares the BB-19 generation channel; does
- * not add listeners or alternate refresh paths. In-flight state tracks real
- * generation-driven query work (spin + disabled) with fixed geometry so the
- * header does not shift.
- */
 function RefreshTasksButton() {
   const { refresh, isRefreshing } = useTasksRefresh();
 
@@ -181,18 +158,11 @@ function RefreshTasksButton() {
   );
 }
 
-export interface TasksTopbarProps {
-  route: TasksRoute;
+interface TasksTopbarProps {
+  route: ResolvedTasksRoute;
   projects: Project[] | undefined;
-  sidebarCollapsed: boolean;
-  /**
-   * Pager scope on task routes: the list/board browsed before (projectId null
-   * = All tasks). null when no list/board was visited this session (deep
-   * link) — the pager then anchors to the task's own project.
-   */
   pagerScope: { projectId: string | null } | null;
   onNavigate: (route: TasksRoute) => void;
-  onToggleSidebar: () => void;
   onNewTask: () => void;
   onBack: () => void;
 }
@@ -200,10 +170,8 @@ export interface TasksTopbarProps {
 export function TasksTopbar({
   route,
   projects,
-  sidebarCollapsed,
   pagerScope,
   onNavigate,
-  onToggleSidebar,
   onNewTask,
   onBack,
 }: TasksTopbarProps) {
@@ -212,7 +180,6 @@ export function TasksTopbar({
       return (projects ?? []).find((p) => p.id === route.projectId) ?? null;
     }
     if (route.kind === "task") {
-      // Task keys are `<prefix>-<number>`, so the prefix resolves the project.
       const prefix = route.taskKey.split("-", 1)[0] ?? "";
       return (projects ?? []).find((p) => p.prefix === prefix) ?? null;
     }
@@ -270,8 +237,6 @@ export function TasksTopbar({
             >
               <Icon name="ChevronLeft" className="size-4" />
             </Button>
-            {/* In narrow containers the project crumb yields the row to the
-                task key — the back button already returns to the project. */}
             {project ? (
               <button
                 type="button"
@@ -280,7 +245,7 @@ export function TasksTopbar({
                   onNavigate({
                     kind: "project",
                     projectId: project.id,
-                    view: "list",
+                    view: null,
                   })
                 }
               >
@@ -307,22 +272,12 @@ export function TasksTopbar({
   })();
 
   return (
-    // On compact viewports the host renders no pane header above this bar, so
-    // the host's fixed sidebar toggle (pinned at the window's top-left, see the
-    // app's SidebarTriggerOverlay) shares this row. Reserve its footprint as
-    // left padding — 12px inset + 28px trigger + 8px gap (36px touch trigger on
-    // coarse pointers) — and match the 48px chrome-row height so the toggle and
-    // this bar's controls sit on one axis. The reserve keys off the viewport
-    // (`max-md:`), not the container, because the toggle is viewport-fixed and
-    // wide windows always place a host pane header above this bar instead.
-    <header className="flex h-11 shrink-0 items-center gap-2.5 border-b border-border-hairline bg-background px-3.5 text-sm max-md:h-12 max-md:pl-12 max-md:pointer-coarse:pl-14">
+    <header className="flex h-11 shrink-0 items-center gap-2.5 border-b border-border-hairline bg-background px-3.5 text-sm max-md:pointer-coarse:h-12 max-md:pl-12 max-md:pointer-coarse:pl-14">
       <div className="min-w-0 flex-1 overflow-hidden">{breadcrumb}</div>
       {route.kind === "task" &&
       (pagerScope !== null || projects !== undefined) ? (
         <TaskPager
           taskKey={route.taskKey}
-          // No browse context (deep link): step through the task's own
-          // project in list order; All tasks only if its project is unknown.
           projectId={
             pagerScope !== null ? pagerScope.projectId : (project?.id ?? null)
           }
@@ -330,8 +285,6 @@ export function TasksTopbar({
         />
       ) : null}
       {route.kind === "project" ? (
-        // Hidden in phone-width containers, where the board is unusable and
-        // the shell renders the list regardless (see BOARD_MIN_WIDTH).
         <span className="hidden @md:block">
           <ViewToggle
             view={route.view}
@@ -339,7 +292,6 @@ export function TasksTopbar({
           />
         </span>
       ) : null}
-      {/* Refresh sits immediately left of the primary New task action. */}
       <RefreshTasksButton />
       {route.kind !== "task" && route.kind !== "manage" ? (
         <Button
@@ -349,21 +301,9 @@ export function TasksTopbar({
           onClick={onNewTask}
         >
           <Icon name="Plus" className="size-3.5" />
-          {/* Icon-only in narrow containers so the breadcrumb (project name,
-              view toggle) keeps readable width. */}
           <span className="hidden @lg:inline">New task</span>
         </Button>
       ) : null}
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-7 max-md:pointer-coarse:size-9"
-        aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-        aria-expanded={!sidebarCollapsed}
-        onClick={onToggleSidebar}
-      >
-        <Icon name="PanelRight" className="size-4" />
-      </Button>
     </header>
   );
 }

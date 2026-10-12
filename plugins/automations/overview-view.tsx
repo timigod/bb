@@ -6,21 +6,23 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  AutomationReadProblem,
   AutomationResponse,
   AutomationsOverviewResponse,
 } from "./src/rpc-types.js";
+import { CREATE_AUTOMATION_PROMPT } from "./composer";
 import {
   AutomationLifecycleControl,
   automationIconName,
-  automationScheduleLabel,
 } from "./detail-view.js";
-import { Icon } from "@bb/shared-ui/icon";
+import { Icon } from "@/components/ui/icon";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
 import {
   ResourcePagination,
   useResourcePagination,
   useResourceViewportPageSize,
-} from "@bb/shared-ui/resource-pagination";
-import { COARSE_POINTER_ICON_SIZE_SHRINK_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
+} from "@/components/ui/resource-pagination";
+import { COARSE_POINTER_ICON_SIZE_SHRINK_CLASS } from "@/components/ui/coarse-pointer-sizing";
 import {
   ResourceBrowseGrid,
   ResourceCollectionPage,
@@ -35,26 +37,27 @@ import {
   ResourceSortMenu,
   ResourceTemplateBrowseCard,
   ResourceToolbar,
-} from "@bb/shared-ui/resource-list";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/resource-list";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import {
   type AutomationStatusFilter,
   formatAutomationTrigger,
   formatOverviewScheduleMetadata,
+  formatScheduleStatusLabel,
   getOneShotLifecycle,
   matchesAutomationStatusFilters,
   oneShotLifecycleAllowsToggle,
+  PERSONAL_PROJECT_ID,
 } from "./lib/format-schedule.js";
 import { AutomationMetadataItem } from "./metadata.js";
-
-const PERSONAL_PROJECT_ID = "proj_personal";
+import { AutomationActionsMenu } from "./actions-menu.js";
 
 const AUTOMATION_STATUS_FILTER_OPTIONS = [
   { id: "active", label: "Active" },
   { id: "paused", label: "Paused" },
 ] as const;
 
-export const CREATE_AUTOMATION_PROMPT = "Create a new bb automation to ";
 export const AUTOMATION_CREATE_TEMPLATES = [
   {
     label: "CI failure triage",
@@ -91,13 +94,22 @@ type AutomationProjectFilter = `project:${string}`;
 type AutomationSortMode = "project" | "alpha";
 type AutomationSortDirection = "asc" | "desc";
 export type AutomationCollectionMode = "installed" | "browse";
+type ReadableOverviewAutomation =
+  | AutomationResponse
+  | Extract<AutomationReadProblem, { problem: "missing-agent-prompt" }>;
 
-export interface AutomationDetailRoute {
+interface AutomationDetailRoute {
   projectId: string;
   automationId: string;
 }
 
-function routeOf(automation: AutomationResponse): AutomationDetailRoute {
+interface AutomationDetailNavigationOptions {
+  editing?: boolean;
+}
+
+function routeOf(
+  automation: Pick<AutomationResponse, "id" | "projectId">,
+): AutomationDetailRoute {
   return { projectId: automation.projectId, automationId: automation.id };
 }
 
@@ -142,24 +154,19 @@ function AutomationRowLeading({
   );
 }
 
-function automationProjectLabel(
-  project: OverviewEntry["project"] | null | undefined,
+export function automationProjectLabel(
+  project: OverviewEntry["project"],
 ): string {
-  if (project == null) return "Workspace";
-  return project.id === PERSONAL_PROJECT_ID ? "Local" : project.name;
+  return project.name;
 }
 
 function automationProjectFilterId(
   entry: OverviewEntry,
 ): AutomationProjectFilter {
-  const projectId = entry.project?.id ?? entry.automation.projectId;
+  const projectId = entry.project.id;
   return `project:${projectId}`;
 }
 
-// The filter menu hands back plain strings, so both selections are narrowed on
-// the way in rather than cast. A cast would keep type-checking while silently
-// admitting a value the rest of the component cannot map back to a project or
-// a status.
 function isAutomationProjectFilter(
   value: string,
 ): value is AutomationProjectFilter {
@@ -169,9 +176,7 @@ function isAutomationProjectFilter(
 function isAutomationStatusFilter(
   value: string,
 ): value is AutomationStatusFilter {
-  return AUTOMATION_STATUS_FILTER_OPTIONS.some(
-    (option) => option.id === value,
-  );
+  return AUTOMATION_STATUS_FILTER_OPTIONS.some((option) => option.id === value);
 }
 
 function applyAutomationSortDirection(
@@ -194,20 +199,74 @@ function automationLifecycleSortRank(automation: AutomationResponse): number {
   return 0;
 }
 
-function OverviewRow({
-  entry,
+function AutomationRowMetadata({
+  automation,
+  project,
+}: {
+  automation: ReadableOverviewAutomation | null;
+  project: OverviewEntry["project"];
+}) {
+  const projectLabel = automationProjectLabel(project);
+  const personalProject = project.id === PERSONAL_PROJECT_ID;
+  const scheduleMetadata =
+    automation === null
+      ? null
+      : formatOverviewScheduleMetadata({
+          enabled: automation.enabled,
+          nextRunAt: automation.nextRunAt,
+          trigger: automation.trigger,
+          runCount: automation.runCount,
+          lastRunStatus: automation.lastRunStatus,
+        });
+  return (
+    <ResourceMeta
+      items={[
+        <AutomationMetadataItem
+          icon="Folder"
+          iconLabel={personalProject ? `Project: ${projectLabel}` : "Project"}
+          title={projectLabel}
+        >
+          {projectLabel}
+        </AutomationMetadataItem>,
+        automation !== null ? (
+          <AutomationMetadataItem icon="DateTime" iconLabel="Schedule">
+            {formatAutomationTrigger(automation.trigger)}
+          </AutomationMetadataItem>
+        ) : null,
+        automation !== null && scheduleMetadata !== null ? (
+          <AutomationMetadataItem
+            icon={scheduleMetadata.isNextRun ? "CalendarCheckOut02" : undefined}
+            iconLabel={scheduleMetadata.isNextRun ? "Next run" : undefined}
+          >
+            {scheduleMetadata.text}
+          </AutomationMetadataItem>
+        ) : null,
+        automation === null ? "The stored configuration cannot be read." : null,
+      ]}
+    />
+  );
+}
+
+export function OverviewRow({
+  automation,
+  project,
   onNavigate,
   onEnabledChange,
+  onRunNow,
+  onDelete,
 }: {
-  entry: OverviewEntry;
+  automation: AutomationResponse;
+  project: OverviewEntry["project"];
   onNavigate: (route: AutomationDetailRoute) => void;
   onEnabledChange: (
     enabled: boolean,
     route: AutomationDetailRoute,
   ) => Promise<void>;
+  onRunNow: (route: AutomationDetailRoute) => Promise<void>;
+  onDelete: (route: AutomationDetailRoute, name: string) => void;
 }) {
-  const { automation } = entry;
   const [togglePending, setTogglePending] = useState(false);
+  const [runPending, setRunPending] = useState(false);
   const route = routeOf(automation);
   const oneShotLifecycle = getOneShotLifecycle({
     enabled: automation.enabled,
@@ -216,49 +275,28 @@ function OverviewRow({
     lastRunStatus: automation.lastRunStatus,
   });
   const lifecycleLocked = !oneShotLifecycleAllowsToggle(oneShotLifecycle);
-  const triggerLabel = formatAutomationTrigger(automation.trigger);
-  const scheduleMetadata = formatOverviewScheduleMetadata({
-    enabled: automation.enabled,
-    nextRunAt: automation.nextRunAt,
-    trigger: automation.trigger,
-    runCount: automation.runCount,
-    lastRunStatus: automation.lastRunStatus,
-  });
-  const projectLabel = automationProjectLabel(entry.project);
-  const personalProject = entry.project.id === PERSONAL_PROJECT_ID;
 
   return (
     <ResourceRow
       leading={<AutomationRowLeading automation={automation} />}
       title={automation.name}
       description={
-        <ResourceMeta
-          items={[
-            <AutomationMetadataItem
-              icon={personalProject ? "Laptop" : "Folder"}
-              iconLabel={personalProject ? "Local project" : "Project"}
-              title={projectLabel}
-            >
-              {projectLabel}
-            </AutomationMetadataItem>,
-            <AutomationMetadataItem icon="DateTime" iconLabel="Schedule">
-              {triggerLabel}
-            </AutomationMetadataItem>,
-            scheduleMetadata ? (
-              <AutomationMetadataItem
-                icon={
-                  scheduleMetadata.isNextRun ? "CalendarCheckOut02" : undefined
-                }
-                iconLabel={scheduleMetadata.isNextRun ? "Next run" : undefined}
-              >
-                {scheduleMetadata.text}
-              </AutomationMetadataItem>
-            ) : null,
-          ]}
-        />
+        <AutomationRowMetadata automation={automation} project={project} />
       }
       muted={lifecycleLocked}
       onOpen={() => onNavigate(route)}
+      actions={
+        <AutomationActionsMenu
+          name={automation.name}
+          pending={runPending}
+          onRunNow={() => {
+            setRunPending(true);
+            void onRunNow(route).finally(() => setRunPending(false));
+          }}
+          onDelete={() => onDelete(route, automation.name)}
+        />
+      }
+      actionsVisibility="always"
       persistentActions={
         <AutomationLifecycleControl
           checked={automation.enabled && !lifecycleLocked}
@@ -284,12 +322,132 @@ function OverviewRow({
   );
 }
 
+function AutomationProblemRow({
+  automation,
+  project,
+  onNavigate,
+  onDelete,
+}: {
+  automation: AutomationReadProblem;
+  project: OverviewEntry["project"];
+  onNavigate: (
+    route: AutomationDetailRoute,
+    options?: AutomationDetailNavigationOptions,
+  ) => void;
+  onDelete: (route: AutomationDetailRoute, name: string) => void;
+}) {
+  const repairTarget =
+    automation.problem === "missing-agent-prompt" ? automation : null;
+  const problemLabel = automationProblemLabel(automation);
+  const route = routeOf(automation);
+  return (
+    <ResourceRow
+      leading={
+        <Icon
+          name={repairTarget !== null ? "AlertCircle" : "CircleX"}
+          className={cn(
+            repairTarget !== null ? "text-warning" : "text-destructive",
+            COARSE_POINTER_ICON_SIZE_SHRINK_CLASS,
+          )}
+          aria-hidden
+        />
+      }
+      title={automation.name}
+      state={
+        <span
+          className={cn(
+            "inline-flex shrink-0 self-center items-center whitespace-nowrap rounded-full px-2 py-0.5 text-2xs font-medium",
+            repairTarget !== null
+              ? "bg-warning/10 text-warning-text"
+              : "bg-destructive/10 text-destructive-text",
+          )}
+        >
+          {problemLabel}
+        </span>
+      }
+      description={
+        <AutomationRowMetadata automation={repairTarget} project={project} />
+      }
+      className="items-start"
+      onOpen={() =>
+        onNavigate(route, repairTarget === null ? undefined : { editing: true })
+      }
+      actions={
+        <AutomationActionsMenu
+          name={automation.name}
+          pending={false}
+          runDisabledReason={
+            repairTarget !== null
+              ? "Add a prompt before running this automation."
+              : "The stored configuration cannot be read."
+          }
+          onRunNow={() => {}}
+          onDelete={() => onDelete(route, automation.name)}
+        />
+      }
+      actionsVisibility="always"
+      persistentActions={
+        repairTarget !== null ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => onNavigate(route, { editing: true })}
+          >
+            Edit
+          </Button>
+        ) : undefined
+      }
+    />
+  );
+}
+
+function automationProblemLabel(automation: AutomationReadProblem): string {
+  return automation.problem === "missing-agent-prompt"
+    ? "Prompt required"
+    : "Invalid data";
+}
+
+function automationProblemSearchText(
+  automation: AutomationReadProblem,
+): string {
+  return automation.problem === "missing-agent-prompt"
+    ? `${automationProblemLabel(automation)} needs prompt missing prompt`
+    : `${automationProblemLabel(automation)} invalid stored data`;
+}
+
+function matchesAutomationReadStatusFilters(
+  automation: OverviewEntry["automation"],
+  statusFilters: readonly AutomationStatusFilter[],
+): boolean {
+  if ("problem" in automation && automation.problem === "invalid-stored-data") {
+    return statusFilters.length === 0;
+  }
+  return matchesAutomationStatusFilters(automation, statusFilters);
+}
+
+function automationSearchValues(
+  automation: OverviewEntry["automation"],
+  projectName: string,
+): string[] {
+  const values = [automation.name, projectName];
+  if ("problem" in automation) {
+    values.push(automationProblemSearchText(automation));
+    if (automation.problem === "invalid-stored-data") return values;
+  }
+  values.push(formatScheduleStatusLabel(automation));
+  values.push(formatAutomationTrigger(automation.trigger));
+  return values;
+}
+
 export function AutomationOverviewView({
   entries,
   error,
   onRetry,
   onOpenDetail,
   onEnabledChange,
+  onRunNow,
+  onDelete,
   onCreateViaChat,
   activeMode,
   onModeChange,
@@ -297,11 +455,16 @@ export function AutomationOverviewView({
   entries: OverviewEntry[] | null;
   error: string | null;
   onRetry: () => void;
-  onOpenDetail: (route: AutomationDetailRoute) => void;
+  onOpenDetail: (
+    route: AutomationDetailRoute,
+    options?: AutomationDetailNavigationOptions,
+  ) => void;
   onEnabledChange: (
     enabled: boolean,
     route: AutomationDetailRoute,
   ) => Promise<void>;
+  onRunNow: (route: AutomationDetailRoute) => Promise<void>;
+  onDelete: (route: AutomationDetailRoute, name: string) => void;
   onCreateViaChat: (prompt?: string) => void;
   activeMode: AutomationCollectionMode;
   onModeChange: (mode: AutomationCollectionMode) => void;
@@ -358,20 +521,27 @@ export function AutomationOverviewView({
       ) {
         return false;
       }
-      if (!matchesAutomationStatusFilters(automation, statusFilters)) {
+      if (!matchesAutomationReadStatusFilters(automation, statusFilters)) {
         return false;
       }
-      if (normalizedQuery.length === 0) return true;
-      return [
-        automation.name,
-        project.name,
-        automationScheduleLabel(automation),
-        formatAutomationTrigger(automation.trigger),
-      ].some((value) => value?.toLowerCase().includes(normalizedQuery));
+      return (
+        normalizedQuery.length === 0 ||
+        automationSearchValues(automation, project.name).some((value) =>
+          value.toLowerCase().includes(normalizedQuery),
+        )
+      );
     });
   }, [entries, normalizedQuery, projectFilters, statusFilters]);
   const visibleEntries = useMemo(() => {
     return [...filteredEntries].sort((left, right) => {
+      if ("problem" in left.automation && "problem" in right.automation) {
+        return applyAutomationSortDirection(
+          left.automation.name.localeCompare(right.automation.name),
+          sortDirection,
+        );
+      }
+      if ("problem" in left.automation) return -1;
+      if ("problem" in right.automation) return 1;
       const lifecycleOrder =
         automationLifecycleSortRank(left.automation) -
         automationLifecycleSortRank(right.automation);
@@ -426,7 +596,11 @@ export function AutomationOverviewView({
       />
     );
   } else if (entries === null) {
-    body = <ResourceListState state="loading" message="Loading automations" />;
+    body = (
+      <DelayedLoading>
+        <ResourceListState state="loading" message="Loading automations" />
+      </DelayedLoading>
+    );
   } else if (entries.length === 0) {
     body = (
       <ResourceListState state="empty" message="No automations installed." />
@@ -447,14 +621,28 @@ export function AutomationOverviewView({
   } else {
     body = (
       <ResourceListPanel>
-        {installedPagination.items.map((entry) => (
-          <OverviewRow
-            key={entry.automation.id}
-            entry={entry}
-            onNavigate={onOpenDetail}
-            onEnabledChange={onEnabledChange}
-          />
-        ))}
+        {installedPagination.items.map((entry) => {
+          const { automation, project } = entry;
+          return "problem" in automation ? (
+            <AutomationProblemRow
+              key={automation.id}
+              automation={automation}
+              project={project}
+              onNavigate={onOpenDetail}
+              onDelete={onDelete}
+            />
+          ) : (
+            <OverviewRow
+              key={automation.id}
+              automation={automation}
+              project={project}
+              onNavigate={onOpenDetail}
+              onEnabledChange={onEnabledChange}
+              onRunNow={onRunNow}
+              onDelete={onDelete}
+            />
+          );
+        })}
       </ResourceListPanel>
     );
   }

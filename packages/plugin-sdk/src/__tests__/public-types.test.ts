@@ -1,17 +1,37 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, expectTypeOf, it } from "vitest";
-import type { BbPluginApi } from "../index.js";
+import type {
+  BbPluginApi,
+  JsonValue,
+  PluginAgentConfigurationContext,
+  PluginEnvironmentProviderDeclaration,
+  PluginEnvironments,
+  ReadonlyJsonValue,
+} from "../index.js";
+import type {
+  ComposerAttachment,
+  ComposerDraftReplacement,
+  ComposerDraftSnapshot,
+  PluginProviderIconRegistration,
+} from "../app-contract.js";
 
 type ExpectedBbPluginApiKey =
   | "agents"
   | "background"
   | "cli"
   | "events"
+  | "experimental_aiServices"
+  | "experimental_environments"
+  | "experimental_hooks"
+  | "experimental_machines"
+  | "onInstall"
+  | "experimental_serverAccess"
   | "hosts"
   | "http"
   | "log"
   | "onDispose"
   | "pluginId"
+  | "providers"
   | "realtime"
   | "rpc"
   | "sdk"
@@ -23,16 +43,25 @@ type ExpectedBbPluginApiKey =
 
 const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "BbPluginApi",
+  "MessageDispatchHookContext",
+  "MessageDispatchHookDecision",
   "PluginAgents",
+  "PluginAiCompleteOptions",
+  "PluginAiServiceDeclaration",
+  "PluginAiServiceStatus",
+  "PluginAiServices",
+  "PluginAiTranscribeOptions",
   "PluginAgentConfiguration",
   "PluginAgentConfigurationContext",
   "PluginAgentToolContentPart",
   "PluginAgentToolContext",
-  "PluginAgentToolExperimentalStatusLabels",
+  "PluginRowLabels",
+  "PluginRowPresentation",
   "PluginAgentToolRegistrationBase",
   "PluginAgentToolResult",
   "PluginAgentToolSelection",
   "PluginBackground",
+  "PluginBbSdk",
   "PluginCli",
   "PluginCliCommandInfo",
   "PluginCliContext",
@@ -40,20 +69,62 @@ const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "PluginCliOutputLimitError",
   "PluginCliRegistration",
   "PluginCliResult",
+  "PluginDispatchAttemptKind",
+  "PluginEnvironmentValidateDecision",
+  "PluginEnvironmentProviderDeclaration",
+  "PluginEnvironmentProviderRequirements",
+  "PluginEnvironments",
+  "PluginDispatchEnvironmentIntent",
+  "PluginDispatchExecution",
+  "PluginDispatchExecutionSources",
+  "PluginDispatchInput",
   "PluginEvents",
+  "ExperimentalPluginWebSocket",
+  "ExperimentalPluginWebSocketContext",
+  "ExperimentalPluginWebSocketHandler",
+  "ExperimentalPluginWebSocketHandlers",
+  "PluginHookHandler",
+  "PluginHookName",
+  "PluginHookSignatures",
+  "PluginHooks",
   "PluginHosts",
   "PluginHttp",
   "PluginHttpAuthMode",
   "PluginHttpHandler",
   "PluginInteractionCancelReason",
+  "PluginInteractionDescription",
   "PluginInteractionRequest",
   "PluginInteractionResult",
   "PluginKvStorage",
   "PluginLogger",
+  "PluginMachineProviderDeclaration",
+  "PluginMachineValidateDecision",
+  "PluginMachines",
   "PluginMentionItem",
   "PluginMentionProviderRegistration",
   "PluginMentionSearchContext",
   "PluginMentionTrigger",
+  "ExperimentalPluginMentionImage",
+  "PluginProviderCapabilities",
+  "PluginProviderComposerAction",
+  "PluginProviderCompletedTurnDisplay",
+  "PluginProviderDeclaration",
+  "ExperimentalPluginProviderEnvContext",
+  "ExperimentalPluginProviderEnvEntry",
+  "ExperimentalPluginProviderEnvHealth",
+  "ExperimentalPluginProviderEnvHealthContext",
+  "PluginProviderExtensionKindDeclaration",
+  "PluginProviderFallbackModel",
+  "PluginProviderMaintenance",
+  "PluginProviderModelCatalogScope",
+  "PluginProviderNativeRootEntry",
+  "PluginProviderNativeRoots",
+  "PluginProviderOptionDescriptor",
+  "PluginProviderOptionsContext",
+  "PluginProviderPermissionMode",
+  "PluginProviderReasoningLevel",
+  "PluginProviderStrings",
+  "PluginProviders",
   "PluginRealtime",
   "PluginRpc",
   "PluginServerApi",
@@ -69,7 +140,11 @@ const EXPECTED_BACKEND_ROOT_TYPE_EXPORTS = [
   "PluginThreadEventHandler",
   "PluginThreadEventName",
   "PluginThreadEventPayloads",
+  "PluginTurnFailedEvent",
   "PluginUi",
+  "PluginServerAccess",
+  "ServerAccessGrant",
+  "ServerAccessProviderDeclaration",
 ] as const;
 
 const EXPECTED_BACKEND_ROOT_VALUE_EXPORTS = [
@@ -77,6 +152,9 @@ const EXPECTED_BACKEND_ROOT_VALUE_EXPORTS = [
 ] as const;
 
 const EXPECTED_RPC_ROOT_TYPE_EXPORTS = [
+  "ExperimentalPluginRpcCaller",
+  "ExperimentalPluginRpcHandlerContext",
+  "ExperimentalPluginRpcHandlersWithContext",
   "PluginRpcCallArgs",
   "PluginRpcContract",
   "PluginRpcError",
@@ -94,6 +172,53 @@ const EXPECTED_RPC_ROOT_TYPE_EXPORTS = [
 ] as const;
 
 const EXPECTED_RPC_ROOT_VALUE_EXPORTS = ["defineRpcContract"] as const;
+
+const EXPECTED_HOST_ROOT_TYPE_EXPORTS = [
+  "ExperimentalHostCallOptions",
+  "ExperimentalHostClient",
+  "ExperimentalHostEntry",
+  "ExperimentalHostPaths",
+  "ExperimentalHostRpcContext",
+  "ExperimentalHostRpcHandlers",
+  "ExperimentalHostSignalContract",
+  "ExperimentalHostSignalEvent",
+  "ExperimentalHostSignals",
+  "ExperimentalHostWatchChange",
+  "ExperimentalHostWatchChangeType",
+  "ExperimentalHostWatchEvent",
+  "ExperimentalHostWatchListener",
+  "ExperimentalHostWatchOptions",
+  "ExperimentalHostWatchSubscription",
+  "ExperimentalHostWorkerLease",
+] as const;
+
+const EXPECTED_HOST_ROOT_VALUE_EXPORTS = [
+  "experimental_defineHostEntry",
+] as const;
+
+const EXPECTED_CLI_SPEC_ROOT_TYPE_EXPORTS = [
+  "PluginCliBooleanOption",
+  "PluginCliCommand",
+  "PluginCliConstraint",
+  "PluginCliDurationOption",
+  "PluginCliDurationUnit",
+  "PluginCliEnumOption",
+  "PluginCliErrorCode",
+  "PluginCliIntegerOption",
+  "PluginCliOption",
+  "PluginCliOptionValues",
+  "PluginCliPositional",
+  "PluginCliPositionalValues",
+  "PluginCliRunInput",
+  "PluginCliSpec",
+  "PluginCliStringOption",
+] as const;
+
+const EXPECTED_CLI_SPEC_ROOT_VALUE_EXPORTS = [
+  "PluginCliError",
+  "cliCommand",
+  "defineCli",
+] as const;
 
 function namesFromMatches(source: string, pattern: RegExp): string[] {
   return Array.from(source.matchAll(pattern), (match) => match[1]).sort();
@@ -116,6 +241,28 @@ function rootExportNames(
 describe("backend plugin SDK public surface", () => {
   it("snapshots every BbPluginApi root member", () => {
     expectTypeOf<keyof BbPluginApi>().toEqualTypeOf<ExpectedBbPluginApiKey>();
+  });
+
+  it("types configure plugin metadata as deep-readonly JSON", () => {
+    expectTypeOf<
+      PluginAgentConfigurationContext["pluginMetadata"]
+    >().toEqualTypeOf<{ readonly [key: string]: ReadonlyJsonValue }>();
+    expectTypeOf<ReadonlyJsonValue>().not.toMatchTypeOf<JsonValue>();
+
+    function writeMetadata(context: PluginAgentConfigurationContext): void {
+      // @ts-expect-error configure receives a deep-frozen snapshot
+      context.pluginMetadata.counter = 1;
+      // @ts-expect-error configure receives a deep-frozen snapshot
+      delete context.pluginMetadata.counter;
+    }
+    function borrowNestedValue(
+      context: PluginAgentConfigurationContext,
+    ): JsonValue | undefined {
+      // @ts-expect-error nested snapshot values are read-only too
+      return context.pluginMetadata.nested;
+    }
+    expectTypeOf(writeMetadata).toBeFunction();
+    expectTypeOf(borrowNestedValue).toBeFunction();
   });
 
   it("keeps every backend contract export in the root declaration bundle", async () => {
@@ -177,4 +324,106 @@ describe("backend plugin SDK public surface", () => {
       expect(rootValueExports.has(exportName), exportName).toBe(true);
     }
   });
+
+  it("keeps every declarative CLI export in the root declaration bundle", async () => {
+    const [cliSpec, declarations] = await Promise.all([
+      readFile(new URL("../cli-spec.ts", import.meta.url), "utf8"),
+      readFile(
+        new URL("../../bundled-types/bb-plugin-sdk.d.ts", import.meta.url),
+        "utf8",
+      ),
+    ]);
+    const declaredTypes = namesFromMatches(
+      cliSpec,
+      /^export (?:interface|type) ([A-Za-z0-9_]+)/gmu,
+    );
+    const declaredValues = namesFromMatches(
+      cliSpec,
+      /^export (?:class|const|function) ([A-Za-z0-9_]+)/gmu,
+    );
+    expect(declaredTypes).toEqual(
+      [...EXPECTED_CLI_SPEC_ROOT_TYPE_EXPORTS].sort(),
+    );
+    expect(declaredValues).toEqual(
+      [...EXPECTED_CLI_SPEC_ROOT_VALUE_EXPORTS].sort(),
+    );
+
+    const rootTypeExports = rootExportNames(declarations, "type");
+    const rootValueExports = rootExportNames(declarations, "value");
+    for (const exportName of EXPECTED_CLI_SPEC_ROOT_TYPE_EXPORTS) {
+      expect(rootTypeExports.has(exportName), exportName).toBe(true);
+    }
+    for (const exportName of EXPECTED_CLI_SPEC_ROOT_VALUE_EXPORTS) {
+      expect(rootValueExports.has(exportName), exportName).toBe(true);
+    }
+  });
+
+  it("keeps every host contract export in the root declaration bundle", async () => {
+    const [hostContract, declarations] = await Promise.all([
+      readFile(new URL("../host-contract.ts", import.meta.url), "utf8"),
+      readFile(
+        new URL("../../bundled-types/bb-plugin-sdk.d.ts", import.meta.url),
+        "utf8",
+      ),
+    ]);
+    const declaredTypes = namesFromMatches(
+      hostContract,
+      /^export (?:interface|type) ([A-Za-z0-9_]+)/gmu,
+    );
+    const declaredValues = namesFromMatches(
+      hostContract,
+      /^export (?:class|const|function) ([A-Za-z0-9_]+)/gmu,
+    );
+    expect(declaredTypes).toEqual([...EXPECTED_HOST_ROOT_TYPE_EXPORTS].sort());
+    expect(declaredValues).toEqual(
+      [...EXPECTED_HOST_ROOT_VALUE_EXPORTS].sort(),
+    );
+
+    const rootTypeExports = rootExportNames(declarations, "type");
+    const rootValueExports = rootExportNames(declarations, "value");
+    for (const exportName of EXPECTED_HOST_ROOT_TYPE_EXPORTS) {
+      expect(rootTypeExports.has(exportName), exportName).toBe(true);
+    }
+    for (const exportName of EXPECTED_HOST_ROOT_VALUE_EXPORTS) {
+      expect(rootValueExports.has(exportName), exportName).toBe(true);
+    }
+  });
+});
+
+it("requires provider presentation fields in author-facing declarations", () => {
+  expectTypeOf<
+    Pick<PluginProviderIconRegistration, "providerKind">
+  >().toEqualTypeOf<{
+    providerKind: "agent" | "machine" | "environment";
+  }>();
+  expectTypeOf<
+    Pick<PluginEnvironmentProviderDeclaration, "description" | "icon">
+  >().toEqualTypeOf<{
+    description: string;
+    icon: string;
+  }>();
+  expectTypeOf<
+    Pick<Parameters<PluginEnvironments["register"]>[0], "description" | "icon">
+  >().toEqualTypeOf<{
+    description: string;
+    icon: string;
+  }>();
+});
+
+it("gives composer attachments one owner and round-trips draft snapshots", () => {
+  const base = {
+    type: "localFile",
+    path: "/tmp/a.txt",
+    name: "a.txt",
+  } as const;
+  expectTypeOf({
+    ...base,
+    hostId: "host_1",
+    sourceProjectId: "proj_1",
+  }).not.toMatchTypeOf<ComposerAttachment>();
+  expectTypeOf({
+    ...base,
+    hostId: "host_1",
+  }).toMatchTypeOf<ComposerAttachment>();
+  expectTypeOf<ComposerDraftSnapshot>().toMatchTypeOf<ComposerDraftReplacement>();
 });

@@ -1,97 +1,86 @@
-// Backend tests: reply-anchor seed policy, archive cascade, empty-fork sweep.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
   makeThreadResponse,
-} from "@bb/plugin-sdk/testing";
+} from "@get-bb/plugin-sdk/testing";
 import plugin, {
   EMPTY_FORK_MAX_AGE_MS,
   EMPTY_FORK_SWEEP_PAGE_SIZE,
   REPLY_SEED_PREFIX,
-  lastConversationMessageText,
-  resolveReplySeedText,
-  timelineRowsContainUserMessage,
-  type SideChatTimelineRowLike,
 } from "./server";
 
 const PLUGIN_ID = "side-chat";
+
+interface TimelineRow {
+  kind: string;
+  role?: string;
+  text?: string;
+  children?: TimelineRow[] | null;
+}
 
 function conversationRow(text: string, role = "assistant") {
   return { kind: "conversation", role, text };
 }
 
-function turnRow(children: SideChatTimelineRowLike[] | null) {
+function turnRow(children: TimelineRow[] | null) {
   return { kind: "turn", children };
 }
 
-function timelineResult(rows: SideChatTimelineRowLike[]) {
+function timelineResult(rows: TimelineRow[]) {
   return { rows };
 }
+
+const hosts: ReturnType<typeof createFakePluginHost>[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  await Promise.all(
+    hosts.splice(0).map((host) => host.harness.lifecycle.dispose()),
+  );
+});
 
 async function loadPlugin(sdkThreads: Record<string, unknown>) {
   const host = createFakePluginHost({
     pluginId: PLUGIN_ID,
-    sdk: { threads: sdkThreads },
+    sdk: {
+      threads: {
+        get: async ({ threadId }: { threadId: string }) =>
+          makeThreadResponse({
+            id: threadId,
+            originKind: "fork",
+            originPluginId: PLUGIN_ID,
+            visibility: "hidden",
+          }),
+        ...sdkThreads,
+      },
+    },
   });
+  hosts.push(host);
   await plugin(host.bb);
   return host;
 }
 
-describe("lastConversationMessageText", () => {
-  it("returns the last non-empty conversation text, recursing into turns", () => {
-    expect(
-      lastConversationMessageText([
-        conversationRow("first"),
-        turnRow([{ kind: "work" }, conversationRow("nested last")]),
-        { kind: "system" },
-      ]),
-    ).toBe("nested last");
-  });
-
-  it("ignores empty conversation rows and returns null with none", () => {
-    expect(lastConversationMessageText([conversationRow("   ")])).toBeNull();
-    expect(lastConversationMessageText([turnRow(null)])).toBeNull();
-  });
-});
-
-describe("resolveReplySeedText", () => {
-  const rows = [
-    conversationRow("earlier answer"),
-    conversationRow("latest answer"),
-  ];
-
-  it("returns null when the anchor IS the source's last conversation message", () => {
-    expect(
-      resolveReplySeedText({
-        anchorText: "  latest answer  ",
-        sourceTimelineRows: rows,
-      }),
-    ).toBeNull();
-  });
-
-  it("returns the trimmed anchor for an earlier message", () => {
-    expect(
-      resolveReplySeedText({
-        anchorText: " earlier answer ",
-        sourceTimelineRows: rows,
-      }),
-    ).toBe("earlier answer");
-  });
-
-  it("returns null for an empty anchor (tip forks carry no seed)", () => {
-    expect(
-      resolveReplySeedText({ anchorText: "  ", sourceTimelineRows: rows }),
-    ).toBeNull();
-  });
-
-  it("returns the anchor when the source has no conversation messages", () => {
-    expect(
-      resolveReplySeedText({ anchorText: "anchor", sourceTimelineRows: [] }),
-    ).toBe("anchor");
-  });
-});
-
 describe("createSideChat rpc", () => {
+  it("does not read the source timeline to decide whether to include the anchor", async () => {
+    const timeline = vi.fn();
+    const fork = vi.fn(
+      async (_args: { agentContextSeed?: Array<{ text: string }> }) =>
+        makeThreadResponse({ id: "thr_fork" }),
+    );
+    const { harness } = await loadPlugin({ timeline, fork });
+
+    await harness.callRpc("createSideChat", {
+      sourceThreadId: "thr_src",
+      sourceSeqEnd: 7,
+      anchorText: "latest answer",
+    });
+
+    expect(timeline).not.toHaveBeenCalled();
+    expect(fork.mock.calls[0]?.[0].agentContextSeed?.[0]?.text).toBe(
+      `${REPLY_SEED_PREFIX}latest answer`,
+    );
+  });
+
   it("forks hidden+isolated with a seed when the anchor is an earlier message", async () => {
     const fork = vi.fn(async () => makeThreadResponse({ id: "thr_fork" }));
     const { harness } = await loadPlugin({
@@ -106,15 +95,15 @@ describe("createSideChat rpc", () => {
     const result = await harness.callRpc("createSideChat", {
       sourceThreadId: "thr_src",
       sourceSeqEnd: 42,
-      anchorText: "earlier answer",
+      anchorText: "  earlier answer  ",
     });
 
     expect(result).toEqual({ threadId: "thr_fork" });
     expect(fork).toHaveBeenCalledWith({
+      lifecycleOwnerThreadId: "thr_src",
       sourceThreadId: "thr_src",
       sourceSeqEnd: 42,
       visibility: "hidden",
-      workspace: "reuse",
       agentContextSeed: [
         {
           type: "text",
@@ -123,6 +112,8 @@ describe("createSideChat rpc", () => {
           visibility: "agent-only",
         },
       ],
+      origin: "plugin",
+      originPluginId: PLUGIN_ID,
     });
   });
 
@@ -195,27 +186,6 @@ describe("createSideChat rpc", () => {
     expect(fork).toHaveBeenCalledTimes(1);
   });
 
-  it("forks without a seed when the anchor is the last conversation message", async () => {
-    const fork = vi.fn(async () => makeThreadResponse({ id: "thr_fork" }));
-    const { harness } = await loadPlugin({
-      timeline: async () => timelineResult([conversationRow("latest answer")]),
-      fork,
-    });
-
-    await harness.callRpc("createSideChat", {
-      sourceThreadId: "thr_src",
-      sourceSeqEnd: 7,
-      anchorText: "latest answer",
-    });
-
-    expect(fork).toHaveBeenCalledWith({
-      sourceThreadId: "thr_src",
-      sourceSeqEnd: 7,
-      visibility: "hidden",
-      workspace: "reuse",
-    });
-  });
-
   it("forks from the tip without a seed or sourceSeqEnd for empty anchors", async () => {
     const fork = vi.fn(async () => makeThreadResponse({ id: "thr_fork" }));
     const { harness } = await loadPlugin({
@@ -225,50 +195,228 @@ describe("createSideChat rpc", () => {
 
     await harness.callRpc("createSideChat", {
       sourceThreadId: "thr_src",
-      anchorText: "",
+      anchorText: "   ",
     });
 
     expect(fork).toHaveBeenCalledWith({
+      lifecycleOwnerThreadId: "thr_src",
       sourceThreadId: "thr_src",
       visibility: "hidden",
-      workspace: "reuse",
-    });
-  });
-});
-
-describe("sendToMain rpc", () => {
-  it("queues the text on the source thread with the fork as sender", async () => {
-    const create = vi.fn(async () => ({ id: "qm_1" }));
-    const { harness } = await loadPlugin({ queuedMessages: { create } });
-
-    const result = await harness.callRpc("sendToMain", {
-      sourceThreadId: "thr_src",
-      senderThreadId: "thr_fork",
-      text: "the answer",
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(create).toHaveBeenCalledWith({
-      threadId: "thr_src",
-      input: [{ type: "text", text: "the answer", mentions: [] }],
-      senderThreadId: "thr_fork",
+      origin: "plugin",
+      originPluginId: PLUGIN_ID,
     });
   });
 });
 
 describe("empty-fork sweep", () => {
-  it("timelineRowsContainUserMessage finds nested user rows", () => {
-    expect(
-      timelineRowsContainUserMessage([
-        turnRow([conversationRow("hi", "user")]),
-      ]),
-    ).toBe(true);
-    expect(
-      timelineRowsContainUserMessage([conversationRow("reply", "assistant")]),
-    ).toBe(false);
+  it("discovers existing forks once and remembers discovery after reload", async () => {
+    const list = vi.fn(async () => []);
+    const host = await loadPlugin({ list });
+    await host.harness.runSchedule("empty-fork-cleanup");
+    const reloaded = await host.harness.lifecycle.reload(plugin);
+    hosts.push(reloaded);
+    await reloaded.harness.runSchedule("empty-fork-cleanup");
+    await reloaded.harness.runSchedule("empty-fork-cleanup");
+    expect(list).toHaveBeenCalledTimes(1);
   });
 
+  it("leaves a pending fork alone when it becomes visible before cleanup", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = Date.now();
+    const thread = makeThreadResponse({
+      id: "thr_promoted",
+      originKind: "fork",
+      originPluginId: PLUGIN_ID,
+      visibility: "hidden",
+      createdAt: now,
+    });
+    const timeline = vi.fn(async () => timelineResult([]));
+    const archive = vi.fn(async () => ({ ok: true }));
+    const { harness } = await loadPlugin({
+      list: async () => [thread],
+      get: async () => thread,
+      timeline,
+      archive,
+      queuedMessages: { list: async () => [] },
+    });
+    await harness.runSchedule("empty-fork-cleanup");
+    thread.visibility = "visible";
+    vi.setSystemTime(now + EMPTY_FORK_MAX_AGE_MS + 1);
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(archive).not.toHaveBeenCalled();
+    expect(timeline).not.toHaveBeenCalled();
+  });
+
+  it("uses a deadline index when all pending candidates are in the future", async () => {
+    const { bb, harness } = await loadPlugin({ list: async () => [] });
+    await harness.runSchedule("empty-fork-cleanup");
+    const db = bb.storage.database();
+    db.prepare(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+      INSERT INTO cleanup_candidates(thread_id, created_at, due_at)
+      SELECT 'future-'||x,?,? FROM n`).run(
+      Date.now(),
+      Date.now() + EMPTY_FORK_MAX_AGE_MS,
+    );
+    const prepare = vi.spyOn(db, "prepare");
+    await harness.runSchedule("empty-fork-cleanup");
+    const queries = prepare.mock.calls.map(([sql]) => sql);
+    prepare.mockRestore();
+    const candidateQuery = queries.find((sql) =>
+      sql.includes("FROM cleanup_candidates"),
+    );
+    expect(candidateQuery).toBeDefined();
+    const plan = db
+      .prepare(`EXPLAIN QUERY PLAN ${candidateQuery}`)
+      .all(Date.now());
+    expect(plan).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          detail: expect.stringMatching(/SEARCH cleanup_candidates .*due_at</),
+        }),
+      ]),
+    );
+  });
+
+  it.each([false, true])(
+    "cleans up new forks only after their deadline (tip fallback: %s)",
+    async (fallback) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const createdAt = Date.now();
+      const thread = makeThreadResponse({
+        id: "thr_new",
+        createdAt,
+        originKind: "fork",
+        originPluginId: PLUGIN_ID,
+        visibility: "hidden",
+      });
+      const fork = vi.fn(async () => thread);
+      if (fallback)
+        fork.mockRejectedValueOnce(
+          Object.assign(new Error("unavailable"), {
+            code: "fork_source_session_unavailable",
+          }),
+        );
+      const list = vi.fn(
+        async (): Promise<ReturnType<typeof makeThreadResponse>[]> => [],
+      );
+      const archive = vi.fn(async () => {
+        list.mockResolvedValue([]);
+        return { ok: true };
+      });
+      const { harness } = await loadPlugin({
+        list,
+        fork,
+        archive,
+        timeline: async () => timelineResult([]),
+        queuedMessages: { list: async () => [] },
+      });
+      await harness.runSchedule("empty-fork-cleanup");
+      await harness.callRpc("createSideChat", {
+        sourceThreadId: "thr_source",
+        sourceSeqEnd: 1,
+        anchorText: "answer",
+      });
+      list.mockResolvedValue([thread]);
+      vi.setSystemTime(createdAt + EMPTY_FORK_MAX_AGE_MS);
+      await harness.runSchedule("empty-fork-cleanup");
+      expect(archive).not.toHaveBeenCalled();
+      vi.setSystemTime(createdAt + EMPTY_FORK_MAX_AGE_MS + 1);
+      await harness.runSchedule("empty-fork-cleanup");
+      await harness.runSchedule("empty-fork-cleanup");
+      expect(archive).toHaveBeenCalledExactlyOnceWith({ threadId: "thr_new" });
+      expect(list).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("bounds due work and defers failed candidates so the backlog can progress", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = Date.now();
+    const threads: ReturnType<typeof makeThreadResponse>[] = [];
+    const fork = vi.fn(async () => {
+      const thread = makeThreadResponse({
+        id: `thr_${fork.mock.calls.length}`,
+        createdAt: now - EMPTY_FORK_MAX_AGE_MS - 1,
+        originKind: "fork",
+        originPluginId: PLUGIN_ID,
+        visibility: "hidden",
+      });
+      threads.push(thread);
+      return thread;
+    });
+    const timeline = vi.fn(async () => {
+      throw new Error("unavailable");
+    });
+    const archive = vi.fn(async () => ({ ok: true }));
+    const { harness } = await loadPlugin({
+      list: async ({ offset = 0, limit = EMPTY_FORK_SWEEP_PAGE_SIZE }) =>
+        threads.slice(offset, offset + limit),
+      fork,
+      timeline,
+      archive,
+    });
+    await harness.runSchedule("empty-fork-cleanup");
+    for (let i = 0; i <= EMPTY_FORK_SWEEP_PAGE_SIZE; i++) {
+      await harness.callRpc("createSideChat", {
+        sourceThreadId: "thr_source",
+        anchorText: "answer",
+      });
+    }
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(timeline).toHaveBeenCalledTimes(EMPTY_FORK_SWEEP_PAGE_SIZE);
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(timeline).toHaveBeenCalledTimes(EMPTY_FORK_SWEEP_PAGE_SIZE + 1);
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(timeline).toHaveBeenCalledTimes(EMPTY_FORK_SWEEP_PAGE_SIZE + 1);
+    expect(archive).not.toHaveBeenCalled();
+    vi.setSystemTime(now + 3_600_000);
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(timeline).toHaveBeenCalledTimes(2 * EMPTY_FORK_SWEEP_PAGE_SIZE + 1);
+  });
+
+  it.each(["thread.archived", "thread.deleted"] as const)(
+    "removes candidates on %s and tracks eligible unarchives",
+    async (event) => {
+      const thread = makeThreadResponse({
+        id: "thr_removed",
+        originKind: "fork",
+        originPluginId: PLUGIN_ID,
+        visibility: "hidden",
+        createdAt: Date.now() - EMPTY_FORK_MAX_AGE_MS - 1,
+      });
+      const archive = vi.fn(async () => ({ ok: true }));
+      const { bb, harness } = await loadPlugin({
+        list: async () => [],
+        fork: async () => thread,
+        archive,
+        timeline: async () => timelineResult([]),
+        queuedMessages: { list: async () => [] },
+      });
+      await harness.runSchedule("empty-fork-cleanup");
+      await harness.callRpc("createSideChat", {
+        sourceThreadId: "thr_source",
+        anchorText: "answer",
+      });
+      await bb.storage.kv.set(`kept-fork:${thread.id}`, true);
+      expect(await harness.emitThreadEvent(event, { thread })).toEqual({
+        errors: [],
+      });
+      await harness.runSchedule("empty-fork-cleanup");
+      expect(archive).not.toHaveBeenCalled();
+      expect(await bb.storage.kv.get(`kept-fork:${thread.id}`)).toBeUndefined();
+      if (event === "thread.archived") {
+        expect(
+          await harness.emitThreadEvent("thread.unarchived", { thread }),
+        ).toEqual({ errors: [] });
+        await harness.runSchedule("empty-fork-cleanup");
+        expect(archive).toHaveBeenCalledExactlyOnceWith({
+          threadId: thread.id,
+        });
+      }
+    },
+  );
+
   it("archives only old forks without user messages and logs what it drops", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const now = Date.now();
     const old = now - EMPTY_FORK_MAX_AGE_MS - 60_000;
     const emptyOldFork = makeThreadResponse({
@@ -333,19 +481,22 @@ describe("empty-fork sweep", () => {
     expect(archive.mock.calls.map(([args]) => args)).toEqual([
       { threadId: "thr_empty_old" },
     ]);
-    // Only candidates past the age cutoff pay for a timeline read.
     expect(timeline.mock.calls.map(([args]) => args.threadId)).toEqual([
       "thr_empty_old",
       "thr_replied_old",
     ]);
+
+    vi.setSystemTime(now + EMPTY_FORK_MAX_AGE_MS);
+    await harness.runSchedule("empty-fork-cleanup");
+    expect(archive.mock.calls.map(([args]) => args.threadId)).toEqual([
+      "thr_empty_old",
+      "thr_empty_young",
+    ]);
   });
 
-  // Archiving removes rows from the `archived: false` set the sweep pages
-  // through, so a full-page offset step would skip that many unswept forks.
   it("advances the page offset by the forks it left behind", async () => {
     const now = Date.now();
     const old = now - EMPTY_FORK_MAX_AGE_MS - 60_000;
-    // One full page: every fork is archived except the one that has a reply.
     const firstPage = Array.from(
       { length: EMPTY_FORK_SWEEP_PAGE_SIZE },
       (_unused, index) =>
@@ -372,8 +523,6 @@ describe("empty-fork sweep", () => {
 
     await harness.runSchedule("empty-fork-cleanup");
 
-    // The single retained fork is the only row still in the set, so the next
-    // page starts at 1 — not at a full page past it.
     expect(list.mock.calls.map(([args]) => args.offset)).toEqual([0, 1]);
   });
 
@@ -403,16 +552,15 @@ describe("empty-fork sweep", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  // A fork with user work can never become empty, so re-reading its whole
-  // timeline every hour is pure waste that grows with the thread history.
   it("remembers a kept fork and stops re-reading its timeline", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const now = Date.now();
     const fork = makeThreadResponse({
       id: "thr_has_work",
       originKind: "fork",
       originPluginId: PLUGIN_ID,
       visibility: "hidden",
-      createdAt: now - EMPTY_FORK_MAX_AGE_MS - 60_000,
+      createdAt: now - 60_000,
     });
     const timeline = vi.fn(async () =>
       timelineResult([turnRow([conversationRow("a reply", "user")])]),
@@ -428,14 +576,15 @@ describe("empty-fork sweep", () => {
     });
 
     await harness.runSchedule("empty-fork-cleanup");
+    expect(timeline).not.toHaveBeenCalled();
+    vi.setSystemTime(now + EMPTY_FORK_MAX_AGE_MS);
+    await harness.runSchedule("empty-fork-cleanup");
     await harness.runSchedule("empty-fork-cleanup");
 
     expect(timeline).toHaveBeenCalledTimes(1);
     expect(archive).not.toHaveBeenCalled();
   });
 
-  // A read failure must not be remembered, or one bad hour retires the fork
-  // from the sweep forever.
   it("retries a fork whose timeline read failed", async () => {
     const now = Date.now();
     const fork = makeThreadResponse({

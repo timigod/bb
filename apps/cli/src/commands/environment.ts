@@ -1,24 +1,41 @@
 import { Command } from "commander";
-import type {
-  CommitActionResponse,
-  SquashMergeActionResponse,
-} from "@bb/server-contract";
+import type { CommitActionResponse } from "@bb/server-contract";
 import type {
   EnvironmentDiffArgs,
   EnvironmentDiffFileArgs,
   EnvironmentDiffPatchArgs,
   EnvironmentUpdateArgs,
 } from "@bb/sdk";
+import {
+  environmentStatusSchema,
+  environmentStatusValues,
+  type EnvironmentStatus,
+} from "@bb/domain";
 import { action } from "../action.js";
 import { createCliBbSdk } from "../client.js";
-import {
-  outputJson,
-  prependErrorContext,
-  printEnvironmentGitOperationResult,
-} from "./helpers.js";
+import { resolveMachineHostId, resolveMachineTargetOption } from "./machine.js";
+import { collectOption, outputJson, prependErrorContext } from "./helpers.js";
 
 interface EnvironmentCommitCommandOptions {
   json?: boolean;
+}
+
+interface EnvironmentListCommandOptions {
+  host?: string;
+  instanceKey?: string;
+  json?: boolean;
+  limit?: string;
+  offset?: string;
+  project?: string;
+  provider?: string;
+  status?: string;
+}
+
+interface EnvironmentProvidersCommandOptions {
+  json?: boolean;
+  project?: string;
+  machine?: string;
+  host?: string;
 }
 
 interface EnvironmentShowCommandOptions {
@@ -72,11 +89,6 @@ interface EnvironmentUpdateCommandOptions {
   name?: string;
 }
 
-interface EnvironmentSquashMergeCommandOptions {
-  mergeBaseBranch: string;
-  json?: boolean;
-}
-
 interface EnvironmentPullRequestCommandOptions {
   json?: boolean;
   method?: "merge" | "squash" | "rebase";
@@ -87,10 +99,35 @@ interface BuildEnvironmentUpdateArgsInput {
   opts: EnvironmentUpdateCommandOptions;
 }
 
+function parseEnvironmentStatus(value: string): EnvironmentStatus {
+  const parsed = environmentStatusSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new Error(
+      `--status must be one of ${environmentStatusValues.join(", ")}.`,
+    );
+  }
+  return parsed.data;
+}
+
 function validateLimit(limit: string | undefined): void {
   if (limit !== undefined && !/^\d+$/u.test(limit)) {
     throw new Error("--limit must contain only digits.");
   }
+}
+
+function parseNonNegativeIntegerOption(
+  value: string | undefined,
+  optionName: "--limit" | "--offset",
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d+$/u.test(value)) {
+    throw new Error(`${optionName} must be a non-negative integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${optionName} must be a non-negative integer.`);
+  }
+  return parsed;
 }
 
 function booleanQueryValue(value: boolean): "true" | "false" {
@@ -173,21 +210,6 @@ function buildEnvironmentDiffFileArgs(
       }
       return { ...common, target: "uncommitted" };
     case "branch_committed":
-      if (!opts.mergeBaseRef) {
-        throw new Error(
-          `--merge-base-ref is required when --target ${opts.target} is used.`,
-        );
-      }
-      if (opts.sha !== undefined) {
-        throw new Error(
-          `--target ${opts.target} cannot be combined with --sha.`,
-        );
-      }
-      return {
-        ...common,
-        target: opts.target,
-        mergeBaseRef: opts.mergeBaseRef,
-      };
     case "all":
       if (!opts.mergeBaseRef) {
         throw new Error(
@@ -201,7 +223,7 @@ function buildEnvironmentDiffFileArgs(
       }
       return {
         ...common,
-        target: "all",
+        target: opts.target,
         mergeBaseRef: opts.mergeBaseRef,
       };
     case "commit":
@@ -219,6 +241,16 @@ function buildEnvironmentDiffFileArgs(
         "--target must be uncommitted, branch_committed, all, or commit.",
       );
   }
+}
+
+function addDiffTargetOptions(command: Command): Command {
+  return command
+    .requiredOption(
+      "--target <target>",
+      "Diff target: uncommitted, branch_committed, all, or commit",
+    )
+    .option("--merge-base-branch <branch>", "Branch-based target base")
+    .option("--sha <sha>", "Commit target SHA");
 }
 
 function buildEnvironmentDiffPatchArgs(
@@ -253,10 +285,6 @@ function buildEnvironmentDiffPatchArgs(
         target: { type: "commit", sha: diffArgs.sha },
       };
   }
-}
-
-function collectPath(value: string, previous: string[]): string[] {
-  return [...previous, value];
 }
 
 function buildEnvironmentUpdateArgs({
@@ -306,7 +334,147 @@ export function registerEnvironmentCommands(
     .description("Inspect and operate on first-class environments");
 
   environment
+    .command("cleanup <id>")
+    .description("Clean up an unused provider-managed environment")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (id: string, opts: { json?: boolean }) => {
+        const result = await createCliBbSdk(
+          getUrl(),
+        ).environments.experimental_cleanup({ environmentId: id });
+        if (!outputJson(opts, result))
+          console.log("Environment cleanup requested.");
+      }),
+    );
+
+  environment
+    .command("providers")
+    .description("List registered environment providers")
+    .option(
+      "--project <id>",
+      "List structurally eligible providers for this project",
+    )
+    .option("--machine <id-or-name>", "Scope eligibility to this machine")
+    .option("--host <id-or-name>", "Alias for --machine")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (opts: EnvironmentProvidersCommandOptions) => {
+        const machineTarget = resolveMachineTargetOption(opts);
+        if (machineTarget !== undefined && opts.project === undefined) {
+          throw new Error("--machine or --host requires --project <id>.");
+        }
+        const hostId =
+          machineTarget === undefined
+            ? undefined
+            : await resolveMachineHostId({
+                serverUrl: getUrl(),
+                target: machineTarget,
+              });
+        const providers = await createCliBbSdk(
+          getUrl(),
+        ).environments.listProviders({
+          ...(opts.project === undefined ? {} : { projectId: opts.project }),
+          ...(hostId === undefined ? {} : { hostId }),
+        });
+        if (outputJson(opts, providers)) return;
+        if (providers.length === 0) {
+          console.log("No environment providers available");
+          return;
+        }
+        for (const provider of providers) {
+          const requirements = Object.entries(provider.requires)
+            .filter(([, required]) => required)
+            .map(([name]) => name)
+            .join(", ");
+          const inputs =
+            provider.inputs === null ? "" : "  takes --environment-inputs";
+          const availability =
+            hostId === undefined
+              ? ""
+              : provider.availability === null
+                ? "  availability: unknown"
+                : provider.availability.status === "available"
+                  ? "  availability: available"
+                  : `  availability: ${provider.availability.status} (${provider.availability.message})`;
+          console.log(
+            `${provider.id}  ${provider.displayName}  ${requirements || "-"}${inputs}${availability}`,
+          );
+        }
+      }),
+    );
+
+  environment
+    .command("list")
+    .description("List environments, including destroyed ones when requested")
+    .option("--project <id>", "Only environments in this project")
+    .option(
+      "--provider <id>",
+      "Only environments produced by this environment provider",
+    )
+    .option("--host <id-or-name>", "Only environments on this machine")
+    .option(
+      "--instance-key <key>",
+      "Only the environment its provider named with this instance key",
+    )
+    .option(
+      "--status <status>",
+      "Only environments in this status: provisioning, ready, error, destroyed",
+    )
+    .option("--limit <n>", "At most this many rows, oldest first")
+    .option("--offset <n>", "Skip this many rows")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (opts: EnvironmentListCommandOptions) => {
+        const limit = parseNonNegativeIntegerOption(opts.limit, "--limit");
+        const offset = parseNonNegativeIntegerOption(opts.offset, "--offset");
+        const sdk = createCliBbSdk(getUrl());
+        const hostId =
+          opts.host === undefined
+            ? undefined
+            : await resolveMachineHostId({
+                serverUrl: getUrl(),
+                target: opts.host,
+              });
+        const rows = await sdk.environments.list({
+          ...(opts.project ? { projectId: opts.project } : {}),
+          ...(opts.provider ? { environmentProviderId: opts.provider } : {}),
+          ...(opts.instanceKey ? { instanceKey: opts.instanceKey } : {}),
+          ...(hostId === undefined ? {} : { hostId }),
+          ...(opts.status === undefined
+            ? {}
+            : { status: parseEnvironmentStatus(opts.status) }),
+          ...(limit === undefined ? {} : { limit }),
+          ...(offset === undefined ? {} : { offset }),
+        });
+        if (outputJson(opts, rows)) return;
+        for (const env of rows) {
+          console.log(
+            `${env.id}  ${env.status}  ${env.environmentProviderId ?? "-"}  ${env.path ?? "-"}`,
+          );
+        }
+      }),
+    );
+
+  environment
+    .command("delete <id>")
+    .description(
+      "Request provider cleanup; refused while threads are live or stopping",
+    )
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (id: string, opts: { json?: boolean }) => {
+        const sdk = createCliBbSdk(getUrl());
+        const result = await sdk.environments.delete({ environmentId: id });
+        if (outputJson(opts, result)) return;
+        const environment = await sdk.environments.get({ environmentId: id });
+        console.log(`Cleanup requested for environment ${id}.`);
+        console.log(`Lifecycle: ${environment.lifecycle.phase}`);
+      }),
+    );
+
+  environment
     .command("show <id>")
+    .alias("get")
     .description("Show environment details")
     .option("--json", "Print machine-readable JSON output")
     .action(
@@ -317,14 +485,29 @@ export function registerEnvironmentCommands(
         console.log(`Environment: ${env.id}`);
         console.log(`  Project: ${env.projectId}`);
         console.log(`  Status: ${env.status}`);
+        console.log(`  Lifecycle: ${env.lifecycle.phase}`);
+        if (env.lifecycle.retireAt !== null)
+          console.log(
+            `  Retire at: ${new Date(env.lifecycle.retireAt).toISOString()}`,
+          );
+        if (env.lifecycle.teardown !== null) {
+          console.log(
+            `  Teardown: ${env.lifecycle.teardown.status} (attempt ${env.lifecycle.teardown.attempt})`,
+          );
+          if (env.lifecycle.teardown.message !== undefined)
+            console.log(
+              `  Teardown message: ${env.lifecycle.teardown.message}`,
+            );
+        }
         if (env.path) {
           console.log(`  Path: ${env.path}`);
         }
         if (env.name) {
           console.log(`  Name: ${env.name}`);
         }
-        console.log(`  Managed: ${env.managed}`);
-        console.log(`  Provision type: ${env.workspaceProvisionType}`);
+        console.log(
+          `  Provider: ${env.environmentProviderId ?? "none (attached directory)"}`,
+        );
         if (env.branchName) {
           console.log(`  Branch: ${env.branchName}`);
         }
@@ -335,7 +518,6 @@ export function registerEnvironmentCommands(
           console.log(`  Merge base: ${env.mergeBaseBranch}`);
         }
         console.log(`  Git repo: ${env.isGitRepo}`);
-        console.log(`  Worktree: ${env.isWorktree}`);
         console.log(`  Created: ${new Date(env.createdAt).toLocaleString()}`);
         console.log(`  Updated: ${new Date(env.updatedAt).toLocaleString()}`);
       }),
@@ -439,15 +621,11 @@ export function registerEnvironmentCommands(
       }),
     );
 
-  environment
-    .command("diff <id>")
-    .description("Show an environment's git diff")
-    .requiredOption(
-      "--target <target>",
-      "Diff target: uncommitted, branch_committed, all, or commit",
-    )
-    .option("--merge-base-branch <branch>", "Branch-based target base")
-    .option("--sha <sha>", "Commit target SHA")
+  addDiffTargetOptions(
+    environment
+      .command("diff <id>")
+      .description("Show an environment's git diff"),
+  )
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (id: string, opts: EnvironmentDiffCommandOptions) => {
@@ -476,15 +654,11 @@ export function registerEnvironmentCommands(
       }),
     );
 
-  environment
-    .command("diff-files <id>")
-    .description("List changed files in an environment")
-    .requiredOption(
-      "--target <target>",
-      "Diff target: uncommitted, branch_committed, all, or commit",
-    )
-    .option("--merge-base-branch <branch>", "Branch-based target base")
-    .option("--sha <sha>", "Commit target SHA")
+  addDiffTargetOptions(
+    environment
+      .command("diff-files <id>")
+      .description("List changed files in an environment"),
+  )
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (id: string, opts: EnvironmentDiffCommandOptions) => {
@@ -513,6 +687,9 @@ export function registerEnvironmentCommands(
         }
         if (result.shortstat.trim().length > 0) {
           console.log(result.shortstat.trim());
+        }
+        if (result.truncated) {
+          console.log("(additional changed files omitted)");
         }
       }),
     );
@@ -554,7 +731,12 @@ export function registerEnvironmentCommands(
       "--target <target>",
       "Diff target: uncommitted, branch_committed, all, or commit",
     )
-    .option("--path <path>", "Changed file path (repeatable)", collectPath, [])
+    .option(
+      "--path <path>",
+      "Changed file path (repeatable)",
+      collectOption,
+      [],
+    )
     .option("--merge-base-branch <branch>", "Branch-based target base")
     .option("--sha <sha>", "Commit target SHA")
     .option("--json", "Print machine-readable JSON output")
@@ -659,25 +841,7 @@ export function registerEnvironmentCommands(
           );
         }
         if (outputJson(opts, result)) return;
-        printEnvironmentGitOperationResult(result);
-      }),
-    );
-
-  environment
-    .command("squash-merge <id>")
-    .description("Squash-merge changes in an environment")
-    .requiredOption("--merge-base-branch <branch>", "Merge-base branch")
-    .option("--json", "Print machine-readable JSON output")
-    .action(
-      action(async (id: string, opts: EnvironmentSquashMergeCommandOptions) => {
-        const sdk = createCliBbSdk(getUrl());
-        const result: SquashMergeActionResponse =
-          await sdk.environments.squashMerge({
-            environmentId: id,
-            mergeBaseBranch: opts.mergeBaseBranch,
-          });
-        if (outputJson(opts, result)) return;
-        printEnvironmentGitOperationResult(result);
+        console.log(`${result.message} [committed]`);
       }),
     );
 
@@ -726,6 +890,10 @@ export function registerEnvironmentCommands(
         console.log(`URL: ${pr.url}`);
         console.log(`Branch: ${pr.headRefName} -> ${pr.baseRefName}`);
         console.log(`Attention: ${pr.attention}`);
+        console.log(`Auto-merge: ${pr.autoMerge ? "on" : "off"}`);
+        console.log(
+          `Merge queue: ${pr.inMergeQueue === null ? "unknown" : pr.inMergeQueue ? "queued" : "not queued"}`,
+        );
         console.log(
           `Checks: ${pr.checks.state} (${pr.checks.passedCount} passed, ` +
             `${pr.checks.failedCount} failed, ${pr.checks.pendingCount} pending, ` +

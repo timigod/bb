@@ -1,21 +1,15 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@bb/plugin-sdk";
+import { pluginCliCall } from "@bb/domain/plugin-cli";
+import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import type { PluginCliCommandInfo } from "./plugin-api.js";
 
-/**
- * Server-generated `plugin-commands` skill (design §4.4): teaches agents the
- * `bb` subcommands installed plugins contribute, one section per plugin, at
- * near-zero context cost. Lives under <dataDir>/skills-generated (a distinct
- * root resolved with the data-dir skill tier mechanics) and exists only while
- * at least one CLI command is registered — the plugin service rewrites or
- * removes it on load/reload/toggle.
- */
 export interface PluginCliContribution {
   pluginId: string;
   name: string;
   summary: string;
   commands: PluginCliCommandInfo[];
+  rendersHelp: boolean;
 }
 
 const SKILL_NAME = "plugin-commands";
@@ -28,20 +22,26 @@ export function pluginCommandsSkillDir(dataDir: string): string {
   return join(generatedSkillsRootPath(dataDir), SKILL_NAME);
 }
 
-export function renderPluginCommandsSkill(
+function renderPluginCommandsSkill(
   contributions: readonly PluginCliContribution[],
 ): string {
   const sections = contributions.map((contribution) => {
+    const direct = `bb ${contribution.name}`;
+    const invocation = pluginCliCall(contribution.pluginId, contribution.name);
     const lines = [
-      `## bb ${contribution.name} — ${contribution.summary}`,
+      `## ${invocation} — ${contribution.summary}`,
       "",
-      `Contributed by plugin \`${contribution.pluginId}\`. Run \`bb ${contribution.name} --help\` for details;`,
-      `\`bb plugin run ${contribution.pluginId} <args...>\` is the explicit equivalent.`,
+      `Contributed by plugin \`${contribution.pluginId}\`. Run \`${invocation} --help\` for details.`,
+      `\`bb plugin run ${contribution.pluginId} <args...>\` is always available.`,
     ];
     if (contribution.commands.length > 0) {
       lines.push("");
       for (const command of contribution.commands) {
-        lines.push(`- \`${command.usage}\` — ${command.summary}`);
+        const usage =
+          command.usage === direct || command.usage.startsWith(`${direct} `)
+            ? `${invocation}${command.usage.slice(direct.length)}`
+            : command.usage;
+        lines.push(`- \`${usage}\` — ${command.summary}`);
       }
     }
     return lines.join("\n");
@@ -49,13 +49,12 @@ export function renderPluginCommandsSkill(
   return [
     "---",
     `name: ${SKILL_NAME}`,
-    "description: CLI commands contributed by installed BB plugins. Use when a task involves one of the plugin commands listed here; run them with bash like any other bb command.",
+    "description: Discover CLI commands contributed by installed BB plugins and their invocation paths.",
     "---",
     "",
     "# Plugin Commands",
     "",
-    "Installed BB plugins contribute these `bb` subcommands. Invoke them with",
-    "bash exactly like core `bb` commands; they run server-side.",
+    "Installed BB plugins contribute commands; core-name collisions use the explicit plugin-id form while others use a top-level `bb` subcommand.",
     `Combined stdout and stderr is capped at ${PLUGIN_CLI_OUTPUT_MAX_BYTES} UTF-8 bytes. Above-limit`,
     "results fail atomically as `plugin_cli_output_too_large` and are never clipped;",
     "use pagination or file/streaming commands for large results.",
@@ -65,11 +64,6 @@ export function renderPluginCommandsSkill(
   ].join("\n");
 }
 
-/**
- * Write the skill when there is at least one contribution; remove it
- * otherwise (an absent directory is how "no plugin commands" reaches
- * resolveInjectedSkillSources, which tolerates a missing root).
- */
 export async function syncPluginCommandsSkill(
   dataDir: string,
   contributions: readonly PluginCliContribution[],

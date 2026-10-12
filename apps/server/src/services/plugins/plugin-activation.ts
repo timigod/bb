@@ -1,3 +1,4 @@
+import { reportPluginUpdatePhase } from "./plugin-update-progress.js";
 import { PLUGIN_SDK_VERSION } from "@bb/domain";
 import {
   getInstalledPlugin,
@@ -24,10 +25,8 @@ import {
   garbageCollectPluginArtifacts,
   pluginArtifactStorageRoot,
 } from "./plugin-artifact-gc.js";
-import type {
-  PluginRuntimeStatus,
-  PluginServiceDeps,
-} from "./plugin-service-internal.js";
+import type { PluginRuntimeStatus } from "@bb/server-contract";
+import type { PluginServiceDeps } from "./plugin-service-internal.js";
 import type { PluginManifest } from "./manifest.js";
 
 export class PluginActivationRolledBackError extends Error {
@@ -37,7 +36,7 @@ export class PluginActivationRolledBackError extends Error {
   }
 }
 
-export interface PluginActivationContext {
+interface PluginActivationContext {
   deps: PluginServiceDeps;
   now: () => number;
   artifactRetentionMs: number;
@@ -55,7 +54,7 @@ export interface PluginActivationContext {
   withArtifactLock: <T>(key: string, fn: () => Promise<T>) => Promise<T>;
   withLifecycleLock: <T>(id: string, fn: () => Promise<T>) => Promise<T>;
   disposeOne: (id: string) => Promise<void>;
-  loadOne: (row: InstalledPluginRow) => Promise<void>;
+  loadOne: (row: InstalledPluginRow) => Promise<string | null>;
   restoreRegistration: (row: InstalledPluginRow) => void;
   provenanceForRow: (row: InstalledPluginRow) => PluginProvenance;
   registrationMatchesForActivation: (
@@ -136,8 +135,6 @@ export function createPluginActivation(context: PluginActivationContext) {
       );
     }
     await disposeOne(snapshot.pluginId);
-    // Rollback is intentionally limited to bb-owned state. Effects the
-    // candidate already caused in external systems cannot be reversed.
     await restorePluginStateSnapshot({
       db: deps.db,
       dataDir: deps.dataDir,
@@ -168,8 +165,6 @@ export function createPluginActivation(context: PluginActivationContext) {
         `plugin "${snapshot.pluginId}" failed to reload during rollback: ${runtime.detail ?? "unknown error"}`,
       );
     }
-    // Loading synchronizes schedule registrations; replay the captured host
-    // rows once more so rollback restores their exact run state.
     await restorePluginHostStateSnapshot({ db: deps.db, snapshotId });
     if (!setPluginStateSnapshotStatus(deps.db, snapshotId, "restored", now())) {
       throw new Error(`plugin rollback snapshot disappeared: ${snapshotId}`);
@@ -238,6 +233,7 @@ export function createPluginActivation(context: PluginActivationContext) {
       }
       let pointerWritten = false;
       try {
+        reportPluginUpdatePhase("activating");
         await args.beforePersist?.();
         const beforeWrite = getInstalledPlugin(deps.db, args.row.id);
         if (
@@ -259,6 +255,7 @@ export function createPluginActivation(context: PluginActivationContext) {
           rootDir: args.rootDir,
           version: args.manifest.version,
           enabled: args.row.enabled,
+          enabledFollowsDefault: args.row.enabledFollowsDefault,
         });
         pointerWritten = true;
         const current = getInstalledPlugin(deps.db, args.row.id);
@@ -269,6 +266,7 @@ export function createPluginActivation(context: PluginActivationContext) {
           throw new Error(immediate.detail ?? "plugin failed to load");
         }
         if (stabilizationWindowMs > 0) {
+          reportPluginUpdatePhase("checking");
           const failure = await new Promise<string | null>((resolveFailure) => {
             let cancelWindow = () => {};
             const listener = (
@@ -326,6 +324,7 @@ export function createPluginActivation(context: PluginActivationContext) {
             `plugin rollback snapshot ${snapshot.id} could not be marked pending`,
           );
         }
+        reportPluginUpdatePhase("rolling-back");
         await recoverRollbackWithinLifecycle(snapshot.id);
         throw new PluginActivationRolledBackError(
           `activation of ${args.manifest.version} failed and was rolled back: ${detail}; run apply update again to retry explicitly`,

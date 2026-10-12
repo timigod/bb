@@ -1,23 +1,26 @@
 import { cn } from "@bb/shared-ui/lib/utils";
+import type { MachineStatusTone } from "./machine-status";
 
-/**
- * Connection-status dot for a machine (host): filled success dot when the
- * daemon is connected, hollow ring when offline. Shared by the environment
- * picker's machine menu, Settings → Machines, and project source rows.
- */
 export function MachineStatusDot({
   connected,
+  tone,
   className,
 }: {
-  connected: boolean;
+  connected?: boolean;
+  tone?: MachineStatusTone;
   className?: string;
 }) {
+  const resolved: MachineStatusTone =
+    tone ?? (connected === true ? "online" : "offline");
   return (
     <span
       aria-hidden
       className={cn(
         "size-1.5 shrink-0 rounded-full",
-        connected ? "bg-success" : "border border-muted-foreground",
+        resolved === "online" && "bg-success",
+        resolved === "attention" && "bg-attention",
+        resolved === "failed" && "bg-destructive",
+        resolved === "offline" && "border border-muted-foreground",
         className,
       )}
     />

@@ -13,57 +13,37 @@ import {
   type PluginComposerPlusMenuContribution,
   type PluginComposerPlusMenuSelection,
 } from "@/components/plugin/PluginComposerActions";
+import { useResolvedComposerPlusMenuItems } from "@/components/plugin/composer-slot-hooks";
+import { useOptionalPluginComposerStaticView } from "@/components/plugin/plugin-composer-host";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { COARSE_POINTER_PROMPT_ICON_ACTION_BUTTON_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
-import { CREATE_PLUGIN_PROMPT } from "@/lib/create-resource-prompts";
-import type { ProviderPromptActionCommand } from "./mentions/command-trigger";
+import { CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS } from "@bb/shared-ui/chrome-style-tokens";
+import type { ProviderPromptActionCommand } from "@bb/client-core";
 
-export type PromptBoxActionKind =
-  | "skills"
-  | "plan"
-  | "goal"
-  | "automation"
-  | "plugin";
+type PromptBoxActionKind = "skills" | "plan" | "goal";
 
 export interface PromptBoxAction {
   kind: PromptBoxActionKind;
   text: string;
   command?: ProviderPromptActionCommand;
-  label?: string;
-  disabled?: boolean;
 }
 
 interface PromptBoxActionsMenuProps {
   actions?: readonly PromptBoxAction[];
-  isAttaching?: boolean;
   onAttach?: () => void;
   onAction: (action: PromptBoxAction) => void;
   pluginItems?: readonly PluginComposerPlusMenuContribution[];
 }
 
-export const AUTOMATION_PROMPT_ACTION: PromptBoxAction = {
-  kind: "automation",
-  command: { trigger: "/", name: "automation", trailingText: " " },
-  text: "/automation ",
-};
-
-/**
- * Seeds the composer with the plugin prompt prefix the plugin library uses, so
- * the user finishes one sentence and the agent reaches the plugin-authoring
- * skill. There is no provider command for it, so the text is inserted as is.
- */
-export const CREATE_PLUGIN_PROMPT_ACTION: PromptBoxAction = {
-  kind: "plugin",
-  text: CREATE_PLUGIN_PROMPT,
-};
-
-const PROMPT_ACTION_ORDER: readonly PromptBoxActionKind[] = [
-  "skills",
-  "plan",
-  "goal",
-  "automation",
-  "plugin",
-];
+export function ComposerPlusMenuSlot(
+  props: Omit<PromptBoxActionsMenuProps, "pluginItems">,
+) {
+  const view = useOptionalPluginComposerStaticView();
+  const pluginItems = useResolvedComposerPlusMenuItems(
+    view?.scope.kind ?? null,
+  );
+  return <PromptBoxActionsMenu {...props} pluginItems={pluginItems} />;
+}
 
 const PROMPT_ACTION_PRESENTATION = {
   skills: {
@@ -78,37 +58,16 @@ const PROMPT_ACTION_PRESENTATION = {
     label: "Goal",
     icon: "Target",
   },
-  automation: {
-    label: "Automation",
-    icon: "Repeat",
-  },
-  // The icons follow the Tools navigation sections, so "Skills" and "Plugin"
-  // read the same here as they do in the sidebar. See tools-navigation.ts.
-  plugin: {
-    label: "Plugin",
-    icon: "ElectricPlugs",
-  },
 } as const satisfies Record<
   PromptBoxActionKind,
   { label: string; icon: IconName }
 >;
 
-/**
- * Adds the app-owned prompt actions to the provider-owned ones. Providers
- * describe only their own composer commands, so bb appends the actions it owns
- * itself and keeps a provider entry when the provider already supplies one.
- */
-export function withAppPromptActions(
-  actions: readonly PromptBoxAction[],
-): PromptBoxAction[] {
-  const appActions = [AUTOMATION_PROMPT_ACTION, CREATE_PLUGIN_PROMPT_ACTION];
-  return [
-    ...actions,
-    ...appActions.filter(
-      (appAction) => !actions.some((action) => action.kind === appAction.kind),
-    ),
-  ];
-}
+const PROMPT_ACTION_ORDER: readonly PromptBoxActionKind[] = [
+  "skills",
+  "plan",
+  "goal",
+];
 
 function orderedPromptActions(
   actions: readonly PromptBoxAction[],
@@ -121,7 +80,6 @@ function orderedPromptActions(
 
 export function PromptBoxActionsMenu({
   actions = [],
-  isAttaching = false,
   onAttach,
   onAction,
   pluginItems = [],
@@ -183,15 +141,11 @@ export function PromptBoxActionsMenu({
           aria-label="Prompt actions"
           className={cn(
             COARSE_POINTER_PROMPT_ICON_ACTION_BUTTON_CLASS,
-            // Outdent so the "+" glyph lines up with the placeholder/text
-            // (toolbar px-3.5 + button px-2 sits 6px right of the editor's px-4).
+            CHROME_SUBTLE_ICON_BUTTON_FOREGROUND_CLASS,
             "-ml-1.5",
           )}
         >
-          <Icon
-            name={isAttaching ? "Spinner" : "Plus"}
-            className={cn("size-4", isAttaching && "animate-spin")}
-          />
+          <Icon name="Plus" className="size-4" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -214,18 +168,14 @@ export function PromptBoxActionsMenu({
         {onAttach ? (
           <>
             <DropdownMenuItem
-              disabled={isAttaching}
               onSelect={() => {
                 selectedItemRef.current = true;
                 onAttach();
               }}
             >
               <Icon
-                name={isAttaching ? "Spinner" : "Paperclip"}
-                className={cn(
-                  "size-4 text-muted-foreground",
-                  isAttaching && "animate-spin",
-                )}
+                name="Paperclip"
+                className="size-4 text-muted-foreground"
                 aria-hidden
               />
               Attach files
@@ -238,7 +188,6 @@ export function PromptBoxActionsMenu({
           return (
             <DropdownMenuItem
               key={action.kind}
-              disabled={action.disabled}
               onSelect={() => {
                 selectedItemRef.current = true;
                 onAction(action);
@@ -249,32 +198,21 @@ export function PromptBoxActionsMenu({
                 className="size-4 text-muted-foreground"
                 aria-hidden
               />
-              {action.label ?? presentation.label}
+              {presentation.label}
             </DropdownMenuItem>
           );
         })}
-        {pluginItems.length > 0 ? <DropdownMenuSeparator /> : null}
-        {pluginItems.map((contribution, index) => {
-          const contributingPluginCount = new Set(
-            pluginItems.map((candidate) => candidate.pluginId),
-          ).size;
-          const previous = pluginItems[index - 1];
-          const startsPluginGroup =
-            contributingPluginCount >= 2 &&
-            previous?.pluginId !== contribution.pluginId;
-          return (
-            <PluginComposerPlusMenuEntry
-              key={`${contribution.pluginId}/${contribution.customizationId}/${contribution.item.id}/${contribution.generation}`}
-              contribution={contribution}
-              showPluginLabel={startsPluginGroup}
-              onSelected={(selection) => {
-                selectedItemRef.current = true;
-                pluginSelectionRef.current = selection;
-                queueMicrotask(() => restorePluginComposerFocus(selection));
-              }}
-            />
-          );
-        })}
+        {pluginItems.map((contribution) => (
+          <PluginComposerPlusMenuEntry
+            key={contribution.key}
+            contribution={contribution}
+            onSelected={(selection) => {
+              selectedItemRef.current = true;
+              pluginSelectionRef.current = selection;
+              queueMicrotask(() => restorePluginComposerFocus(selection));
+            }}
+          />
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

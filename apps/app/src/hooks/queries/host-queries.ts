@@ -1,60 +1,64 @@
 import { useMemo } from "react";
 import { keepPreviousData, skipToken, useQuery } from "@tanstack/react-query";
 import type { Host } from "@bb/domain";
-import type { HostDirectoryListing } from "@bb/server-contract";
+import type {
+  HostDirectoryListing,
+  HostDiscoveredReposResponse,
+} from "@bb/server-contract";
 import { sdk } from "@/lib/sdk";
 import { useHostListRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
 import { useSystemConfig } from "@/hooks/queries/system-queries";
 import {
   hostCloneDefaultPathQueryKey,
   hostDirectoryQueryKey,
+  hostDiscoveredReposQueryKey,
   hostsQueryKey,
 } from "./query-keys";
+import type { QueryOptions } from "./query-helpers";
 
-interface QueryOptions {
-  enabled?: boolean;
-}
-
-/**
- * Hosts known to the server, with live connection status. Server-derived, so it
- * resolves from any device on the tailnet — unlike the loopback host-daemon
- * probe, which only answers on the machine actually running bb.
- */
-export function useHosts(options?: QueryOptions) {
+export function useHosts(
+  options?: QueryOptions & { includeCreating?: boolean },
+) {
   const enabled = options?.enabled ?? true;
+  const includeCreating = options?.includeCreating ?? false;
   useHostListRealtimeSubscription({ enabled });
 
   return useQuery<Host[]>({
-    queryKey: hostsQueryKey(),
-    queryFn: ({ signal }) => sdk.hosts.list({ signal }),
+    queryKey: hostsQueryKey(includeCreating),
+    queryFn: ({ signal }) => sdk.hosts.list({ signal, includeCreating }),
     enabled,
     staleTime: 60_000,
   });
 }
 
-/**
- * The host bb defaults work to. The server-resolved `primaryHostId` from
- * `/system/config` is authoritative — with several connected machines the
- * first-connected guess can crown the wrong one. The connected-first
- * heuristic remains only for a null id (fresh server, or config still
- * loading). A non-null id that isn't in the list means the primary isn't
- * visible here: return null rather than promote another machine.
- */
+export type HostScope = "persistent" | "all";
+
+export function selectHosts(
+  hosts: readonly Host[] | undefined,
+  scope: HostScope,
+): Host[] {
+  const everyHost = hosts ? [...hosts] : [];
+  return scope === "all"
+    ? everyHost
+    : everyHost.filter((host) => host.type !== "ephemeral");
+}
+
 export function selectPrimaryHost(
   hosts: readonly Host[] | undefined,
   primaryHostId: string | null,
 ): Host | null {
-  if (!hosts || hosts.length === 0) return null;
+  const availableHosts = selectHosts(hosts, "persistent");
+  if (availableHosts.length === 0) return null;
   if (primaryHostId !== null) {
-    return hosts.find((host) => host.id === primaryHostId) ?? null;
+    return availableHosts.find((host) => host.id === primaryHostId) ?? null;
   }
-  return hosts.find((host) => host.status === "connected") ?? hosts[0] ?? null;
+  return (
+    availableHosts.find((host) => host.status === "connected") ??
+    availableHosts[0] ??
+    null
+  );
 }
 
-/**
- * The single host the server runs work on by default, resolved server-side.
- * Returns null while loading or before any host has ever connected.
- */
 export function usePrimaryHost(options?: QueryOptions): Host | null {
   const { data: hosts } = useHosts(options);
   const primaryHostId = useSystemConfig(options).data?.primaryHostId ?? null;
@@ -64,15 +68,6 @@ export function usePrimaryHost(options?: QueryOptions): Host | null {
   );
 }
 
-/**
- * Single-level directory listing on a host, for the interactive path browser.
- * A null `path` lists the host's home directory. Keeps the previous listing
- * visible while navigating so the list doesn't blank out between folders.
- */
-/**
- * Default clone destination for a project on a host (the daemon's checkout
- * convention). Discovery only — nothing is created until the clone runs.
- */
 export function useHostCloneDefaultPath(
   hostId: string | null,
   projectId: string | null,
@@ -88,6 +83,23 @@ export function useHostCloneDefaultPath(
               .path
         : skipToken,
     staleTime: 60_000,
+  });
+}
+
+export function useHostDiscoveredRepos(
+  hostId: string | null,
+  options?: QueryOptions,
+) {
+  return useQuery<HostDiscoveredReposResponse>({
+    queryKey: hostDiscoveredReposQueryKey(hostId),
+    queryFn:
+      hostId === null
+        ? skipToken
+        : ({ signal }) =>
+            sdk.hosts.experimental_discoverRepos({ hostId, signal }),
+    enabled: options?.enabled ?? true,
+    staleTime: 5 * 60_000,
+    retry: false,
   });
 }
 

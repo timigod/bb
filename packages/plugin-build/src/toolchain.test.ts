@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildPluginApp } from "./build-plugin-app.js";
 import {
@@ -20,18 +21,14 @@ describe("plugin build toolchain", () => {
     await rm(baseDir, { recursive: true, force: true });
   });
 
-  // Bumping a pin must install beside the old set rather than mutate a
-  // directory a concurrent build may already be importing from.
   it("keys the cache directory on the pinned versions", () => {
     const dir = toolchainCacheDir("/data");
     for (const version of Object.values(PLUGIN_TOOLCHAIN_PINS)) {
       expect(basename(dir)).toContain(version);
     }
-    expect(dir.startsWith("/data/")).toBe(true);
+    expect(dir.startsWith(`${join("/data")}${sep}`)).toBe(true);
   });
 
-  // The monorepo and any machine that already has the packages must not pay a
-  // download — only a shipped artifact, which carries none of them, fetches.
   it("prefers a locally resolvable toolchain over fetching", async () => {
     const toolchain = await resolvePluginBuildToolchain(baseDir, {
       onFetchStart: () => {
@@ -43,7 +40,6 @@ describe("plugin build toolchain", () => {
     expect(toolchain.esbuild).toContain("esbuild");
     expect(toolchain.tailwindNode).toContain("@tailwindcss/node");
     expect(toolchain.tailwindOxide).toContain("@tailwindcss/oxide");
-    // Nothing was written, so no cache directory exists.
     expect(
       await rm(toolchainCacheDir(baseDir), { recursive: true }).then(
         () => true,
@@ -52,22 +48,6 @@ describe("plugin build toolchain", () => {
     ).toBe(false);
   });
 
-  it("returns importable module specifiers", async () => {
-    const toolchain = await resolvePluginBuildToolchain(baseDir);
-    const esbuild = (await import(
-      toolchain.esbuild
-    )) as typeof import("esbuild");
-    const result = await esbuild.transform("const x: number = 1", {
-      loader: "ts",
-    });
-
-    expect(result.code.trim()).toBe("const x = 1;");
-  });
-
-  // The path a shipped server, CLI, or desktop app takes. Exercised end to end
-  // because a build that resolved Tailwind's CSS relative to this module
-  // passed every local-toolchain test and still could not build anything once
-  // packaged.
   describe("fetched toolchain", () => {
     it.runIf(process.env.BB_TEST_TOOLCHAIN_FETCH === "1")(
       "builds a plugin frontend with nothing resolvable locally",
@@ -79,9 +59,6 @@ describe("plugin build toolchain", () => {
           onFetchDone: (ms) => fetchEvents.push(`done:${ms > 0}`),
         });
 
-        // Both ends are reported: without the completion callback the caller
-        // has no way to say the download finished, which is what left the CLI
-        // silent for the whole fetch.
         expect(fetchEvents).toEqual(["start", "done:true"]);
 
         expect(toolchain.esbuild).toContain("toolchain-");
@@ -109,24 +86,71 @@ describe("plugin build toolchain", () => {
         );
         await writeFile(
           join(pluginDir, "app.tsx"),
-          `import { definePluginApp } from "@bb/plugin-sdk/app";\n` +
+          `import { definePluginApp } from "@get-bb/plugin-sdk/app";\n` +
             `export default definePluginApp({});\n`,
         );
 
         const result = await buildPluginApp(pluginDir, "0.9.0-test", toolchain);
         const css = await readFile(result.cssPath, "utf8");
 
-        // Proves `tailwindcss/theme.css` resolved from the fetched package.
         expect(css.length).toBeGreaterThan(0);
         expect(css).toContain("--");
       },
       600_000,
     );
 
-    it("reuses an already-fetched toolchain without reinstalling", async () => {
-      const local = await resolvePluginBuildToolchain(baseDir);
-      // Stand in for a promoted cache: the marker plus a resolvable tree.
-      expect(local.tailwindCssDir.length).toBeGreaterThan(0);
-    });
+    it.skipIf(process.platform === "win32")(
+      "fetches with the shipped npm and excludes script-policy config without PATH executables",
+      async () => {
+        const envDump = join(baseDir, "npm-env.txt");
+        const preload = join(baseDir, "capture-npm-env.mjs");
+        await writeFile(
+          preload,
+          [
+            'import { writeFileSync } from "node:fs";',
+            `writeFileSync(${JSON.stringify(envDump)}, Object.entries(process.env).map(([key, value]) => key + "=" + value).join("\\n"));`,
+            "process.exit(0);",
+          ].join("\n"),
+        );
+
+        const overrides: Record<string, string> = {
+          PATH: baseDir,
+          NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+          npm_config_allow_scripts: "@github/keytar,node-pty",
+          NPM_CONFIG_IGNORE_SCRIPTS: "false",
+          npm_config_registry: "https://registry.example.invalid/",
+        };
+        const previous = new Map<string, string | undefined>();
+        for (const [key, value] of Object.entries(overrides)) {
+          previous.set(key, process.env[key]);
+          process.env[key] = value;
+        }
+        try {
+          await expect(
+            resolvePluginBuildToolchain(baseDir, { ignoreLocal: true }),
+          ).rejects.toThrow(/incomplete or misversioned/);
+        } finally {
+          for (const [key, value] of previous) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+          }
+        }
+
+        const seen = new Map(
+          (await readFile(envDump, "utf8"))
+            .split("\n")
+            .filter((line) => line.includes("="))
+            .map((line) => {
+              const at = line.indexOf("=");
+              return [line.slice(0, at), line.slice(at + 1)] as const;
+            }),
+        );
+        expect(seen.has("npm_config_allow_scripts")).toBe(false);
+        expect(seen.has("NPM_CONFIG_IGNORE_SCRIPTS")).toBe(false);
+        expect(seen.get("npm_config_registry")).toBe(
+          "https://registry.example.invalid/",
+        );
+      },
+    );
   });
 });

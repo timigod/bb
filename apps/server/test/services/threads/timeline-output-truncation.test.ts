@@ -18,12 +18,16 @@ const base = {
 function response(rows: TimelineRow[]): ThreadTimelineResponse {
   return {
     rows,
+    contextBoundarySeq: null,
+    completedTurnDisplay: "collapse",
     activePromptMode: null,
     activeThinking: null,
     activeWorkflows: [],
     activeBackgroundCommands: [],
     pendingTodos: null,
     goal: null,
+    providerCommands: null,
+    sessionOptions: null,
     modelFallback: null,
     maxSeq: 0,
     timelinePage: {

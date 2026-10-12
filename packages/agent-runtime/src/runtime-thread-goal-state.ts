@@ -1,3 +1,4 @@
+import { LEGACY_CODEX_GOAL_EXTENSION_KIND } from "@bb/domain";
 import type { ThreadEvent } from "@bb/domain";
 
 interface PendingGoalClearWaiter {
@@ -6,18 +7,12 @@ interface PendingGoalClearWaiter {
   timeout: ReturnType<typeof setTimeout>;
 }
 
-export interface WaitForGoalClearArgs {
+interface WaitForGoalClearArgs {
   afterRevision: number;
   threadId: string;
   timeoutMs: number;
 }
 
-/**
- * Tracks observed provider Goal-clear events so callers can wait for the event
- * that makes the provider response durable in BB's event stream. Revisions
- * close the response-before-notification race without missing a notification
- * that arrives between sending the request and beginning the wait.
- */
 export class RuntimeThreadGoalState {
   private readonly clearRevisionByThreadId = new Map<string, number>();
   private readonly clearWaitersByThreadId = new Map<
@@ -67,7 +62,11 @@ export class RuntimeThreadGoalState {
   }
 
   observe(event: ThreadEvent): void {
-    if (event.type !== "thread/goal/cleared") {
+    if (
+      event.type !== "thread/extensionState/updated" ||
+      event.kind !== LEGACY_CODEX_GOAL_EXTENSION_KIND ||
+      event.payload !== null
+    ) {
       return;
     }
 

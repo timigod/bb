@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { PERSONAL_PROJECT_ID } from "@bb/domain";
+import { useCallback } from "react";
+import { PERSONAL_PROJECT_ID, type ThreadListEntry } from "@bb/domain";
 import type { SidebarBootstrapResponse } from "@bb/server-contract";
+import { listSidebarNavigationThreads } from "@/hooks/cache-owners/query-cache";
 import { apiClient } from "@/lib/api-server";
 import { request, requestOptions } from "@/lib/api";
 import {
@@ -9,23 +11,15 @@ import {
   useProjectListRealtimeSubscription,
   useThreadListRealtimeSubscription,
 } from "@/hooks/useRealtimeSubscription";
+import type { QueryOptions } from "./query-helpers";
+import { sidebarNavigationQueryKey } from "./query-keys";
 import { REALTIME_OWNED_STATIC_CACHE_QUERY_POLICY } from "./query-policies";
+import {
+  readCachedSidebarBootstrap,
+  writeCachedSidebarBootstrap,
+} from "@/lib/sidebar-bootstrap-cache";
 
-export const SIDEBAR_NAVIGATION_QUERY_KEY = "sidebarNavigation";
-
-export type SidebarNavigationQueryKey = readonly [
-  typeof SIDEBAR_NAVIGATION_QUERY_KEY,
-];
-
-interface QueryOptions {
-  enabled?: boolean;
-}
-
-export function sidebarNavigationQueryKey(): SidebarNavigationQueryKey {
-  return [SIDEBAR_NAVIGATION_QUERY_KEY];
-}
-
-export function fetchSidebarNavigation(
+function fetchSidebarNavigation(
   signal?: AbortSignal,
 ): Promise<SidebarBootstrapResponse> {
   return request<SidebarBootstrapResponse>(
@@ -42,19 +36,17 @@ export function useSidebarNavigation(options?: QueryOptions) {
 
   return useQuery<SidebarBootstrapResponse>({
     queryKey: sidebarNavigationQueryKey(),
-    queryFn: ({ signal }) => fetchSidebarNavigation(signal),
+    queryFn: async ({ signal }) => {
+      const response = await fetchSidebarNavigation(signal);
+      writeCachedSidebarBootstrap(response);
+      return response;
+    },
     enabled,
     ...REALTIME_OWNED_STATIC_CACHE_QUERY_POLICY,
+    placeholderData: () => readCachedSidebarBootstrap() ?? undefined,
   });
 }
 
-/**
- * Read the active project's display name from the shared sidebar-navigation
- * cache. The sidebar owns the realtime subscriptions and initial load; this only
- * reads the cached projects (no extra subscriptions) so surfaces like the
- * follow-up composer footer can label the current project. Returns undefined
- * until the cache is populated or when the project is unknown.
- */
 export function useProjectDisplayName(
   projectId: string | undefined,
 ): string | undefined {
@@ -62,8 +54,6 @@ export function useProjectDisplayName(
     queryKey: sidebarNavigationQueryKey(),
     queryFn: ({ signal }) => fetchSidebarNavigation(signal),
     ...REALTIME_OWNED_STATIC_CACHE_QUERY_POLICY,
-    // Nothing to resolve without a project id (e.g. personal threads), so don't
-    // trigger the bootstrap fetch from this read-only selector.
     enabled: Boolean(projectId),
   });
   if (!data || !projectId) {
@@ -73,4 +63,31 @@ export function useProjectDisplayName(
     return data.personalProject.name;
   }
   return data.projects.find((project) => project.id === projectId)?.name;
+}
+
+interface SidebarNavigationThreadSelection<T> {
+  data: T | undefined;
+  isBootstrapPending: boolean;
+}
+
+export function useSidebarNavigationThreadSelection<T>(
+  select: (threads: ThreadListEntry[]) => T,
+): SidebarNavigationThreadSelection<T> {
+  const selectFromNavigation = useCallback(
+    (navigation: SidebarBootstrapResponse) =>
+      select(listSidebarNavigationThreads(navigation)),
+    [select],
+  );
+  const result = useQuery<SidebarBootstrapResponse, Error, T>({
+    queryKey: sidebarNavigationQueryKey(),
+    queryFn: ({ signal }) => fetchSidebarNavigation(signal),
+    ...REALTIME_OWNED_STATIC_CACHE_QUERY_POLICY,
+    enabled: false,
+    select: selectFromNavigation,
+  });
+  const data = result.data;
+  return {
+    data,
+    isBootstrapPending: data === undefined && result.isFetching,
+  };
 }

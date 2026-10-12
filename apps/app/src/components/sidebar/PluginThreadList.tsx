@@ -1,66 +1,80 @@
-import { useCallback, type ReactNode } from "react";
-import { toast } from "sonner";
-import { PluginSlotMount } from "@/components/plugin/PluginSlotMount";
+import { useCallback, useState } from "react";
+import {
+  PluginSlotMount,
+  resetCrashedPluginSlots,
+} from "@/components/plugin/PluginSlotMount";
 import { useSidebar } from "@/components/ui/sidebar.js";
 import { useRouteState } from "@/hooks/useRouteState";
+import type { ResolvedReplacement } from "@/lib/plugin-slot-resolvers";
 import type { PluginThreadListSlot } from "@/lib/plugin-slots";
+import { appToast } from "@/components/ui/app-toast";
+import { usePluginFrontendsSettled } from "@/lib/plugin-frontend-boot-state";
+import { ThreadListPlaceholder } from "./ThreadListPlaceholder";
 
-/** Shared by the mount and the host's crash check. */
-export const THREAD_LIST_SLOT_KIND = "threadList";
+const THREAD_LIST_SLOT_KIND = "threadList";
 
 interface PluginThreadListProps {
-  slot: PluginThreadListSlot;
-  /**
-   * The built-in list. Rendered instead of the plugin when its component
-   * crashes: unlike an additive slot, there is no useful "plugin crashed"
-   * chip to show here — a chip in place of the whole sidebar would strand the
-   * user with no way to reach their threads.
-   */
-  builtInFallback: ReactNode;
-  /** The host search field's text; "" when closed or plugin-owned. */
-  searchQuery: string;
+  replacement: ResolvedReplacement<PluginThreadListSlot>;
   onNavigate: () => void;
 }
 
-/**
- * Mounts the chosen `experimental_threadList` slot in the sidebar's scroll
- * area, keyed by generation so a plugin reload remounts it with fresh
- * error-boundary state.
- */
 export function PluginThreadList({
-  slot,
-  builtInFallback,
-  searchQuery,
+  replacement,
   onNavigate,
 }: PluginThreadListProps) {
   const { projectId, threadId } = useRouteState();
   const { isCompactViewport } = useSidebar();
-  const Component = slot.component;
+  const bootSettled = usePluginFrontendsSettled();
+  const [attempt, setAttempt] = useState(0);
+  const registration =
+    replacement.kind === "plugin" ? replacement.registration : null;
+  const pluginId = registration?.pluginId ?? null;
+  const title = registration?.title ?? "Thread list";
 
   const handleCrash = useCallback(
-    (pluginId: string) => {
-      toast.error("Sidebar plugin crashed", {
-        description: `${slot.title} (${pluginId}) stopped working, so bb's own thread list is back.`,
+    (crashedPluginId: string) => {
+      appToast.error("Thread list plugin crashed", {
+        description: `${title} (${crashedPluginId}) stopped working.`,
       });
     },
-    [slot.title],
+    [title],
   );
+  const handleReload = useCallback(() => {
+    if (pluginId !== null) resetCrashedPluginSlots(pluginId);
+    setAttempt((current) => current + 1);
+  }, [pluginId]);
 
+  if (registration === null) {
+    return (
+      <ThreadListPlaceholder
+        state={bootSettled ? { kind: "missing" } : { kind: "loading" }}
+      />
+    );
+  }
+  const List = registration.component;
   return (
     <PluginSlotMount
-      key={`${slot.pluginId}/${slot.id}/${slot.generation}`}
-      pluginId={slot.pluginId}
+      key={`${registration.pluginId}/${registration.id}/${registration.generation}/${attempt}`}
+      pluginId={registration.pluginId}
       slotKind={THREAD_LIST_SLOT_KIND}
-      slotId={slot.id}
-      crashFallback={builtInFallback}
+      slotId={registration.id}
+      crashFallback={
+        <ThreadListPlaceholder
+          state={{
+            kind: "crashed",
+            pluginTitle: title,
+            onReload: handleReload,
+          }}
+        />
+      }
       onCrash={handleCrash}
     >
-      <Component
+      <List
         activeThreadId={threadId ?? null}
         activeProjectId={projectId ?? null}
         isCompactViewport={isCompactViewport}
         onNavigate={onNavigate}
-        searchQuery={searchQuery}
+        searchQuery=""
       />
     </PluginSlotMount>
   );

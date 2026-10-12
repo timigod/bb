@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { hostTypeSchema } from "@bb/domain";
 
 export const HOST_AUTH_FILE_NAME = "auth.json";
 export const HOST_ID_FILE_NAME = "host-id";
@@ -11,24 +10,29 @@ export function normalizeServerUrl(serverUrl: string): string {
   if (url.hostname === "localhost") {
     url.hostname = "127.0.0.1";
   }
-  // Remove trailing slash added by URL constructor
   return url.href.replace(/\/$/u, "");
 }
 
-export const hostAuthStateSchema = z
+const currentHostAuthStateSchema = z
   .object({
     hostId: z.string().min(1),
     hostKey: nonEmptyTrimmedStringSchema,
-    hostType: hostTypeSchema,
-    // Legacy auth files included serverUrl. Accept it so old files keep
-    // loading, but strip it from the parsed auth state.
+  })
+  .strict();
+
+const legacyHostAuthStateSchema = z
+  .object({
+    hostId: z.string().min(1),
+    hostKey: nonEmptyTrimmedStringSchema,
+    hostType: z.literal("persistent").optional(),
     serverUrl: z.unknown().optional(),
   })
   .strict()
-  .transform(({ hostId, hostKey, hostType }) => ({
-    hostId,
-    hostKey,
-    hostType,
-  }));
+  .transform(({ hostId, hostKey }) => ({ hostId, hostKey }));
+
+export const hostAuthStateSchema = z.union([
+  currentHostAuthStateSchema,
+  legacyHostAuthStateSchema,
+]);
 
 export type HostAuthState = z.infer<typeof hostAuthStateSchema>;

@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { CURATED_PLUGIN_MARKETPLACE_NAME } from "@bb/server-contract";
 import {
   createPluginStateSnapshot,
   getInstalledPlugin,
@@ -61,6 +62,9 @@ const installedPluginRowFields = {
   sourceGitSubdirectory: z.string().nullable(),
   sourceGitRequestedRef: z.string().nullable(),
   sourceGitRefKind: z.enum(["branch", "tag", "commit"]).nullable(),
+  sourceGitRange: z.string().nullable().default(null),
+  sourceGitTagPrefix: z.string().nullable().default(null),
+  sourceGitResolvedTag: z.string().nullable().default(null),
   npmResolvedVersion: z.string().nullable(),
   npmIntegrity: z.string().nullable(),
   gitResolvedCommit: z.string().nullable(),
@@ -76,6 +80,7 @@ const installedPluginRowFields = {
   rootDir: z.string(),
   version: z.string(),
   enabled: z.boolean(),
+  enabledFollowsDefault: z.boolean().default(false),
   removedAt: z.number().int().nullable(),
   installedAt: z.number().int(),
   updatedAt: z.number().int(),
@@ -85,6 +90,7 @@ const installedPluginRowSchema = z
     ...installedPluginRowFields,
     provenance: z.enum(["builtin", "direct", "catalog"]),
     catalogEntryId: z.string().nullable(),
+    catalogMarketplaceName: z.string().nullable().default(null),
   })
   .strict();
 const legacyInstalledPluginRowSchema = z
@@ -112,7 +118,7 @@ async function exists(path: string): Promise<boolean> {
   );
 }
 
-export function pluginDataDir(dataDir: string, pluginId: string): string {
+function pluginDataDir(dataDir: string, pluginId: string): string {
   return join(dataDir, "plugins", pluginId);
 }
 
@@ -175,8 +181,6 @@ export async function createPluginStateSnapshotOnDisk(args: {
       await copyFile(sourceDatabasePath, databasePath);
     }
     if (hasSecrets) {
-      // Secret files are deliberately opaque: names and contents never enter
-      // the snapshot record, JSON state, or logs.
       await cp(sourceSecretsPath, secretsPath, { recursive: true });
     }
     await writeFile(
@@ -266,7 +270,7 @@ export async function readPluginSnapshotRegistration(args: {
   const installed = getInstalledPlugin(args.db, legacy.id);
   if (
     legacy.provenance === "marketplace" &&
-    marketplaceId === "bb-official" &&
+    marketplaceId === CURATED_PLUGIN_MARKETPLACE_NAME &&
     marketplaceEntryId !== null &&
     installed?.provenance === "catalog" &&
     installed.catalogEntryId === marketplaceEntryId
@@ -275,12 +279,14 @@ export async function readPluginSnapshotRegistration(args: {
       ...registration,
       provenance: "catalog",
       catalogEntryId: marketplaceEntryId,
+      catalogMarketplaceName: CURATED_PLUGIN_MARKETPLACE_NAME,
     };
   }
   return {
     ...registration,
     provenance: legacy.provenance === "builtin" ? "builtin" : "direct",
     catalogEntryId: null,
+    catalogMarketplaceName: null,
   };
 }
 

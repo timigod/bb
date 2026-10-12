@@ -7,17 +7,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   claimPluginScheduledRun,
   createConnection,
+  getInstalledPlugin,
   listPluginSchedules,
   migrate,
   pluginSchedules,
   type DbConnection,
 } from "@bb/db";
 import type { Logger } from "@bb/logger";
+import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
 import {
   createPluginService,
   type PluginService,
 } from "../../../src/services/plugins/plugin-service.js";
 import { testLogger } from "../../helpers/test-app.js";
+import { createNoopTelemetryService } from "../../../src/services/system/telemetry.js";
 
 const logger = testLogger as unknown as Logger;
 
@@ -73,6 +76,8 @@ describe("plugin background services", () => {
     migrate(db);
     workDir = await mkdtemp(join(tmpdir(), "bb-plugin-bg-test-"));
     service = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
       db,
       hub: {
         getDaemonSessionIdForHost: () => null,
@@ -121,12 +126,67 @@ describe("plugin background services", () => {
     expect(globals.__connStarts).toBe(1);
 
     await service.reload("connector");
-    // The old instance was aborted (and resolved) before the new one started.
     expect(globals.__connAborts).toBe(1);
     expect(globals.__connStarts).toBe(2);
     const reloaded = service.list().find((p) => p.id === "connector");
     expect(reloaded?.status).toBe("running");
     expect(reloaded?.services).toEqual([{ name: "conn", state: "running" }]);
+  });
+
+  it("suspends every plugin but the kept ones without disabling them, then resumes them", async () => {
+    globals.__suspendStarts = {};
+    globals.__suspendAborts = {};
+    for (const name of ["bb-plugin-suspended", "bb-plugin-kept"]) {
+      const rootDir = await writePlugin(workDir, {
+        name,
+        serverSource: `
+          export default function plugin(bb: any) {
+            const g = globalThis as any;
+            bb.background.service("tick", {
+              start(signal: any) {
+                g.__suspendStarts[${JSON.stringify(name)}] =
+                  (g.__suspendStarts[${JSON.stringify(name)}] ?? 0) + 1;
+                return new Promise<void>((resolve) => {
+                  signal.addEventListener("abort", () => {
+                    g.__suspendAborts[${JSON.stringify(name)}] =
+                      (g.__suspendAborts[${JSON.stringify(name)}] ?? 0) + 1;
+                    resolve();
+                  });
+                });
+              },
+            });
+          }
+        `,
+      });
+      await service.installPath(rootDir);
+    }
+
+    const suspended = await service.suspendPlugins({
+      keep: (plugin) => plugin.id === "kept",
+    });
+
+    expect(suspended).toEqual(["suspended"]);
+    expect(service.getApi("suspended")).toBeUndefined();
+    expect(service.getApi("kept")).toBeDefined();
+    expect(service.isPluginExpectedToRun("suspended")).toBe(true);
+    expect(service.isPluginExpectedToRun("kept")).toBe(true);
+    expect(globals.__suspendAborts).toEqual({ "bb-plugin-suspended": 1 });
+    expect(getInstalledPlugin(db, "suspended")?.enabled).toBe(true);
+    expect(
+      service.list().find((plugin) => plugin.id === "suspended"),
+    ).toMatchObject({
+      status: "disabled",
+      statusDetail: "Paused while the server moves to another machine",
+    });
+
+    expect(await service.resumeSuspendedPlugins()).toEqual(["suspended"]);
+    expect(service.getApi("suspended")).toBeDefined();
+    expect(service.isPluginExpectedToRun("suspended")).toBe(true);
+    expect(globals.__suspendStarts).toEqual({
+      "bb-plugin-suspended": 2,
+      "bb-plugin-kept": 1,
+    });
+    expect(await service.resumeSuspendedPlugins()).toEqual([]);
   });
 
   it("rejects new interactions while a plugin is disposing", async () => {
@@ -137,6 +197,8 @@ describe("plugin background services", () => {
     }));
     const interruptPluginInteractions = vi.fn(() => []);
     const local = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
       db,
       hub: {
         getDaemonSessionIdForHost: () => null,
@@ -147,6 +209,7 @@ describe("plugin background services", () => {
       pendingInteractions: {
         requestPluginInteraction,
         interruptPluginInteractions,
+        setPluginDirectory: () => {},
       },
       dataDir: join(workDir, "data-dispose-request"),
       appVersion: "0.9.0",
@@ -194,9 +257,9 @@ describe("plugin background services", () => {
   });
 
   it("serializes concurrent reloads so a slow-stopping service never double-starts", async () => {
-    // Own instance: the stop bound must exceed the service's stop delay so
-    // the slow stop is a legitimate (non-hung) dispose in progress.
     const local = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
       db,
       hub: {
         getDaemonSessionIdForHost: () => null,
@@ -244,9 +307,6 @@ describe("plugin background services", () => {
       const reloaded = local.list().find((p) => p.id === "slowstop");
       expect(reloaded?.status).toBe("running");
       expect(reloaded?.services).toEqual([{ name: "slow", state: "running" }]);
-      // 1 install + 2 serialized reloads. Without the lifecycle lock the
-      // second reload loads mid-dispose and a second instance runs while
-      // the first is still stopping (maxActive 2).
       expect(globals.__slowStarts).toBe(3);
       expect(globals.__slowMaxActive).toBe(1);
     } finally {
@@ -269,18 +329,62 @@ describe("plugin background services", () => {
       `,
     });
     await service.installPath(rootDir);
-    await service.reload("stubborn");
+    const outcome = await service.reload("stubborn");
     const entry = service.list().find((p) => p.id === "stubborn");
     expect(entry?.status).toBe("degraded");
     expect(entry?.statusDetail).toContain("service socket did not stop");
-    // Not re-loaded: that would double-start the hung service.
     expect(service.getApi("stubborn")).toBeUndefined();
+    expect(outcome).toEqual({
+      ok: false,
+      error: 'plugin "stubborn" reload failed: service socket did not stop',
+      plugins: service.list(),
+    });
 
-    // Still degraded on a second reload attempt.
-    await service.reload("stubborn");
+    const again = await service.reload("stubborn");
     expect(service.list().find((p) => p.id === "stubborn")?.status).toBe(
       "degraded",
     );
+    expect(again.ok).toBe(false);
+  });
+
+  it("reports a failed reload that kept the previous instance", async () => {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-keeper",
+      serverSource: `
+        export default function plugin(bb: any) {
+          bb.cli.register({ name: "keeper", summary: "keeper", run() { return { exitCode: 0, stdout: "ok" }; } });
+        }
+      `,
+    });
+    const installed = await service.installPath(rootDir);
+    expect(installed.status).toBe("running");
+    const healthy = await service.reload("keeper");
+    expect(healthy.ok).toBe(true);
+
+    await writeFile(
+      join(rootDir, "server.ts"),
+      `export default function plugin() { throw new Error("boom on load"); }`,
+    );
+    const outcome = await service.reload("keeper");
+    const entry = service.list().find((p) => p.id === "keeper");
+    expect(entry?.status).toBe("running");
+    expect(entry?.statusDetail).toBe("reload failed: boom on load");
+    expect(service.getApi("keeper")).toBeDefined();
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error("unreachable");
+    expect(outcome.error).toBe(
+      'plugin "keeper" reload failed: boom on load (the previous instance is still running)',
+    );
+
+    expect((await service.reload()).ok).toBe(false);
+    await writeFile(
+      join(rootDir, "server.ts"),
+      `export default function plugin(bb: any) { bb.cli.register({ name: "keeper", summary: "keeper", run() { return { exitCode: 0, stdout: "ok" }; } }); }`,
+    );
+    expect((await service.reload("keeper")).ok).toBe(true);
+    expect(
+      service.list().find((p) => p.id === "keeper")?.statusDetail,
+    ).toBeNull();
   });
 
   it("restarts a crashed service with backoff", async () => {
@@ -315,6 +419,64 @@ describe("plugin background services", () => {
     });
   });
 
+  it("routes an uncaught exception from a service's async context to the supervisor", async () => {
+    const rootDir = await writePlugin(workDir, {
+      name: "bb-plugin-emitter",
+      serverSource: `
+        import { EventEmitter } from "node:events";
+        export default function plugin(bb: any) {
+          const g = globalThis as any;
+          g.__emitterStarts = 0;
+          g.__emitterAborts = 0;
+          bb.background.service("imap", {
+            async start(signal: any) {
+              g.__emitterStarts += 1;
+              if (g.__emitterStarts === 1) {
+                const client = new EventEmitter(); // no client.on("error")
+                setTimeout(() => client.emit("error", new Error("Socket timeout")), 5);
+              }
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => {
+                  g.__emitterAborts += 1;
+                  resolve();
+                }));
+            },
+          });
+        }
+      `,
+    });
+    const vitestListeners = process.listeners("uncaughtException");
+    process.removeAllListeners("uncaughtException");
+    const unclaimed: unknown[] = [];
+    process.on("uncaughtException", (error) => {
+      if (!service.handleUncaughtException(error)) unclaimed.push(error);
+    });
+    try {
+      await service.installPath(rootDir);
+      await vi.waitFor(
+        () => {
+          expect(globals.__emitterStarts).toBe(2);
+        },
+        { timeout: 2000 },
+      );
+      expect(globals.__emitterAborts).toBe(1);
+      await vi.waitFor(() => {
+        expect(
+          service.list().find((p) => p.id === "emitter")?.services,
+        ).toEqual([{ name: "imap", state: "running" }]);
+      });
+      expect(unclaimed).toEqual([]);
+      expect(service.list().find((p) => p.id === "emitter")?.status).toBe(
+        "running",
+      );
+    } finally {
+      process.removeAllListeners("uncaughtException");
+      for (const listener of vitestListeners) {
+        process.on("uncaughtException", listener);
+      }
+    }
+  });
+
   it("NeedsConfigurationError maps to needs-configuration and stops restarts", async () => {
     const rootDir = await writePlugin(workDir, {
       name: "bb-plugin-needy",
@@ -342,11 +504,9 @@ describe("plugin background services", () => {
     const entry = service.list().find((p) => p.id === "needy");
     expect(entry?.statusDetail).toBe("api key missing");
     expect(entry?.services).toEqual([{ name: "bot", state: "stopped" }]);
-    // No restart: wait past several backoff windows (base is 5ms).
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(globals.__needyStarts).toBe(1);
 
-    // Reload gives the service a fresh chance to prove itself.
     await service.reload("needy");
     await vi.waitFor(() => {
       expect(globals.__needyStarts).toBe(2);
@@ -365,8 +525,6 @@ describe("plugin background services", () => {
     const entry = await service.installPath(rootDir);
     expect(entry.status).toBe("needs-configuration");
     expect(entry.statusDetail).toBe("set the token first");
-    // Still loaded: handlers and wire surfaces keep working while the user
-    // configures it.
     expect(service.getApi("unconfigured")).toBeDefined();
   });
 
@@ -396,6 +554,8 @@ describe("plugin schedules", () => {
     migrate(db);
     workDir = await mkdtemp(join(tmpdir(), "bb-plugin-sched-test-"));
     service = createPluginService({
+      aiServices: createAiServiceRegistry(),
+      telemetry: createNoopTelemetryService(),
       db,
       hub: {
         getDaemonSessionIdForHost: () => null,
@@ -439,7 +599,6 @@ describe("plugin schedules", () => {
     expect(rows[0]?.cron).toBe("*/5 * * * *");
     expect(rows[0]?.nextRunAt).toBeGreaterThan(before);
     expect(rows[0]?.lastStatus).toBeNull();
-    // Surfaced in the list entry too.
     const entry = service.list().find((p) => p.id === "ticker");
     expect(entry?.schedules).toHaveLength(1);
     expect(entry?.schedules[0]?.name).toBe("tick");
@@ -463,6 +622,19 @@ describe("plugin schedules", () => {
     expect(row?.lastError).toBeNull();
   });
 
+  it("leaves due schedules unclaimed while schedules are paused", async () => {
+    await installTicker();
+    const past = Date.now() - 60_000;
+    setNextRunAt(db, "ticker", "tick", past);
+    service.setSchedulesPaused(true);
+    await service.sweepDueSchedules(Date.now());
+    expect(globals.__tickRuns).toBe(0);
+    expect(listPluginSchedules(db, "ticker")[0]?.nextRunAt).toBe(past);
+    service.setSchedulesPaused(false);
+    await service.sweepDueSchedules(Date.now());
+    expect(globals.__tickRuns).toBe(1);
+  });
+
   it("claims with CAS: parallel sweeps run the fn exactly once", async () => {
     await installTicker();
     const past = Date.now() - 60_000;
@@ -473,7 +645,6 @@ describe("plugin schedules", () => {
       service.sweepDueSchedules(now),
     ]);
     expect(globals.__tickRuns).toBe(1);
-    // The CAS itself: a claim against the already-advanced next_run_at loses.
     const claimed = claimPluginScheduledRun(db, {
       pluginId: "ticker",
       name: "tick",
@@ -503,7 +674,6 @@ describe("plugin schedules", () => {
     expect(row?.lastStatus).toBe("error");
     expect(row?.lastError).toContain("sync exploded");
     expect(row?.nextRunAt).toBeGreaterThan(now);
-    // The failure counts against the plugin's handler stats.
     const entry = service.list().find((p) => p.id === "boomer");
     expect(entry?.handlerStats.errorCount).toBe(1);
   });
@@ -511,7 +681,6 @@ describe("plugin schedules", () => {
   it("leaves rows unclaimed while the plugin is not loaded; remove deletes them", async () => {
     await installTicker();
     await service.setEnabled("ticker", false);
-    // Dispose keeps the durable row.
     expect(listPluginSchedules(db, "ticker")).toHaveLength(1);
     const past = Date.now() - 60_000;
     setNextRunAt(db, "ticker", "tick", past);

@@ -34,7 +34,7 @@ const testState = vi.hoisted(() => ({
         alt: false,
         shift: true,
       },
-      when: { all: ["mainSurface" as const], none: [] },
+      when: { all: ["mainSurface" as const], none: ["modalOpen" as const] },
     },
     {
       command: "thread.new" as const,
@@ -47,7 +47,7 @@ const testState = vi.hoisted(() => ({
         alt: false,
         shift: false,
       },
-      when: { all: ["mainSurface" as const], none: [] },
+      when: { all: ["mainSurface" as const], none: ["modalOpen" as const] },
     },
     {
       command: "thread.previous" as const,
@@ -167,6 +167,19 @@ const testState = vi.hoisted(() => ({
       },
     },
     {
+      command: "panel.toggle" as const,
+      desktopOnly: false,
+      shortcut: {
+        key: "j",
+        mod: true,
+        meta: false,
+        control: false,
+        alt: false,
+        shift: false,
+      },
+      when: { all: ["mainSurface" as const], none: ["modalOpen" as const] },
+    },
+    {
       command: "browser.reload" as const,
       desktopOnly: false,
       shortcut: {
@@ -203,6 +216,7 @@ vi.mock("@/lib/bb-desktop", () => ({
 
 interface HandlerProps {
   command?: AppCommandId;
+  enabled?: boolean;
   name: string;
   priority?: number;
   result: boolean;
@@ -210,6 +224,7 @@ interface HandlerProps {
 
 function Handler({
   command = "thread.search",
+  enabled,
   name,
   priority,
   result,
@@ -221,6 +236,7 @@ function Handler({
       return result;
     },
     priority,
+    enabled,
   );
   return null;
 }
@@ -324,9 +340,15 @@ describe("AppCommandProvider", () => {
     vi.useRealTimers();
   });
 
-  it("cancels keyboard hints when the modifier becomes part of a shortcut chord", () => {
+  it("cancels pending hints but preserves revealed hints through shortcut dispatch", () => {
     vi.useFakeTimers();
-    renderProvider(<ModifierState />);
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    renderProvider(
+      <>
+        <ModifierState />
+        <Handler command="thread.jump.1" name="thread" result={true} />
+      </>,
+    );
 
     fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
     act(() => vi.advanceTimersByTime(699));
@@ -342,7 +364,35 @@ describe("AppCommandProvider", () => {
     fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
     act(() => vi.advanceTimersByTime(700));
     expect(screen.getByText("held")).toBeDefined();
-    fireEvent.keyDown(window, { key: "3", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    expect(testState.calls).toEqual(["thread"]);
+    expect(screen.getByText("held")).toBeDefined();
+    fireEvent.keyUp(window, { key: "1", ctrlKey: true });
+    expect(screen.getByText("held")).toBeDefined();
+    fireEvent.keyUp(window, { key: "Control" });
+    expect(screen.getByText("released")).toBeDefined();
+    vi.useRealTimers();
+  });
+
+  it("tracks modifier holds and releases from controls that stop propagation", () => {
+    vi.useFakeTimers();
+    renderProvider(
+      <>
+        <ModifierState />
+        <button
+          onKeyDown={(event) => event.stopPropagation()}
+          onKeyUp={(event) => event.stopPropagation()}
+        >
+          Collapse section
+        </button>
+      </>,
+    );
+    const button = screen.getByRole("button", { name: "Collapse section" });
+    button.focus();
+    fireEvent.keyDown(button, { key: "Control", ctrlKey: true });
+    act(() => vi.advanceTimersByTime(700));
+    expect(screen.getByText("held")).toBeDefined();
+    fireEvent.keyUp(button, { key: "Control" });
     expect(screen.getByText("released")).toBeDefined();
     vi.useRealTimers();
   });
@@ -384,7 +434,7 @@ describe("AppCommandProvider", () => {
     );
 
     expect(screen.getByText("Ctrl + Shift + O")).toBeDefined();
-    expect(screen.getByText("Ctrl + Shift + ArrowUp")).toBeDefined();
+    expect(screen.getByText("Ctrl + Shift + ↑")).toBeDefined();
     expect(screen.getByText("Ctrl + Shift + 1")).toBeDefined();
   });
 
@@ -512,6 +562,13 @@ describe("AppCommandProvider", () => {
     expect(testState.calls).toEqual([]);
   });
 
+  it("does not register a disabled handler", () => {
+    renderProvider(<Handler enabled={false} name="disabled" result={true} />);
+
+    expect(dispatchShortcut().defaultPrevented).toBe(false);
+    expect(testState.calls).toEqual([]);
+  });
+
   it("lets equal-priority handlers fall through to the focus-owning instance", () => {
     renderProvider(
       <>
@@ -566,5 +623,69 @@ describe("AppCommandProvider", () => {
     expect(testState.calls).toEqual([]);
     expect(dispatchReload(inside).defaultPrevented).toBe(true);
     expect(testState.calls).toEqual(["browser"]);
+  });
+
+  it.each([
+    ["thread.new" as const, "o", true],
+    ["panel.toggle" as const, "j", false],
+  ])(
+    "runs %s from any focused surface while a closed drawer stays mounted",
+    (command, key, shiftKey) => {
+      renderProvider(
+        <>
+          <Handler command={command} name={command} result={true} />
+          <div role="dialog" aria-modal="true" data-state="closed" inert>
+            <div role="dialog" data-state="open">
+              <button type="button">Sidebar entry</button>
+            </div>
+          </div>
+          <button type="button">Timeline row</button>
+          <div contentEditable data-testid="composer" />
+        </>,
+      );
+      const dispatchChord = (target: Element | null) => {
+        const event = new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+          key,
+          shiftKey,
+        });
+        target?.dispatchEvent(event);
+        return event;
+      };
+
+      for (const target of [
+        screen.getByText("Timeline row"),
+        screen.getByText("Sidebar entry"),
+        screen.getByTestId("composer"),
+      ]) {
+        testState.calls.length = 0;
+        expect(dispatchChord(target).defaultPrevented).toBe(true);
+        expect(testState.calls).toEqual([command]);
+      }
+    },
+  );
+
+  it("suppresses main-surface commands while a drawer is actually open", () => {
+    renderProvider(
+      <>
+        <Handler command="thread.new" name="thread.new" result={true} />
+        <div role="dialog" aria-modal="true" data-state="open">
+          <button type="button">Drawer entry</button>
+        </div>
+      </>,
+    );
+    const event = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: true,
+      key: "o",
+      shiftKey: true,
+    });
+    screen.getByText("Drawer entry").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(testState.calls).toEqual([]);
   });
 });

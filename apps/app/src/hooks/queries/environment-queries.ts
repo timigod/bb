@@ -5,7 +5,6 @@ import type {
   WorkspaceDiffTarget,
 } from "@bb/domain";
 import type {
-  EnvironmentDiffFileResponse,
   EnvironmentDiffBranchesResponse,
   EnvironmentDiffFilesResponse,
   EnvironmentPullRequestResponse,
@@ -13,12 +12,12 @@ import type {
   WorkspacePathListResponse,
 } from "@bb/server-contract";
 import type { EnvironmentDiffArgs } from "@bb/sdk/browser";
-import {
-  buildFilePreview,
-  normalizeFilePreviewMimeType,
-  type EnvironmentFilePreviewSource,
-  type FilePreview,
-} from "@/lib/file-preview";
+import type {
+  EnvironmentFilePreviewSource,
+  FilePreview,
+} from "@bb/client-core";
+import { loadFilePreview } from "@/lib/api";
+import { buildEnvironmentFileContentUrl } from "@/lib/file-content-urls";
 import { sdk } from "@/lib/sdk";
 import { useEnvironmentDetailRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
 import {
@@ -31,22 +30,20 @@ import {
   environmentQueryKey,
   environmentWorkStatusQueryKey,
 } from "./query-keys";
+import { useDebouncedBranchSearchQuery } from "./branch-search-debounce";
 import {
   resolveEnvironmentDiffFilesPlaceholder,
   resolveEnvironmentMergeBaseBranchesPlaceholder,
   resolveEnvironmentWorkStatusPlaceholder,
 } from "./query-placeholders";
-import { requireEnabledQueryArg } from "./query-helpers";
+import { requireEnabledQueryArg, type QueryOptions } from "./query-helpers";
 import {
   EXPENSIVE_MANUAL_QUERY_POLICY,
+  HEAVY_PAYLOAD_QUERY_POLICY,
   REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
   REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
   TYPEAHEAD_QUERY_POLICY,
 } from "./query-policies";
-
-interface QueryOptions {
-  enabled?: boolean;
-}
 
 interface EnvironmentQueryOptions extends QueryOptions {
   staleTime?: number;
@@ -64,10 +61,9 @@ interface UseEnvironmentDiffFilesOptions extends QueryOptions {
 
 const ENVIRONMENT_PULL_REQUEST_STALE_MS = 30_000;
 const ENVIRONMENT_SETTLED_PULL_REQUEST_STALE_MS = 60 * 60_000;
-const ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS = 5_000;
+const ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS = 30_000;
 const MERGE_BASE_BRANCHES_STALE_MS = 30_000;
 const MERGE_BASE_BRANCHES_LIMIT = 50;
-/** Staleness window for the environment diff TOC query. */
 const ENVIRONMENT_DIFF_STALE_MS = 5_000;
 
 function requireEnvironmentId(
@@ -124,8 +120,6 @@ export function useEnvironmentWorkStatus(
         signal,
       }),
     enabled,
-    // Subscriptions can be absent while no UI is listening, so remount must
-    // establish a fresh baseline instead of trusting cached data.
     ...REALTIME_OWNED_MOUNT_BASELINE_QUERY_POLICY,
     staleTime: 0,
     placeholderData: (previousData, previousQuery) =>
@@ -139,11 +133,6 @@ export function useEnvironmentWorkStatus(
   });
 }
 
-/**
- * The PR carried by a lookup response, or `null` when the lookup answered
- * "absent" or could not run ("unavailable" — treated like the active/absent
- * case for freshness so a transient gh failure retries on the short cycle).
- */
 export function getEnvironmentPullRequestFromResponse(
   response: EnvironmentPullRequestResponse | undefined,
 ): ThreadPullRequest | null {
@@ -165,6 +154,8 @@ export function getEnvironmentPullRequestRefetchInterval(
     return false;
   }
   if (
+    pullRequest.autoMerge ||
+    pullRequest.inMergeQueue === true ||
     pullRequest.checks.state === "pending" ||
     pullRequest.mergeability.state === "unknown"
   ) {
@@ -191,8 +182,8 @@ export function useEnvironmentPullRequest(
         signal,
       }),
     enabled,
-    refetchOnMount: true,
-    refetchOnWindowFocus: "always",
+    refetchOnMount: "always",
+    refetchOnWindowFocus: true,
     refetchInterval: (query) =>
       getEnvironmentPullRequestRefetchInterval(
         getEnvironmentPullRequestFromResponse(query.state.data),
@@ -208,7 +199,7 @@ export function useEnvironmentMergeBaseBranches(
   environmentId: string,
   options?: BranchQueryOptions,
 ) {
-  const query = options?.query?.trim() ?? "";
+  const query = useDebouncedBranchSearchQuery(options?.query?.trim() ?? "");
   const selectedBranch = options?.selectedBranch?.trim();
   const limit = options?.limit ?? MERGE_BASE_BRANCHES_LIMIT;
   const enabled = (options?.enabled ?? true) && Boolean(environmentId);
@@ -270,25 +261,26 @@ export function useEnvironmentFilePreview(
         hookName: "useEnvironmentFilePreview",
         argName: "source",
       });
-      const response = await sdk.environments.diffFile({
-        environmentId: requireEnvironmentId(
-          environmentId,
-          "useEnvironmentFilePreview",
-        ),
-        path: resolvedPath,
-        side: resolvedSource.kind === "working-tree" ? "new" : "old",
+      const resolvedEnvironmentId = requireEnvironmentId(
+        environmentId,
+        "useEnvironmentFilePreview",
+      );
+      return loadFilePreview(
+        {
+          name: resolvedPath.split("/").at(-1),
+          path: resolvedPath,
+          url: buildEnvironmentFileContentUrl(
+            resolvedEnvironmentId,
+            resolvedSource,
+            resolvedPath,
+          ),
+        },
         signal,
-        ...(resolvedSource.kind === "merge-base"
-          ? {
-              target: "branch_committed" as const,
-              mergeBaseRef: resolvedSource.ref,
-            }
-          : { target: "uncommitted" as const }),
-      });
-      return buildEnvironmentFilePreview(resolvedPath, response);
+      );
     },
     enabled,
     ...EXPENSIVE_MANUAL_QUERY_POLICY,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
   });
 }
 
@@ -300,11 +292,6 @@ interface UseEnvironmentPathSuggestionsArgs {
   includeDirectories: boolean;
 }
 
-/**
- * Search a thread environment's workspace for path suggestions. Project-agnostic
- * — the canonical workspace path search once a thread has an environment, used
- * for both file mentions and the new-tab file picker.
- */
 export function useEnvironmentPathSuggestions(
   args: UseEnvironmentPathSuggestionsArgs,
 ) {
@@ -345,11 +332,6 @@ export function useEnvironmentPathSuggestions(
   });
 }
 
-/**
- * Loads the diff tab's table of contents (one {@link DiffFileEntry} per changed
- * file, no patch text). Patches for visible rows are fetched separately and on
- * demand by {@link useEnvironmentDiffPatches}.
- */
 export function useEnvironmentDiffFiles(
   environmentId: string,
   options: UseEnvironmentDiffFilesOptions,
@@ -406,46 +388,4 @@ function buildEnvironmentDiffArgs(
     case "commit":
       return { environmentId, sha: target.sha, target: target.type };
   }
-}
-
-function decodeBase64Bytes(content: string): Uint8Array {
-  const binaryContent = atob(content);
-  const bytes = new Uint8Array(binaryContent.length);
-  for (let index = 0; index < binaryContent.length; index += 1) {
-    bytes[index] = binaryContent.charCodeAt(index);
-  }
-  return bytes;
-}
-
-function encodeBase64Bytes(bytes: Uint8Array): string {
-  const chunkSize = 0x8000;
-  const binaryChunks: string[] = [];
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binaryChunks.push(
-      String.fromCharCode(...bytes.subarray(index, index + chunkSize)),
-    );
-  }
-  return btoa(binaryChunks.join(""));
-}
-
-function buildEnvironmentFilePreview(
-  path: string,
-  response: EnvironmentDiffFileResponse,
-): FilePreview {
-  const contentBytes =
-    response.contentEncoding === "base64"
-      ? decodeBase64Bytes(response.content)
-      : new TextEncoder().encode(response.content);
-  const mimeType = normalizeFilePreviewMimeType(response.mimeType ?? null);
-  const base64Content =
-    response.contentEncoding === "base64"
-      ? response.content
-      : encodeBase64Bytes(contentBytes);
-  return buildFilePreview({
-    contentBytes,
-    mimeType,
-    name: path.split("/").at(-1),
-    path,
-    url: `data:${mimeType};base64,${base64Content}`,
-  });
 }

@@ -1,14 +1,5 @@
 import { z } from "zod";
-import {
-  deriveConnectBaseUrl,
-  type ConnectCredential,
-} from "@bb/connect-client";
-
-const machineCodeResponseSchema = z.object({
-  code: z.string().min(1),
-  expiresInMs: z.number().int().positive(),
-  serverUrl: z.string().url(),
-});
+import { deriveConnectBaseUrl } from "@bb/connect-client";
 
 export interface MachineCode {
   code: string;
@@ -16,36 +7,36 @@ export interface MachineCode {
   serverUrl: string;
 }
 
+export type MachineCodeErrorCode = "machine_limit" | "network" | "not_paired";
+
 export class MachineCodeError extends Error {
-  constructor(readonly code: "machine_limit" | "network" | "not_paired") {
+  constructor(readonly code: MachineCodeErrorCode) {
     super(code);
     this.name = "MachineCodeError";
   }
 }
 
-export async function fetchMachineCode(
-  credential: ConnectCredential,
-): Promise<MachineCode> {
-  const url = `${deriveConnectBaseUrl(credential.serverUrl).replace(/\/$/u, "")}/api/connect/machine-code`;
-  let response: Response;
-  try {
-    response = await fetch(url, {
+export async function redeemMachineCode(args: {
+  signal: AbortSignal;
+  code: string;
+  serverUrl: string;
+}): Promise<{ credential: string; machineId: string; serverUrl: string }> {
+  const response = await fetch(
+    `${deriveConnectBaseUrl(args.serverUrl)}/api/connect/redeem-machine`,
+    {
       method: "POST",
-      headers: { "x-bb-connect-machine": credential.credential },
-    });
-  } catch {
-    throw new MachineCodeError("network");
-  }
-  if (!response.ok) {
-    throw new MachineCodeError(
-      response.status === 409 ? "machine_limit" : "network",
-    );
-  }
-  const parsed = machineCodeResponseSchema.safeParse(await response.json());
-  if (!parsed.success) throw new MachineCodeError("network");
-  return {
-    code: parsed.data.code,
-    expiresAt: Date.now() + parsed.data.expiresInMs,
-    serverUrl: parsed.data.serverUrl,
-  };
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: args.code }),
+      signal: AbortSignal.any([args.signal, AbortSignal.timeout(10_000)]),
+    },
+  );
+  if (!response.ok)
+    throw new Error(`Machine redeem failed (${response.status})`);
+  return z
+    .object({
+      credential: z.string().min(1),
+      machineId: z.string().min(1),
+      serverUrl: z.string().url(),
+    })
+    .parse(await response.json());
 }

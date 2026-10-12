@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadPluginApp, renderSlot } from "@bb/plugin-sdk/testing/app";
+import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import { makeTask } from "../../test-fixtures.js";
 
-// jsdom lacks matchMedia; the vendored Dialog's responsive root needs it.
 if (!window.matchMedia) {
   window.matchMedia = (query: string) => ({
     matches: false,
@@ -24,22 +24,16 @@ afterEach(cleanup);
 const PROJECT_ID = "01HZZZZZZZZZZZZZZZZZZZZZP1";
 const TASK_ID = "01HZZZZZZZZZZZZZZZZZZZZZT1";
 
-const task = {
+const task = makeTask({
   id: TASK_ID,
   projectId: PROJECT_ID,
   number: 4,
   key: "TSK-4",
   title: "Ship task embeds",
-  description: "",
   status: "in_progress",
   priority: "high",
-  dueDate: null,
-  parentTaskId: null,
   position: 100,
-  createdAt: "2026-07-15T00:00:00.000Z",
-  updatedAt: "2026-07-15T00:00:00.000Z",
-  labelIds: [],
-};
+});
 
 function directiveProps(attributes: Record<string, string>) {
   return {
@@ -99,8 +93,6 @@ describe("Task directive card", () => {
       method: "getTaskByKey",
       input: { taskKey: "TSK-4" },
     });
-    // Visible key/title/glyphs are duplicated by the accessible name and
-    // must stay hidden from the accessibility tree.
     expect(slot.getByText("TSK-4").closest("[aria-hidden]")).toBeTruthy();
   });
 
@@ -193,7 +185,12 @@ describe("Task directive card", () => {
   });
 
   it("rejects malformed keys without calling the backend", () => {
-    for (const attributes of [{}, { key: "  " }, { key: "not a key" }]) {
+    const malformed: Record<string, string>[] = [
+      {},
+      { key: "  " },
+      { key: "not a key" },
+    ];
+    for (const attributes of malformed) {
       const slot = renderSlot(
         app.messageDirectives[0]!,
         directiveProps(attributes),
@@ -279,6 +276,24 @@ describe("Task directive card", () => {
 });
 
 describe("Task embed panel", () => {
+  it("keeps an aliased task in the side panel until the user opens Tasks", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thr_1", params: { taskKey: "OLD-4" } },
+      { rpc: taskDetailRpc(() => ({ task })) },
+    );
+    await slot.findByRole("textbox", { name: "Task title" });
+    expect(slot.navigateCalls).toEqual([]);
+    fireEvent.click(slot.getByRole("button", { name: "Open OLD-4 in Tasks" }));
+    expect(slot.navigateCalls).toEqual([
+      {
+        method: "toPluginPanel",
+        path: "tasks",
+        options: { subPath: "task/OLD-4" },
+      },
+    ]);
+  });
+
   it("renders the task detail for the panel params and links to the app", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,

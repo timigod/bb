@@ -1,14 +1,18 @@
+import { isDeepStrictEqual } from "node:util";
 import {
-  type ApprovalPendingInteractionPayload,
+  PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES,
+  type ApprovalPendingInteraction,
   type ApprovalPendingInteractionResolution,
   type PendingInteraction,
   type PendingInteractionApprovalDecision,
   type PendingInteractionGrantedPermissionProfile,
   type PendingInteractionResolution,
-  type UserQuestionPendingInteractionPayload,
-  isApprovalPendingInteractionPayload,
+  type UserQuestionPendingInteraction,
+  isApprovalPendingInteraction,
   isApprovalPendingInteractionResolution,
-  isUserQuestionPendingInteractionPayload,
+  isPluginExtensionInteractionResolution,
+  isPluginExtensionPendingInteraction,
+  isUserQuestionPendingInteraction,
   isUserQuestionPendingInteractionResolution,
   isPluginPendingInteractionResolution,
 } from "@bb/domain";
@@ -18,24 +22,6 @@ type GrantedPendingInteractionResolution = Extract<
   ApprovalPendingInteractionResolution,
   { decision: "allow_once" | "allow_for_session" }
 >;
-type ApprovalPendingInteraction = PendingInteraction & {
-  payload: ApprovalPendingInteractionPayload;
-};
-type UserQuestionPendingInteraction = PendingInteraction & {
-  payload: UserQuestionPendingInteractionPayload;
-};
-
-function isApprovalPendingInteraction(
-  interaction: PendingInteraction,
-): interaction is ApprovalPendingInteraction {
-  return isApprovalPendingInteractionPayload(interaction.payload);
-}
-
-function isUserQuestionPendingInteraction(
-  interaction: PendingInteraction,
-): interaction is UserQuestionPendingInteraction {
-  return isUserQuestionPendingInteractionPayload(interaction.payload);
-}
 
 function stringSetEquals(
   left: readonly string[],
@@ -98,6 +84,28 @@ function hasNonWhitespaceText(value: string): boolean {
   return value.trim().length > 0;
 }
 
+function validatePluginExtensionResolution(
+  resolution: PendingInteractionResolution,
+): void {
+  if (!isPluginExtensionInteractionResolution(resolution)) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      "Only a request answer can resolve a plugin request",
+    );
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(resolution.value), "utf8") >
+    PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES
+  ) {
+    throw new ApiError(
+      413,
+      "invalid_request",
+      "Interaction response exceeds 64 KiB",
+    );
+  }
+}
+
 export function pendingInteractionResolutionEquals(
   left: PendingInteraction["resolution"],
   right: PendingInteraction["resolution"],
@@ -112,6 +120,16 @@ export function pendingInteractionResolutionEquals(
     return (
       isPluginPendingInteractionResolution(left) &&
       isPluginPendingInteractionResolution(right)
+    );
+  }
+  if (
+    isPluginExtensionInteractionResolution(left) ||
+    isPluginExtensionInteractionResolution(right)
+  ) {
+    return (
+      isPluginExtensionInteractionResolution(left) &&
+      isPluginExtensionInteractionResolution(right) &&
+      isDeepStrictEqual(left.value, right.value)
     );
   }
   if (
@@ -204,10 +222,6 @@ function validateGrantedPermissions(
     );
   }
 
-  // An empty grant is only wrong when the request had something to grant.
-  // A provider can ask about an action it cannot describe as a permission, and
-  // that prompt still reaches the user. Rejecting the empty grant there would
-  // leave the prompt unanswerable, so the approval stands on its own.
   if (
     !hasGrantedPermissions(permissions) &&
     hasGrantedPermissions(requestedPermissions)
@@ -298,6 +312,10 @@ export function validatePendingInteractionResolution(
     validateUserQuestionResolution(interaction, resolution);
     return;
   }
+  if (isPluginExtensionPendingInteraction(interaction)) {
+    validatePluginExtensionResolution(resolution);
+    return;
+  }
   if (!isApprovalPendingInteraction(interaction)) {
     throw new ApiError(
       400,
@@ -309,7 +327,7 @@ export function validatePendingInteractionResolution(
     throw new ApiError(
       400,
       "invalid_request",
-      "User-answer resolutions can only resolve user-question interactions",
+      "Only an approval decision can resolve an approval interaction",
     );
   }
   validateAvailableDecision(interaction, resolution.decision);

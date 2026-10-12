@@ -11,6 +11,11 @@ import type { CommandRegistrar } from "../helpers/command-output-harness.js";
 import * as fixtures from "../helpers/command-output-fixtures.js";
 import { registerThreadCommands } from "../../commands/thread/index.js";
 
+interface RetryRequest {
+  param: { id: string };
+  json: { turnRequestId: string | null; sendAt: number | null; reason: string };
+}
+
 describe("bb thread action command output", () => {
   setupCommandOutputTestEnvironment();
 
@@ -381,174 +386,86 @@ describe("bb thread action command output", () => {
     });
   });
 
-  it("bb thread stop lets the server no-op when the thread is already idle", async () => {
-    const get = vi.fn(async () =>
-      fixtures.makeThread({
-        id: "thread-stop-idle",
-        projectId: "proj-1",
-        providerId: "codex",
-        status: "idle",
-        createdAt: 1,
-        updatedAt: 2,
-      }),
-    );
-    const stopPost = vi.fn(async () => ({ ok: true }));
-    stubServerApi({
-      "v1.threads.:id.$get": get,
-      "v1.threads.:id.stop.$post": stopPost,
-    });
-
-    await runCommand(["thread", "stop", "thread-stop-idle"], register);
-
-    expect(collectLogLines(vi.mocked(console.log))).toContain(
-      "Thread thread-stop-idle stopped",
-    );
-    expect(get).not.toHaveBeenCalled();
-    expect(stopPost).toHaveBeenCalledTimes(1);
-  });
-
-  it("bb thread retry continues the current eligible failed request", async () => {
-    const statusGet = vi.fn(async () => ({
-      reason: "eligible",
-      scopeKey: "host-1:codex",
-      hostId: "host-1",
-      rateLimits: null,
-      candidate: {
-        failedRequestId: "request-failed-1",
-        turnId: "turn-failed-1",
-        automatic: true,
-        resetsAtMs: 123,
-        rateLimits: {
-          providerId: "codex",
-          status: "blocked",
-          kind: "subscription-window",
-          windows: [],
-          reachedReason: null,
-          overageStatus: null,
-          overageReason: null,
-        },
-      },
-    }));
-    const continuePost = vi.fn(async () => ({
-      ok: true,
-      requestId: "request-continuation-1",
-    }));
-    stubServerApi({
-      "v1.threads.:id.rate-limit-recovery.$get": statusGet,
-      "v1.threads.:id.rate-limit-recovery.continue.$post": continuePost,
-    });
-
-    await runCommand(["thread", "retry", "thread-retry-1"], register);
-
-    expect(statusGet).toHaveBeenCalledWith({
-      param: { id: "thread-retry-1" },
-    });
-    expect(continuePost).toHaveBeenCalledWith({
-      param: { id: "thread-retry-1" },
-      json: { failedRequestId: "request-failed-1", mode: "manual" },
-    });
-    expect(collectLogLines(vi.mocked(console.log))).toContain(
-      "Thread thread-retry-1 provider rate limit retry requested manually",
-    );
-  });
-
-  it("bb thread retry fails when the server finds no eligible candidate", async () => {
-    stubServerApi({
-      "v1.threads.:id.rate-limit-recovery.$get": vi.fn(async () => ({
-        reason: "input-not-accepted",
-        scopeKey: "host-1:codex",
-        hostId: "host-1",
-        rateLimits: null,
-        candidate: null,
-      })),
-    });
-
-    await expect(
-      runCommand(["thread", "retry", "thread-ineligible"], register),
-    ).rejects.toThrow("process.exit:1");
-    expect(collectLogLines(vi.mocked(console.error))).toContain(
-      "Error: Thread thread-ineligible cannot be continued after a provider rate limit (input-not-accepted).",
-    );
-  });
-
-  it("bb thread stop lets the server no-op when the thread is in error", async () => {
-    const get = vi.fn(async () =>
-      fixtures.makeThread({
-        id: "thread-stop-error",
-        projectId: "proj-1",
-        providerId: "codex",
-        status: "error",
-        createdAt: 1,
-        updatedAt: 2,
-      }),
-    );
-    const stopPost = vi.fn(async () => ({ ok: true }));
-    stubServerApi({
-      "v1.threads.:id.$get": get,
-      "v1.threads.:id.stop.$post": stopPost,
-    });
-
-    await runCommand(["thread", "stop", "thread-stop-error"], register);
-
-    expect(collectLogLines(vi.mocked(console.log))).toContain(
-      "Thread thread-stop-error stopped",
-    );
-    expect(get).not.toHaveBeenCalled();
-    expect(stopPost).toHaveBeenCalledTimes(1);
-  });
-
-  it("bb thread stop still stops active threads", async () => {
-    const get = vi.fn(async () =>
-      fixtures.makeThread({
-        id: "thread-stop-active",
-        projectId: "proj-1",
-        providerId: "codex",
-        status: "active",
-        createdAt: 1,
-        updatedAt: 2,
-      }),
-    );
-    const stopPost = vi.fn(async () => ({ ok: true }));
-    stubServerApi({
-      "v1.threads.:id.$get": get,
-      "v1.threads.:id.stop.$post": stopPost,
-    });
-
-    await runCommand(["thread", "stop", "thread-stop-active"], register);
-
-    expect(collectLogLines(vi.mocked(console.log))).toContain(
-      "Thread thread-stop-active stopped",
-    );
-    expect(stopPost).toHaveBeenCalledTimes(1);
-  });
-
-  it("bb thread compact calls the manual compaction endpoint", async () => {
-    const post = vi.fn(async () => ({ ok: true }));
-    stubServerApi({ "v1.threads.:id.compact.$post": post });
-
-    await runCommand(["thread", "compact", "thread-compact"], register);
-
-    expect(post).toHaveBeenCalledWith({ param: { id: "thread-compact" } });
-    expect(collectLogLines(vi.mocked(console.log))).toContain(
-      "Thread thread-compact context compaction requested",
-    );
-  });
-
   it.each([
+    ["stop", "stop", "stopped"],
+    ["compact", "compact", "context compaction requested"],
+    ["clear", "context.clear", "context cleared"],
     ["cancel-plan", "plan.cancel", "exited Plan mode"],
     ["clear-goal", "goal.clear", "cleared its Goal"],
   ])(
-    "bb thread %s calls the authoritative banner action",
+    "bb thread %s posts its action without reading the thread first",
     async (command, route, output) => {
       const post = vi.fn(async () => ({ ok: true }));
       stubServerApi({ [`v1.threads.:id.${route}.$post`]: post });
 
-      await runCommand(["thread", command, "thread-banner"], register);
+      await runCommand(["thread", command, "thread-action"], register);
 
-      expect(post).toHaveBeenCalledWith({ param: { id: "thread-banner" } });
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledWith({ param: { id: "thread-action" } });
       expect(collectLogLines(vi.mocked(console.log))).toContain(
-        `Thread thread-banner ${output}`,
+        `Thread thread-action ${output}`,
       );
     },
   );
+
+  it("bb thread retry defaults the turn and the reason at the boundary", async () => {
+    const retryPost = vi.fn(async () => ({
+      ok: true,
+      delivery: "sent",
+      turnRequestId: "creq_2222222222",
+      attempt: 2,
+    }));
+    stubServerApi({ "v1.threads.:id.retry.$post": retryPost });
+
+    await runCommand(["thread", "retry", "thread-retry-1"], register);
+
+    // No `--turn` means "whichever turn failed", which the server resolves;
+    // the reason is filled rather than sent as an absent field.
+    expect(retryPost).toHaveBeenCalledWith({
+      param: { id: "thread-retry-1" },
+      json: { turnRequestId: null, sendAt: null, reason: "Retry" },
+    });
+    expect(collectLogLines(vi.mocked(console.log))).toContain(
+      "Thread thread-retry-1 retrying turn creq_2222222222 (attempt 2)",
+    );
+  });
+
+  it("bb thread retry names the turn, the instant and the reason when asked", async () => {
+    const retryPost = vi.fn(async (_request: RetryRequest) => ({
+      ok: true,
+      delivery: "queued",
+      turnRequestId: "creq_3333333333",
+      attempt: 3,
+      queuedMessageId: "queued_1",
+      waitingOn: { kind: "time" },
+      sendAt: 1,
+    }));
+    stubServerApi({ "v1.threads.:id.retry.$post": retryPost });
+
+    await runCommand(
+      [
+        "thread",
+        "retry",
+        "thread-retry-2",
+        "--turn",
+        "creq_3333333333",
+        "--send-at",
+        "10m",
+        "--reason",
+        "Rate limited",
+      ],
+      register,
+    );
+
+    const call = retryPost.mock.calls[0]?.[0];
+    expect(call?.param).toEqual({ id: "thread-retry-2" });
+    expect(call?.json.turnRequestId).toBe("creq_3333333333");
+    expect(call?.json.reason).toBe("Rate limited");
+    // `--send-at` is the same grammar `bb thread tell` uses: a duration from
+    // now becomes an absolute instant at the boundary.
+    expect(call?.json.sendAt).toBeGreaterThan(Date.now());
+    expect(collectLogLines(vi.mocked(console.log)).join("\n")).toContain(
+      "retry of turn creq_3333333333 (attempt 3) queued",
+    );
+  });
 });

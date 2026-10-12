@@ -1,29 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { resolvePermissionModeSelection } from "./useThreadCreationOptions";
+import { resolvePermissionModeSelection } from "./thread-creation-options/selection-state";
 
 describe("resolvePermissionModeSelection", () => {
   it("chooses the raw permission mode when supported", () => {
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "accept-edits",
-        supportedPermissionModes: ["accept-edits", "auto", "full"],
+        permissionModes: ["accept-edits", "auto", "full"],
       }),
     ).toBe("accept-edits");
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "full",
-        supportedPermissionModes: ["accept-edits", "full"],
+        permissionModes: ["accept-edits", "full"],
       }),
     ).toBe("full");
   });
 
   it("falls back to full when auto is unsupported", () => {
-    // ACP advertises accept-edits/full only. Full is the product fallback when
-    // the provider has no native automatic reviewer.
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "auto",
-        supportedPermissionModes: ["accept-edits", "full"],
+        permissionModes: ["accept-edits", "full"],
       }),
     ).toBe("full");
   });
@@ -32,7 +30,7 @@ describe("resolvePermissionModeSelection", () => {
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "accept-edits",
-        supportedPermissionModes: ["auto", "full"],
+        permissionModes: ["auto", "full"],
       }),
     ).toBe("auto");
   });
@@ -41,13 +39,13 @@ describe("resolvePermissionModeSelection", () => {
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "accept-edits",
-        supportedPermissionModes: ["full"],
+        permissionModes: ["full"],
       }),
     ).toBe("full");
     expect(
       resolvePermissionModeSelection({
         rawPermissionMode: "accept-edits",
-        supportedPermissionModes: [],
+        permissionModes: [],
       }),
     ).toBe("auto");
   });

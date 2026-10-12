@@ -1,10 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { atom, getDefaultStore, useSetAtom } from "jotai";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   defaultFaviconColor,
   faviconColorPreferenceSchema,
-  type AppThemeSelection,
   type FaviconColor,
   type FaviconColorPreference,
 } from "@bb/domain";
@@ -13,19 +11,12 @@ import {
   getMediaQuerySnapshot,
   subscribeMediaQuery,
 } from "@bb/shared-ui/hooks/use-media-query";
-import { invalidateSystemConfig } from "@/hooks/cache-owners/system-cache-effects";
 import { useSystemConfig } from "@/hooks/queries/system-queries";
-import { sdk } from "@/lib/sdk";
 
-// Reused as both the boot cache (apply the last-known tint before /system/config
-// loads, so the tab icon doesn't flash) and the legacy source for the one-time
-// migration off the old localStorage-only preference.
 export const FAVICON_COLOR_STORAGE_KEY = "bb.faviconColor";
-export const FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY =
-  "bb.faviconColor.serverSynced";
 
-export const FAVICON_BADGES = ["none", "unread"] as const;
-export type FaviconBadge = (typeof FAVICON_BADGES)[number];
+const FAVICON_BADGES = ["none", "unread"] as const;
+type FaviconBadge = (typeof FAVICON_BADGES)[number];
 
 export const FAVICON_COLOR_VALUES: Record<FaviconColor, string> = {
   red: "#e5484d",
@@ -56,31 +47,9 @@ function cacheFaviconColor(color: FaviconColorPreference): void {
     } else {
       localStorage.setItem(FAVICON_COLOR_STORAGE_KEY, color);
     }
-  } catch {
-    // Best-effort cache; ignore private-mode / quota failures.
-  }
+  } catch {}
 }
 
-function hasServerSyncedFaviconColor(): boolean {
-  try {
-    return (
-      localStorage.getItem(FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY) === "true"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function markServerSyncedFaviconColor(): void {
-  try {
-    localStorage.setItem(FAVICON_COLOR_SERVER_SYNCED_STORAGE_KEY, "true");
-  } catch {
-    // Best-effort migration marker; the server value still remains authoritative.
-  }
-}
-
-// Seeded from the boot cache so initializeFavicon() can tint immediately, then
-// reconciled with the server's authoritative value by useFaviconColorSync().
 const faviconColorAtom = atom<FaviconColorPreference>(readCachedFaviconColor());
 const faviconBadgeAtom = atom<FaviconBadge>("none");
 
@@ -89,50 +58,14 @@ function setActiveFaviconColor(color: FaviconColorPreference): void {
   cacheFaviconColor(color);
 }
 
-/**
- * Reconciles the favicon tint with the server-stored appearance and re-applies
- * it whenever /system/config changes (another window updated it). Also performs
- * a one-time migration off the old localStorage-only preference: if this client
- * still has a non-default cached color and the server has none, adopt it
- * server-side so the choice survives the move to server storage.
- */
 export function useFaviconColorSync(): void {
   const { data } = useSystemConfig();
-  const appearance = data?.appearance;
-  const queryClient = useQueryClient();
-  const { mutate: updateAppearance } = useMutation({
-    meta: {
-      errorMessage: "Failed to update appearance.",
-    },
-    mutationFn: (selection: AppThemeSelection) => sdk.theme.set(selection),
-    onSuccess: () => {
-      invalidateSystemConfig({ queryClient });
-    },
-  });
-  const legacyMigrationRequestedRef = useRef(false);
+  const faviconColor = data?.appearance.faviconColor;
 
   useEffect(() => {
-    if (!appearance) return;
-    const legacy = readCachedFaviconColor();
-    const needsMigration =
-      !hasServerSyncedFaviconColor() &&
-      !legacyMigrationRequestedRef.current &&
-      legacy !== defaultFaviconColor &&
-      appearance.faviconColor === defaultFaviconColor;
-    if (needsMigration) {
-      // Keep showing the legacy tint locally until the server adopts it (so it
-      // doesn't flash to default mid-flight), and fire the migration once.
-      legacyMigrationRequestedRef.current = true;
-      setActiveFaviconColor(legacy);
-      updateAppearance(
-        { themeId: appearance.themeId, faviconColor: legacy },
-        { onSuccess: markServerSyncedFaviconColor },
-      );
-      return;
-    }
-    markServerSyncedFaviconColor();
-    setActiveFaviconColor(appearance.faviconColor);
-  }, [appearance, updateAppearance]);
+    if (faviconColor === undefined) return;
+    setActiveFaviconColor(faviconColor);
+  }, [faviconColor]);
 }
 
 export function useFaviconBadge(badge: FaviconBadge): void {
@@ -173,19 +106,10 @@ interface UnreadBadgeDot {
   radius: number;
 }
 
-/**
- * Favicon glyph used as a CSS mask when previewing colors in the UI. Only
- * the alpha channel matters for masking, so the light/dark variants are
- * interchangeable; dev builds use the dev glyph to match the actual favicon.
- */
 export function getFaviconGlyphHref(): string {
   return import.meta.env.DEV ? "/favicon-32x32-dev.png" : "/favicon-32x32.png";
 }
 
-/**
- * Mirrors the favicon bootstrap script in index.html: dev builds use the
- * "-dev" variant, production follows the system color scheme.
- */
 function getFaviconVariantSuffix(): string {
   if (import.meta.env.DEV) return "-dev";
   return getMediaQuerySnapshot(DARK_COLOR_SCHEME_QUERY) ? "-dark" : "";
@@ -205,21 +129,17 @@ function getTintedAssetSuffix(colorPreference: FaviconColorPreference): string {
   return colorPreference === defaultFaviconColor ? "" : `-${colorPreference}`;
 }
 
-export function getPwaManifestHref(
-  colorPreference: FaviconColorPreference,
-): string {
+function getPwaManifestHref(colorPreference: FaviconColorPreference): string {
   return `/manifest${getTintedAssetSuffix(colorPreference)}.webmanifest`;
 }
 
-export function getAppleTouchIconHref(
+function getAppleTouchIconHref(
   colorPreference: FaviconColorPreference,
 ): string {
   return `/apple-touch-icon${getTintedAssetSuffix(colorPreference)}.png`;
 }
 
-export function applyInstallIconState(
-  colorPreference: FaviconColorPreference,
-): void {
+function applyInstallIconState(colorPreference: FaviconColorPreference): void {
   const manifestLink = getDocumentLink(WEB_MANIFEST_LINK_ID);
   if (manifestLink) manifestLink.href = getPwaManifestHref(colorPreference);
 
@@ -239,11 +159,21 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-/**
- * The favicon is a monochrome glyph on a transparent background, so tinting
- * is a straight color replacement: draw the glyph, then fill with the target
- * color using "source-in" compositing to keep only the glyph's alpha.
- */
+const baseImageCache = new Map<string, Promise<HTMLImageElement>>();
+
+function loadBaseImage(src: string): Promise<HTMLImageElement> {
+  const cached = baseImageCache.get(src);
+  if (cached) return cached;
+  const pending = loadImage(src);
+  baseImageCache.set(src, pending);
+  pending.catch(() => {
+    baseImageCache.delete(src);
+  });
+  return pending;
+}
+
+const STANDALONE_DISPLAY_MODE_QUERY = "(display-mode: standalone)";
+
 async function createFaviconHref({
   badge,
   baseHref,
@@ -253,7 +183,7 @@ async function createFaviconHref({
     return baseHref;
   }
 
-  const image = await loadImage(baseHref);
+  const image = await loadBaseImage(baseHref);
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth;
   canvas.height = image.naturalHeight;
@@ -303,6 +233,7 @@ let applyToken = 0;
 
 async function applyFaviconState(state: FaviconRenderState): Promise<void> {
   const token = ++applyToken;
+  if (getMediaQuerySnapshot(STANDALONE_DISPLAY_MODE_QUERY)) return;
   const suffix = getFaviconVariantSuffix();
   const links = await Promise.all(
     FAVICON_SIZES.map(async (size): Promise<RenderedFaviconLink> => {
@@ -324,12 +255,6 @@ async function applyFaviconState(state: FaviconRenderState): Promise<void> {
 
 let initialized = false;
 
-/**
- * Applies the favicon state on startup and re-applies it whenever the color
- * preference, unread badge, or system color scheme changes. The scheme listener runs
- * after the index.html bootstrap listener (registered first), so a tinted
- * or badged favicon survives that script resetting the hrefs on theme changes.
- */
 export function initializeFavicon(): void {
   if (initialized || typeof window === "undefined") return;
   initialized = true;
@@ -338,8 +263,6 @@ export function initializeFavicon(): void {
     const colorPreference = store.get(faviconColorAtom);
     applyInstallIconState(colorPreference);
 
-    // On failure (e.g. the favicon image fails to load), keep whatever the
-    // index.html bootstrap script already applied.
     void applyFaviconState({
       badge: store.get(faviconBadgeAtom),
       colorPreference,

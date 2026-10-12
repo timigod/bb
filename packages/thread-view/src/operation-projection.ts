@@ -6,6 +6,7 @@ import type {
   EventProjectionOperationMessage,
   EventProjectionPermissionGrantLifecycleMessage,
   EventProjectionUserQuestionLifecycleMessage,
+  EventProjectionPluginFormLifecycleMessage,
 } from "./event-projection-types.js";
 import type { CompactionLifecycleEvent } from "./compaction-lifecycle.js";
 import type { EventMeta } from "./event-decode.js";
@@ -37,7 +38,6 @@ import {
 export interface OperationProjectionState {
   messages: EventProjectionMessage[];
   fileEditsByCallId: Map<string, EventProjectionFileEditMessage[]>;
-  /** Keyed by {@link scopedFileEditCallKey}, never by the bare call id. */
   fileEditStdoutBuffersByScopedCallKey: Map<string, VisibleTextBuffer>;
   openCompactionsByKey: Map<string, EventProjectionOperationMessage>;
   finalizedCompactionKeys: Set<string>;
@@ -49,6 +49,10 @@ export interface OperationProjectionState {
   userQuestionsByInteractionId: Map<
     string,
     EventProjectionUserQuestionLifecycleMessage
+  >;
+  pluginFormsByInteractionId: Map<
+    string,
+    EventProjectionPluginFormLifecycleMessage
   >;
   threadOperationsById: Map<string, EventProjectionOperationMessage>;
 }
@@ -63,6 +67,7 @@ export function createOperationProjectionState(
     provisioningOperationsByKey: new Map(),
     permissionGrantsByInteractionId: new Map(),
     userQuestionsByInteractionId: new Map(),
+    pluginFormsByInteractionId: new Map(),
     threadOperationsById: new Map(),
     fileEditsByCallId: new Map(),
     fileEditStdoutBuffersByScopedCallKey: new Map(),
@@ -71,7 +76,7 @@ export function createOperationProjectionState(
 
 export type CompactionTurnFinalizationStatus = Extract<
   EventProjectionOperationMessage["status"],
-  "error" | "interrupted"
+  "completed" | "error" | "interrupted"
 >;
 
 interface FinalizeOpenCompactionsForTurnArgs {
@@ -83,6 +88,12 @@ interface FinalizeOpenCompactionsForTurnArgs {
   detail: string | undefined;
 }
 
+interface InterruptOpenCompactionsArgs {
+  state: OperationProjectionState;
+  meta: EventMeta;
+  threadId: string;
+}
+
 type LifecycleStatus = Extract<
   EventProjectionOperationMessage["status"],
   "pending" | "completed" | "error" | "interrupted"
@@ -91,7 +102,8 @@ type LifecycleStatus = Extract<
 type LifecycleEventProjectionMessage =
   | EventProjectionOperationMessage
   | EventProjectionPermissionGrantLifecycleMessage
-  | EventProjectionUserQuestionLifecycleMessage;
+  | EventProjectionUserQuestionLifecycleMessage
+  | EventProjectionPluginFormLifecycleMessage;
 type EventProjectionMessageScopeFields = ReturnType<
   | typeof eventProjectionMessageThreadScopeFields
   | typeof eventProjectionMessageTurnScopeFields
@@ -290,6 +302,35 @@ export function upsertUserQuestionLifecycleMessage(
   });
 }
 
+export function upsertPluginFormLifecycleMessage(
+  state: OperationProjectionState,
+  incoming: EventProjectionPluginFormLifecycleMessage,
+): void {
+  upsertKeyedLifecycleMessage({
+    index: state.pluginFormsByInteractionId,
+    incoming,
+    key: incoming.interactionId,
+    mergeExisting: mergePluginFormLifecycleMessage,
+    state,
+  });
+}
+
+function mergePluginFormLifecycleMessage(
+  existing: EventProjectionPluginFormLifecycleMessage,
+  incoming: EventProjectionPluginFormLifecycleMessage,
+): void {
+  const wasTerminal = isTerminalLifecycleStatus(existing.status);
+  existing.status = mergeLifecycleStatus(existing.status, incoming.status);
+  if (wasTerminal) {
+    return;
+  }
+  existing.lifecycle = incoming.lifecycle;
+  existing.title = incoming.title;
+  existing.statusReason = incoming.statusReason;
+  existing.presentation = incoming.presentation;
+  existing.payload = incoming.payload;
+}
+
 function mergeUserQuestionLifecycleMessage(
   existing: EventProjectionUserQuestionLifecycleMessage,
   incoming: EventProjectionUserQuestionLifecycleMessage,
@@ -365,9 +406,6 @@ function isTerminalFileEditStatus(
 export function flushPendingFileEditOutput(
   state: OperationProjectionState,
 ): void {
-  // Rows for one call id can sit in different scopes, and each scope owns its
-  // own output buffer, so resolve the buffer from the row's own scope. Each
-  // buffer flushes once, and every row of that scope then takes its text.
   const flushedBufferByScopedCallKey = new Map<
     string,
     VisibleTextBuffer | null
@@ -391,6 +429,7 @@ export function flushPendingFileEditOutput(
 }
 
 interface CreateFileEditMessageArgs {
+  sourcePart: number;
   callId: string;
   change: EventProjectionFileEditChange | null;
   messageKey: string;
@@ -402,6 +441,7 @@ interface CreateFileEditMessageArgs {
 }
 
 function createFileEditMessage({
+  sourcePart,
   callId,
   change,
   messageKey,
@@ -415,6 +455,7 @@ function createFileEditMessage({
     kind: "file-edit",
     id: messageId(threadId, "file-edit", messageKey),
     threadId,
+    sourceEvent: { seq: meta.seq, part: sourcePart },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -422,6 +463,9 @@ function createFileEditMessage({
     ...scopeFields,
     ...(partial.parentToolCallId
       ? { parentToolCallId: partial.parentToolCallId }
+      : {}),
+    ...("presentation" in partial && partial.presentation
+      ? { presentation: partial.presentation }
       : {}),
     callId,
     changes: change ? [{ ...change }] : [],
@@ -469,12 +513,6 @@ function fileEditScopeDiscriminator(
   return scope.kind === "turn" ? scope.turnId : "thread";
 }
 
-/**
- * The identity a file-edit call really has. A provider can reuse one call id
- * across scopes (a resumed ACP session restarts its synthetic id counter), so
- * per-call projection state must be keyed by scope as well, or two unrelated
- * calls share it.
- */
 function scopedFileEditCallKey(
   callId: string,
   scopeFields: EventProjectionMessageScopeFields,
@@ -489,11 +527,6 @@ interface ResolveScopedFileEditMessageKeyArgs {
   threadId: string;
 }
 
-/**
- * A call id reused across scopes must still mint distinct message ids, so fall
- * back to a scope-qualified key when the plain key is already taken by a
- * foreign-scope row.
- */
 function resolveScopedFileEditMessageKey(
   args: ResolveScopedFileEditMessageKeyArgs,
 ): string {
@@ -638,6 +671,9 @@ function updateFileEditMessage(
   if (!existing.parentToolCallId && partial.parentToolCallId) {
     existing.parentToolCallId = partial.parentToolCallId;
   }
+  if ("presentation" in partial && partial.presentation) {
+    existing.presentation = partial.presentation;
+  }
 
   if (change) {
     existing.changes = [mergeFileChange(existing.changes[0], change)];
@@ -676,10 +712,6 @@ export function upsertFileEdit(
     ? eventProjectionMessageTurnScopeFields(turnId)
     : eventProjectionMessageThreadScopeFields();
   const existingRows = state.fileEditsByCallId.get(partial.callId) ?? [];
-  // Providers can reuse call ids across scopes (e.g. resumed ACP sessions
-  // restart their synthetic id counters). Merge only rows from a compatible
-  // scope and leave foreign-scope rows untouched, so each scope keeps its own
-  // file-edit message instead of failing the whole projection.
   const compatibleRows: EventProjectionFileEditMessage[] = [];
   const foreignRows: EventProjectionFileEditMessage[] = [];
   for (const row of existingRows) {
@@ -694,9 +726,6 @@ export function upsertFileEdit(
   const stdoutBuffer =
     state.fileEditStdoutBuffersByScopedCallKey.get(scopedCallKey) ??
     createVisibleTextBuffer();
-  // Provider stdout is per call, so split file-edit rows for the same call
-  // intentionally share one buffer — but only within one scope, so a reused
-  // call id cannot leak an earlier turn's output into a later turn's rows.
   state.fileEditStdoutBuffersByScopedCallKey.set(scopedCallKey, stdoutBuffer);
 
   const partialStdout = fileEditPartialStdout(partial);
@@ -717,16 +746,14 @@ export function upsertFileEdit(
   const stdout = getVisibleTextBufferText(stdoutBuffer);
   const partialChanges = fileEditPartialChanges(partial);
   if (partialChanges && partialChanges.length > 0) {
-    // A later change list is authoritative for the call: rows absent from the
-    // new list are dropped so stale split file-edit rows do not linger.
     const existingRowsByMatchKey =
       groupFileEditRowsByChangeMatchKey(compatibleRows);
     const usedRowIds = new Set<string>();
     const nextRows: EventProjectionFileEditMessage[] = [];
-    for (const entry of buildFileEditChangeEntries(
+    for (const [sourcePart, entry] of buildFileEditChangeEntries(
       partial.callId,
       partialChanges,
-    )) {
+    ).entries()) {
       const existing = takeFileEditRowForChangeEntry({
         entry,
         groupedRows: existingRowsByMatchKey,
@@ -747,6 +774,7 @@ export function upsertFileEdit(
 
       nextRows.push(
         createFileEditMessage({
+          sourcePart,
           callId: partial.callId,
           change: entry.change,
           messageKey: resolveScopedFileEditMessageKey({
@@ -788,6 +816,7 @@ export function upsertFileEdit(
     }
 
     const message = createFileEditMessage({
+      sourcePart: changeIndex,
       callId: partial.callId,
       change,
       messageKey: resolveScopedFileEditMessageKey({
@@ -830,6 +859,8 @@ export function onCompactionBegin(
     existing.status = "pending";
     existing.title = "Compacting context";
     existing.detail = payload.detail ?? existing.detail;
+    existing.parentToolCallId =
+      payload.parentToolCallId ?? existing.parentToolCallId;
     return;
   }
 
@@ -837,6 +868,7 @@ export function onCompactionBegin(
     kind: "operation",
     id: messageId(threadId, "op", `compaction:${payload.key}`),
     threadId,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -848,6 +880,9 @@ export function onCompactionBegin(
     opType: "compaction",
     title: "Compacting context",
     detail: payload.detail,
+    ...(payload.parentToolCallId
+      ? { parentToolCallId: payload.parentToolCallId }
+      : {}),
     status: "pending",
   };
   state.openCompactionsByKey.set(payload.key, message);
@@ -869,6 +904,8 @@ export function onCompactionEnd(
     existing.status = "completed";
     existing.title = "Context compacted";
     existing.detail = payload.detail ?? existing.detail;
+    existing.parentToolCallId =
+      payload.parentToolCallId ?? existing.parentToolCallId;
     state.openCompactionsByKey.delete(payload.key);
     state.finalizedCompactionKeys.add(payload.key);
     return;
@@ -882,6 +919,7 @@ export function onCompactionEnd(
     kind: "operation",
     id: messageId(threadId, "op", `compaction:${payload.key}`),
     threadId,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -893,20 +931,39 @@ export function onCompactionEnd(
     opType: "compaction",
     title: "Context compacted",
     detail: payload.detail,
+    ...(payload.parentToolCallId
+      ? { parentToolCallId: payload.parentToolCallId }
+      : {}),
     status: "completed",
   });
   state.finalizedCompactionKeys.add(payload.key);
 }
 
-/**
- * Turn-end finalization is provisional: keep the compaction open so a later
- * explicit compaction completion can override the inferred error/interruption.
- */
+function finalizeOpenCompaction(
+  message: EventProjectionOperationMessage,
+  meta: EventMeta,
+  status: CompactionTurnFinalizationStatus,
+  detail: string | undefined,
+): void {
+  message.sourceSeqEnd = Math.max(message.sourceSeqEnd, meta.seq);
+  message.createdAt = Math.max(message.createdAt, meta.createdAt);
+  message.completedAt = meta.createdAt;
+  message.status = status;
+  message.title =
+    status === "error"
+      ? "Context compaction failed"
+      : status === "completed"
+        ? "Context compaction skipped"
+        : "Context compaction interrupted";
+  message.detail = detail ?? message.detail;
+}
+
 export function finalizeOpenCompactionsForTurn(
   args: FinalizeOpenCompactionsForTurnArgs,
-): void {
-  if (!args.turnId) return;
+): boolean {
+  if (!args.turnId) return false;
 
+  let settledPending = false;
   for (const message of args.state.openCompactionsByKey.values()) {
     if (
       message.threadId !== args.threadId ||
@@ -916,14 +973,26 @@ export function finalizeOpenCompactionsForTurn(
       continue;
     }
 
-    message.sourceSeqEnd = Math.max(message.sourceSeqEnd, args.meta.seq);
-    message.createdAt = Math.max(message.createdAt, args.meta.createdAt);
-    message.completedAt = args.meta.createdAt;
-    message.status = args.status;
-    message.title =
-      args.status === "error"
-        ? "Context compaction failed"
-        : "Context compaction interrupted";
-    message.detail = args.detail ?? message.detail;
+    if (message.status === "pending") {
+      settledPending = true;
+    }
+    finalizeOpenCompaction(message, args.meta, args.status, args.detail);
+  }
+  return settledPending;
+}
+
+export function interruptOpenCompactions(
+  args: InterruptOpenCompactionsArgs,
+): void {
+  for (const message of args.state.openCompactionsByKey.values()) {
+    if (
+      message.threadId !== args.threadId ||
+      message.status !== "pending" ||
+      message.sourceSeqStart > args.meta.seq
+    ) {
+      continue;
+    }
+
+    finalizeOpenCompaction(message, args.meta, "interrupted", undefined);
   }
 }

@@ -9,7 +9,12 @@ describe("createPluginDevLoop", () => {
     vi.useRealTimers();
   });
 
-  function makeDeps(overrides: { hasApp?: boolean } = {}) {
+  function makeDeps(
+    overrides: {
+      hasApp?: boolean;
+      hasHost?: boolean;
+    } = {},
+  ) {
     const calls: string[] = [];
     const lines: string[] = [];
     return {
@@ -17,9 +22,15 @@ describe("createPluginDevLoop", () => {
       lines,
       deps: {
         pluginId: "hello",
-        hasApp: overrides.hasApp ?? true,
+        targets: async () => ({
+          hasApp: overrides.hasApp ?? true,
+          hasHost: overrides.hasHost ?? false,
+        }),
         buildApp: vi.fn(async () => {
           calls.push("build");
+        }),
+        buildHost: vi.fn(async () => {
+          calls.push("build-host");
         }),
         reloadPlugin: vi.fn(async () => {
           calls.push("reload");
@@ -27,7 +38,6 @@ describe("createPluginDevLoop", () => {
         log: (line: string) => {
           lines.push(line);
         },
-        debounceMs: 300,
       },
     };
   }
@@ -39,7 +49,7 @@ describe("createPluginDevLoop", () => {
     loop.handleChange("app.tsx");
     await vi.advanceTimersByTimeAsync(200);
     loop.handleChange("server.ts");
-    loop.handleChange("app.tsx"); // duplicate collapses
+    loop.handleChange("app.tsx");
     expect(deps.buildApp).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(300);
@@ -65,6 +75,21 @@ describe("createPluginDevLoop", () => {
     expect(lines[0]).toBe("1 file changed · reloaded hello");
   });
 
+  it("rebuilds the host artifact before reloading a host plugin", async () => {
+    const { calls, lines, deps } = makeDeps({
+      hasApp: false,
+      hasHost: true,
+    });
+    const loop = createPluginDevLoop(deps);
+
+    loop.handleChange("host.ts");
+    await vi.advanceTimersByTimeAsync(300);
+    await loop.settled();
+
+    expect(calls).toEqual(["build-host", "reload"]);
+    expect(lines[0]).toContain("rebuilt host in");
+  });
+
   it("a build failure prints the error, skips the reload, and keeps watching", async () => {
     const { calls, lines, deps } = makeDeps();
     deps.buildApp.mockRejectedValueOnce(new Error("Unexpected token"));
@@ -77,7 +102,6 @@ describe("createPluginDevLoop", () => {
     expect(deps.reloadPlugin).not.toHaveBeenCalled();
     expect(lines[0]).toContain("build failed: Unexpected token");
 
-    // The loop recovers on the next save.
     loop.handleChange("app.tsx");
     await vi.advanceTimersByTimeAsync(300);
     await loop.settled();
@@ -115,7 +139,6 @@ describe("createPluginDevLoop", () => {
 
     loop.handleChange("server.ts");
     await vi.advanceTimersByTimeAsync(300);
-    // First cycle's reload is in flight; a new change lands.
     loop.handleChange("server.ts");
     await vi.advanceTimersByTimeAsync(300);
     expect(calls).toEqual(["reload-start"]);

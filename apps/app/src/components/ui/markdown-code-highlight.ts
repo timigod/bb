@@ -1,46 +1,75 @@
-import { highlight } from "sugar-high";
-import { c, css, go, java, python, rust } from "sugar-high/presets";
+import { highlight, type LanguageName } from "sugar-high";
+import { lang } from "sugar-high/lang";
 
-// sugar-high's core highlighter targets JavaScript/JSX/TypeScript. These presets
-// extend it to the other languages agents emit most often. A language without a
-// preset falls through to the core highlighter, which still tokenizes
-// identifiers, strings, and comments rather than failing.
-const PRESET_BY_LANGUAGE: Record<string, typeof rust> = {
-  rust,
-  rs: rust,
-  python,
-  py: python,
-  go,
-  c,
-  "c++": c,
-  cpp: c,
-  cc: c,
-  h: c,
-  hpp: c,
-  java,
-  kotlin: java,
-  kt: java,
-  css,
-  scss: css,
-  less: css,
+const EXTRA_LANGUAGE_ALIASES: Record<string, LanguageName> = {
+  console: "shell",
+  shellscript: "shell",
+  h: "c",
+  hpp: "cpp",
+  hh: "cpp",
+  hxx: "cpp",
+  less: "css",
 };
 
-export interface HighlightMarkdownCodeArgs {
+const HIGHLIGHT_CACHE_MAX_ENTRIES = 128;
+const HIGHLIGHT_CACHE_MAX_CHARS = 4_000_000;
+const HIGHLIGHT_CACHE_MAX_CODE_LENGTH = 128_000;
+
+const highlightCache = new Map<string, string>();
+let highlightCacheChars = 0;
+
+interface HighlightMarkdownCodeArgs {
   code: string;
   language: string | null;
 }
 
-/**
- * Returns sugar-high HTML for a fenced code block. sugar-high HTML-escapes the
- * input (`<` becomes `&lt;`), so the returned markup is safe to inject with
- * dangerouslySetInnerHTML; the input is fenced code text, never user-authored
- * HTML. Token colors come from the `--sh-*` custom properties scoped to
- * `.bb-code-highlight` (see markdown-code-highlight.css).
- */
-export function highlightMarkdownCode({
+function highlightUncached({
   code,
   language,
 }: HighlightMarkdownCodeArgs): string {
-  const preset = language === null ? undefined : PRESET_BY_LANGUAGE[language];
-  return highlight(code, preset);
+  const resolved =
+    language === null
+      ? undefined
+      : (lang(language) ?? EXTRA_LANGUAGE_ALIASES[language]);
+  return highlight(code, { lang: resolved });
+}
+
+function highlightCacheKey({
+  code,
+  language,
+}: HighlightMarkdownCodeArgs): string {
+  return language === null
+    ? `:${code}`
+    : `${language.length}:${language}:${code}`;
+}
+
+export function highlightMarkdownCode(args: HighlightMarkdownCodeArgs): string {
+  if (args.code.length > HIGHLIGHT_CACHE_MAX_CODE_LENGTH) {
+    return highlightUncached(args);
+  }
+  const key = highlightCacheKey(args);
+  const cached = highlightCache.get(key);
+  if (cached !== undefined) {
+    highlightCache.delete(key);
+    highlightCache.set(key, cached);
+    return cached;
+  }
+  const html = highlightUncached(args);
+  const entryChars = key.length + html.length;
+  if (entryChars > HIGHLIGHT_CACHE_MAX_CHARS) {
+    return html;
+  }
+  highlightCache.set(key, html);
+  highlightCacheChars += entryChars;
+  for (const [oldestKey, oldestHtml] of highlightCache) {
+    if (
+      highlightCache.size <= HIGHLIGHT_CACHE_MAX_ENTRIES &&
+      highlightCacheChars <= HIGHLIGHT_CACHE_MAX_CHARS
+    ) {
+      break;
+    }
+    highlightCache.delete(oldestKey);
+    highlightCacheChars -= oldestKey.length + oldestHtml.length;
+  }
+  return html;
 }

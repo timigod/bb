@@ -16,9 +16,14 @@ import {
 } from "@bb/server-contract";
 import {
   hostDaemonEnrollKeyResponseSchema,
-  type HostDaemonEnrollKeyRequest,
   type HostDaemonEnrollKeyResponse,
 } from "@bb/host-daemon-contract";
+import {
+  listOpenFilePids,
+  readPositivePidFile,
+  resolveProjectEnvCandidates,
+  shellSingleQuote,
+} from "@bb/test-helpers";
 import { z } from "zod";
 
 const execFile = promisify(execFileCallback);
@@ -30,11 +35,6 @@ const STANDALONE_TMP_PREFIX = "bb-standalone-";
 const PROCESS_SCAN_MAX_BUFFER = 10 * 1024 * 1024;
 
 type EnvironmentMap = Record<string, string>;
-// Thread-context env the parent agent injects into every shell. A standalone
-// pair must not inherit it: BB_THREAD_STORAGE in particular points at the parent
-// thread's own storage subdirectory, which the daemon would otherwise adopt as
-// its storage root and diverge from the server's data-dir-derived path, breaking
-// thread.start with "Thread storage path escapes the storage root".
 const STANDALONE_THREAD_CONTEXT_ENV = [
   "BB_THREAD_ID",
   "BB_ENVIRONMENT_ID",
@@ -95,20 +95,13 @@ interface SpawnLoggedProcessOptions {
 
 interface StartQaServerArgs {
   dataDir: string;
-  /**
-   * Complete server process environment. This is not merged over process.env;
-   * callers that need inherited variables must include them explicitly.
-   */
   env?: NodeJS.ProcessEnv;
   logPath: string;
   port: number;
-  publicUrl?: string;
-  reuseExisting?: boolean;
 }
 
 interface StartQaServerResult {
-  process: ChildProcess | null;
-  reusedExisting: boolean;
+  process: ChildProcess;
   serverUrl: string;
 }
 
@@ -150,19 +143,18 @@ interface LoadDotEnvResult {
   path: string | null;
 }
 
-export interface BuildStandaloneRuntimeEnvArgs {
+interface BuildStandaloneRuntimeEnvArgs {
   baseEnv: NodeJS.ProcessEnv;
   overrides: NodeJS.ProcessEnv;
 }
 
-export interface ResolveStandaloneParentPidArgs {
+interface ResolveStandaloneParentPidArgs {
   env: NodeJS.ProcessEnv;
   fallbackPid: number;
 }
 
 interface WaitForOptions {
   description: string;
-  intervalMs?: number;
   timeoutMs: number;
 }
 
@@ -222,13 +214,9 @@ function warnStandaloneParentSkipped(
   );
 }
 
-export function shellQuote(value: string): string {
-  return `'${String(value).replaceAll("'", `'\\''`)}'`;
-}
-
-export function buildShellExports(env: EnvironmentMap): string {
+function buildShellExports(env: EnvironmentMap): string {
   return Object.entries(env)
-    .map(([key, value]) => `export ${key}=${shellQuote(String(value))}`)
+    .map(([key, value]) => `export ${key}=${shellSingleQuote(String(value))}`)
     .join("\n");
 }
 
@@ -239,12 +227,6 @@ export function buildStandaloneShellExports(env: EnvironmentMap): string {
   return [...unsetThreadContext, buildShellExports(env)].join("\n");
 }
 
-/**
- * Builds the standalone QA process environment. Isolates the pair from the
- * parent agent by stripping inherited thread context (see
- * STANDALONE_THREAD_CONTEXT_ENV) and applies provider-key policy: ambient
- * OPENAI_API_KEY is stripped unless BB_QA_OPENAI_API_KEY opts in.
- */
 export function buildStandaloneRuntimeEnv(
   args: BuildStandaloneRuntimeEnvArgs,
 ): NodeJS.ProcessEnv {
@@ -293,35 +275,6 @@ export function resolveStandaloneParentPid(
     : args.fallbackPid;
 }
 
-async function resolveProjectEnvCandidates(): Promise<string[]> {
-  const candidates = new Set([path.join(repoRoot, ".env")]);
-  const gitMetadataPath = path.join(repoRoot, ".git");
-
-  try {
-    const gitMetadata = await fs.stat(gitMetadataPath);
-    if (!gitMetadata.isFile()) {
-      return [...candidates];
-    }
-
-    const gitdirPointer = await fs.readFile(gitMetadataPath, "utf8");
-    const match = /^gitdir:\s*(.+)\s*$/m.exec(gitdirPointer);
-    if (!match?.[1]) {
-      return [...candidates];
-    }
-
-    const worktreeGitDir = path.resolve(repoRoot, match[1]);
-    const commonGitDir = path.dirname(path.dirname(worktreeGitDir));
-    candidates.add(path.join(path.dirname(commonGitDir), ".env"));
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return [...candidates];
-    }
-    throw error;
-  }
-
-  return [...candidates];
-}
-
 export async function createTestGitRepo(repoDir: string): Promise<string> {
   await fs.mkdir(repoDir, { recursive: true });
   await runGit(repoDir, ["init", "--initial-branch", "main"]);
@@ -359,14 +312,13 @@ export async function createProject(
 
 export async function createHostEnrollKey(
   serverUrl: string,
-  body: HostDaemonEnrollKeyRequest = {},
 ): Promise<HostDaemonEnrollKeyResponse> {
   const response = await fetch(`${serverUrl}/internal/hosts/enroll-key`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({}),
   });
   if (!response.ok) {
     throw new Error(
@@ -374,12 +326,6 @@ export async function createHostEnrollKey(
     );
   }
   return hostDaemonEnrollKeyResponseSchema.parse(await response.json());
-}
-
-export async function createStandaloneHostEnrollKey(
-  serverUrl: string,
-): Promise<HostDaemonEnrollKeyResponse> {
-  return createHostEnrollKey(serverUrl);
 }
 
 export async function killProcess(
@@ -411,7 +357,7 @@ export async function killProcess(
 export async function loadDotEnv(): Promise<LoadDotEnvResult> {
   const loaded: EnvironmentMap = {};
 
-  for (const candidate of await resolveProjectEnvCandidates()) {
+  for (const candidate of await resolveProjectEnvCandidates(repoRoot)) {
     try {
       const content = await fs.readFile(candidate, "utf8");
       for (const line of content.split("\n")) {
@@ -470,11 +416,11 @@ export async function reservePort(): Promise<number> {
   });
 }
 
-export function buildLocalServerUrl(port: number): string {
+function buildLocalServerUrl(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
-export async function runGit(cwd: string, args: string[]): Promise<void> {
+async function runGit(cwd: string, args: string[]): Promise<void> {
   await execFile("git", args, { cwd });
 }
 
@@ -485,8 +431,6 @@ export function spawnLoggedProcess(
   try {
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
-      // Standalone QA commands return after startup, so the child must leave the
-      // wrapper's process group or pnpm tears the stack down immediately.
       detached: true,
       env: options.env,
       stdio: ["ignore", logFd, logFd],
@@ -495,17 +439,6 @@ export function spawnLoggedProcess(
     return child;
   } finally {
     closeSync(logFd);
-  }
-}
-
-async function isServerReady(serverUrl: string): Promise<boolean> {
-  try {
-    const response = await fetch(`${serverUrl}/api/v1/system/config`, {
-      signal: AbortSignal.timeout(1_000),
-    });
-    return response.ok;
-  } catch {
-    return false;
   }
 }
 
@@ -526,26 +459,13 @@ export async function startQaServer(
 ): Promise<StartQaServerResult> {
   const serverUrl = buildLocalServerUrl(args.port);
 
-  if (args.reuseExisting && (await isServerReady(serverUrl))) {
-    return {
-      process: null,
-      reusedExisting: true,
-      serverUrl,
-    };
-  }
-
   const serverEnv: NodeJS.ProcessEnv = {
     ...(args.env ?? process.env),
     BB_DATA_DIR: args.dataDir,
     BB_SERVER_PORT: String(args.port),
   };
-  if (args.publicUrl) {
-    serverEnv.BB_APP_URL = args.publicUrl;
-    serverEnv.BB_EXTERNAL_URL = args.publicUrl;
-  } else {
-    delete serverEnv.BB_APP_URL;
-    delete serverEnv.BB_EXTERNAL_URL;
-  }
+  delete serverEnv.BB_APP_URL;
+  delete serverEnv.BB_EXTERNAL_URL;
 
   const serverProcess = spawnLoggedProcess({
     command: process.execPath,
@@ -569,7 +489,6 @@ export async function startQaServer(
 
   return {
     process: serverProcess,
-    reusedExisting: false,
     serverUrl,
   };
 }
@@ -596,40 +515,6 @@ async function listStandaloneTmpRoots(): Promise<string[]> {
         entry.isDirectory() && entry.name.startsWith(STANDALONE_TMP_PREFIX),
     )
     .map((entry) => path.join(tmpdir(), entry.name));
-}
-
-async function listOpenFilePids(targetPath: string): Promise<number[]> {
-  try {
-    const { stdout } = await execFile("lsof", ["-t", "+D", targetPath], {
-      encoding: "utf8",
-    });
-    return stdout
-      .split("\n")
-      .map((value) => Number.parseInt(value.trim(), 10))
-      .filter((value) => Number.isInteger(value) && value > 0);
-  } catch (error) {
-    if (isNodeError(error) && (error.code === "ENOENT" || error.code === 1)) {
-      return [];
-    }
-    throw error;
-  }
-}
-
-async function readPidFile(pidPath: string | null): Promise<number | null> {
-  if (!pidPath) {
-    return null;
-  }
-
-  try {
-    const rawPid = await fs.readFile(pidPath, "utf8");
-    const pid = Number.parseInt(rawPid.trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
 }
 
 async function listProcessesByInstance(instanceId: string): Promise<number[]> {
@@ -731,7 +616,9 @@ export async function cleanupStandaloneInstance(
   const killedPids = new Set<number>();
   const pidsToKill = new Set<number | null>([
     runtime.daemonPid,
-    await readPidFile(runtime.daemonRestartPidPath),
+    runtime.daemonRestartPidPath
+      ? await readPositivePidFile(runtime.daemonRestartPidPath)
+      : null,
     runtime.serverPid,
     ...(runtime.instanceId
       ? await listProcessesByInstance(runtime.instanceId)
@@ -820,9 +707,9 @@ export function buildDaemonRestartCommand(
   args: BuildDaemonRestartCommandArgs,
 ): string {
   const fallbackDaemonPid = args.daemonPid
-    ? shellQuote(String(args.daemonPid))
+    ? shellSingleQuote(String(args.daemonPid))
     : "''";
-  const pidPath = shellQuote(args.pidPath);
+  const pidPath = shellSingleQuote(args.pidPath);
   const resolveCurrentPidCommand = [
     `daemon_pid=${fallbackDaemonPid}`,
     `if [ -s ${pidPath} ]; then daemon_pid=$(cat ${pidPath}); fi`,
@@ -835,7 +722,7 @@ export function buildDaemonRestartCommand(
   ].join("; ");
 
   const envFileCommand = args.envFilePath
-    ? `[ ! -f ${shellQuote(args.envFilePath)} ] || . ${shellQuote(args.envFilePath)}`
+    ? `[ ! -f ${shellSingleQuote(args.envFilePath)} ] || . ${shellSingleQuote(args.envFilePath)}`
     : ":";
   const qaOpenAiApiKeyParameter = `\${${STANDALONE_OPENAI_API_KEY_ENV}-}`;
   const providerEnvCommand =
@@ -843,26 +730,26 @@ export function buildDaemonRestartCommand(
     `OPENAI_API_KEY="$${STANDALONE_OPENAI_API_KEY_ENV}"; export OPENAI_API_KEY ;; ` +
     "*) unset OPENAI_API_KEY ;; esac";
   const daemonEnv = [
-    `BB_DATA_DIR=${shellQuote(args.dataDir)}`,
-    `BB_HOST_DAEMON_PORT=${shellQuote(String(args.daemonPort))}`,
-    `BB_SERVER_URL=${shellQuote(args.serverUrl)}`,
-    `${STANDALONE_INSTANCE_ENV}=${shellQuote(args.instanceId)}`,
-    `BB_STANDALONE_PARENT_PID=${shellQuote(String(args.parentPid))}`,
+    `BB_DATA_DIR=${shellSingleQuote(args.dataDir)}`,
+    `BB_HOST_DAEMON_PORT=${shellSingleQuote(String(args.daemonPort))}`,
+    `BB_SERVER_URL=${shellSingleQuote(args.serverUrl)}`,
+    `${STANDALONE_INSTANCE_ENV}=${shellSingleQuote(args.instanceId)}`,
+    `BB_STANDALONE_PARENT_PID=${shellSingleQuote(String(args.parentPid))}`,
   ].join(" ");
   const launcherEnv = [
-    `${RESTART_DAEMON_ENTRYPOINT_ENV}=${shellQuote(args.entrypoint)}`,
-    `${RESTART_DAEMON_CWD_ENV}=${shellQuote(args.cwd)}`,
-    `${RESTART_DAEMON_LOG_PATH_ENV}=${shellQuote(args.logPath)}`,
-    `${RESTART_DAEMON_PID_PATH_ENV}=${shellQuote(args.pidPath)}`,
+    `${RESTART_DAEMON_ENTRYPOINT_ENV}=${shellSingleQuote(args.entrypoint)}`,
+    `${RESTART_DAEMON_CWD_ENV}=${shellSingleQuote(args.cwd)}`,
+    `${RESTART_DAEMON_LOG_PATH_ENV}=${shellSingleQuote(args.logPath)}`,
+    `${RESTART_DAEMON_PID_PATH_ENV}=${shellSingleQuote(args.pidPath)}`,
   ].join(" ");
   const startScript =
     `set -a; ${envFileCommand}; set +a; ` +
     `${providerEnvCommand}; ` +
-    `${daemonEnv} ${launcherEnv} node -e ${shellQuote(DETACHED_DAEMON_LAUNCHER_SCRIPT)}`;
-  const startCommand = `(${startScript}) </dev/null >> ${shellQuote(args.logPath)} 2>&1`;
+    `${daemonEnv} ${launcherEnv} node -e ${shellSingleQuote(DETACHED_DAEMON_LAUNCHER_SCRIPT)}`;
+  const startCommand = `(${startScript}) </dev/null >> ${shellSingleQuote(args.logPath)} 2>&1`;
   const waitForReconnectCommand = [
     "connected=0",
-    `for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS ${shellQuote(`${args.serverUrl}/api/v1/hosts`)} | jq -e ${shellQuote(`any(.[]; .id == ${JSON.stringify(args.hostId)} and .status == "connected")`)} >/dev/null; then connected=1; break; fi`,
+    `for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do if curl -fsS ${shellSingleQuote(`${args.serverUrl}/api/v1/hosts`)} | jq -e ${shellSingleQuote(`any(.[]; .id == ${JSON.stringify(args.hostId)} and .status == "connected")`)} >/dev/null; then connected=1; break; fi`,
     "sleep 1",
     "done",
     `[ "$connected" = 1 ]`,
@@ -877,7 +764,7 @@ export function buildDaemonRestartCommand(
   );
 }
 
-export async function waitFor<TResult>(
+async function waitFor<TResult>(
   check: () => Promise<TResult | null | false> | TResult | null | false,
   options: WaitForOptions,
 ): Promise<TResult> {
@@ -888,9 +775,7 @@ export async function waitFor<TResult>(
     if (result) {
       return result;
     }
-    await new Promise((resolve) =>
-      setTimeout(resolve, options.intervalMs ?? 100),
-    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   throw new Error(`Timed out waiting for ${options.description}`);
@@ -918,7 +803,7 @@ export async function waitForConnectedHost(serverUrl: string): Promise<Host> {
   );
 }
 
-export async function waitForServerReady(serverUrl: string): Promise<boolean> {
+async function waitForServerReady(serverUrl: string): Promise<boolean> {
   return waitFor(
     async () => {
       try {

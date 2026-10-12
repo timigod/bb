@@ -1,78 +1,95 @@
-import { and, eq, isNull } from "drizzle-orm";
+import {
+  runThreadPruningSweep,
+  THREAD_PRUNING_SWEEP_LIMITS,
+  type ThreadPruningSweepLimits,
+} from "./thread-pruning-sweep.js";
+import {
+  PROJECT_ATTACHMENT_BACKFILL_LIMITS,
+  runProjectAttachmentBackfill,
+  runProjectAttachmentPrune,
+} from "../projects/attachment-maintenance.js";
+import { sweepProviderLifecycles } from "../environments/environment-engine.js";
+import {
+  runThreadStorageOrphanSweep,
+  THREAD_STORAGE_ORPHAN_SWEEP_CADENCE_MS,
+} from "../threads/thread-storage-orphans.js";
+import { and, eq, isNull, isNotNull, inArray } from "drizzle-orm";
+import { sweepMachineLifecycles } from "../machines/provider-orchestration.js";
 import {
   CLOSED_SESSION_ROW_RETENTION_MS,
   compactDatabase,
-  COMPLETED_EVENT_OUTPUT_RETENTION_MS,
   DATABASE_COMPACTION_MIN_RECLAIMABLE_BYTES,
   DATABASE_COMPACTION_MIN_RECLAIMABLE_RATIO,
   DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
   DATABASE_INCREMENTAL_VACUUM_MIN_FREELIST_PAGES,
   DEFAULT_CLOSED_SESSION_PRUNE_BATCH_SIZE,
-  DEFAULT_COMPLETED_EVENT_OUTPUT_TRUNCATION_BATCH_SIZE,
+  deleteExpiredRetainedEventOutputs,
   dropDeferredLegacyTables,
   getDatabaseAutoVacuumMode,
   getDatabaseCompactionStats,
   getDatabaseFreelistStats,
   getDatabaseMaintenanceActivity,
+  getEnvironment,
   isDatabaseMaintenanceIdle,
+  listArchivedThreadsPendingTeardown,
   listDeferredLegacyTables,
+  migrateNextCompletedEventItemOutput,
+  migrateNextLegacyImageGenerationOutput,
   environments,
   pruneClosedSessions,
-  pruneDestroyedEnvironments,
+  RETAINED_EVENT_OUTPUT_TARGETS,
   runIncrementalVacuum,
   shouldCompactDatabase,
   shouldRunIncrementalVacuum,
-  sweepManagedEnvironments,
   threads,
-  truncateCompletedEventItemOutputs,
+  DEFAULT_COMPLETED_EVENT_OUTPUT_MIGRATION_SCAN_LIMIT,
+  DEFAULT_LEGACY_IMAGE_GENERATION_MIGRATION_SCAN_LIMIT,
 } from "@bb/db";
 import type {
   AppDeps,
   LoggedPendingInteractionWorkSessionDeps,
 } from "../../types.js";
-import {
-  recoverOrphanedEnvironmentDestroyRequests,
-  runEnvironmentCleanupAdvance,
-} from "../environments/environment-cleanup-internal.js";
-import {
-  isCommandTimeoutError,
-  isHostUnavailableError,
-  runtimeErrorLogFields,
-} from "../lib/error-log-fields.js";
-import { advanceEnvironmentProvisioning } from "../environments/environment-provisioning-internal.js";
+import { advanceEnvironmentProvisioning } from "../environments/environment-engine.js";
 import {
   advanceProjectDeletion,
   listProjectsPendingDeletion,
 } from "../projects/project-deletion.js";
-import { hasLiveThreadStartInFlight } from "../threads/thread-lifecycle.js";
+import {
+  finalizeStoppedThread,
+  hasLiveThreadStartInFlight,
+  requestThreadStopForCurrentState,
+  requestThreadStorageDeletion,
+} from "../threads/thread-lifecycle.js";
+import {
+  archiveUndoGraceKeepsTerminals,
+  archiveUndoGraceKeepsTurnRunning,
+} from "../threads/archive-undo-grace.js";
 import { advanceThreadProvisioning } from "../threads/thread-provisioning.js";
-import { runQueuedMessageAutoSendSweep } from "../threads/queued-messages.js";
-import { LIVE_DAEMON_COMMAND_TIMEOUT_MS } from "../hosts/live-command.js";
-import { runEventLoopWork } from "./event-loop-work.js";
+import {
+  runQueuedMessageDispatch,
+  type QueueWaitPluginDirectory,
+} from "../threads/queued-message-dispatch.js";
+import { deliverLegacyDeferredThreadMessages } from "../threads/legacy-deferred-messages.js";
+import { runEventLoopWork, runEventLoopWorkSync } from "./event-loop-work.js";
 
-export type DatabaseMaintenanceSweepDeps = Pick<AppDeps, "db" | "logger">;
+type DatabaseMaintenanceSweepDeps = Pick<AppDeps, "db" | "logger">;
 
-/**
- * Narrow slice of the plugin service the schedule sweep needs (the plugin
- * service owns claiming and invocation; this loop just drives it).
- */
-export interface PluginScheduleSweeper {
+interface PluginScheduleSweeper {
   sweepDueSchedules(now: number): Promise<void>;
 }
 
-export type PeriodicSweepDeps = LoggedPendingInteractionWorkSessionDeps & {
+type PeriodicSweepDeps = LoggedPendingInteractionWorkSessionDeps & {
   pluginSchedules: PluginScheduleSweeper;
+  /** Liveness directory for `plugin:<id>` wait holders. */
+  plugins: QueueWaitPluginDirectory;
 };
 
 const DATABASE_MAINTENANCE_CHECK_INTERVAL_MS = 60 * 60_000;
-// Archive cleanup paths schedule immediate advances; this bounds only fallback
-// recovery from polling blocked workspaces while the app is idle.
-export const MANAGED_ENVIRONMENT_ARCHIVE_CLEANUP_RECOVERY_INTERVAL_MS =
-  15 * 60_000;
-const ORPHANED_ENVIRONMENT_DESTROY_RECOVERY_DELAY_MS =
-  LIVE_DAEMON_COMMAND_TIMEOUT_MS;
+const COMPLETED_EVENT_OUTPUT_MIGRATION_MAX_ADVANCES_PER_SWEEP = 64;
+const RETAINED_EVENT_OUTPUT_EXPIRY_MAX_ADVANCES_PER_SWEEP = 256;
+const RETAINED_EVENT_OUTPUT_EXPIRY_BATCH_SIZE = 1;
 
-export type PeriodicSweepJobCategory =
+type PeriodicSweepJobCategory =
   | "retention"
   | "durable-intent-retry"
   | "orphan-cleanup"
@@ -91,27 +108,7 @@ interface PeriodicSweepJobState {
   running: boolean;
 }
 
-interface ManagedEnvironmentArchiveCleanupEvaluationResult {
-  candidates: number;
-  hostUnavailableDeferrals: number;
-}
-
 type PeriodicSweepJobList = readonly PeriodicSweepJob[];
-type HostUnavailableDeferralsByHostId = ReadonlyMap<string, number>;
-
-function countHostUnavailableDeferrals(
-  deferralsByHostId: HostUnavailableDeferralsByHostId,
-): number {
-  let total = 0;
-  for (const count of deferralsByHostId.values()) {
-    total += count;
-  }
-  return total;
-}
-
-let lastDatabaseMaintenanceCheckAt = 0;
-let databaseMaintenanceRunning = false;
-let lastManagedEnvironmentArchiveCleanupRecoveryAt = 0;
 const periodicSweepJobStates = new Map<string, PeriodicSweepJobState>();
 
 function getPeriodicSweepJobState(
@@ -176,100 +173,9 @@ export async function runPeriodicSweepJobs(
   }
 }
 
-async function advanceRetiringManagedEnvironments(
-  deps: LoggedPendingInteractionWorkSessionDeps,
-): Promise<ManagedEnvironmentArchiveCleanupEvaluationResult> {
-  // The advance enforces the archive grace window per environment, so this sweeps
-  // every retiring candidate each tick and lets in-grace ones short-circuit.
-  const environmentsToClean = sweepManagedEnvironments(deps.db);
-  if (environmentsToClean.length === 0) {
-    return {
-      candidates: 0,
-      hostUnavailableDeferrals: 0,
-    };
-  }
-
-  const hostUnavailableDeferralsByHostId = new Map<string, number>();
-  for (const environment of environmentsToClean) {
-    if (environment.path && !deps.hub.hasDaemonForHost(environment.hostId)) {
-      hostUnavailableDeferralsByHostId.set(
-        environment.hostId,
-        (hostUnavailableDeferralsByHostId.get(environment.hostId) ?? 0) + 1,
-      );
-      continue;
-    }
-
-    try {
-      await runEnvironmentCleanupAdvance(deps, {
-        environmentId: environment.id,
-      });
-    } catch (error) {
-      if (isCommandTimeoutError(error)) {
-        deps.logger.debug(
-          {
-            environmentId: environment.id,
-            ...runtimeErrorLogFields(deps.config, error),
-          },
-          "Managed environment archive cleanup deferred by host timeout",
-        );
-        continue;
-      }
-      if (isHostUnavailableError(error)) {
-        hostUnavailableDeferralsByHostId.set(
-          environment.hostId,
-          (hostUnavailableDeferralsByHostId.get(environment.hostId) ?? 0) + 1,
-        );
-        continue;
-      }
-      deps.logger.warn(
-        {
-          environmentId: environment.id,
-          err: error,
-        },
-        "Managed environment archive cleanup sweep failed",
-      );
-    }
-  }
-
-  const hostUnavailableDeferrals = countHostUnavailableDeferrals(
-    hostUnavailableDeferralsByHostId,
-  );
-  if (
-    hostUnavailableDeferrals > 0 &&
-    hostUnavailableDeferrals < environmentsToClean.length
-  ) {
-    deps.logger.debug(
-      {
-        deferredEnvironmentCount: hostUnavailableDeferrals,
-        deferredHostIds: Array.from(hostUnavailableDeferralsByHostId.keys()),
-      },
-      "Managed environment archive cleanup deferred some candidates until host reconnects",
-    );
-  }
-
-  return {
-    candidates: environmentsToClean.length,
-    hostUnavailableDeferrals,
-  };
-}
-
 export function runDatabaseMaintenanceSweep(
   deps: DatabaseMaintenanceSweepDeps,
-  now: number,
 ): void {
-  if (databaseMaintenanceRunning) {
-    return;
-  }
-
-  if (
-    now - lastDatabaseMaintenanceCheckAt <
-    DATABASE_MAINTENANCE_CHECK_INTERVAL_MS
-  ) {
-    return;
-  }
-
-  lastDatabaseMaintenanceCheckAt = now;
-
   const deferredLegacyTables = listDeferredLegacyTables(deps.db);
   if (deferredLegacyTables.length > 0) {
     const activity = getDatabaseMaintenanceActivity(deps.db);
@@ -281,7 +187,6 @@ export function runDatabaseMaintenanceSweep(
       return;
     }
 
-    databaseMaintenanceRunning = true;
     try {
       const result = dropDeferredLegacyTables(deps.db);
       deps.logger.info(
@@ -293,8 +198,6 @@ export function runDatabaseMaintenanceSweep(
         { err: error },
         "Deferred legacy database table cleanup failed",
       );
-    } finally {
-      databaseMaintenanceRunning = false;
     }
     return;
   }
@@ -309,18 +212,12 @@ export function runDatabaseMaintenanceSweep(
         stats: freelistStats,
       })
     ) {
-      // Incremental vacuum only reclaims freelist pages. It does not defragment
-      // internal page slack reported by dbstat.unused, and checking dbstat here
-      // would add an expensive scan to busy servers that cannot act on it.
       deps.logger.debug(
         { freelistStats },
         "Incremental database vacuum skipped below freelist threshold",
       );
       return;
     }
-    // This steady-state path may write and checkpoint, but each attempt is
-    // capped by page count and DB busy timeout so active app work can proceed.
-    databaseMaintenanceRunning = true;
     try {
       const result = runIncrementalVacuum(deps.db, {
         maxPages: DATABASE_INCREMENTAL_VACUUM_MAX_PAGES,
@@ -328,16 +225,10 @@ export function runDatabaseMaintenanceSweep(
       deps.logger.info({ result }, "Incremental database vacuum completed");
     } catch (error) {
       deps.logger.warn({ err: error }, "Incremental database vacuum failed");
-    } finally {
-      databaseMaintenanceRunning = false;
     }
     return;
   }
 
-  // Non-incremental databases need a full VACUUM to reclaim dbstat-reported
-  // internal slack and convert legacy auto_vacuum=NONE databases to
-  // incremental mode. A full VACUUM rewrites the file, so only compute the
-  // expensive dbstat-based compaction stats after the instance is idle.
   const activity = getDatabaseMaintenanceActivity(deps.db);
   if (!isDatabaseMaintenanceIdle(activity)) {
     deps.logger.debug(
@@ -362,42 +253,15 @@ export function runDatabaseMaintenanceSweep(
     return;
   }
 
-  databaseMaintenanceRunning = true;
   try {
     const result = compactDatabase(deps.db);
     deps.logger.info({ result }, "Database compaction completed");
   } catch (error) {
     deps.logger.warn({ err: error }, "Database compaction failed");
-  } finally {
-    databaseMaintenanceRunning = false;
   }
 }
 
-export async function runManagedEnvironmentArchiveCleanupRecoverySweep(
-  deps: LoggedPendingInteractionWorkSessionDeps,
-  now: number,
-): Promise<void> {
-  // Orphaned-destroy recovery only touches environments stuck `destroying` for
-  // longer than the daemon command timeout, so it stays throttled — it is a rare
-  // backstop, not the steady-state driver.
-  if (
-    now - lastManagedEnvironmentArchiveCleanupRecoveryAt >=
-    MANAGED_ENVIRONMENT_ARCHIVE_CLEANUP_RECOVERY_INTERVAL_MS
-  ) {
-    recoverOrphanedEnvironmentDestroyRequests(deps, {
-      updatedBefore: now - ORPHANED_ENVIRONMENT_DESTROY_RECOVERY_DELAY_MS,
-    });
-    lastManagedEnvironmentArchiveCleanupRecoveryAt = now;
-  }
-
-  // Grace-gated destroy runs every tick: a retiring managed worktree is reclaimed
-  // ~one sweep tick after its archive grace window elapses. The advance enforces
-  // the window against the durable `updatedAt` clock (no in-memory timer), so it
-  // survives restart.
-  await advanceRetiringManagedEnvironments(deps);
-}
-
-export async function runProjectDeletionSweep(
+async function runProjectDeletionSweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
 ): Promise<void> {
   for (const projectId of listProjectsPendingDeletion(deps)) {
@@ -415,16 +279,13 @@ export async function runProjectDeletionSweep(
   }
 }
 
-// Provisioning has no host-command queue to resume here. This
-// sweep only re-enters server-owned provisioning state so orphaned in-process
-// advances can either continue from persisted resource state or fail cleanly.
 export async function runEnvironmentProvisioningSweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
 ): Promise<void> {
   const provisioningEnvironments = deps.db
     .select({ id: environments.id })
     .from(environments)
-    .where(eq(environments.status, "provisioning"))
+    .where(inArray(environments.status, ["creating", "provisioning"]))
     .all();
 
   for (const environment of provisioningEnvironments) {
@@ -444,10 +305,9 @@ export async function runEnvironmentProvisioningSweep(
   }
 }
 
-// Thread provisioning context is process-local. This sweep is orphan cleanup,
-// not resumable recovery, and live same-process provisioning is skipped.
-export async function runThreadProvisioningOrphanCleanupSweep(
+async function runThreadProvisioningOrphanCleanupSweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
+  now: number,
 ): Promise<void> {
   const provisioningThreads = deps.db
     .select({
@@ -476,12 +336,51 @@ export async function runThreadProvisioningOrphanCleanupSweep(
       );
     }
   }
+  for (const thread of listArchivedThreadsPendingTeardown(deps.db)) {
+    if (!archiveUndoGraceKeepsTerminals(thread, now)) {
+      deps.terminalSessions.closeArchivedThreadTerminals({
+        threadId: thread.id,
+      });
+    }
+    if (archiveUndoGraceKeepsTurnRunning(thread, now)) {
+      continue;
+    }
+    requestThreadStopForCurrentState(
+      deps,
+      thread,
+      thread.environmentId
+        ? getEnvironment(deps.db, thread.environmentId)
+        : null,
+    );
+  }
+  const deletedThreads = deps.db
+    .select({
+      environmentId: threads.environmentId,
+      id: threads.id,
+      storageDeletedAt: threads.storageDeletedAt,
+    })
+    .from(threads)
+    .where(isNotNull(threads.deletedAt))
+    .all();
+  for (const thread of deletedThreads) {
+    deps.terminalSessions.closeDeletedThreadTerminals({ threadId: thread.id });
+    if (thread.storageDeletedAt !== null) {
+      finalizeStoppedThread(deps, { threadId: thread.id });
+      continue;
+    }
+    const environment = thread.environmentId
+      ? getEnvironment(deps.db, thread.environmentId)
+      : null;
+    requestThreadStorageDeletion(deps, thread, environment);
+  }
 }
 
 export async function runThreadLifecycleSweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
 ): Promise<void> {
-  await runThreadProvisioningOrphanCleanupSweep(deps);
+  await runThreadProvisioningOrphanCleanupSweep(deps, Date.now());
+  await sweepProviderLifecycles(deps);
+  await sweepMachineLifecycles(deps);
 }
 
 async function runMachineAuthPruneSweep(
@@ -490,15 +389,90 @@ async function runMachineAuthPruneSweep(
   await deps.machineAuth.pruneExpiredKeys();
 }
 
-function runCompletedEventOutputTruncationSweep(
+async function runCompletedEventOutputMigrationSweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
   now: number,
-): void {
-  truncateCompletedEventItemOutputs(deps.db, {
-    createdBefore: now - COMPLETED_EVENT_OUTPUT_RETENTION_MS,
-    limit: DEFAULT_COMPLETED_EVENT_OUTPUT_TRUNCATION_BATCH_SIZE,
-    truncatedAt: now,
-  });
+): Promise<void> {
+  const migrationTargetCount = RETAINED_EVENT_OUTPUT_TARGETS.length + 1;
+  const exhaustedTargets = new Set<number>();
+  const changedThreadIds = new Set<string>();
+  let targetIndex = 0;
+  try {
+    for (
+      let advance = 0;
+      advance < COMPLETED_EVENT_OUTPUT_MIGRATION_MAX_ADVANCES_PER_SWEEP &&
+      exhaustedTargets.size < migrationTargetCount;
+      advance += 1
+    ) {
+      while (exhaustedTargets.has(targetIndex)) {
+        targetIndex = (targetIndex + 1) % migrationTargetCount;
+      }
+      const result = runEventLoopWorkSync(
+        "sweep:completed-event-output-migration:advance",
+        () => {
+          const target = RETAINED_EVENT_OUTPUT_TARGETS[targetIndex];
+          return target
+            ? migrateNextCompletedEventItemOutput(deps.db, {
+                ...target,
+                limit: DEFAULT_COMPLETED_EVENT_OUTPUT_MIGRATION_SCAN_LIMIT,
+                migratedAt: now,
+              })
+            : migrateNextLegacyImageGenerationOutput(deps.db, {
+                limit: DEFAULT_LEGACY_IMAGE_GENERATION_MIGRATION_SCAN_LIMIT,
+                migratedAt: now,
+              });
+        },
+      );
+      if (result.action === "migrated") {
+        if (!result.threadId) {
+          throw new Error("Migrated completed output has no thread");
+        }
+        changedThreadIds.add(result.threadId);
+      } else if (result.action === "complete" || result.action === "idle") {
+        exhaustedTargets.add(targetIndex);
+      }
+      targetIndex = (targetIndex + 1) % migrationTargetCount;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    for (const threadId of changedThreadIds) {
+      deps.hub.notifyThread(threadId, ["history-compacted"]);
+    }
+  }
+}
+
+async function runRetainedEventOutputExpirySweep(
+  deps: LoggedPendingInteractionWorkSessionDeps,
+  now: number,
+): Promise<void> {
+  const changedThreadIds = new Set<string>();
+  try {
+    for (
+      let advance = 0;
+      advance < RETAINED_EVENT_OUTPUT_EXPIRY_MAX_ADVANCES_PER_SWEEP;
+      advance += 1
+    ) {
+      const { deleted, threadIds } = runEventLoopWorkSync(
+        "sweep:retained-event-output-expiry:delete",
+        () =>
+          deleteExpiredRetainedEventOutputs(deps.db, {
+            expiredAtOrBefore: now,
+            limit: RETAINED_EVENT_OUTPUT_EXPIRY_BATCH_SIZE,
+          }),
+      );
+      for (const threadId of threadIds) {
+        changedThreadIds.add(threadId);
+      }
+      if (deleted === 0) {
+        break;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    for (const threadId of changedThreadIds) {
+      deps.hub.notifyThread(threadId, ["history-compacted"]);
+    }
+  }
 }
 
 function runClosedSessionPruneSweep(
@@ -511,13 +485,30 @@ function runClosedSessionPruneSweep(
   });
 }
 
-function runDestroyedEnvironmentPruneSweep(
-  deps: LoggedPendingInteractionWorkSessionDeps,
-): void {
-  pruneDestroyedEnvironments(deps.db, deps.hub);
+export function createThreadEventPruningJob(
+  limits: ThreadPruningSweepLimits,
+): PeriodicSweepJob {
+  return {
+    cadenceMs: 0,
+    category: "retention",
+    name: "thread-event-pruning",
+    run: (deps) => runThreadPruningSweep(deps, limits),
+  };
 }
 
 const PERIODIC_SWEEP_JOBS: PeriodicSweepJob[] = [
+  {
+    cadenceMs: 0,
+    category: "durable-intent-retry",
+    name: "environment-provider-lifecycle",
+    run: sweepProviderLifecycles,
+  },
+  {
+    cadenceMs: 0,
+    category: "durable-intent-retry",
+    name: "machine-provider-lifecycle",
+    run: (deps) => sweepMachineLifecycles(deps, { background: true }),
+  },
   {
     cadenceMs: 0,
     category: "retention",
@@ -527,20 +518,20 @@ const PERIODIC_SWEEP_JOBS: PeriodicSweepJob[] = [
   {
     cadenceMs: 0,
     category: "retention",
-    name: "completed-event-output-truncation",
-    run: runCompletedEventOutputTruncationSweep,
+    name: "completed-event-output-migration",
+    run: runCompletedEventOutputMigrationSweep,
+  },
+  {
+    cadenceMs: 0,
+    category: "retention",
+    name: "retained-event-output-expiry",
+    run: runRetainedEventOutputExpirySweep,
   },
   {
     cadenceMs: 0,
     category: "retention",
     name: "closed-session-prune",
     run: runClosedSessionPruneSweep,
-  },
-  {
-    cadenceMs: 0,
-    category: "retention",
-    name: "destroyed-environment-prune",
-    run: runDestroyedEnvironmentPruneSweep,
   },
   {
     cadenceMs: 0,
@@ -558,13 +549,35 @@ const PERIODIC_SWEEP_JOBS: PeriodicSweepJob[] = [
     cadenceMs: 0,
     category: "durable-intent-retry",
     name: "queued-message-auto-send",
-    run: runQueuedMessageAutoSendSweep,
+    run: (deps, now) =>
+      runQueuedMessageDispatch(deps, {
+        kind: "idle-recovery",
+        now,
+      }),
   },
   {
     cadenceMs: 0,
     category: "durable-intent-retry",
-    name: "managed-environment-archive-cleanup-recovery",
-    run: runManagedEnvironmentArchiveCleanupRecoverySweep,
+    name: "due-scheduled-queue-dispatch",
+    run: (deps, now) =>
+      runQueuedMessageDispatch(deps, { kind: "time-reached", now }),
+  },
+  {
+    cadenceMs: 0,
+    category: "durable-intent-retry",
+    name: "failed-queue-message-retry",
+    run: (deps, now) =>
+      runQueuedMessageDispatch(deps, { kind: "failed-retry", now }),
+  },
+  {
+    cadenceMs: 0,
+    category: "durable-intent-retry",
+    name: "orphaned-queue-wait-clear",
+    run: (deps) =>
+      runQueuedMessageDispatch(deps, {
+        kind: "orphaned-plugin-recovery",
+        plugins: deps.plugins,
+      }),
   },
   {
     cadenceMs: 0,
@@ -576,32 +589,46 @@ const PERIODIC_SWEEP_JOBS: PeriodicSweepJob[] = [
     cadenceMs: 0,
     category: "scheduler",
     name: "plugin-schedule",
-    // No primary-host gate: plugin schedules run even with no hosts enrolled
-    // (design §4.8) — they are not automations.
     run: (deps, now) => deps.pluginSchedules.sweepDueSchedules(now),
   },
+  createThreadEventPruningJob(THREAD_PRUNING_SWEEP_LIMITS),
   {
     cadenceMs: DATABASE_MAINTENANCE_CHECK_INTERVAL_MS,
     category: "maintenance",
     name: "database-maintenance",
     run: runDatabaseMaintenanceSweep,
   },
+  {
+    cadenceMs: 0,
+    category: "maintenance",
+    name: "project-attachment-backfill",
+    run: (deps, now) =>
+      runProjectAttachmentBackfill(
+        deps,
+        PROJECT_ATTACHMENT_BACKFILL_LIMITS,
+        now,
+      ),
+  },
+  {
+    cadenceMs: 60_000,
+    category: "retention",
+    name: "project-attachment-orphan-prune",
+    run: runProjectAttachmentPrune,
+  },
+  {
+    cadenceMs: THREAD_STORAGE_ORPHAN_SWEEP_CADENCE_MS,
+    category: "orphan-cleanup",
+    name: "thread-storage-orphan-cleanup",
+    run: runThreadStorageOrphanSweep,
+  },
 ];
 
 export async function runStartupRecoverySweep(
   deps: LoggedPendingInteractionWorkSessionDeps,
 ): Promise<void> {
+  await deliverLegacyDeferredThreadMessages(deps);
   await runEnvironmentProvisioningSweep(deps);
   await runThreadLifecycleSweep(deps);
-  // A daemon can reconnect and settle an in-flight destroy after the server
-  // restarts. Apply the same orphan timeout used by periodic recovery instead
-  // of immediately moving every `destroying` row to `error`; genuinely stale
-  // attempts are still recovered, and a matching late success can settle from
-  // `error` as a final backstop.
-  recoverOrphanedEnvironmentDestroyRequests(deps, {
-    updatedBefore: Date.now() - ORPHANED_ENVIRONMENT_DESTROY_RECOVERY_DELAY_MS,
-  });
-  await advanceRetiringManagedEnvironments(deps);
 }
 
 export async function runPeriodicSweeps(

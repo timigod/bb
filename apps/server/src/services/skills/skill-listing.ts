@@ -14,50 +14,37 @@ import { COMMAND_TIMEOUT_MS } from "../../constants.js";
 import { ApiError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
 import {
-  callHostOnlineRpc,
+  callHostOnlineRpcForWork,
   callHostRetryableOnlineRpc,
 } from "../hosts/online-rpc.js";
 import type { ProjectCommandWorkspace as CommandWorkspace } from "../projects/project-workspace.js";
 import { resolveServerOwnedSkillCatalogEntries } from "./injected-skills.js";
 import { resolveSkillCatalog } from "./skill-catalog.js";
 import { readRegistrySkillProvenance } from "./registry-skill-provenance.js";
-import { resolveSharedSkills } from "./shared-skills.js";
+import { hostPathDirname, resolveSharedSkills } from "./shared-skills.js";
+import {
+  DEFAULT_PATH_LIST_EXCLUDE_NAMES,
+  SKILL_PATH_LIST_INCLUDE_HIDDEN,
+} from "../../routes/path-list-policy.js";
+import {
+  providerHasNativeRootSurface,
+  scanProviderNativeRoots,
+} from "../providers/native-roots.js";
 
 const SKILL_FILE_NAME = "SKILL.md";
 const SERVER_SKILL_FILE_LIMIT = 200;
 const SERVER_SKILL_CONTENT_LIMIT_BYTES = 25 * 1024 * 1024;
 
-/**
- * Providers with a skill surface. A bb skill is discovered under each, so the
- * listing queries all of them and de-dupes provider-agnostic bb skills by path.
- */
-export const SKILL_COMMAND_SURFACE_PROVIDERS: readonly SkillProvider[] = [
-  "claude-code",
-  "codex",
-  "acp-cursor",
-];
-
-/** Deterministic page grouping order; also keeps listing output test-stable. */
 const SKILL_SCOPE_ORDER: readonly SkillScope[] = [
   "bb-project",
   "bb-user",
   "bb-builtin",
   "shared-project",
   "shared-user",
-  "claude-project",
-  "claude-user",
-  "codex-project",
-  "codex-user",
-  "cursor-project",
-  "cursor-user",
+  "provider-project",
+  "provider-user",
   "plugin",
 ];
-
-function hostPathDirname(filePath: string): string {
-  return /^[a-zA-Z]:[\\/]/u.test(filePath)
-    ? path.win32.dirname(filePath)
-    : path.posix.dirname(filePath);
-}
 
 function hostPathBasename(filePath: string): string {
   return /^[a-zA-Z]:[\\/]/u.test(filePath)
@@ -71,17 +58,10 @@ function isBundledProviderSkill(filePath: string): boolean {
 
 interface MappedScope {
   scope: SkillScope;
-  /** `null` for provider-agnostic bb scopes. */
   provider: SkillProvider | null;
   manageable: boolean;
 }
 
-/**
- * Product policy: map the daemon's raw `(provider, rootKind)` to a user-facing
- * scope. bb scopes are provider-agnostic (`provider: null`); provider roots
- * retain project/user identity. User-owned provider roots are manageable;
- * bundled provider and plugin roots remain protected.
- */
 export function mapSkillScope(
   provider: SkillProvider,
   rootKind: SkillRootKind,
@@ -95,27 +75,13 @@ export function mapSkillScope(
     case "bb-builtin":
       return { scope: "bb-builtin", provider: null, manageable: false };
     case "provider-project":
-      if (provider === "claude-code") {
-        return { scope: "claude-project", provider, manageable: true };
-      }
-      return provider === "codex"
-        ? { scope: "codex-project", provider, manageable: true }
-        : { scope: "cursor-project", provider, manageable: true };
+      return { scope: "provider-project", provider, manageable: true };
     case "provider-user":
-      if (isBundledProviderSkill(filePath)) {
-        if (provider === "claude-code") {
-          return { scope: "claude-user", provider, manageable: false };
-        }
-        return provider === "codex"
-          ? { scope: "codex-user", provider, manageable: false }
-          : { scope: "cursor-user", provider, manageable: false };
-      }
-      if (provider === "claude-code") {
-        return { scope: "claude-user", provider, manageable: true };
-      }
-      return provider === "codex"
-        ? { scope: "codex-user", provider, manageable: true }
-        : { scope: "cursor-user", provider, manageable: true };
+      return {
+        scope: "provider-user",
+        provider,
+        manageable: !isBundledProviderSkill(filePath),
+      };
     case "shared-project":
       return { scope: "shared-project", provider: null, manageable: false };
     case "shared-user":
@@ -125,7 +91,7 @@ export function mapSkillScope(
   }
 }
 
-export interface ProviderSkillDiscovery {
+interface ProviderSkillDiscovery {
   provider: SkillProvider;
   skills: DiscoveredSkill[];
 }
@@ -140,6 +106,12 @@ function compareSkillSummaries(
   if (scopeDelta !== 0) {
     return scopeDelta;
   }
+  const providerDelta = (left.provider ?? "").localeCompare(
+    right.provider ?? "",
+  );
+  if (providerDelta !== 0) {
+    return providerDelta;
+  }
   const nameDelta = left.name.localeCompare(right.name);
   if (nameDelta !== 0) {
     return nameDelta;
@@ -147,11 +119,6 @@ function compareSkillSummaries(
   return left.filePath.localeCompare(right.filePath);
 }
 
-/**
- * Assemble the per-provider daemon results into the listing: map each record to
- * its product scope and de-dupe by absolute `filePath` so a bb skill discovered
- * under both providers is listed once. Output is sorted by scope then name.
- */
 export function assembleSkillList(
   perProvider: readonly ProviderSkillDiscovery[],
 ): SkillSummary[] {
@@ -187,41 +154,36 @@ function skillId(identitySeed: string, logicalPath: string): string {
     .digest("hex")}`;
 }
 
-/** List bb-global resources from the same server-owned roots runtime injection uses. */
 function listServerOwnedSkills(deps: AppDeps): SkillSummary[] {
   return resolveServerOwnedSkillCatalogEntries({
-    builtinSkillsRootPath: deps.config.builtinSkillsRootPath,
+    builtinSkillsRootPath: null,
     dataDir: deps.config.dataDir,
     logger: deps.logger,
     skillTreeRegistry: deps.skillTreeRegistry,
   })
-    .map(({ provenance, runtimeSource }): SkillSummary | null => {
+    .map(({ runtimeSource }): SkillSummary | null => {
       if (runtimeSource.kind !== "tree") return null;
-      const builtin = provenance.kind === "builtin";
       const rootPath = path.join(
-        builtin
-          ? deps.config.builtinSkillsRootPath
-          : resolveDataDirSkillsRootPath(deps.config.dataDir),
+        resolveDataDirSkillsRootPath(deps.config.dataDir),
         runtimeSource.name,
       );
       const logicalPath = `${runtimeSource.name}/${runtimeSource.entryPath}`;
       return {
-        id: skillId(builtin ? "bb-builtin" : "bb-data-dir", logicalPath),
+        id: skillId("bb-data-dir", logicalPath),
         name: runtimeSource.name,
         description: runtimeSource.description,
         provider: null,
-        scope: builtin ? "bb-builtin" : "bb-user",
+        scope: "bb-user",
         pluginId: null,
         filePath: path.join(rootPath, runtimeSource.entryPath),
-        manageable: !builtin,
-        registrySkillId: builtin ? null : readRegistrySkillProvenance(rootPath),
+        manageable: true,
+        registrySkillId: readRegistrySkillProvenance(rootPath),
       };
     })
     .filter((skill): skill is SkillSummary => skill !== null)
     .sort(compareSkillSummaries);
 }
 
-/** List active skills contributed by running bb plugins from the runtime catalog. */
 function listBbPluginSkills(deps: AppDeps): SkillSummary[] {
   return resolveSkillCatalog(deps)
     .map(({ provenance, runtimeSource }): SkillSummary | null => {
@@ -247,25 +209,24 @@ function listBbPluginSkills(deps: AppDeps): SkillSummary[] {
     .sort(compareSkillSummaries);
 }
 
-/** Query every skill-surface provider and assemble the de-duped listing. */
 export async function listProjectSkills(
   deps: AppDeps,
   args: { workspace: CommandWorkspace },
 ): Promise<SkillSummary[]> {
+  const skillProviders = deps.providerRegistry
+    .list()
+    .filter(providerHasNativeRootSurface);
   const [perProvider, sharedSkills] = await Promise.all([
     Promise.all(
-      SKILL_COMMAND_SURFACE_PROVIDERS.map(
-        async (provider): Promise<ProviderSkillDiscovery> => {
-          const result = await callHostRetryableOnlineRpc(deps, {
+      skillProviders.map(
+        async (registration): Promise<ProviderSkillDiscovery> => {
+          const result = await scanProviderNativeRoots(deps, {
+            type: "host.list_skills",
+            registration,
             hostId: args.workspace.hostId,
-            timeoutMs: COMMAND_TIMEOUT_MS,
-            command: {
-              type: "host.list_skills",
-              providerId: provider,
-              cwd: args.workspace.cwd,
-            },
+            cwd: args.workspace.cwd,
           });
-          return { provider, skills: result.skills };
+          return { provider: registration.info.id, skills: result.skills };
         },
       ),
     ),
@@ -427,7 +388,14 @@ export async function listProjectSkillFiles(
   const result = await callHostRetryableOnlineRpc(deps, {
     hostId: args.workspace.hostId,
     timeoutMs: COMMAND_TIMEOUT_MS,
-    command: { type: "host.list_files", path: rootPath, limit: 200 },
+    command: {
+      type: "host.list_files",
+      path: rootPath,
+      limit: 200,
+      includeHidden: SKILL_PATH_LIST_INCLUDE_HIDDEN,
+      respectGitIgnore: false,
+      excludeNames: [...DEFAULT_PATH_LIST_EXCLUDE_NAMES],
+    },
   });
   const files = result.files
     .map((file) => file.path)
@@ -439,11 +407,6 @@ export async function listProjectSkillFiles(
   return { files, truncated: result.truncated };
 }
 
-/**
- * Read a selected file inside an authoritative skill root. The client supplies
- * only a relative path; the daemon confines it to the server-resolved skill
- * directory and rejects traversal or denied dotfiles.
- */
 export async function readProjectSkill(
   deps: AppDeps,
   args: {
@@ -485,7 +448,6 @@ export async function readProjectSkill(
   };
 }
 
-/** Overwrite an editable local SKILL.md through a confined host write. */
 export async function writeProjectSkill(
   deps: AppDeps,
   args: {
@@ -549,7 +511,7 @@ export async function writeProjectSkill(
     return { filePath: skillFilePath, revision };
   }
   if (editableScope.data !== "bb-user" && editableScope.data !== "bb-project") {
-    const result = await callHostOnlineRpc(deps, {
+    const result = await callHostOnlineRpcForWork(deps, {
       hostId: args.workspace.hostId,
       timeoutMs: COMMAND_TIMEOUT_MS,
       command: {
@@ -567,7 +529,7 @@ export async function writeProjectSkill(
     }
     return { filePath: skill.filePath, revision: result.sha256 };
   }
-  const result = await callHostOnlineRpc(deps, {
+  const result = await callHostOnlineRpcForWork(deps, {
     hostId: args.workspace.hostId,
     timeoutMs: COMMAND_TIMEOUT_MS,
     command: {
@@ -585,12 +547,6 @@ export async function writeProjectSkill(
   return { filePath: result.filePath, revision: result.sha256 };
 }
 
-/**
- * Delete a user-owned local skill via the daemon's confined primitive. bb roots
- * are resolved host-side from scope; provider roots come from the authoritative
- * server-side listing and are re-confined by the daemon. Uses the non-retryable
- * RPC so a transient failure never re-issues the delete.
- */
 export async function deleteProjectSkill(
   deps: AppDeps,
   args: {
@@ -649,7 +605,7 @@ export async function deleteProjectSkill(
     daemonName = hostPathBasename(skillDirPath);
     rootPath = hostPathDirname(skillDirPath);
   }
-  const result = await callHostOnlineRpc(deps, {
+  const result = await callHostOnlineRpcForWork(deps, {
     hostId: args.workspace.hostId,
     timeoutMs: COMMAND_TIMEOUT_MS,
     command: {

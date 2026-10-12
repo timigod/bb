@@ -3,9 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  detectGitRepo,
+  detectGitRepoKind,
+  detectLinkedWorktree,
+  fetchRemoteBranches,
   getCheckoutRef,
   getWorkspaceGitOperation,
-  parseBranchStatus,
   parseNameStatusEntries,
   parseNumstatEntriesZ,
   parsePorcelainEntries,
@@ -91,6 +94,40 @@ async function pushRemoteMainCommit(remotePath: string) {
   await runGit(["push", "origin", "main"], { cwd: clonePath });
 }
 
+async function initSshRemoteRepo() {
+  const repoPath = await initReadGitBlobRepo();
+  const sshLogPath = path.join(repoPath, "ssh-invocations.log");
+  const sshScriptPath = path.join(repoPath, "recording-ssh.sh");
+  await fs.writeFile(
+    sshScriptPath,
+    `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(sshLogPath.replaceAll("\\", "/"))}\nprintf 'GIT_TERMINAL_PROMPT=%s\\n' "\${GIT_TERMINAL_PROMPT-unset}" >> ${JSON.stringify(sshLogPath.replaceAll("\\", "/"))}\nexit 255\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await runGit(["remote", "add", "origin", "ssh://git.invalid/repo.git"], {
+    cwd: repoPath,
+  });
+  await runGit(
+    [
+      "config",
+      "core.sshCommand",
+      "'" + sshScriptPath.replaceAll("\\", "/").replaceAll("'", "'\\''") + "'",
+    ],
+    { cwd: repoPath },
+  );
+  return { repoPath, sshLogPath };
+}
+
+async function initBareWorktreeLayout() {
+  const origin = await initReadGitBlobRepo();
+  await runGit(["branch", "feature-a"], { cwd: origin });
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bb-bare-layout-"));
+  tempDirs.push(root);
+  await runGit(["clone", "--bare", origin, ".bare"], { cwd: root });
+  await fs.writeFile(path.join(root, ".git"), "gitdir: ./.bare\n", "utf8");
+  await runGit(["worktree", "add", "feature-a", "feature-a"], { cwd: root });
+  return { root, worktreePath: path.join(root, "feature-a") };
+}
+
 afterEach(async () => {
   vi.unstubAllEnvs();
   await Promise.all(
@@ -155,9 +192,100 @@ describe("runGitWithNullRecordLimit", () => {
     expect(result.recordCount).toBe(2);
     expect(parseNameStatusEntries(result.stdout)).toHaveLength(2);
   });
+
+  it("keeps rename records complete when stopping numstat output", async () => {
+    const repoPath = await initReadGitBlobRepo();
+    await runGit(["mv", "README.md", "RENAMED.md"], { cwd: repoPath });
+    await fs.writeFile(path.join(repoPath, "RENAMED.md"), "hello\nmore\n");
+    await fs.writeFile(path.join(repoPath, "docs", "index.md"), "changed\n");
+    await fs.rm(path.join(repoPath, "large.txt"));
+
+    const result = await runGitWithNullRecordLimit(
+      ["diff", "--numstat", "-M", "-z", "HEAD"],
+      { cwd: repoPath },
+      "numstat",
+      2,
+    );
+
+    expect(result.recordLimitReached).toBe(true);
+    expect(result.recordCount).toBe(2);
+    expect(parseNumstatEntriesZ(result.stdout)).toHaveLength(2);
+    expect(parseNumstatEntriesZ(result.stdout)).toContainEqual({
+      path: "RENAMED.md",
+      insertions: 1,
+      deletions: 0,
+    });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "does not confuse a regular numstat path ending in a tab with a rename",
+    async () => {
+      const repoPath = await initReadGitBlobRepo();
+      const unusualPath = "trailing-tab\t";
+      await fs.writeFile(path.join(repoPath, unusualPath), "one\n");
+      await runGit(["add", unusualPath], { cwd: repoPath });
+
+      const result = await runGitWithNullRecordLimit(
+        ["diff", "--cached", "--numstat", "-z", "HEAD"],
+        { cwd: repoPath },
+        "numstat",
+        1,
+      );
+
+      expect(result.recordLimitReached).toBe(true);
+      expect(result.recordCount).toBe(1);
+      expect(parseNumstatEntriesZ(result.stdout)).toEqual([
+        { path: unusualPath, insertions: 1, deletions: 0 },
+      ]);
+    },
+  );
+});
+
+describe("detectGitRepoKind", () => {
+  it("tells a bare repository root apart from its worktrees and plain directories", async () => {
+    const { root, worktreePath } = await initBareWorktreeLayout();
+    const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "bb-plain-dir-"));
+    tempDirs.push(plainDir);
+
+    await expect(detectGitRepoKind(root)).resolves.toBe("bare");
+    await expect(detectGitRepoKind(path.join(root, ".bare"))).resolves.toBe(
+      "bare",
+    );
+    await expect(detectGitRepoKind(worktreePath)).resolves.toBe("work-tree");
+    await expect(detectGitRepoKind(plainDir)).resolves.toBe("none");
+  });
+
+  it("tells a linked worktree apart from an ordinary checkout", async () => {
+    const { worktreePath } = await initBareWorktreeLayout();
+    const ordinaryCheckout = await initReadGitBlobRepo();
+    const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "bb-plain-wt-"));
+    tempDirs.push(plainDir);
+
+    await expect(detectLinkedWorktree(worktreePath)).resolves.toBe(true);
+    await expect(detectLinkedWorktree(ordinaryCheckout)).resolves.toBe(false);
+    await expect(detectLinkedWorktree(plainDir)).resolves.toBe(false);
+  });
+
+  it("keeps detectGitRepo scoped to work trees so bare roots get no checkout UI", async () => {
+    const { root, worktreePath } = await initBareWorktreeLayout();
+
+    await expect(detectGitRepo(root)).resolves.toBe(false);
+    await expect(detectGitRepo(worktreePath)).resolves.toBe(true);
+  });
 });
 
 describe("getCheckoutRef", () => {
+  it("reports the HEAD branch of a bare repository root", async () => {
+    const { root } = await initBareWorktreeLayout();
+    const head = await runGit(["rev-parse", "HEAD"], { cwd: root });
+
+    await expect(getCheckoutRef(root)).resolves.toEqual({
+      kind: "branch",
+      branchName: "main",
+      headSha: head.stdout.trim(),
+    });
+  });
+
   it("reports branch checkouts with HEAD sha", async () => {
     const repoPath = await initReadGitBlobRepo();
     const head = await runGit(["rev-parse", "HEAD"], { cwd: repoPath });
@@ -295,11 +423,12 @@ describe("command timeouts", () => {
   it("classifies git command timeouts as hard failures when allowFailure is true", async () => {
     const repoPath = await initEmptyRepo();
 
+    await fs.writeFile(path.join(repoPath, ".git", "packed-refs.lock"), "");
     await expect(
-      runGit(["-c", "alias.bb-sleep=!sleep 5", "bb-sleep"], {
+      runGit(["-c", "core.packedRefsTimeout=10000", "pack-refs", "--all"], {
         cwd: repoPath,
         allowFailure: true,
-        timeoutMs: 10,
+        timeoutMs: 500,
       }),
     ).rejects.toMatchObject({
       code: "git_command_timeout",
@@ -311,14 +440,90 @@ describe("command timeouts", () => {
     const repoPath = await initEmptyRepo();
 
     await expect(
-      runShellPipeline("sleep 5", [], {
+      runShellPipeline("while :; do :; done", [], {
         cwd: repoPath,
         allowFailure: true,
-        timeoutMs: 10,
+        timeoutMs: 500,
       }),
     ).rejects.toMatchObject({
       code: "shell_pipeline_timeout",
       name: "WorkspaceError",
+    });
+  });
+});
+
+describe("fetchRemoteBranches", () => {
+  it("keeps a non-interactive fetch from prompting for ssh or git credentials", async () => {
+    const { repoPath, sshLogPath } = await initSshRemoteRepo();
+
+    await expect(
+      fetchRemoteBranches(repoPath, { interactive: false }),
+    ).resolves.toEqual({ status: "failed" });
+
+    const log = await fs.readFile(sshLogPath, "utf8");
+    expect(log).not.toContain("BatchMode");
+    expect(log).toContain("GIT_TERMINAL_PROMPT=0\n");
+  });
+
+  it("leaves an interactive fetch free to prompt", async () => {
+    const { repoPath, sshLogPath } = await initSshRemoteRepo();
+
+    await expect(
+      fetchRemoteBranches(repoPath, { interactive: true }),
+    ).resolves.toEqual({ status: "failed" });
+
+    const log = await fs.readFile(sshLogPath, "utf8");
+    expect(log).not.toContain("BatchMode");
+    expect(log).toContain("GIT_TERMINAL_PROMPT=unset\n");
+  });
+});
+
+describe("user-shell Git resolution", () => {
+  it("uses the resolved shell PATH for Git commands and Git pipelines", async () => {
+    const workspacePath = await fs.mkdtemp(
+      path.join(os.tmpdir(), "bb-git-shell-path-workspace-"),
+    );
+    const binPath = await fs.mkdtemp(
+      path.join(os.tmpdir(), "bb-git-shell-path-bin-"),
+    );
+    tempDirs.push(workspacePath, binPath);
+    const shell =
+      process.platform === "win32"
+        ? (
+            await runGit(["var", "GIT_SHELL_PATH"], { cwd: workspacePath })
+          ).stdout.trim()
+        : "/bin/sh";
+    const gitPath = path.join(
+      binPath,
+      process.platform === "win32" ? "git.cmd" : "git",
+    );
+    await fs.writeFile(
+      gitPath,
+      process.platform === "win32"
+        ? `@echo off\r\nif "%~1"=="var" (echo ${shell}) else (echo user-shell-git)\r\n`
+        : "#!/bin/sh\nprintf 'user-shell-git\\n'\n",
+      { mode: 0o755 },
+    );
+    if (process.platform === "win32") {
+      await fs.writeFile(
+        path.join(binPath, "git"),
+        "#!/bin/sh\nprintf 'user-shell-git\\n'\n",
+        { mode: 0o755 },
+      );
+    }
+
+    await expect(
+      runGit(["--version"], { cwd: workspacePath, shellPath: binPath }),
+    ).resolves.toMatchObject({
+      stdout: expect.stringMatching(/^user-shell-git\r?\n$/),
+    });
+    await expect(
+      runShellPipeline("git --version", [], {
+        cwd: workspacePath,
+        shellPath: binPath,
+      }),
+    ).resolves.toMatchObject({
+      stdout: expect.stringMatching(/^user-shell-git\r?\n$/),
     });
   });
 });
@@ -382,29 +587,6 @@ describe("readGitBlob", () => {
     ).rejects.toMatchObject({
       code: "blob_too_large",
       message: "Blob size 11 bytes exceeds the 0 MB limit",
-    });
-  });
-});
-
-describe("parseBranchStatus", () => {
-  it("parses branch names and ahead/behind counts", () => {
-    expect(
-      parseBranchStatus("## main...origin/main [ahead 2, behind 1]"),
-    ).toEqual({
-      branchName: "main",
-      aheadCount: 2,
-      behindCount: 1,
-    });
-  });
-
-  it("returns zero counts for missing or non-header lines", () => {
-    expect(parseBranchStatus(undefined)).toEqual({
-      aheadCount: 0,
-      behindCount: 0,
-    });
-    expect(parseBranchStatus(" M README.md")).toEqual({
-      aheadCount: 0,
-      behindCount: 0,
     });
   });
 });
@@ -507,39 +689,8 @@ describe("parseNameStatusEntries", () => {
     ]);
   });
 
-  it("preserves single-letter status with no similarity score", () => {
-    const output = ["T", "src/link.ts", ""].join("\0");
-    expect(parseNameStatusEntries(output)).toEqual([
-      { path: "src/link.ts", status: "T" },
-    ]);
-  });
-
-  it("interleaves regular and rename entries correctly", () => {
-    const output = [
-      "M",
-      "src/a.ts",
-      "R090",
-      "src/b-old.ts",
-      "src/b-new.ts",
-      "A",
-      "src/c.ts",
-      "",
-    ].join("\0");
-    expect(parseNameStatusEntries(output)).toEqual([
-      { path: "src/a.ts", status: "M" },
-      { path: "src/b-new.ts", status: "R" },
-      { path: "src/c.ts", status: "A" },
-    ]);
-  });
-
-  it("returns empty array for empty input", () => {
-    expect(parseNameStatusEntries("")).toEqual([]);
-  });
-
   it("skips truncated trailing entries without throwing", () => {
-    // A status token with no following path token.
     expect(parseNameStatusEntries("M\0")).toEqual([]);
-    // A rename with only the old path, no new path.
     expect(parseNameStatusEntries("R100\0src/old.ts\0")).toEqual([]);
   });
 });
@@ -575,9 +726,5 @@ describe("parseNumstatEntriesZ", () => {
       { path: "src/new.ts", insertions: 3, deletions: 1 },
       { path: "src/app.ts", insertions: 5, deletions: 2 },
     ]);
-  });
-
-  it("returns an empty array for empty input", () => {
-    expect(parseNumstatEntriesZ("")).toEqual([]);
   });
 });

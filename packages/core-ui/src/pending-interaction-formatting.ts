@@ -8,8 +8,15 @@ import type {
   PendingInteractionResolution,
   PendingInteractionRequestedPermissionProfile,
 } from "@bb/domain";
-import { isApprovalPendingInteractionPayload } from "@bb/domain";
+import {
+  isApprovalPendingInteractionPayload,
+  isUserQuestionPendingInteractionPayload,
+} from "@bb/domain";
 import { assertNever } from "./assert-never.js";
+import {
+  describePendingInteractionToolUse,
+  formatPendingInteractionToolUseDetailLines,
+} from "./pending-interaction-tool-use.js";
 
 type PendingInteractionPermissionSummaryProfile =
   | PendingInteractionGrantablePermissionProfile
@@ -131,11 +138,11 @@ function formatPermissionSummaryLine(
 export function formatPendingInteractionSubjectDetailLines(
   interaction: PendingInteraction,
 ): string[] {
-  if (interaction.payload.kind === "plugin") {
-    return [];
+  if (isUserQuestionPendingInteractionPayload(interaction.payload)) {
+    return interaction.payload.questions.map((question) => question.prompt);
   }
   if (!isApprovalPendingInteractionPayload(interaction.payload)) {
-    return interaction.payload.questions.map((question) => question.prompt);
+    return [];
   }
   switch (interaction.payload.subject.kind) {
     case "command": {
@@ -180,12 +187,17 @@ export function formatPendingInteractionSubjectDetailLines(
       ];
     }
     case "plan": {
-      // The plan body is the subject, not a detail line. Surfaces render it
-      // themselves so they can keep its Markdown; this only names the file.
       return interaction.payload.subject.planFilePath
         ? [`Plan file: ${interaction.payload.subject.planFilePath}`]
         : [];
     }
+    case "tool_use":
+      return formatPendingInteractionToolUseDetailLines(
+        describePendingInteractionToolUse({
+          ...interaction.payload,
+          subject: interaction.payload.subject,
+        }),
+      );
     default:
       return assertNever(interaction.payload.subject);
   }
@@ -242,7 +254,6 @@ function resolveGrantedPermissionsForApproval(
     return interaction.payload.subject.sessionGrant;
   }
 
-  // A plan verdict carries no grant.
   return null;
 }
 

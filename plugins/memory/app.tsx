@@ -1,92 +1,19 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { definePluginApp, useRpc } from "@bb/plugin-sdk/app";
+import {
+  definePluginApp,
+  useRpc,
+  type PluginRpcResult,
+} from "@get-bb/plugin-sdk/app";
 import type { memoryRpcContract } from "./server.js";
-import { Button } from "@bb/shared-ui/button";
-import { Input } from "@bb/shared-ui/input";
-import { Switch } from "@bb/shared-ui/switch";
-import { Textarea } from "@bb/shared-ui/textarea";
+import { isMemoryKind, MEMORY_KINDS } from "./memory-kinds.js";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 
-const MEMORY_KINDS = [
-  "fact",
-  "preference",
-  "decision",
-  "procedure",
-  "episode",
-  "reference",
-] as const;
-type MemoryKind = (typeof MEMORY_KINDS)[number];
-
-function isMemoryKind(value: string): value is MemoryKind {
-  return MEMORY_KINDS.some((candidate) => candidate === value);
-}
-
-interface MemoryRecord {
-  id: string;
-  scope: "global" | "project";
-  projectId: string | null;
-  name: string;
-  summary: string;
-  details: string;
-  kind: MemoryKind;
-  tags: string[];
-  importance: number;
-  pinned: boolean;
-  version: number;
-  updatedAt: number;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseMemory(value: unknown): MemoryRecord {
-  if (!isRecord(value)) throw new Error("Memory returned an invalid record.");
-  const kind = value.kind;
-  if (
-    typeof value.id !== "string" ||
-    (value.scope !== "global" && value.scope !== "project") ||
-    (value.projectId !== null && typeof value.projectId !== "string") ||
-    typeof value.name !== "string" ||
-    typeof value.summary !== "string" ||
-    typeof value.details !== "string" ||
-    typeof kind !== "string" ||
-    !isMemoryKind(kind) ||
-    !Array.isArray(value.tags) ||
-    !value.tags.every((tag) => typeof tag === "string") ||
-    typeof value.importance !== "number" ||
-    typeof value.pinned !== "boolean" ||
-    typeof value.version !== "number" ||
-    typeof value.updatedAt !== "number"
-  ) {
-    throw new Error("Memory returned an invalid record.");
-  }
-  return {
-    id: value.id,
-    scope: value.scope,
-    projectId: value.projectId,
-    name: value.name,
-    summary: value.summary,
-    details: value.details,
-    kind,
-    tags: value.tags,
-    importance: value.importance,
-    pinned: value.pinned,
-    version: value.version,
-    updatedAt: value.updatedAt,
-  };
-}
-
-function parseMemoryList(value: unknown): MemoryRecord[] {
-  if (!isRecord(value) || !Array.isArray(value.memories)) {
-    throw new Error("Memory returned an invalid list.");
-  }
-  return value.memories.map(parseMemory);
-}
-
-function parseUpdatedMemory(value: unknown): MemoryRecord {
-  if (!isRecord(value)) throw new Error("Memory returned an invalid update.");
-  return parseMemory(value.memory);
-}
+type MemoryRecord = PluginRpcResult<
+  (typeof memoryRpcContract)["listMemories"]
+>["memories"][number];
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -108,8 +35,8 @@ function MemoryEditor({
   const [error, setError] = useState<string | null>(null);
 
   return (
-    <div className="space-y-3 rounded-md border border-border bg-muted/20 p-3">
-      <div className="grid gap-3 lg:grid-cols-2">
+    <div className="@container/memory-editor space-y-3 rounded-md border border-border bg-muted/20 p-3">
+      <div className="grid gap-3 @min-[36rem]/memory-editor:grid-cols-2">
         <label className="space-y-1 text-xs text-muted-foreground">
           Summary
           <Input
@@ -143,7 +70,7 @@ function MemoryEditor({
           }
         />
       </label>
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 @min-[32rem]/memory-editor:grid-cols-3">
         <label className="space-y-1 text-xs text-muted-foreground">
           Kind
           <select
@@ -214,7 +141,7 @@ function MemoryEditor({
                 importance: draft.importance,
                 pinned: draft.pinned,
               })
-              .then(parseUpdatedMemory)
+              .then((result) => result.memory)
               .then(onSaved)
               .catch((saveError: unknown) => setError(errorMessage(saveError)))
               .finally(() => setSaving(false));
@@ -239,7 +166,7 @@ function MemorySettings() {
     setLoading(true);
     setError(null);
     try {
-      setMemories(parseMemoryList(await rpc.call("listMemories")));
+      setMemories((await rpc.call("listMemories")).memories);
     } catch (loadError) {
       setError(errorMessage(loadError));
     } finally {

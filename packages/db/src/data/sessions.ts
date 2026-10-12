@@ -1,5 +1,4 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import type { HostType } from "@bb/domain";
 import type { DbConnection, DbTransaction } from "../connection.js";
 import type { DbNotifier } from "../notifier.js";
 import { hostDaemonSessions } from "../schema.js";
@@ -17,7 +16,7 @@ export interface GetLatestSessionForHostArgs {
   hostId: string;
 }
 
-export interface ListLatestSessionsForHostsArgs {
+export interface ListLatestClosedSessionsForHostsArgs {
   hostIds: readonly string[];
 }
 
@@ -25,22 +24,13 @@ export interface OpenSessionInput {
   hostId: string;
   instanceId: string;
   hostName: string;
-  hostType: HostType;
   dataDir: string;
   protocolVersion: number;
   heartbeatIntervalMs: number;
   leaseTimeoutMs: number;
 }
 
-/**
- * Open a new session. If an active session exists for the same hostId,
- * close it first (status="closed", closeReason="replaced").
- */
-export function openSession(
-  db: DbConnection,
-  notifier: DbNotifier,
-  input: OpenSessionInput,
-) {
+export function openSession(db: DbConnection, input: OpenSessionInput) {
   const now = Date.now();
   const id = createHostDaemonSessionId();
 
@@ -68,7 +58,6 @@ export function openSession(
       hostId: input.hostId,
       instanceId: input.instanceId,
       hostName: input.hostName,
-      hostType: input.hostType,
       dataDir: input.dataDir,
       protocolVersion: input.protocolVersion,
       heartbeatIntervalMs: input.heartbeatIntervalMs,
@@ -82,12 +71,6 @@ export function openSession(
     .get();
 
   markHostSeen(db, input.hostId, now);
-
-  // No host-connected broadcast here: host status reads "connected" only once
-  // the daemon's WebSocket registers in the hub, which happens after this
-  // session-open call. Broadcasting now would tell clients to refetch while
-  // /hosts still answers "disconnected", and they'd cache that as fresh.
-  // NotificationHub.registerDaemon emits the broadcast instead.
 
   return row;
 }
@@ -123,8 +106,6 @@ export function closeSession(
     .returning()
     .get();
 
-  markHostSeen(db, existing.hostId, now);
-
   notifier.notifyHost(existing.hostId, ["host-disconnected"]);
 
   return updated ?? null;
@@ -152,19 +133,15 @@ export function getLatestSessionForHost(
   );
 }
 
-export function listLatestSessionsForHosts(
+export function listLatestClosedSessionsForHosts(
   db: SessionReadConnection,
-  args: ListLatestSessionsForHostsArgs,
+  args: ListLatestClosedSessionsForHostsArgs,
 ): HostDaemonSessionRow[] {
   const hostIds = [...new Set(args.hostIds)];
   if (hostIds.length === 0) {
     return [];
   }
 
-  // Correlated `id = (ORDER BY ... LIMIT 1)` keeps the seek on
-  // host_daemon_sessions_host_latest_idx (host_id, updated_at, created_at, id)
-  // and only sorts the inner rows for one host. The earlier NOT EXISTS
-  // OR-chain was not sargable and degraded to row-by-row anti-join.
   return db
     .select()
     .from(hostDaemonSessions)
@@ -175,11 +152,8 @@ export function listLatestSessionsForHosts(
           SELECT latest.id
           FROM host_daemon_sessions AS latest
           WHERE latest.host_id = ${hostDaemonSessions.hostId}
-          ORDER BY
-            latest.updated_at DESC,
-            latest.created_at DESC,
-            CASE WHEN latest.status = 'active' THEN 1 ELSE 0 END DESC,
-            latest.id DESC
+            AND latest.status = 'closed'
+          ORDER BY latest.closed_at DESC, latest.id DESC
           LIMIT 1
         )`,
       ),
@@ -205,19 +179,21 @@ export function heartbeatSession(
   sessionId: string,
   leaseExpiresAt: number,
 ) {
-  const now = Date.now();
-  const updated =
-    db
-      .update(hostDaemonSessions)
-      .set({
-        leaseExpiresAt,
-        updatedAt: now,
-      })
-      .where(eq(hostDaemonSessions.id, sessionId))
-      .returning()
-      .get() ?? null;
-  if (updated) {
-    markHostSeen(db, updated.hostId, now);
-  }
-  return updated;
+  return db.transaction((tx) => {
+    const now = Date.now();
+    const updated =
+      tx
+        .update(hostDaemonSessions)
+        .set({
+          leaseExpiresAt,
+          updatedAt: now,
+        })
+        .where(eq(hostDaemonSessions.id, sessionId))
+        .returning()
+        .get() ?? null;
+    if (updated) {
+      markHostSeen(tx, updated.hostId, now);
+    }
+    return updated;
+  });
 }

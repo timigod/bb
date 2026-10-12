@@ -1,6 +1,7 @@
 import {
   type CSSProperties,
   type MouseEventHandler,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
   useCallback,
   useEffect,
@@ -30,40 +31,47 @@ import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@bb/shared-ui/button";
 import { Icon } from "@bb/shared-ui/icon";
 import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@bb/shared-ui/context-menu";
+import { useIsCompactViewport } from "@bb/shared-ui/hooks/use-compact-viewport";
+import {
   OverflowFade,
   type OverflowFadeTone,
 } from "@/components/ui/overflow-fade";
 import { TabPill } from "@/components/ui/tab-pill";
-import { useDragClickSuppression } from "@/components/ui/use-drag-click-suppression";
+import { useDragClickSuppression } from "@bb/shared-ui/use-drag-click-suppression";
 import { cn } from "@bb/shared-ui/lib/utils";
 import {
   MACOS_APP_REGION_NO_DRAG_CLASS,
   MACOS_WINDOW_NO_DRAG_CLASS,
 } from "@/lib/bb-desktop";
 import type {
-  SecondaryPanelFileTab,
+  SecondaryPanelRenderableTab,
   SecondaryPanelTabReorderHandler,
-} from "./secondaryPanelFileTab";
-export type { SecondaryPanelFileTab } from "./secondaryPanelFileTab";
+} from "./secondaryPanelTab";
 
-// Roughly one wide tab, so one click reveals the next tab without overshooting.
 const CHEVRON_SCROLL_STEP_PX = 140;
 
-// Keep fine-pointer caret columns compact without shrinking touch targets.
 const TAB_STRIP_SCROLL_BUTTON_CLASS =
-  "h-7 w-5 rounded-md p-0 [&_svg]:size-3.5 max-md:pointer-coarse:h-9 max-md:pointer-coarse:w-9 max-md:pointer-coarse:[&_svg]:size-5";
+  "h-7 w-5 rounded-md p-0 [&_[data-icon-root]]:size-3.5 max-md:pointer-coarse:h-9 max-md:pointer-coarse:w-9 max-md:pointer-coarse:[&_[data-icon-root]]:size-5";
 
-// Slack so sub-pixel scroll offsets don't leave an overflow cue at a hard edge.
 const EDGE_EPSILON_PX = 1;
 
-export const SECONDARY_PANEL_TAB_STRIP_FADE_TONE: OverflowFadeTone = "sidebar";
+const SECONDARY_PANEL_TAB_STRIP_FADE_TONE: OverflowFadeTone = "sidebar";
+
+class InertTouchSensor extends TouchSensor {
+  static override setup(): () => void {
+    return () => {};
+  }
+}
 
 interface TabStripOverflowState {
-  /** The intrinsic tab row is wider than the whole strip. */
   hasOverflow: boolean;
-  /** Scrolled away from the left edge (content hidden to the left). */
   canScrollLeft: boolean;
-  /** More content remains to the right. */
   canScrollRight: boolean;
 }
 
@@ -74,34 +82,59 @@ const INITIAL_OVERFLOW_STATE: TabStripOverflowState = {
 };
 
 export interface SecondaryPanelTabStripProps {
-  fileTabs: SecondaryPanelFileTab[];
+  activeTabId: string | null;
+  tabs: readonly SecondaryPanelRenderableTab[];
+  onBeginTabDrag?: (
+    tabId: string,
+    event: ReactPointerEvent<HTMLElement>,
+  ) => void;
   onReorderTab: SecondaryPanelTabReorderHandler;
   usesDesktopChrome: boolean;
-  activeTreatment?: "fill" | "underline";
+  isPanelOpen: boolean;
 }
 
-interface SortableFileTabProps {
-  activeTreatment: "fill" | "underline";
+export type SecondaryPanelTabCloseScope = "self" | "others" | "right";
+
+export function secondaryPanelTabsToClose(
+  tabs: readonly SecondaryPanelRenderableTab[],
+  tabId: string,
+  scope: SecondaryPanelTabCloseScope,
+): SecondaryPanelRenderableTab[] {
+  const index = tabs.findIndex((tab) => tab.tab.id === tabId);
+  if (index === -1) {
+    return [];
+  }
+  const candidates =
+    scope === "self"
+      ? tabs.slice(index, index + 1)
+      : scope === "right"
+        ? tabs.slice(index + 1)
+        : tabs.filter((tab) => tab.tab.id !== tabId);
+  return candidates.filter((tab) => !tab.isPinned);
+}
+
+interface SortablePanelTabProps {
+  isActive: boolean;
   activeTabRef: RefObject<HTMLDivElement | null>;
+  contextMenuDisabled: boolean;
   dragDisabled: boolean;
   noDragClass: string | null;
-  tab: SecondaryPanelFileTab;
+  onCloseTabs: (tabId: string, scope: SecondaryPanelTabCloseScope) => void;
+  tabs: readonly SecondaryPanelRenderableTab[];
+  onBeginTabDrag?: (
+    tabId: string,
+    event: ReactPointerEvent<HTMLElement>,
+  ) => void;
+  tab: SecondaryPanelRenderableTab;
 }
 
-/**
- * The middle, horizontally-scrolling region of the secondary panel tab strip.
- *
- * Only the file tabs scroll; the leading Info/Diff controls and trailing
- * new-tab/panel controls stay anchored outside this component. Edge
- * fades and scroll buttons appear only on a side that has more tabs, and the
- * active tab is auto-scrolled into view on mount and whenever it changes
- * (covering pointer, keyboard, and programmatic selection).
- */
 export function SecondaryPanelTabStrip({
-  fileTabs,
+  activeTabId,
+  tabs,
+  onBeginTabDrag,
   onReorderTab,
   usesDesktopChrome,
-  activeTreatment = "fill",
+  isPanelOpen,
 }: SecondaryPanelTabStripProps) {
   const stripRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -112,11 +145,6 @@ export function SecondaryPanelTabStrip({
   const [overflow, setOverflow] = useState<TabStripOverflowState>(
     INITIAL_OVERFLOW_STATE,
   );
-  // Scroll capacity (max scrollLeft). Measured only on resize / tab-list change,
-  // never per scroll: reading scrollWidth/clientWidth in a scroll handler forces
-  // a synchronous reflow, which thrashes at narrow widths where every edge
-  // crossing (and its fade/chevron repaint) re-dirties layout. The scroll handler
-  // then reads only scrollLeft, which is cheap and doesn't flush layout.
   const maxScrollLeftRef = useRef(0);
   const hasOverflowRef = useRef(false);
   const scrollFrameRef = useRef<number | null>(null);
@@ -126,20 +154,21 @@ export function SecondaryPanelTabStrip({
     clearDragClickSuppressionSoon,
     consumeDragClickSuppression,
   } = useDragClickSuppression();
-  const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(TouchSensor, {
-      activationConstraint: { delay: 200, tolerance: 6 },
-    }),
+  const dragDisabled = tabs.length < 2;
+  const mouseSensor = useSensor(MouseSensor, {
+    activationConstraint: { distance: 4 },
+  });
+  const touchSensor = useSensor(
+    isPanelOpen && !dragDisabled ? TouchSensor : InertTouchSensor,
+    { activationConstraint: { delay: 200, tolerance: 6 } },
   );
-  const tabIds = useMemo(() => fileTabs.map((tab) => tab.id), [fileTabs]);
-  const dragDisabled = fileTabs.length < 2;
+  const sensors = useSensors(mouseSensor, touchSensor);
+  const tabIds = useMemo(() => tabs.map((tab) => tab.tab.id), [tabs]);
   const draggingTab =
     draggingTabId === null
       ? null
-      : (fileTabs.find((tab) => tab.id === draggingTabId) ?? null);
+      : (tabs.find((tab) => tab.tab.id === draggingTabId) ?? null);
 
-  // Cheap: reads only scrollLeft (no layout flush) against the cached capacity.
   const applyEdgeFlags = useCallback(() => {
     const viewport = viewportRef.current;
     if (viewport === null) {
@@ -152,9 +181,6 @@ export function SecondaryPanelTabStrip({
     const canScrollLeft = isScrollable && scrollLeft > EDGE_EPSILON_PX;
     const canScrollRight =
       isScrollable && scrollLeft < maxScrollLeft - EDGE_EPSILON_PX;
-    // Return the existing state object when neither flag changed so React bails
-    // out of re-rendering. With the tab tree memoized, a real change only
-    // repaints the always-mounted edge fades/chevrons (an opacity toggle).
     setOverflow((prev) =>
       prev.hasOverflow === hasOverflow &&
       prev.canScrollLeft === canScrollLeft &&
@@ -164,8 +190,6 @@ export function SecondaryPanelTabStrip({
     );
   }, []);
 
-  // Expensive (reads scrollWidth/clientWidth): run only on resize / tab change,
-  // then re-derive the edge flags from the fresh capacity.
   const measureCapacity = useCallback(() => {
     const strip = stripRef.current;
     const viewport = viewportRef.current;
@@ -173,9 +197,6 @@ export function SecondaryPanelTabStrip({
     if (strip === null || viewport === null || content === null) {
       return;
     }
-    // Decide whether controls are needed against the whole strip width, not the
-    // narrower viewport between those controls. Otherwise the control slots can
-    // make themselves permanently necessary after the tabs would fit again.
     const hasOverflow =
       content.scrollWidth > strip.clientWidth + EDGE_EPSILON_PX;
     hasOverflowRef.current = hasOverflow;
@@ -185,16 +206,11 @@ export function SecondaryPanelTabStrip({
     applyEdgeFlags();
   }, [applyEdgeFlags]);
 
-  // Track the viewport's own scrolling and both dimensions that determine its
-  // capacity. The content row can change intrinsic width without the viewport
-  // resizing (for example, when an async browser title replaces "Browser").
   useEffect(() => {
     const viewport = viewportRef.current;
     if (viewport === null) {
       return;
     }
-    // rAF-throttle: a trackpad fires a burst of scroll events; coalesce them into
-    // one edge-flag check per frame.
     const handleScroll = () => {
       if (scrollFrameRef.current !== null) {
         return;
@@ -223,26 +239,14 @@ export function SecondaryPanelTabStrip({
     };
   }, [applyEdgeFlags, measureCapacity]);
 
-  // The set of tabs can change width without resizing the viewport (open/close,
-  // rename), so re-measure capacity whenever the tab list changes.
   useEffect(() => {
     measureCapacity();
-  }, [fileTabs, measureCapacity]);
+  }, [tabs, measureCapacity]);
 
-  // A web-font swap changes the tabs' intrinsic width (and so scrollWidth)
-  // without resizing the viewport or changing the tab list, which would leave the
-  // cached capacity stale. Re-measure once fonts settle. (document.fonts is
-  // absent in jsdom, hence the optional chain.)
   useEffect(() => {
     void document.fonts?.ready?.then(() => measureCapacity());
   }, [measureCapacity]);
 
-  // Bring the active tab into view on mount, on every active-tab change, and
-  // after the overflow control slots enter or leave the row. The last case
-  // keeps a tab that was aligned to the old viewport edge from being clipped
-  // when the controls reserve space. jsdom doesn't implement scrollIntoView,
-  // so guard the call.
-  const activeTabId = fileTabs.find((tab) => tab.isActive)?.id ?? null;
   useLayoutEffect(() => {
     const activeTabElement = activeTabRef.current;
     if (activeTabElement === null) {
@@ -251,8 +255,6 @@ export function SecondaryPanelTabStrip({
     activeTabElement.scrollIntoView({ inline: "nearest", block: "nearest" });
   }, [activeTabId, overflow.hasOverflow]);
 
-  // A scroll button can reach its edge while it has keyboard focus. Move focus
-  // before the button becomes an invisible, aria-hidden control.
   useLayoutEffect(() => {
     const focusedElement = document.activeElement;
     const activeTabButton =
@@ -278,23 +280,12 @@ export function SecondaryPanelTabStrip({
     }
   }, [overflow.canScrollLeft, overflow.canScrollRight]);
 
-  // A plain mouse wheel over the strip should move it sideways. React registers
-  // its onWheel listener as passive, so a synthetic handler can't call
-  // preventDefault; attach a non-passive native listener instead. Only consume
-  // the gesture (and suppress the page's vertical scroll) when the strip can
-  // actually move horizontally in the wheel's direction — at a horizontal edge
-  // we let the event bubble so the page keeps scrolling normally. Trackpad
-  // horizontal gestures arrive as deltaX and scroll natively, so only deltaY is
-  // translated here.
   useEffect(() => {
     const viewport = viewportRef.current;
     if (viewport === null) {
       return;
     }
     const handleWheel = (event: WheelEvent) => {
-      // Let native horizontal trackpad gestures scroll the strip themselves; only
-      // translate a primarily-vertical wheel into horizontal movement. (A mostly
-      // horizontal swipe can carry small deltaY noise — don't hijack it.)
       if (
         event.deltaY === 0 ||
         Math.abs(event.deltaX) >= Math.abs(event.deltaY)
@@ -313,7 +304,6 @@ export function SecondaryPanelTabStrip({
       if (!canScrollInWheelDirection) {
         return;
       }
-      // Clamp against the cached capacity instead of re-reading scrollWidth.
       viewport.scrollLeft = Math.min(
         maxScrollLeft,
         Math.max(0, scrollLeft + event.deltaY),
@@ -371,15 +361,27 @@ export function SecondaryPanelTabStrip({
     [consumeDragClickSuppression],
   );
 
+  const isCompactViewport = useIsCompactViewport();
+  const handleCloseTabs = useCallback(
+    (tabId: string, scope: SecondaryPanelTabCloseScope) => {
+      const tabsToClose = secondaryPanelTabsToClose(tabs, tabId, scope);
+      const closesActiveTab = tabsToClose.some(
+        (tab) => tab.tab.id === activeTabId,
+      );
+      if (scope !== "self" && closesActiveTab) {
+        tabs.find((tab) => tab.tab.id === tabId)?.onSelect();
+      }
+      for (const tab of tabsToClose) {
+        tab.onClose();
+      }
+    },
+    [activeTabId, tabs],
+  );
+
   const noDragClass = usesDesktopChrome ? MACOS_WINDOW_NO_DRAG_CLASS : null;
   const chevronNoDragClass = usesDesktopChrome
     ? MACOS_APP_REGION_NO_DRAG_CLASS
     : null;
-  // Memoize the sortable tab tree so the directional overflow flags — which
-  // flip every time you reach a scroll edge, i.e. constantly at narrow widths —
-  // re-render only the edge controls, never the tabs. Without this, each edge
-  // crossing reconciles the whole list and re-runs useSortable for every tab,
-  // which is what kept narrow-width scrolling stuttery.
   const dndTabs = useMemo(
     () => (
       <DndContext
@@ -393,25 +395,28 @@ export function SecondaryPanelTabStrip({
           items={tabIds}
           strategy={horizontalListSortingStrategy}
         >
-          {fileTabs.map((tab) => (
-            <SortableFileTab
-              key={tab.id}
-              activeTreatment={activeTreatment}
+          {tabs.map((tab) => (
+            <SortablePanelTab
+              key={tab.tab.id}
               activeTabRef={activeTabRef}
+              contextMenuDisabled={isCompactViewport}
               dragDisabled={dragDisabled}
+              isActive={tab.tab.id === activeTabId}
               noDragClass={noDragClass}
+              onBeginTabDrag={onBeginTabDrag}
+              onCloseTabs={handleCloseTabs}
               tab={tab}
+              tabs={tabs}
             />
           ))}
         </SortableContext>
-        {/* The lifted tab follows the pointer on both axes and must not be
-            clipped by the viewport's `overflow` or stretch its scroll width, so
-            render it as a fixed-position clone portaled out of the strip rather
-            than translating the in-place tab. */}
         {createPortal(
           <DragOverlay className="cursor-grabbing">
             {draggingTab === null ? null : (
-              <FileTab tab={draggingTab} activeTreatment={activeTreatment} />
+              <PanelTab
+                isActive={draggingTab.tab.id === activeTabId}
+                tab={draggingTab}
+              />
             )}
           </DragOverlay>,
           document.body,
@@ -424,35 +429,31 @@ export function SecondaryPanelTabStrip({
       handleDragCancel,
       handleDragEnd,
       tabIds,
-      fileTabs,
+      tabs,
       dragDisabled,
+      isCompactViewport,
       noDragClass,
+      onBeginTabDrag,
+      handleCloseTabs,
       draggingTab,
-      activeTreatment,
+      activeTabId,
     ],
   );
 
   return (
-    // Hugs its tabs (no `flex-1`) and shrinks (`min-w-0`) when they overflow.
-    // The New Tab button follows this strip as an anchored sibling, while the
-    // in-flow scroll controls reserve their own space on either side of the tab
-    // viewport instead of covering its contents.
     <div
       ref={stripRef}
       data-testid="secondary-panel-tab-strip"
-      className="group relative flex min-w-0 items-center"
+      className="group relative flex min-w-0 items-center [&_[data-tab-pill-close]]:text-muted-foreground/70 [&_[data-tab-pill-close]:hover]:text-foreground [&_[data-tab-pill-close]_[data-icon-root]]:size-3"
     >
       <TabStripScrollButton
         buttonRef={leftScrollButtonRef}
         direction="left"
-        hasOverflow={overflow.hasOverflow}
         canScroll={overflow.canScrollLeft}
         className={chevronNoDragClass}
         onClick={() => scrollByStep(-1)}
       />
       <div data-secondary-panel-tab-scroll-region className="relative min-w-0">
-        {/* The fades are scoped to the tab viewport, so neither they nor the
-            scrolling pills extend into the in-flow caret slots. */}
         <OverflowFade
           placement="left"
           tone={SECONDARY_PANEL_TAB_STRIP_FADE_TONE}
@@ -472,12 +473,10 @@ export function SecondaryPanelTabStrip({
         <div
           ref={viewportRef}
           onClickCapture={handleClickCapture}
-          // No `scroll-smooth` here: wheel translation assigns scrollLeft
-          // directly (see the wheel handler), and CSS smooth-scroll would turn
-          // each wheel notch into its own ~150ms animation — the strip advances,
-          // sits frozen between notches, then jumps. Letting it track 1:1 matches
-          // native horizontal trackpad scrolling.
-          className="no-scrollbar min-w-0 overflow-x-auto overflow-y-hidden"
+          className={cn(
+            "no-scrollbar min-w-0 overflow-x-auto overflow-y-hidden",
+            usesDesktopChrome && MACOS_APP_REGION_NO_DRAG_CLASS,
+          )}
         >
           <div
             ref={contentRef}
@@ -491,7 +490,6 @@ export function SecondaryPanelTabStrip({
       <TabStripScrollButton
         buttonRef={rightScrollButtonRef}
         direction="right"
-        hasOverflow={overflow.hasOverflow}
         canScroll={overflow.canScrollRight}
         className={chevronNoDragClass}
         onClick={() => scrollByStep(1)}
@@ -500,26 +498,32 @@ export function SecondaryPanelTabStrip({
   );
 }
 
-function SortableFileTab({
-  activeTreatment,
+function SortablePanelTab({
   activeTabRef,
+  contextMenuDisabled,
   dragDisabled,
+  isActive,
   noDragClass,
+  onBeginTabDrag,
+  onCloseTabs,
   tab,
-}: SortableFileTabProps) {
+  tabs,
+}: SortablePanelTabProps) {
   const { isDragging, listeners, setNodeRef, transform, transition } =
     useSortable({
-      id: tab.id,
+      id: tab.tab.id,
       disabled: dragDisabled,
     });
+  const { onPointerDown: sortablePointerDown, ...sortableListeners } =
+    listeners ?? {};
   const setTabRef = useCallback(
     (element: HTMLDivElement | null) => {
       setNodeRef(element);
-      if (tab.isActive) {
+      if (isActive) {
         activeTabRef.current = element;
       }
     },
-    [activeTabRef, setNodeRef, tab.isActive],
+    [activeTabRef, isActive, setNodeRef],
   );
   const style = useMemo<CSSProperties>(
     () => ({
@@ -529,29 +533,63 @@ function SortableFileTab({
     [transform, transition],
   );
 
+  const tabId = tab.tab.id;
+  const canCloseSelf =
+    secondaryPanelTabsToClose(tabs, tabId, "self").length > 0;
+  const canCloseOthers =
+    secondaryPanelTabsToClose(tabs, tabId, "others").length > 0;
+  const canCloseRight =
+    secondaryPanelTabsToClose(tabs, tabId, "right").length > 0;
+
   return (
-    <div
-      ref={setTabRef}
-      style={style}
-      className={cn(
-        "shrink-0",
-        !dragDisabled && "cursor-grab active:cursor-grabbing",
-        // The lifted clone renders in the DragOverlay; fade the in-place source
-        // to a placeholder marking where the tab will land.
-        isDragging && "opacity-40",
-        noDragClass,
-      )}
-      {...listeners}
-    >
-      <FileTab tab={tab} activeTreatment={activeTreatment} />
-    </div>
+    <ContextMenu modal={false}>
+      <ContextMenuTrigger asChild disabled={contextMenuDisabled}>
+        <div
+          ref={setTabRef}
+          style={style}
+          className={cn(
+            "shrink-0",
+            !dragDisabled && "cursor-grab active:cursor-grabbing",
+            isDragging && "opacity-40",
+            noDragClass,
+          )}
+          onPointerDown={(event) => {
+            onBeginTabDrag?.(tabId, event);
+            sortablePointerDown?.(event);
+          }}
+          {...sortableListeners}
+        >
+          <PanelTab tab={tab} isActive={isActive} />
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent aria-label={`${tab.label} tab actions`}>
+        <ContextMenuItem
+          disabled={!canCloseSelf}
+          onSelect={() => onCloseTabs(tabId, "self")}
+        >
+          Close tab
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem
+          disabled={!canCloseOthers}
+          onSelect={() => onCloseTabs(tabId, "others")}
+        >
+          Close other tabs
+        </ContextMenuItem>
+        <ContextMenuItem
+          disabled={!canCloseRight}
+          onSelect={() => onCloseTabs(tabId, "right")}
+        >
+          Close tabs to the right
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 
 interface TabStripScrollButtonProps {
   buttonRef: RefObject<HTMLButtonElement | null>;
   direction: "left" | "right";
-  hasOverflow: boolean;
   canScroll: boolean;
   className: string | null;
   onClick: () => void;
@@ -560,7 +598,6 @@ interface TabStripScrollButtonProps {
 function TabStripScrollButton({
   buttonRef,
   direction,
-  hasOverflow,
   canScroll,
   className,
   onClick,
@@ -577,8 +614,8 @@ function TabStripScrollButton({
       aria-label={label}
       onClick={onClick}
       className={cn(
-        "z-20 shrink-0 bg-sidebar text-muted-foreground shadow-none hover:bg-surface-raised-solid hover:text-foreground focus-visible:bg-sidebar",
-        hasOverflow
+        "z-20 shrink-0 bg-sidebar text-muted-foreground/70 shadow-none hover:bg-surface-raised-solid hover:text-foreground focus-visible:bg-sidebar",
+        canScroll
           ? TAB_STRIP_SCROLL_BUTTON_CLASS
           : "h-7 w-0 overflow-hidden p-0 max-md:pointer-coarse:h-9",
         "transition-opacity",
@@ -593,34 +630,36 @@ function TabStripScrollButton({
   );
 }
 
-function FileTab({
+function PanelTab({
   tab,
-  activeTreatment,
+  isActive,
 }: {
-  tab: SecondaryPanelFileTab;
-  activeTreatment: "fill" | "underline";
+  tab: SecondaryPanelRenderableTab;
+  isActive: boolean;
 }) {
   const title =
-    tab.statusLabel === null
-      ? tab.filename
-      : `${tab.filename} (${tab.statusLabel})`;
+    tab.statusLabel === null ? tab.label : `${tab.label} (${tab.statusLabel})`;
   return (
     <TabPill
-      label={tab.filename}
+      label={tab.label}
       leadingVisual={tab.leadingVisual}
       secondaryLabel={tab.statusLabel === null ? null : `(${tab.statusLabel})`}
       title={title}
-      isActive={tab.isActive}
-      activeTreatment={activeTreatment}
+      isActive={isActive}
       onSelect={tab.onSelect}
       labelMaxWidthClass="max-w-[160px]"
+      enlargeCloseTargetOnCoarsePointer={
+        tab.tab.kind === "workspace-file-preview" ||
+        tab.tab.kind === "host-file-preview" ||
+        tab.tab.kind === "thread-storage-file-preview" ||
+        tab.tab.kind === "attachment-file-preview"
+      }
       closeAction={
         tab.isPinned
           ? null
           : {
               onClose: tab.onClose,
-              closeLabel: `Close ${tab.filename}`,
-              closeTooltip: "Close tab",
+              closeLabel: `Close ${tab.label}`,
             }
       }
     />

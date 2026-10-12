@@ -1,5 +1,4 @@
 import type { SkillSummary } from "@bb/server-contract";
-import { RESOURCE_GRID_PAGE_SIZE } from "@bb/shared-ui/resource-pagination";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildRegistrySkillReferencePrompt,
@@ -9,9 +8,6 @@ import {
   fetchRegistrySkills,
   formatInstallCount,
   formatRegistrySource,
-  installRegistrySkill,
-  normalizeSkillName,
-  REGISTRY_PAGE_SIZE,
   registryRepositoryKey,
   resolveInstalledRegistrySkill,
 } from "./skills-registry";
@@ -93,7 +89,7 @@ describe("registry skill contracts", () => {
     );
   });
 
-  it("uses the shared detail and install schemas at the HTTP boundary", async () => {
+  it("uses the shared detail schema at the HTTP boundary", async () => {
     const detail = {
       id: registrySkill.id,
       source: registrySkill.source,
@@ -108,20 +104,6 @@ describe("registry skill contracts", () => {
         skillId: registrySkill.skillId,
       }),
     ).resolves.toEqual(detail);
-
-    const expectedInstall = {
-      ok: true,
-      filePath: "/tmp/useful-skill/SKILL.md",
-    };
-    const installFetch = stubJsonResponse(expectedInstall);
-    await expect(
-      installRegistrySkill({ skill: registrySkill }),
-    ).resolves.toEqual(expectedInstall);
-    const [input, init] = installFetch.mock.calls[0]!;
-    expect(requestPath(input)).toBe("/api/v1/skills-registry/install");
-    expect(JSON.parse(String(init?.body))).toEqual({
-      registrySkillId: registrySkill.id,
-    });
   });
 
   it("loads repository stars through the shared schema", async () => {
@@ -133,14 +115,6 @@ describe("registry skill contracts", () => {
     expect(requestPath(starsFetch.mock.calls[0]![0])).toBe(
       "/api/v1/skills-registry/repository-stars?source=github.com%2Fowner%2Frepo",
     );
-  });
-
-  it("preserves the server's install error message", async () => {
-    stubJsonResponse({ message: "Skill is already installed" }, 409);
-
-    await expect(
-      installRegistrySkill({ skill: registrySkill }),
-    ).rejects.toThrow("Skill is already installed");
   });
 });
 
@@ -161,7 +135,7 @@ describe("registry skill matching", () => {
     expect(
       resolveInstalledRegistrySkill(registrySkill, [
         installedSkill({ manageable: false }),
-        installedSkill({ scope: "claude-user" }),
+        installedSkill({ scope: "provider-user" }),
         installedSkill({ provider: "codex" }),
       ]),
     ).toBeNull();
@@ -201,10 +175,6 @@ describe("registry skill formatting", () => {
     );
   });
 
-  it("normalizes names using the existing registry slug behavior", () => {
-    expect(normalizeSkillName("  Ship & Review_IT  ")).toBe("ship-review-it");
-  });
-
   it("formats sources and compact install counts at the existing thresholds", () => {
     expect(formatRegistrySource("github.com/owner/repo")).toBe("owner/repo");
     expect(formatRegistrySource("owner/repo")).toBe("owner/repo");
@@ -216,9 +186,5 @@ describe("registry skill formatting", () => {
     expect(formatInstallCount(999)).toBe("999");
     expect(formatInstallCount(1_000)).toBe("1.0K");
     expect(formatInstallCount(1_250_000)).toBe("1.3M");
-  });
-
-  it("uses the shared resource grid page size", () => {
-    expect(REGISTRY_PAGE_SIZE).toBe(RESOURCE_GRID_PAGE_SIZE);
   });
 });

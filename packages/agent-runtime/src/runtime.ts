@@ -1,81 +1,83 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
-import { isAcpProviderId } from "@bb/agent-providers";
 import {
   normalizeProviderThreadNameEvent,
   toProviderExternalThreadName,
 } from "@bb/domain";
+import type { DynamicTool, InstructionMode, ThreadEvent } from "@bb/domain";
+import type { AdapterCommand } from "./provider-adapter.js";
+import {
+  BRIDGE_JSON_RPC_ERRORS,
+  providerHealthResultSchema,
+  providerInstallationRunResultSchema,
+  providerInstallationStatusSchema,
+  providerUsageResultSchema,
+  ThreadEventGrammar,
+  threadIdentityResultSchema,
+} from "@bb/provider-bridge-protocol";
+import {
+  JsonRpcResponseError,
+  PROVIDER_TOOL_CALL_CANCELLED_METHOD,
+  providerToolCallCancellationSchema,
+  getJsonRpcStringParam,
+  ignoredJsonRpcResultSchema,
+  parseJsonRpcLine,
+  sendJsonRpcError,
+  sendJsonRpcRequest,
+  settleJsonRpcResponse,
+} from "@bb/provider-bridge-protocol/bridge-kit";
 import type {
-  DynamicTool,
-  InstructionMode,
-  ProviderErrorCategory,
-  ThreadEvent,
-} from "@bb/domain";
-import type { HostDaemonAcpLaunchSpec } from "@bb/host-daemon-contract";
-import type {
-  AdapterCommand,
-  ProviderAdapter,
-  ProviderAdapterFactory,
+  JsonRpcObject,
   ProviderCommandPlan,
   ProviderRequestCommandPlan,
-} from "./provider-adapter.js";
+  SendJsonRpcRequestArgs,
+} from "@bb/provider-bridge-protocol/bridge-kit";
 import {
   assertProviderSupportsExecutionOptions,
   toProviderExecutionContext,
 } from "./execution-options.js";
 import {
-  getJsonRpcStringParam,
-  ignoredJsonRpcResultSchema,
-  JsonRpcResponseError,
-  type JsonRpcObject,
-  parseJsonRpcLine,
-  type SendJsonRpcRequestArgs,
-  sendJsonRpcError,
-  sendJsonRpcRequest,
-  settleJsonRpcResponse,
-} from "./runtime-json-rpc.js";
-import { ACP_BRIDGE_NO_ACTIVE_TURN_ERROR_CODE } from "./acp/bridge-protocol.js";
-import {
   handleRuntimeProviderRequest,
+  RuntimeToolCalls,
   type ResolveRuntimeProviderRequestThreadIdArgs,
   type RuntimeProviderRequestKind,
 } from "./runtime-provider-requests.js";
 import {
   RuntimeProviderProcessManager,
+  hasChildProcessExited,
   type RuntimeProviderProcess,
 } from "./runtime-provider-process.js";
-import {
-  filterSkillRootsForProvider,
-  normalizeSkillRoots,
-} from "./runtime-skill-roots.js";
 import {
   RuntimeThreadIdentityRegistry,
   stampThreadEventScope,
 } from "./runtime-thread-identity.js";
 import { RuntimeThreadGoalState } from "./runtime-thread-goal-state.js";
-import { RuntimeTurnReplayFilter } from "./runtime-turn-replay-filter.js";
 import { RuntimeBackgroundWorkState } from "./runtime-background-work-state.js";
 import { RuntimeTurnState } from "./runtime-turn-state.js";
 import type {
+  AgentRuntimeContributedEnvEntry,
   AgentRuntime,
+  AgentRuntimeProviderRecoveryHint,
+  AgentRuntimeBridgeLaunch,
   AgentRuntimeExecutionOptions,
   AgentRuntimeOptions,
-  ReapedIdleProviderSession,
   AgentRuntimeSkillRoot,
+  ReapedIdleProviderSession,
 } from "./types.js";
-import { buildThreadShellEnvironment } from "./thread-shell-environment.js";
 import {
-  resolveThreadIdentityResult,
-  threadIdentityResultSchema,
-} from "./thread-identity.js";
-import { fingerprintAcpLaunchSpec } from "./acp-launch-spec-fingerprint.js";
+  resolveThreadEnvironment,
+  type DroppedThreadEnvironmentContribution,
+  type ResolvedThreadEnvironmentEntry,
+} from "./thread-shell-environment.js";
+import { bridgeLaunchProcessKey } from "./bridge-launch-process-key.js";
 
-interface ReconfigureThreadIfNeededArgs {
+interface RecordThreadExecutionOptionsArgs {
   options: AgentRuntimeExecutionOptions;
   threadId: string;
 }
 
-interface RestartCodexThreadForNextTurnArgs {
+interface RestartThreadBridgeArgs {
   instructions: string | undefined;
   options: AgentRuntimeExecutionOptions;
   threadId: string;
@@ -84,13 +86,6 @@ interface RestartCodexThreadForNextTurnArgs {
 interface RunThreadOperationArgs<TResult> {
   threadId: string;
   work: () => Promise<TResult>;
-}
-
-function normalizeExecutionOptions(args: {
-  adapter: ProviderAdapter;
-  options: AgentRuntimeExecutionOptions;
-}): AgentRuntimeExecutionOptions {
-  return args.adapter.normalizeExecutionOptions?.(args.options) ?? args.options;
 }
 
 interface PreparedThreadRewind {
@@ -110,11 +105,6 @@ interface PreparingThreadRewind {
   promise: Promise<{ providerThreadId: string }>;
 }
 
-/**
- * A staged rewind fork, keyed by the server-minted per-attempt lease id.
- * Each attempt owns exactly one staged fork; there is no cross-attempt
- * sharing, so discarding a lease can never affect another attempt.
- */
 type StagedThreadRewind = PreparingThreadRewind | PreparedThreadRewind;
 
 interface ReapIdleProviderSessionCandidate {
@@ -131,39 +121,60 @@ interface FindReapableIdleProviderSessionArgs {
 }
 
 interface ResolveProviderProcessKeyArgs {
-  acpLaunchSpec?: HostDaemonAcpLaunchSpec;
-  providerId: string;
-  threadId?: string;
-}
-
-interface RequireProviderProcessArgs {
-  processKey: string;
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots?: readonly AgentRuntimeSkillRoot[];
   providerId: string;
 }
 
 interface ArchiveOrUnarchiveThreadArgs {
+  bridgeLaunch?: AgentRuntimeBridgeLaunch;
   commandType: "thread/archive" | "thread/unarchive";
   providerId: string;
   providerThreadId: string;
   threadId: string;
 }
 
-interface CodexArchivedSessionRecoveryArgs {
+interface RequestRecoveryArgs {
+  bridgeLaunch?: AgentRuntimeBridgeLaunch;
   providerId: string;
   providerThreadId: string;
   threadId: string;
 }
 
-interface AgentRuntimeInternalOptions extends AgentRuntimeOptions {
-  adapterFactory?: ProviderAdapterFactory;
+export class CompetingTurnError extends Error {
+  constructor(threadId: string) {
+    super(
+      `Refusing to start a competing turn for thread "${threadId}" while another turn is active or starting`,
+    );
+    this.name = "CompetingTurnError";
+  }
 }
+
+export class AgentRuntimeRecoveryError extends Error {
+  readonly code: "auth_required" | "rate_limited";
+  readonly recovery: AgentRuntimeProviderRecoveryHint;
+
+  constructor(args: {
+    code: "auth_required" | "rate_limited";
+    message: string;
+    recovery: AgentRuntimeProviderRecoveryHint;
+    cause: unknown;
+  }) {
+    super(args.message, { cause: args.cause });
+    this.name = "AgentRuntimeRecoveryError";
+    this.code = args.code;
+    this.recovery = args.recovery;
+  }
+}
+
+const DEFAULT_RATE_LIMITED_RETRY_DELAYS_MS = [2_000, 8_000] as const;
 
 interface ResolveProviderRequestThreadIdArgs extends ResolveRuntimeProviderRequestThreadIdArgs {
   proc: ProviderProcess;
 }
 
 interface ResolveThreadStoragePathArgs {
-  options: AgentRuntimeInternalOptions;
+  options: AgentRuntimeOptions;
   threadId: string;
 }
 
@@ -180,10 +191,6 @@ function defaultBridgeNodeEnv(): Record<string, string> | undefined {
   return { ELECTRON_RUN_AS_NODE: "1" };
 }
 
-// ---------------------------------------------------------------------------
-// Runtime implementation
-// ---------------------------------------------------------------------------
-
 type ProviderProcess = RuntimeProviderProcess;
 
 const threadGoalClearResultSchema = z.object({ cleared: z.boolean() }).strict();
@@ -192,21 +199,19 @@ const PREPARED_THREAD_REWIND_TTL_MS = 5 * 60_000;
 const PREPARED_THREAD_REWIND_RETRY_MS = 30_000;
 
 interface ThreadRuntimeConfig {
+  bridgeLaunch: AgentRuntimeBridgeLaunch;
+  skillRoots: readonly AgentRuntimeSkillRoot[];
+  contributedEnv: readonly AgentRuntimeContributedEnvEntry[];
   dynamicTools?: DynamicTool[];
-  disallowedTools?: readonly string[];
   environmentId: string;
   instructionMode: InstructionMode;
-  /**
-   * The instructions the live provider session was constructed with. Frozen
-   * until the next session construction (start, resume, fork).
-   */
   instructions?: string;
+  envVars: Record<string, string>;
   options: AgentRuntimeExecutionOptions;
   processKey: string;
   projectId?: string;
   providerId: string;
-  skillRoots: readonly AgentRuntimeSkillRoot[];
-  workspacePath: string;
+  sessionRestorable: boolean;
 }
 
 interface RuntimeParsedMessageArgs {
@@ -214,20 +219,9 @@ interface RuntimeParsedMessageArgs {
   proc: ProviderProcess;
 }
 
-interface RuntimeJsonRpcResponseArgs extends RuntimeParsedMessageArgs {
-  parsedId: string | number;
-}
-
 interface EmitTranslatedEventsArgs {
   events: ThreadEvent[];
   proc: ProviderProcess;
-  sourceThreadId?: string;
-}
-
-interface EmitAcceptedCommandEventsArgs {
-  command: AdapterCommand;
-  proc: ProviderProcess;
-  providerThreadId?: string;
   sourceThreadId?: string;
 }
 
@@ -237,59 +231,13 @@ interface RequireProviderRequestPlanArgs {
   providerId: string;
 }
 
-const CODEX_PROVIDER_ID = "codex";
-const CODEX_THREAD_PROCESS_KEY_PREFIX = `${CODEX_PROVIDER_ID}\0thread:`;
-const THREAD_CREATION_REQUEST_TIMEOUT_MS = 2 * 60_000;
-const CODEX_ACCOUNT_RESTART_PROVIDER_ERROR_CATEGORIES =
-  new Set<ProviderErrorCategory>(["rate-limit", "unauthorized"]);
-const CODEX_ACCOUNT_RESTART_PROVIDER_ERROR_TEXT_PATTERN =
-  /\b(?:40[19]|429|auth(?:entication|orization)?|credits?|quota|rate[-\s]?limit(?:ed)?|unauthori[sz]ed|usage limit)\b/i;
-const CODEX_ARCHIVED_SESSION_ERROR_PATTERN =
-  /\b(?:session|thread)\s+\S+\s+is archived\b/i;
-const CODEX_EMPTY_ROLLOUT_RENAME_ERROR_PATTERN = /\brollout at .+ is empty\b/i;
-const CODEX_RENAME_RETRY_DELAYS_MS = [50, 200] as const;
+const DEFAULT_THREAD_CREATION_REQUEST_TIMEOUT_MS = 2 * 60_000;
+const FAILED_CONSTRUCTION_RELEASE_TIMEOUT_MS = 5_000;
 
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-interface SendRenameWithRolloutRetriesArgs {
-  onStderr: AgentRuntimeOptions["onStderr"];
-  providerId: string;
-  send: () => Promise<void>;
-  threadId: string;
-}
-
-/**
- * A brand-new Codex rollout file can exist before its first record is written,
- * and a rename landing in that window fails until Codex flushes. Retry only
- * that error, backing off after each attempt, then make one final attempt
- * whose failure propagates. Every other error fails immediately.
- */
-async function sendRenameWithRolloutRetries(
-  args: SendRenameWithRolloutRetriesArgs,
-): Promise<void> {
-  for (const retryDelayMs of CODEX_RENAME_RETRY_DELAYS_MS) {
-    try {
-      await args.send();
-      return;
-    } catch (error) {
-      if (
-        args.providerId !== CODEX_PROVIDER_ID ||
-        !(error instanceof Error) ||
-        !CODEX_EMPTY_ROLLOUT_RENAME_ERROR_PATTERN.test(error.message)
-      ) {
-        throw error;
-      }
-      args.onStderr?.(
-        `Codex session rollout is not ready; retrying rename for thread "${args.threadId}" in ${retryDelayMs}ms.`,
-      );
-      await delay(retryDelayMs);
-    }
-  }
-  await args.send();
 }
 
 function resolveThreadStoragePath(
@@ -302,54 +250,75 @@ function resolveThreadStoragePath(
   return path.join(rootPath, args.threadId);
 }
 
-/**
- * Coordinates provider processes for an environment and bridges provider
- * JSON-RPC traffic into bb thread events, dynamic tool calls, and pending
- * interactions.
- */
 export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
-  return createAgentRuntimeInternal(options);
-}
-
-export function createAgentRuntimeWithAdapters(
-  options: AgentRuntimeInternalOptions,
-): AgentRuntime {
-  return createAgentRuntimeInternal(options);
-}
-
-function createAgentRuntimeInternal(
-  options: AgentRuntimeInternalOptions,
-): AgentRuntime {
   const additionalWorkspaceWriteRoots =
     options.additionalWorkspaceWriteRoots ?? [];
-  const skillRoots = normalizeSkillRoots({
-    skillRoots: options.skillRoots,
-  });
+  const skillRoots = options.skillRoots ?? [];
+  for (const skillRoot of skillRoots) {
+    if (!path.isAbsolute(skillRoot.path)) {
+      throw new Error(
+        `Agent runtime skill root "${skillRoot.id}" must use an absolute path: ${skillRoot.path}`,
+      );
+    }
+  }
   let nextRequestId = 1;
   const threadIdentityRegistry = new RuntimeThreadIdentityRegistry();
   const threadRuntimeConfigs = new Map<string, ThreadRuntimeConfig>();
-  const codexThreadsRequiringAccountRestart = new Set<string>();
+  const rateLimitedRetryDelaysMs =
+    options.rateLimitRetry?.delaysMs ?? DEFAULT_RATE_LIMITED_RETRY_DELAYS_MS;
+  const threadCreationRequestTimeoutMs =
+    options.threadCreation?.requestTimeoutMs ??
+    DEFAULT_THREAD_CREATION_REQUEST_TIMEOUT_MS;
+  const threadsAwaitingBridgeRestart = new Map<
+    string,
+    AgentRuntimeProviderRecoveryHint
+  >();
+  const threadsRetryingBridgeRestartOnIdle = new Set<string>();
   const idleProviderSessionSinceMsByThreadId = new Map<string, number>();
-  const pendingTurnStartThreadIds = new Set<string>();
+  const pendingTurnStarts = new Map<
+    string,
+    { sinceMs: number; watchdogFired: boolean }
+  >();
+  const turnStartWatchdogThresholdMs =
+    options.turnStartWatchdog?.thresholdMs ?? 120_000;
+  const turnStartWatchdogTimer = setInterval(() => {
+    const nowMs = Date.now();
+    for (const [threadId, entry] of pendingTurnStarts) {
+      if (
+        entry.watchdogFired ||
+        nowMs - entry.sinceMs < turnStartWatchdogThresholdMs
+      ) {
+        continue;
+      }
+      entry.watchdogFired = true;
+      options.onEvent({
+        type: "system/error",
+        threadId,
+        scope: { kind: "thread" },
+        code: "provider_turn_start_timeout",
+        message: `The provider accepted a turn but did not start it within ${Math.round(turnStartWatchdogThresholdMs / 1000)}s. The request may be stalled; stopping the thread interrupts it.`,
+      });
+    }
+  }, options.turnStartWatchdog?.intervalMs ?? 15_000);
+  turnStartWatchdogTimer.unref?.();
   const threadOperationCounts = new Map<string, number>();
   const stagedThreadRewinds = new Map<string, StagedThreadRewind>();
   const suppressedThreadEventIds = new Set<string>();
   const threadGoalState = new RuntimeThreadGoalState();
   const turnState = new RuntimeTurnState();
+  const toolCalls = new RuntimeToolCalls();
   const backgroundWorkState = new RuntimeBackgroundWorkState();
-  const turnReplayFilter = new RuntimeTurnReplayFilter();
-  const bridgeNodeEnv = options.bridgeNodeEnv ?? defaultBridgeNodeEnv();
+  const threadEventGrammar = new ThreadEventGrammar();
+  const bridgeNodeEnv = defaultBridgeNodeEnv();
 
   const providerProcesses = new RuntimeProviderProcessManager({
     additionalWorkspaceWriteRoots,
-    adapterFactory: options.adapterFactory,
     bridgeBundleDir: options.bridgeBundleDir,
     ...(bridgeNodeEnv !== undefined ? { bridgeNodeEnv } : {}),
-    bridgeNodeExecutablePath:
-      options.bridgeNodeExecutablePath ?? process.execPath,
+    bridgeNodeExecutablePath: process.execPath,
     captureThreadExitState: (threadId) => ({
       activeTurnId: turnState.getActiveTurnId(threadId),
-      pendingTurnStart: pendingTurnStartThreadIds.has(threadId),
+      pendingTurnStart: pendingTurnStarts.has(threadId),
       providerThreadId:
         threadIdentityRegistry.getProviderThreadId(threadId) ?? null,
       threadId,
@@ -361,28 +330,13 @@ function createAgentRuntimeInternal(
     handleStdoutLine: (args) =>
       handleStdoutLine(args.line, args.providerProcess),
     onProcessExit: options.onProcessExit,
-    onProviderIdentityWaitersInterrupted: (providerProcess) =>
-      threadIdentityRegistry.resolvePendingIdentityWaiters(
-        providerProcess.identity,
-      ),
-    onProviderThreadDetached: (threadId, providerProcess) => {
-      // Reconcile adapter state that dies with the provider process (open
-      // background tasks) before the thread's identity mappings are cleared —
-      // the synthesized events still need provider-thread stamping.
-      const detachEvents =
-        providerProcess.adapter.buildThreadDetachedEvents?.({ threadId }) ?? [];
-      if (detachEvents.length > 0) {
-        emitTranslatedEvents({
-          events: detachEvents,
-          proc: providerProcess,
-          sourceThreadId: threadId,
-        });
-      }
+    onProviderThreadDetached: (threadId) => {
+      toolCalls.cancelThread(threadId);
       threadIdentityRegistry.clearThread(threadId);
       clearThreadRuntimeConfig(threadId);
       turnState.clearThread(threadId);
       backgroundWorkState.clearThread(threadId);
-      turnReplayFilter.clearThread(threadId);
+      threadEventGrammar.clearThread(threadId);
     },
     onStderr: options.onStderr,
     skillRoots,
@@ -392,41 +346,74 @@ function createAgentRuntimeInternal(
   function resolveProviderProcessKey(
     args: ResolveProviderProcessKeyArgs,
   ): string {
-    const baseKey =
-      args.providerId !== CODEX_PROVIDER_ID || args.threadId === undefined
-        ? args.providerId
-        : `${CODEX_THREAD_PROCESS_KEY_PREFIX}${args.threadId}`;
-    if (args.acpLaunchSpec === undefined) {
-      return baseKey;
+    const roots = args.skillRoots ?? skillRoots;
+    for (const root of roots) {
+      if (!path.isAbsolute(root.path)) {
+        throw new Error(
+          `Agent runtime skill root "${root.id}" must use an absolute path: ${root.path}`,
+        );
+      }
     }
-    return `${baseKey}#acp:${fingerprintAcpLaunchSpec(args.acpLaunchSpec)}`;
-  }
-
-  function requireProviderProcess(
-    args: RequireProviderProcessArgs,
-  ): ProviderProcess {
-    return providerProcesses.requireProviderProcess(args);
+    const catalogKey =
+      roots.length === 0
+        ? ""
+        : `#skills:${createHash("sha256").update(JSON.stringify(roots)).digest("hex")}`;
+    return `${args.providerId}#bridge:${bridgeLaunchProcessKey(args.bridgeLaunch)}${catalogKey}`;
   }
 
   function requireProviderProcessForThread(threadId: string): ProviderProcess {
-    const providerId = resolveProviderForThread(threadId);
-    const processKey =
-      threadRuntimeConfigs.get(threadId)?.processKey ??
-      resolveProviderProcessKey({ providerId });
-    return requireProviderProcess({ processKey, providerId });
+    const providerId =
+      threadIdentityRegistry.resolveProviderForThread(threadId);
+    const config = threadRuntimeConfigs.get(threadId);
+    if (config === undefined) {
+      throw new Error(
+        `Thread "${threadId}" has no live provider session on "${providerId}"`,
+      );
+    }
+    return providerProcesses.requireProviderProcess({
+      processKey: config.processKey,
+      providerId,
+    });
   }
 
-  function isThreadScopedCodexProcess(proc: ProviderProcess): boolean {
-    return (
-      proc.providerId === CODEX_PROVIDER_ID &&
-      proc.processKey.startsWith(CODEX_THREAD_PROCESS_KEY_PREFIX)
-    );
+  async function releaseThreadOnBridgeBestEffort(args: {
+    proc: ProviderProcess;
+    threadId: string;
+  }): Promise<void> {
+    if (hasChildProcessExited(args.proc.child)) {
+      return;
+    }
+    const providerThreadId =
+      threadIdentityRegistry.getProviderThreadId(args.threadId) ??
+      args.threadId;
+    const plan = args.proc.adapter.buildCommandPlan({
+      type: "thread/stop",
+      threadId: args.threadId,
+      providerThreadId,
+      activeTurnId: null,
+    });
+    if (plan.kind !== "request") {
+      return;
+    }
+    try {
+      await sendCommand({
+        proc: args.proc,
+        message: plan,
+        resultSchema: ignoredJsonRpcResultSchema,
+        timeoutMs: FAILED_CONSTRUCTION_RELEASE_TIMEOUT_MS,
+      });
+    } catch (error) {
+      options.onStderr?.(
+        `Best-effort release of thread "${args.threadId}" after a failed session construction did not complete: ${error instanceof Error ? error.message : String(error)}`,
+        args.threadId,
+      );
+    }
   }
 
-  async function shutdownThreadScopedCodexProcessIfIdle(
+  async function releaseIdleProviderProcess(
     proc: ProviderProcess,
   ): Promise<void> {
-    if (!isThreadScopedCodexProcess(proc) || proc.identity.threadIds.size > 0) {
+    if (proc.identity.threadIds.size > 0) {
       return;
     }
     await providerProcesses.shutdownProvider({
@@ -435,73 +422,229 @@ function createAgentRuntimeInternal(
     });
   }
 
+  async function abandonFailedSessionConstruction(args: {
+    proc: ProviderProcess;
+    threadId: string;
+  }): Promise<void> {
+    await releaseThreadOnBridgeBestEffort(args);
+    forgetThreadRuntimeStateForProviderState(args.proc.identity, args.threadId);
+    try {
+      await releaseIdleProviderProcess(args.proc);
+    } catch (shutdownError) {
+      options.onStderr?.(
+        `Failed to retire the provider after thread "${args.threadId}" session construction failed: ${shutdownError instanceof Error ? shutdownError.message : String(shutdownError)}`,
+      );
+    }
+  }
+
   async function sendCommand<TResult>(args: {
     proc: ProviderProcess;
     message: SendJsonRpcRequestArgs<TResult>["message"];
     resultSchema: SendJsonRpcRequestArgs<TResult>["resultSchema"];
     timeoutMs?: number;
-    recovery?: CodexArchivedSessionRecoveryArgs;
+    recovery?: RequestRecoveryArgs;
   }): Promise<TResult> {
-    const request = {
-      child: args.proc.child,
-      getNextId: () => nextRequestId++,
-      message: args.message,
-      pending: args.proc.pending,
-      resultSchema: args.resultSchema,
-      ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
-    };
+    return sendRequestWithRecovery({
+      allowUnarchive: true,
+      proc: args.proc,
+      recovery: args.recovery,
+      request: {
+        child: args.proc.child,
+        getNextId: () => nextRequestId++,
+        message: args.message,
+        pending: args.proc.pending,
+        resultSchema: args.resultSchema,
+        ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+      },
+    });
+  }
 
+  interface RequestRecoveryPolicy<TResult> {
+    allowUnarchive: boolean;
+    proc: ProviderProcess;
+    recovery: RequestRecoveryArgs | undefined;
+    request: SendJsonRpcRequestArgs<TResult>;
+  }
+
+  async function sendRequestWithRecovery<TResult>(
+    args: RequestRecoveryPolicy<TResult>,
+  ): Promise<TResult> {
     try {
-      return await sendJsonRpcRequest(request);
+      return await sendJsonRpcRequest({
+        ...args.request,
+        child: args.proc.child,
+        pending: args.proc.pending,
+      });
     } catch (error) {
-      const recovery = args.recovery;
-      if (
-        !recovery ||
-        !isCodexArchivedSessionError(recovery.providerId, error)
-      ) {
+      const hint = rejectionHint(error, {
+        providerId: args.proc.providerId,
+        ...(args.recovery === undefined
+          ? {}
+          : { threadId: args.recovery.threadId }),
+      });
+      if (hint === null) {
         throw error;
       }
-
-      options.onStderr?.(
-        `Codex session "${recovery.providerThreadId}" is archived; unarchiving before retrying thread "${recovery.threadId}".`,
-      );
-      let retryProc: ProviderProcess;
-      try {
-        await archiveOrUnarchiveThread({
-          commandType: "thread/unarchive",
-          ...recovery,
-        });
-        // Unarchiving can replace an exited provider process, so resolve the
-        // process again instead of writing to the captured child's stdin.
-        retryProc = requireProviderProcess({
-          processKey: args.proc.processKey,
-          providerId: args.proc.providerId,
-        });
-      } catch (recoveryError) {
-        // The archived-session error names the session and the CLI command
-        // that fixes it, so keep it as the reported failure whenever the
-        // recovery itself could not run.
-        throw new Error(error.message, { cause: recoveryError });
-      }
-
-      return sendJsonRpcRequest({
-        ...request,
-        child: retryProc.child,
-        pending: retryProc.pending,
-      });
+      return await actOnRejection({ ...args, error, hint });
     }
   }
 
-  function resolveProviderForThread(threadId: string): string {
-    return threadIdentityRegistry.resolveProviderForThread(threadId);
+  async function actOnRejection<TResult>(
+    args: RequestRecoveryPolicy<TResult> & {
+      error: unknown;
+      hint: AgentRuntimeProviderRecoveryHint;
+    },
+  ): Promise<TResult> {
+    const { error, hint, recovery } = args;
+    switch (hint.kind) {
+      case "sessionArchived":
+        if (recovery !== undefined && hint.retryable && args.allowUnarchive) {
+          return await unarchiveAndRetryRequest({
+            error,
+            proc: args.proc,
+            recovery,
+            request: args.request,
+          });
+        }
+        throw error;
+      case "rateLimited":
+        if (recovery !== undefined && hint.retryable) {
+          return await retryRateLimitedRequest({
+            allowUnarchive: args.allowUnarchive,
+            error,
+            hint,
+            proc: args.proc,
+            recovery,
+            request: args.request,
+          });
+        }
+        handleRecoveryHint({ hint, proc: args.proc, source: "rejection" });
+        throw toRecoveryError({ cause: error, code: "rate_limited", hint });
+      case "authRequired":
+        handleRecoveryHint({ hint, proc: args.proc, source: "rejection" });
+        throw toRecoveryError({ cause: error, code: "auth_required", hint });
+      case "restartRecommended":
+        handleRecoveryHint({ hint, proc: args.proc, source: "rejection" });
+        throw error;
+      case "staleTurn":
+        throw error;
+    }
   }
 
-  function skillRootsForProvider(
-    providerId: string,
-  ): readonly AgentRuntimeSkillRoot[] {
-    return filterSkillRootsForProvider({
-      providerId,
-      skillRoots,
+  function rejectionHint(
+    error: unknown,
+    scope: { providerId: string; threadId?: string },
+  ): AgentRuntimeProviderRecoveryHint | null {
+    if (!(error instanceof JsonRpcResponseError) || error.recovery === null) {
+      return null;
+    }
+    return { ...scope, ...error.recovery };
+  }
+
+  function toRecoveryError(args: {
+    cause: unknown;
+    code: AgentRuntimeRecoveryError["code"];
+    hint: AgentRuntimeProviderRecoveryHint;
+  }): AgentRuntimeRecoveryError {
+    return new AgentRuntimeRecoveryError({
+      cause: args.cause,
+      code: args.code,
+      message: args.hint.message,
+      recovery: args.hint,
+    });
+  }
+
+  interface RetryableRequestArgs<TResult> {
+    error: unknown;
+    proc: ProviderProcess;
+    recovery: RequestRecoveryArgs;
+    request: SendJsonRpcRequestArgs<TResult>;
+  }
+
+  async function unarchiveAndRetryRequest<TResult>(
+    args: RetryableRequestArgs<TResult>,
+  ): Promise<TResult> {
+    const { error, recovery } = args;
+    options.onStderr?.(
+      `Session "${recovery.providerThreadId}" is archived; unarchiving before retrying thread "${recovery.threadId}".`,
+    );
+    let retryProc: ProviderProcess;
+    try {
+      await archiveOrUnarchiveThread({
+        commandType: "thread/unarchive",
+        ...recovery,
+      });
+      retryProc = providerProcesses.requireProviderProcess({
+        processKey: args.proc.processKey,
+        providerId: args.proc.providerId,
+      });
+    } catch (recoveryError) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(message, { cause: recoveryError });
+    }
+
+    return sendRequestWithRecovery({
+      allowUnarchive: false,
+      proc: retryProc,
+      recovery,
+      request: args.request,
+    });
+  }
+
+  async function retryRateLimitedRequest<TResult>(
+    args: RetryableRequestArgs<TResult> & {
+      allowUnarchive: boolean;
+      hint: AgentRuntimeProviderRecoveryHint;
+    },
+  ): Promise<TResult> {
+    let lastError = args.error;
+    let lastHint = args.hint;
+    for (const retryDelayMs of rateLimitedRetryDelaysMs) {
+      options.onStderr?.(
+        `Provider "${args.recovery.providerId}" is rate limited; retrying thread "${args.recovery.threadId}" in ${retryDelayMs}ms.`,
+      );
+      await delay(retryDelayMs);
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: args.proc.processKey,
+        providerId: args.proc.providerId,
+      });
+      try {
+        return await sendJsonRpcRequest({
+          ...args.request,
+          child: proc.child,
+          pending: proc.pending,
+        });
+      } catch (retryError) {
+        const nextHint = rejectionHint(retryError, {
+          providerId: args.recovery.providerId,
+          threadId: args.recovery.threadId,
+        });
+        if (nextHint === null) {
+          throw retryError;
+        }
+        if (!(nextHint.kind === "rateLimited" && nextHint.retryable)) {
+          return await actOnRejection({
+            allowUnarchive: args.allowUnarchive,
+            error: retryError,
+            hint: nextHint,
+            proc,
+            recovery: args.recovery,
+            request: args.request,
+          });
+        }
+        lastError = retryError;
+        lastHint = nextHint;
+      }
+    }
+    handleRecoveryHint({
+      hint: lastHint,
+      proc: args.proc,
+      source: "rejection",
+    });
+    throw toRecoveryError({
+      cause: lastError,
+      code: "rate_limited",
+      hint: lastHint,
     });
   }
 
@@ -563,14 +706,27 @@ function createAgentRuntimeInternal(
     threadId: string,
     config: ThreadRuntimeConfig,
   ): void {
-    codexThreadsRequiringAccountRestart.delete(threadId);
     threadRuntimeConfigs.set(threadId, config);
   }
 
+  function updateSessionRestoreCapability(
+    threadId: string,
+    sessionRestorable: boolean | undefined,
+  ): void {
+    if (sessionRestorable === undefined) {
+      return;
+    }
+    const current = threadRuntimeConfigs.get(threadId);
+    if (current) {
+      threadRuntimeConfigs.set(threadId, { ...current, sessionRestorable });
+    }
+  }
+
   function clearThreadRuntimeConfig(threadId: string): void {
-    codexThreadsRequiringAccountRestart.delete(threadId);
+    threadsAwaitingBridgeRestart.delete(threadId);
+    threadsRetryingBridgeRestartOnIdle.delete(threadId);
     idleProviderSessionSinceMsByThreadId.delete(threadId);
-    pendingTurnStartThreadIds.delete(threadId);
+    pendingTurnStarts.delete(threadId);
     threadGoalState.clearThread(threadId);
     threadRuntimeConfigs.delete(threadId);
   }
@@ -586,9 +742,31 @@ function createAgentRuntimeInternal(
     const current = threadOperationCounts.get(threadId);
     if (current === undefined || current <= 1) {
       threadOperationCounts.delete(threadId);
+      retryBridgeRestartOnIdle(threadId);
       return;
     }
     threadOperationCounts.set(threadId, current - 1);
+  }
+
+  function retryBridgeRestartOnIdle(threadId: string): void {
+    if (!threadsRetryingBridgeRestartOnIdle.has(threadId)) {
+      return;
+    }
+    queueMicrotask(() => {
+      const hint = threadsAwaitingBridgeRestart.get(threadId);
+      if (hint === undefined) {
+        threadsRetryingBridgeRestartOnIdle.delete(threadId);
+        return;
+      }
+      if (
+        threadHasInFlightOperation(threadId) ||
+        turnState.getActiveTurnId(threadId) !== null
+      ) {
+        return;
+      }
+      threadsRetryingBridgeRestartOnIdle.delete(threadId);
+      scheduleBridgeRestart({ hint, threadId, retryOnIdle: true });
+    });
   }
 
   function threadHasInFlightOperation(threadId: string): boolean {
@@ -606,6 +784,15 @@ function createAgentRuntimeInternal(
     }
   }
 
+  function assertThreadCanStartTurn(threadId: string): void {
+    if (
+      turnState.getActiveTurnId(threadId) !== null ||
+      pendingTurnStarts.has(threadId)
+    ) {
+      throw new CompetingTurnError(threadId);
+    }
+  }
+
   function recordProviderThreadIdentity(
     proc: ProviderProcess,
     threadId: string,
@@ -616,30 +803,6 @@ function createAgentRuntimeInternal(
       threadId,
       providerThreadId,
     });
-  }
-
-  function waitForProviderThreadIdentity(
-    proc: ProviderProcess,
-    threadId: string,
-    timeoutMs: number,
-  ): Promise<string | null> {
-    return threadIdentityRegistry.waitForProviderThreadIdentity({
-      providerState: proc.identity,
-      threadId,
-      timeoutMs,
-    });
-  }
-
-  /**
-   * Removes one thread's runtime state while its provider process keeps
-   * running: identity, execution config, turn state (resolving pending
-   * active-turn waiters with `null`), and replay-filter state.
-   */
-  function forgetThreadRuntimeState(
-    proc: ProviderProcess,
-    threadId: string,
-  ): void {
-    forgetThreadRuntimeStateForProviderState(proc.identity, threadId);
   }
 
   function forgetThreadRuntimeStateForProviderState(
@@ -653,7 +816,7 @@ function createAgentRuntimeInternal(
     clearThreadRuntimeConfig(threadId);
     turnState.clearThread(threadId);
     backgroundWorkState.clearThread(threadId);
-    turnReplayFilter.clearThread(threadId);
+    threadEventGrammar.clearThread(threadId);
   }
 
   function markProviderSessionNotIdle(threadId: string): void {
@@ -664,7 +827,7 @@ function createAgentRuntimeInternal(
     if (
       threadIdentityRegistry.getProviderSession(threadId) === null ||
       turnState.getActiveTurnId(threadId) !== null ||
-      pendingTurnStartThreadIds.has(threadId)
+      pendingTurnStarts.has(threadId)
     ) {
       return;
     }
@@ -675,19 +838,19 @@ function createAgentRuntimeInternal(
 
   function observeProviderSessionIdleState(event: ThreadEvent): void {
     if (event.type === "turn/started") {
-      pendingTurnStartThreadIds.delete(event.threadId);
+      pendingTurnStarts.delete(event.threadId);
       markProviderSessionNotIdle(event.threadId);
       return;
     }
 
     if (event.type === "turn/completed") {
-      pendingTurnStartThreadIds.delete(event.threadId);
+      pendingTurnStarts.delete(event.threadId);
       markHostedProviderSessionIdle(event.threadId);
       return;
     }
 
     if (event.type === "provider/error" && event.willRetry !== true) {
-      pendingTurnStartThreadIds.delete(event.threadId);
+      pendingTurnStarts.delete(event.threadId);
       markHostedProviderSessionIdle(event.threadId);
     }
   }
@@ -697,14 +860,14 @@ function createAgentRuntimeInternal(
   ): ReapIdleProviderSessionCandidate | null {
     if (
       threadHasInFlightOperation(args.threadId) ||
-      pendingTurnStartThreadIds.has(args.threadId) ||
+      pendingTurnStarts.has(args.threadId) ||
       turnState.getActiveTurnId(args.threadId) !== null
     ) {
       return null;
     }
 
     const runtimeConfig = threadRuntimeConfigs.get(args.threadId);
-    if (runtimeConfig?.providerId !== CODEX_PROVIDER_ID) {
+    if (!runtimeConfig?.sessionRestorable) {
       return null;
     }
 
@@ -741,75 +904,170 @@ function createAgentRuntimeInternal(
     return providerThreadId;
   }
 
-  function shouldRestartCodexThreadAfterEvent(
-    event: ThreadEvent,
-    proc: ProviderProcess,
-  ): boolean {
-    if (
-      proc.providerId !== CODEX_PROVIDER_ID ||
-      event.type !== "provider/error" ||
-      event.willRetry === true
-    ) {
-      return false;
+  function handleRecoveryHint(args: {
+    hint: AgentRuntimeProviderRecoveryHint;
+    proc: ProviderProcess;
+    source: "rejection" | "unsolicited";
+  }): void {
+    const { hint } = args;
+    options.onProviderRecovery?.(hint);
+    if (hint.kind === "restartRecommended" && hint.threadId !== undefined) {
+      scheduleBridgeRestart({
+        hint,
+        retryOnIdle: args.source === "unsolicited",
+        threadId: hint.threadId,
+      });
     }
-
-    if (
-      event.errorInfo !== undefined &&
-      CODEX_ACCOUNT_RESTART_PROVIDER_ERROR_CATEGORIES.has(
-        event.errorInfo.category,
-      )
-    ) {
-      return true;
-    }
-
-    const errorText = [event.message, event.detail]
-      .filter((part) => part !== undefined)
-      .join("\n");
-    return CODEX_ACCOUNT_RESTART_PROVIDER_ERROR_TEXT_PATTERN.test(errorText);
   }
 
-  async function restartCodexThreadForNextTurnIfNeeded(
-    args: RestartCodexThreadForNextTurnArgs,
-  ): Promise<void> {
-    if (!codexThreadsRequiringAccountRestart.has(args.threadId)) {
+  function scheduleBridgeRestart(args: {
+    hint: AgentRuntimeProviderRecoveryHint;
+    retryOnIdle: boolean;
+    threadId: string;
+  }): void {
+    if (!threadRuntimeConfigs.has(args.threadId)) {
       return;
     }
-
-    const currentConfig = threadRuntimeConfigs.get(args.threadId);
-    if (!currentConfig || currentConfig.providerId !== CODEX_PROVIDER_ID) {
-      codexThreadsRequiringAccountRestart.delete(args.threadId);
-      return;
-    }
-
+    threadsAwaitingBridgeRestart.set(args.threadId, args.hint);
     if (turnState.getActiveTurnId(args.threadId) !== null) {
       return;
     }
+    if (threadHasInFlightOperation(args.threadId)) {
+      if (args.retryOnIdle) {
+        threadsRetryingBridgeRestartOnIdle.add(args.threadId);
+      }
+      return;
+    }
+    threadsRetryingBridgeRestartOnIdle.delete(args.threadId);
+    void runThreadOperation({
+      threadId: args.threadId,
+      work: async () => {
+        const currentConfig = threadRuntimeConfigs.get(args.threadId);
+        if (!currentConfig) {
+          threadsAwaitingBridgeRestart.delete(args.threadId);
+          return;
+        }
+        await restartThreadBridgeIfRecommended({
+          threadId: args.threadId,
+          options: currentConfig.options,
+          instructions: currentConfig.instructions,
+        });
+      },
+    }).catch((error: unknown) => {
+      options.onStderr?.(
+        `Bridge restart for thread "${args.threadId}" failed: ${error instanceof Error ? error.message : String(error)}`,
+        args.threadId,
+      );
+    });
+  }
 
-    const providerThreadId = requireProviderThreadId(args.threadId);
-    const proc = requireProviderProcess({
+  async function restartThreadBridgeIfRecommended(
+    args: RestartThreadBridgeArgs,
+  ): Promise<void> {
+    const hint = threadsAwaitingBridgeRestart.get(args.threadId);
+    if (hint === undefined) {
+      return;
+    }
+    const currentConfig = threadRuntimeConfigs.get(args.threadId);
+    if (!currentConfig) {
+      threadsAwaitingBridgeRestart.delete(args.threadId);
+      return;
+    }
+    if (turnState.getActiveTurnId(args.threadId) !== null) {
+      return;
+    }
+    const proc = providerProcesses.requireProviderProcess({
       processKey: currentConfig.processKey,
       providerId: currentConfig.providerId,
     });
-    if (!isThreadScopedCodexProcess(proc)) {
-      codexThreadsRequiringAccountRestart.delete(args.threadId);
+    const hostedThreadIds = [...proc.identity.threadIds].filter(
+      (threadId) => threadId !== args.threadId,
+    );
+    const busyThreadId = hostedThreadIds.find(
+      (threadId) =>
+        turnState.getActiveTurnId(threadId) !== null ||
+        pendingTurnStarts.has(threadId) ||
+        threadHasInFlightOperation(threadId) ||
+        backgroundWorkState.hasOpenThreadWork(threadId),
+    );
+    if (busyThreadId !== undefined) {
+      options.onStderr?.(
+        `Deferring the "${currentConfig.providerId}" bridge restart recommended for thread "${args.threadId}": thread "${busyThreadId}" is mid-turn or has open background work on the same process.`,
+        args.threadId,
+      );
       return;
     }
-
-    codexThreadsRequiringAccountRestart.delete(args.threadId);
+    threadsAwaitingBridgeRestart.delete(args.threadId);
+    const providerThreadId = requireProviderThreadId(args.threadId);
+    const hostedSessions = hostedThreadIds.flatMap((threadId) => {
+      const config = threadRuntimeConfigs.get(threadId);
+      const hostedProviderThreadId =
+        threadIdentityRegistry.getProviderThreadId(threadId);
+      return config !== undefined && hostedProviderThreadId !== undefined
+        ? [{ config, providerThreadId: hostedProviderThreadId, threadId }]
+        : [];
+    });
+    options.onStderr?.(
+      `Restarting the "${currentConfig.providerId}" bridge for thread "${args.threadId}": ${hint.message}`,
+      args.threadId,
+    );
     await providerProcesses.shutdownProvider({
       processKey: proc.processKey,
       providerId: proc.providerId,
     });
+    await resumeThreadFromConfig({
+      currentConfig,
+      instructions: args.instructions,
+      options: args.options,
+      providerThreadId,
+      threadId: args.threadId,
+    });
+    for (const hosted of hostedSessions) {
+      if (
+        threadIdentityRegistry.getProviderSession(hosted.threadId) !== null ||
+        threadHasInFlightOperation(hosted.threadId) ||
+        pendingTurnStarts.has(hosted.threadId) ||
+        turnState.getActiveTurnId(hosted.threadId) !== null
+      ) {
+        continue;
+      }
+      try {
+        await resumeThreadFromConfig({
+          currentConfig: hosted.config,
+          instructions: hosted.config.instructions,
+          options: hosted.config.options,
+          providerThreadId: hosted.providerThreadId,
+          threadId: hosted.threadId,
+        });
+      } catch (error) {
+        options.onStderr?.(
+          `Failed to resume thread "${hosted.threadId}" after the bridge restart: ${error instanceof Error ? error.message : String(error)}`,
+          hosted.threadId,
+        );
+      }
+    }
+  }
 
+  async function resumeThreadFromConfig(args: {
+    currentConfig: ThreadRuntimeConfig;
+    instructions: string | undefined;
+    options: AgentRuntimeExecutionOptions;
+    providerThreadId: string;
+    threadId: string;
+  }): Promise<void> {
+    const { currentConfig } = args;
     const resumeInstructions = args.instructions ?? currentConfig.instructions;
     await runtime.resumeThread({
+      bridgeLaunch: currentConfig.bridgeLaunch,
+      skillRoots: currentConfig.skillRoots,
       environmentId: currentConfig.environmentId,
       threadId: args.threadId,
       ...(currentConfig.projectId !== undefined
         ? { projectId: currentConfig.projectId }
         : {}),
-      providerThreadId,
+      providerThreadId: args.providerThreadId,
       providerId: currentConfig.providerId,
+      contributedEnv: currentConfig.contributedEnv,
       options: args.options,
       ...(resumeInstructions !== undefined
         ? { instructions: resumeInstructions }
@@ -817,33 +1075,35 @@ function createAgentRuntimeInternal(
       ...(currentConfig.dynamicTools !== undefined
         ? { dynamicTools: currentConfig.dynamicTools }
         : {}),
-      ...(currentConfig.disallowedTools !== undefined
-        ? { disallowedTools: currentConfig.disallowedTools }
-        : {}),
       instructionMode: currentConfig.instructionMode,
     });
-  }
-
-  function isAcceptedThreadArchiveError(
-    commandType: "thread/archive" | "thread/unarchive",
-    message: string,
-  ): boolean {
-    if (commandType === "thread/archive") {
-      return message.includes("no rollout found for thread id");
-    }
-    return message.includes("no archived rollout found for thread id");
   }
 
   async function archiveOrUnarchiveThread(
     args: ArchiveOrUnarchiveThreadArgs,
   ): Promise<void> {
     const { commandType, providerId, providerThreadId, threadId } = args;
+    const threadConfig = threadRuntimeConfigs.get(threadId);
+    const bridgeLaunch = args.bridgeLaunch ?? threadConfig?.bridgeLaunch;
+    if (bridgeLaunch === undefined) {
+      throw new Error(
+        `Cannot ${commandType} thread "${threadId}" on "${providerId}": the thread has no live session and the request carried no bridge launch`,
+      );
+    }
     const processKey =
-      threadRuntimeConfigs.get(threadId)?.processKey ??
-      resolveProviderProcessKey({ providerId, threadId });
-    await providerProcesses.ensureProvider({ processKey, providerId });
-    const proc = requireProviderProcess({ processKey, providerId });
-    if (!proc.adapter.capabilities.supportsArchive) {
+      threadConfig?.processKey ??
+      resolveProviderProcessKey({ bridgeLaunch, providerId });
+    await providerProcesses.ensureProvider({
+      processKey,
+      providerId,
+      bridgeLaunch,
+      skillRoots: threadConfig?.skillRoots,
+    });
+    const proc = providerProcesses.requireProviderProcess({
+      processKey,
+      providerId,
+    });
+    if (!proc.adapter.capabilities.supportsThreadArchive) {
       throw new Error(
         `Provider "${providerId}" does not support thread archive.`,
       );
@@ -859,248 +1119,165 @@ function createAgentRuntimeInternal(
       plan: proc.adapter.buildCommandPlan(adapterCommand),
       providerId,
     });
-    try {
-      await sendCommand({
-        proc,
-        message: cmd,
-        resultSchema: ignoredJsonRpcResultSchema,
-      });
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        isAcceptedThreadArchiveError(commandType, error.message)
-      ) {
-        // Codex archive/unarchive is not idempotent at the protocol layer;
-        // duplicate-state errors mean the requested final state is already
-        // reached from bb's perspective.
-      } else {
-        throw error;
-      }
-    }
-    emitAcceptedCommandEvents({
-      command: adapterCommand,
+    await sendCommand({
       proc,
-      sourceThreadId: threadId,
+      message: cmd,
+      resultSchema: ignoredJsonRpcResultSchema,
     });
     if (commandType === "thread/archive") {
-      // An archived thread is no longer live in the runtime; the next turn
-      // must resume it (after unarchive) instead of reusing stale state.
-      forgetThreadRuntimeState(proc, threadId);
+      forgetThreadRuntimeStateForProviderState(proc.identity, threadId);
     }
-    await shutdownThreadScopedCodexProcessIfIdle(proc);
+    await releaseIdleProviderProcess(proc);
   }
 
-  function isCodexArchivedSessionError(
-    providerId: string,
-    error: unknown,
-  ): error is Error {
-    return (
-      providerId === CODEX_PROVIDER_ID &&
-      error instanceof Error &&
-      CODEX_ARCHIVED_SESSION_ERROR_PATTERN.test(error.message)
-    );
-  }
-
-  async function reconfigureThreadIfNeeded(
-    args: ReconfigureThreadIfNeededArgs,
-  ): Promise<void> {
+  function recordThreadExecutionOptions(
+    args: RecordThreadExecutionOptionsArgs,
+  ): void {
     const currentConfig = threadRuntimeConfigs.get(args.threadId);
     if (!currentConfig) {
       return;
     }
-
-    const nextOptions = args.options;
-
-    // Instructions are frozen for the life of a provider session: drifted
-    // instructions (memory catalog, AGENTS.md edits, plugin dynamic
-    // instructions) must never force a thread/resume, because a resume can
-    // replace the live CLI session and kill its running background tasks.
-    // Fresh instructions apply when the next session is constructed.
-    const proc = requireProviderProcess({
-      processKey: currentConfig.processKey,
-      providerId: currentConfig.providerId,
+    setThreadRuntimeConfig(args.threadId, {
+      ...currentConfig,
+      options: args.options,
     });
-    const settingsChange = proc.adapter.classifyExecutionSettingsChange({
-      current: currentConfig.options,
-      next: nextOptions,
+  }
+
+  function environmentRecordsEqual(
+    left: Readonly<Record<string, string>>,
+    right: Readonly<Record<string, string>>,
+  ): boolean {
+    const leftEntries = Object.entries(left);
+    const rightEntries = Object.entries(right);
+    return (
+      leftEntries.length === rightEntries.length &&
+      leftEntries.every(([name, value]) => right[name] === value)
+    );
+  }
+
+  function emitResolvedProviderEnvironment(args: {
+    droppedContributions: DroppedThreadEnvironmentContribution[];
+    entries: ResolvedThreadEnvironmentEntry[];
+    providerThreadId: string;
+    threadId: string;
+  }): void {
+    options.onEvent({
+      type: "provider.env-resolved",
+      threadId: args.threadId,
+      providerThreadId: args.providerThreadId,
+      entries: args.entries,
+      scope: { kind: "thread" },
     });
-    if (settingsChange !== "session") {
-      // Live settings ride on the next turn command; record them without
-      // replacing the session (which would kill its background tasks).
-      setThreadRuntimeConfig(args.threadId, {
-        ...currentConfig,
-        options: nextOptions,
+    for (const contribution of args.droppedContributions) {
+      options.onEvent({
+        type: "provider/warning",
+        threadId: args.threadId,
+        providerThreadId: args.providerThreadId,
+        category: "config",
+        summary: `Dropped environment variable "${contribution.name}" from plugin "${contribution.plugin}".`,
+        details:
+          "BB_SERVER_URL is unavailable, so its serverPath contribution was not applied.",
+        scope: { kind: "thread" },
       });
-      return;
     }
+  }
 
-    const providerSkillRoots = currentConfig.skillRoots;
-    const envVars = buildThreadShellEnvironment({
+  function resolveRuntimeThreadEnvironment(args: {
+    contributedEnv: readonly AgentRuntimeContributedEnvEntry[];
+    environmentId: string;
+    projectId?: string;
+    threadId: string;
+  }): {
+    droppedContributions: DroppedThreadEnvironmentContribution[];
+    envVars: Record<string, string>;
+    entries: ResolvedThreadEnvironmentEntry[];
+  } {
+    return resolveThreadEnvironment({
       baseShellEnv: options.shellEnv,
-      environmentId: currentConfig.environmentId,
-      projectId: currentConfig.projectId,
+      contributedEnv: args.contributedEnv,
+      environmentId: args.environmentId,
+      projectId: args.projectId,
       threadStoragePath: resolveThreadStoragePath({
         options,
         threadId: args.threadId,
       }),
       threadId: args.threadId,
     });
-
-    const adapterCommand: AdapterCommand = {
-      type: "thread/resume",
-      threadId: args.threadId,
-      cwd: currentConfig.workspacePath,
-      providerThreadId: requireProviderThreadId(args.threadId),
-      options: toProviderExecutionContext({
-        envVars,
-        execOpts: nextOptions,
-        instructions: currentConfig.instructions,
-        skillRoots: providerSkillRoots,
-      }),
-      dynamicTools: currentConfig.dynamicTools,
-      disallowedTools: currentConfig.disallowedTools,
-      instructionMode: currentConfig.instructionMode,
-    };
-    const plan = proc.adapter.buildCommandPlan(adapterCommand);
-    if (plan.kind === "request") {
-      const result = await sendCommand({
-        proc,
-        message: plan,
-        resultSchema: threadIdentityResultSchema,
-        recovery: {
-          providerId: currentConfig.providerId,
-          providerThreadId: adapterCommand.providerThreadId,
-          threadId: args.threadId,
-        },
-      });
-      const providerThreadId = resolveThreadIdentityResult({
-        result,
-        threadId: args.threadId,
-      });
-      if (providerThreadId) {
-        recordProviderThreadIdentity(proc, args.threadId, providerThreadId);
-      }
-      emitAcceptedCommandEvents({
-        command: adapterCommand,
-        proc,
-        ...(providerThreadId !== undefined ? { providerThreadId } : {}),
-        sourceThreadId: args.threadId,
-      });
-    }
-
-    setThreadRuntimeConfig(args.threadId, {
-      ...currentConfig,
-      options: nextOptions,
-    });
-  }
-
-  function handleJsonRpcResponse(args: RuntimeJsonRpcResponseArgs): void {
-    settleJsonRpcResponse({
-      id: args.parsedId,
-      pending: args.proc.pending,
-      response: args.parsed,
-    });
   }
 
   function emitTranslatedEvents(args: EmitTranslatedEventsArgs): void {
     for (const event of args.events) {
-      if (event.type !== "thread/identity" || !event.providerThreadId) {
-        continue;
-      }
-
-      if (args.proc.identity.threadIds.has(event.threadId)) {
-        recordProviderThreadIdentity(
-          args.proc,
-          event.threadId,
-          event.providerThreadId,
-        );
-        continue;
-      }
-
-      const bbThreadId =
-        threadIdentityRegistry.resolvePendingProviderThreadIdentity(
-          args.proc.identity,
-        );
-      if (bbThreadId) {
-        recordProviderThreadIdentity(
-          args.proc,
-          bbThreadId,
-          event.providerThreadId,
-        );
-      }
-    }
-
-    for (const event of args.events) {
+      const scope = {
+        eventThreadId: event.threadId,
+        providerState: args.proc.identity,
+        sourceThreadId: args.sourceThreadId,
+      };
       const resolvedBbThreadId =
-        threadIdentityRegistry.resolveProviderEventThreadId({
-          eventThreadId: event.threadId,
-          providerState: args.proc.identity,
-          sourceThreadId: args.sourceThreadId,
-        });
+        event.type === "thread/identity"
+          ? threadIdentityRegistry.resolveProviderIdentityThreadId(scope)
+          : threadIdentityRegistry.resolveProviderEventThreadId(scope);
 
-      const targetThreadIds = resolvedBbThreadId ? [resolvedBbThreadId] : [];
-
-      if (targetThreadIds.length === 0) {
+      if (!resolvedBbThreadId) {
         options.onStderr?.(
           `Dropping unscoped provider event ${event.type}; no bb thread could be resolved`,
         );
         continue;
       }
+      const targetThreadId = resolvedBbThreadId;
 
-      for (const targetThreadId of targetThreadIds) {
-        if (suppressedThreadEventIds.has(targetThreadId)) {
-          continue;
-        }
-        const stampedEvent = stampThreadEventScope({
-          event,
-          providerThreadId:
-            threadIdentityRegistry.getProviderThreadId(targetThreadId),
-          threadId: targetThreadId,
-        });
-
-        const replayResult = turnReplayFilter.observe(stampedEvent);
-        if (replayResult.kind === "drop-replayed-turn-start") {
-          options.onStderr?.(
-            `Dropping replayed turn/started on already completed turn "${replayResult.turnId}" in thread "${replayResult.threadId}".`,
-          );
-          continue;
-        }
-
-        const normalizedEvent = normalizeProviderThreadNameEvent(
-          replayResult.event,
-        );
-        turnState.observe(normalizedEvent);
-        backgroundWorkState.observe(normalizedEvent);
-        observeProviderSessionIdleState(normalizedEvent);
-        if (shouldRestartCodexThreadAfterEvent(normalizedEvent, args.proc)) {
-          codexThreadsRequiringAccountRestart.add(normalizedEvent.threadId);
-        }
-        options.onEvent(normalizedEvent);
-        threadGoalState.observe(normalizedEvent);
+      if (suppressedThreadEventIds.has(targetThreadId)) {
+        continue;
       }
-    }
-  }
+      if (event.type === "thread/identity" && event.providerThreadId) {
+        recordProviderThreadIdentity(
+          args.proc,
+          targetThreadId,
+          event.providerThreadId,
+        );
+      }
+      const stampedEvent = stampThreadEventScope({
+        event,
+        providerThreadId:
+          threadIdentityRegistry.getProviderThreadId(targetThreadId),
+        threadId: targetThreadId,
+      });
 
-  function emitAcceptedCommandEvents(
-    args: EmitAcceptedCommandEventsArgs,
-  ): void {
-    const events = args.proc.adapter.translateAcceptedCommand({
-      command: args.command,
-      ...(args.providerThreadId !== undefined
-        ? { providerThreadId: args.providerThreadId }
-        : {}),
-    });
-    if (events.length === 0) {
-      return;
+      const grammarResult = threadEventGrammar.observe(stampedEvent);
+      if (grammarResult.kind === "violation") {
+        options.onStderr?.(
+          `Dropping ${stampedEvent.type} from provider "${args.proc.providerId}" in thread "${targetThreadId}" (${grammarResult.rule}): ${grammarResult.reason}.`,
+        );
+        continue;
+      }
+
+      const normalizedEvent = normalizeProviderThreadNameEvent(stampedEvent);
+      if (
+        normalizedEvent.type === "turn/completed" &&
+        normalizedEvent.scope.kind === "turn"
+      ) {
+        toolCalls.cancelThread(targetThreadId, normalizedEvent.scope.turnId);
+      }
+      turnState.observe(normalizedEvent);
+      backgroundWorkState.observe(normalizedEvent);
+      observeProviderSessionIdleState(normalizedEvent);
+      options.onEvent(normalizedEvent);
+      threadGoalState.observe(normalizedEvent);
     }
-    emitTranslatedEvents({
-      events,
-      proc: args.proc,
-      sourceThreadId: args.sourceThreadId,
-    });
   }
 
   function handleProviderNotification(args: RuntimeParsedMessageArgs): void {
+    if (args.parsed.method === PROVIDER_TOOL_CALL_CANCELLED_METHOD) {
+      const cancellation = providerToolCallCancellationSchema.safeParse(
+        args.parsed.params,
+      );
+      if (cancellation.success) {
+        toolCalls.cancel(
+          args.proc.interactiveRequestScope,
+          cancellation.data.requestId,
+        );
+      }
+      return;
+    }
     const sourceThreadId = getJsonRpcStringParam(args.parsed, "threadId");
     if (
       sourceThreadId !== undefined &&
@@ -1108,10 +1285,26 @@ function createAgentRuntimeInternal(
     ) {
       return;
     }
+    const recoveryHint = args.proc.adapter.decodeRecoveryHint?.(args.parsed);
+    if (recoveryHint !== null && recoveryHint !== undefined) {
+      if (
+        recoveryHint.threadId !== undefined &&
+        !args.proc.identity.threadIds.has(recoveryHint.threadId)
+      ) {
+        options.onStderr?.(
+          `Dropping provider/recovery ${recoveryHint.kind} from "${args.proc.providerId}": it names thread "${recoveryHint.threadId}", which that process does not host.`,
+        );
+        return;
+      }
+      handleRecoveryHint({
+        hint: { providerId: args.proc.providerId, ...recoveryHint },
+        proc: args.proc,
+        source: "unsolicited",
+      });
+      return;
+    }
     emitTranslatedEvents({
-      events: args.proc.adapter.translateEvent(args.parsed, {
-        threadId: sourceThreadId,
-      }),
+      events: args.proc.adapter.translateEvent(args.parsed),
       proc: args.proc,
       sourceThreadId,
     });
@@ -1128,10 +1321,10 @@ function createAgentRuntimeInternal(
     }
 
     if (parsedLine.kind === "response") {
-      handleJsonRpcResponse({
-        parsed: parsedLine.parsed,
-        parsedId: parsedLine.parsedId,
-        proc,
+      settleJsonRpcResponse({
+        id: parsedLine.parsedId,
+        pending: proc.pending,
+        response: parsedLine.parsed,
       });
       return;
     }
@@ -1143,6 +1336,7 @@ function createAgentRuntimeInternal(
           threadRuntimeConfigs.get(threadId)?.options,
         onInteractiveRequest: options.onInteractiveRequest,
         onToolCall: options.onToolCall,
+        toolCalls,
         parsedId: parsedLine.parsedId,
         parsedMethod: parsedLine.parsedMethod,
         providerProcess: proc,
@@ -1156,19 +1350,11 @@ function createAgentRuntimeInternal(
       return;
     }
 
-    // The runtime does NOT interpret notification content — it delegates
-    // entirely to the adapter's translateEvent. Each adapter knows its
-    // own wire format (codex sends direct notifications, bridges wrap
-    // SDK messages in sdk/message envelopes, etc.).
     handleProviderNotification({
       parsed: parsedLine.parsed,
       proc,
     });
   }
-
-  // -------------------------------------------------------------------------
-  // Public API
-  // -------------------------------------------------------------------------
 
   function schedulePreparedThreadRewindCleanup(
     leaseId: string,
@@ -1238,7 +1424,7 @@ function createAgentRuntimeInternal(
     const cleanup = (async () => {
       let proc: ProviderProcess;
       try {
-        proc = requireProviderProcess({
+        proc = providerProcesses.requireProviderProcess({
           processKey: prepared.processKey,
           providerId: prepared.providerId,
         });
@@ -1269,10 +1455,13 @@ function createAgentRuntimeInternal(
         return;
       }
 
-      forgetThreadRuntimeState(proc, prepared.stagingThreadId);
+      forgetThreadRuntimeStateForProviderState(
+        proc.identity,
+        prepared.stagingThreadId,
+      );
       finishPreparedThreadRewindCleanup(leaseId, prepared);
       try {
-        await shutdownThreadScopedCodexProcessIfIdle(proc);
+        await releaseIdleProviderProcess(proc);
       } catch (error) {
         options.onStderr?.(
           `Failed to stop the idle provider after discarding staged rewind ${leaseId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -1293,15 +1482,20 @@ function createAgentRuntimeInternal(
   }
 
   const runtime: AgentRuntime = {
-    async ensureProvider({ providerId, forThreadId, acpLaunchSpec }) {
+    async ensureProvider({
+      providerId,
+      bridgeLaunch,
+      skillRoots: sessionSkillRoots = skillRoots,
+    }) {
       await providerProcesses.ensureProvider({
         processKey: resolveProviderProcessKey({
-          ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+          bridgeLaunch,
           providerId,
-          ...(forThreadId !== undefined ? { threadId: forThreadId } : {}),
+          skillRoots: sessionSkillRoots,
         }),
         providerId,
-        ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+        bridgeLaunch,
+        skillRoots: sessionSkillRoots,
       });
     },
 
@@ -1310,79 +1504,71 @@ function createAgentRuntimeInternal(
       threadId,
       projectId,
       providerId,
-      acpLaunchSpec,
+      bridgeLaunch,
+      skillRoots: sessionSkillRoots = skillRoots,
+      contributedEnv = [],
       clientRequestId,
       input,
-      inputGroups,
       options: execOpts,
       instructions,
       dynamicTools,
-      disallowedTools,
       instructionMode = "append",
-      outputSchema,
       fork,
     }) {
       return runThreadOperation({
         threadId,
         work: async () => {
           const processKey = resolveProviderProcessKey({
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
             providerId,
-            threadId,
+            skillRoots: sessionSkillRoots,
           });
           await runtime.ensureProvider({
             providerId,
-            forThreadId: threadId,
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
+            skillRoots: sessionSkillRoots,
           });
 
-          const proc = requireProviderProcess({ processKey, providerId });
-          const effectiveExecOpts = normalizeExecutionOptions({
-            adapter: proc.adapter,
-            options: execOpts,
+          const proc = providerProcesses.requireProviderProcess({
+            processKey,
+            providerId,
           });
-          const providerSkillRoots = skillRootsForProvider(providerId);
           assertProviderSupportsExecutionOptions({
             adapter: proc.adapter,
-            options: effectiveExecOpts,
+            options: execOpts,
             providerId,
+          });
+          const resolvedEnvironment = resolveRuntimeThreadEnvironment({
+            contributedEnv,
+            environmentId,
+            projectId,
+            threadId,
           });
           threadIdentityRegistry.registerThreadProvider({
             providerId,
             providerState: proc.identity,
-            shouldWaitForProviderIdentity: true,
             threadId,
           });
           setThreadRuntimeConfig(threadId, {
+            bridgeLaunch,
+            skillRoots: sessionSkillRoots,
+            contributedEnv,
             dynamicTools,
-            disallowedTools,
             environmentId,
+            envVars: resolvedEnvironment.envVars,
             instructionMode,
             instructions,
-            options: effectiveExecOpts,
+            options: execOpts,
             processKey,
             projectId,
             providerId,
-            skillRoots: providerSkillRoots,
-            workspacePath: options.workspacePath,
-          });
-
-          const envVars = buildThreadShellEnvironment({
-            baseShellEnv: options.shellEnv,
-            environmentId,
-            projectId,
-            threadStoragePath: resolveThreadStoragePath({
-              options,
-              threadId,
-            }),
-            threadId,
+            sessionRestorable: false,
           });
 
           const providerExecutionContext = toProviderExecutionContext({
-            envVars,
-            execOpts: effectiveExecOpts,
+            envVars: resolvedEnvironment.envVars,
+            execOpts,
             instructions,
-            skillRoots: providerSkillRoots,
           });
           const adapterCommand: AdapterCommand = fork
             ? {
@@ -1390,9 +1576,14 @@ function createAgentRuntimeInternal(
                 threadId,
                 cwd: options.workspacePath,
                 sourceProviderThreadId: fork.sourceProviderThreadId,
+                ...(fork.sourceProviderCheckpointId !== undefined
+                  ? {
+                      sourceProviderCheckpointId:
+                        fork.sourceProviderCheckpointId,
+                    }
+                  : {}),
                 options: providerExecutionContext,
                 dynamicTools,
-                disallowedTools,
                 instructionMode,
               }
             : {
@@ -1401,56 +1592,46 @@ function createAgentRuntimeInternal(
                 cwd: options.workspacePath,
                 options: providerExecutionContext,
                 dynamicTools,
-                disallowedTools,
                 instructionMode,
-                ...(outputSchema !== undefined ? { outputSchema } : {}),
               };
-          const cmd = requireProviderRequestPlan({
-            commandType: adapterCommand.type,
-            plan: proc.adapter.buildCommandPlan(adapterCommand),
-            providerId,
-          });
-
-          const result = await sendCommand({
-            proc,
-            message: cmd,
-            resultSchema: threadIdentityResultSchema,
-            timeoutMs: THREAD_CREATION_REQUEST_TIMEOUT_MS,
-            // A fork reads the source session, so an archived source fails the
-            // same way a resume does. A plain start has no session to unarchive.
-            ...(fork
-              ? {
-                  recovery: {
-                    providerId,
-                    providerThreadId: fork.sourceProviderThreadId,
-                    threadId,
-                  },
-                }
-              : {}),
-          });
-          const providerThreadId = resolveThreadIdentityResult({
-            result,
-            threadId,
-          });
-          if (providerThreadId) {
-            recordProviderThreadIdentity(proc, threadId, providerThreadId);
-          }
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
-            proc,
-            ...(providerThreadId !== undefined ? { providerThreadId } : {}),
-            sourceThreadId: threadId,
-          });
-
-          const resolved = await waitForProviderThreadIdentity(
-            proc,
-            threadId,
-            5000,
-          );
-          if (!resolved) {
-            throw new Error(
-              `Provider "${providerId}" did not return a providerThreadId for thread "${threadId}" within 5 seconds`,
+          let resolved: string;
+          try {
+            const cmd = requireProviderRequestPlan({
+              commandType: adapterCommand.type,
+              plan: proc.adapter.buildCommandPlan(adapterCommand),
+              providerId,
+            });
+            const result = await sendCommand({
+              proc,
+              message: cmd,
+              resultSchema: threadIdentityResultSchema,
+              timeoutMs: threadCreationRequestTimeoutMs,
+              ...(fork
+                ? {
+                    recovery: {
+                      providerId,
+                      providerThreadId: fork.sourceProviderThreadId,
+                      threadId,
+                    },
+                  }
+                : {}),
+            });
+            updateSessionRestoreCapability(threadId, result.sessionRestorable);
+            recordProviderThreadIdentity(
+              proc,
+              threadId,
+              result.providerThreadId,
             );
+            resolved = result.providerThreadId;
+            emitResolvedProviderEnvironment({
+              droppedContributions: resolvedEnvironment.droppedContributions,
+              entries: resolvedEnvironment.entries,
+              providerThreadId: resolved,
+              threadId,
+            });
+          } catch (startError) {
+            await abandonFailedSessionConstruction({ proc, threadId });
+            throw startError;
           }
 
           if (input && input.length > 0) {
@@ -1462,9 +1643,9 @@ function createAgentRuntimeInternal(
             await runtime.runTurn({
               threadId,
               input,
-              ...(inputGroups !== undefined ? { inputGroups } : {}),
               clientRequestId,
-              options: effectiveExecOpts,
+              options: execOpts,
+              contributedEnv,
               instructions,
             });
           }
@@ -1481,19 +1662,18 @@ function createAgentRuntimeInternal(
       leaseId,
       projectId,
       providerId,
+      contributedEnv = [],
       sourceProviderThreadId,
       retainThroughProviderCheckpoint,
-      acpLaunchSpec,
+      bridgeLaunch,
+      skillRoots: sessionSkillRoots = skillRoots,
       options: execOpts,
       instructions,
       dynamicTools,
-      disallowedTools,
       instructionMode = "append",
     }) {
       const existing = stagedThreadRewinds.get(leaseId);
       if (existing !== undefined) {
-        // The server mints a fresh lease per attempt, so a duplicate can only
-        // be a replay of this exact request; return the same staged fork.
         return existing.state === "preparing"
           ? existing.promise
           : { providerThreadId: existing.providerThreadId };
@@ -1503,49 +1683,44 @@ function createAgentRuntimeInternal(
         threadId,
         work: async () => {
           const processKey = resolveProviderProcessKey({
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
             providerId,
-            threadId,
+            skillRoots: sessionSkillRoots,
           });
           await runtime.ensureProvider({
             providerId,
-            forThreadId: threadId,
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
+            skillRoots: sessionSkillRoots,
           });
-          const proc = requireProviderProcess({ processKey, providerId });
+          const proc = providerProcesses.requireProviderProcess({
+            processKey,
+            providerId,
+          });
           if (!proc.adapter.capabilities.supportsFork) {
             throw new Error(
               `Preparing a thread rewind is not supported by ${providerId}`,
             );
           }
-          const providerSkillRoots = skillRootsForProvider(providerId);
           assertProviderSupportsExecutionOptions({
             adapter: proc.adapter,
             options: execOpts,
             providerId,
           });
 
-          // The lease id is a server-minted UUID, so it is safe inside
-          // identities that provider adapters may turn into filesystem keys.
           const stagingThreadId = `${threadId}:rewind:${leaseId}`;
           suppressedThreadEventIds.add(stagingThreadId);
           threadIdentityRegistry.registerThreadProvider({
             providerId,
             providerState: proc.identity,
-            shouldWaitForProviderIdentity: true,
             threadId: stagingThreadId,
           });
           let retainedForDiscard = false;
           let providerThreadIdForCleanup: string | undefined;
           try {
-            const envVars = buildThreadShellEnvironment({
-              baseShellEnv: options.shellEnv,
+            const resolvedEnvironment = resolveRuntimeThreadEnvironment({
+              contributedEnv,
               environmentId,
               projectId,
-              threadStoragePath: resolveThreadStoragePath({
-                options,
-                threadId,
-              }),
               threadId,
             });
             const adapterCommand: AdapterCommand = {
@@ -1555,13 +1730,11 @@ function createAgentRuntimeInternal(
               sourceProviderThreadId,
               sourceProviderCheckpointId: retainThroughProviderCheckpoint,
               options: toProviderExecutionContext({
-                envVars,
+                envVars: resolvedEnvironment.envVars,
                 execOpts,
                 instructions,
-                skillRoots: providerSkillRoots,
               }),
               dynamicTools,
-              disallowedTools,
               instructionMode,
             };
             const command = requireProviderRequestPlan({
@@ -1573,25 +1746,16 @@ function createAgentRuntimeInternal(
               proc,
               message: command,
               resultSchema: threadIdentityResultSchema,
-              timeoutMs: THREAD_CREATION_REQUEST_TIMEOUT_MS,
+              timeoutMs: threadCreationRequestTimeoutMs,
+              recovery: {
+                bridgeLaunch,
+                providerId,
+                providerThreadId: sourceProviderThreadId,
+                threadId: stagingThreadId,
+              },
             });
-            // An ambiguous threadId is not sufficient to adopt a provider
-            // thread, but it is safe to use for best-effort cleanup because
-            // the BB staging id is unique to this rewind operation.
-            providerThreadIdForCleanup =
-              result.providerThreadId ??
-              result.thread?.id ??
-              result.threadId ??
-              undefined;
-            const providerThreadId = resolveThreadIdentityResult({
-              result,
-              threadId: stagingThreadId,
-            });
-            if (!providerThreadId) {
-              throw new Error(
-                `${providerId} did not return a provider thread for rewind lease ${leaseId}`,
-              );
-            }
+            const providerThreadId = result.providerThreadId;
+            providerThreadIdForCleanup = providerThreadId;
             recordProviderThreadIdentity(
               proc,
               stagingThreadId,
@@ -1630,6 +1794,11 @@ function createAgentRuntimeInternal(
                     `Failed to discard unretained staged rewind ${leaseId}: ${error instanceof Error ? error.message : String(error)}`,
                   );
                 }
+              } else {
+                await releaseThreadOnBridgeBestEffort({
+                  proc,
+                  threadId: stagingThreadId,
+                });
               }
               suppressedThreadEventIds.delete(stagingThreadId);
               threadIdentityRegistry.forgetThread({
@@ -1665,72 +1834,79 @@ function createAgentRuntimeInternal(
       projectId,
       providerThreadId,
       providerId,
-      acpLaunchSpec,
+      bridgeLaunch,
+      skillRoots: sessionSkillRoots = skillRoots,
+      contributedEnv = [],
       options: execOpts,
       instructions,
       dynamicTools,
-      disallowedTools,
       instructionMode = "append",
     }) {
       return runThreadOperation({
         threadId,
         work: async () => {
           const processKey = resolveProviderProcessKey({
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
             providerId,
-            threadId,
+            skillRoots: sessionSkillRoots,
           });
           await runtime.ensureProvider({
             providerId,
-            forThreadId: threadId,
-            ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
+            bridgeLaunch,
+            skillRoots: sessionSkillRoots,
           });
 
-          const proc = requireProviderProcess({ processKey, providerId });
-          const effectiveExecOpts = normalizeExecutionOptions({
-            adapter: proc.adapter,
-            options: execOpts,
+          const proc = providerProcesses.requireProviderProcess({
+            processKey,
+            providerId,
           });
-          const providerSkillRoots = skillRootsForProvider(providerId);
           assertProviderSupportsExecutionOptions({
             adapter: proc.adapter,
-            options: effectiveExecOpts,
+            options: execOpts,
             providerId,
+          });
+          if (providerThreadId !== undefined) {
+            const ownerThreadId =
+              threadIdentityRegistry.resolveBbThreadIdForProviderThread({
+                providerState: proc.identity,
+                providerThreadId,
+              });
+            if (ownerThreadId !== undefined && ownerThreadId !== threadId) {
+              throw new Error(
+                `Cannot resume thread "${threadId}" on "${providerId}": provider thread "${providerThreadId}" is already hosted by thread "${ownerThreadId}"`,
+              );
+            }
+          }
+          const resolvedEnvironment = resolveRuntimeThreadEnvironment({
+            contributedEnv,
+            environmentId,
+            projectId,
+            threadId,
           });
           threadIdentityRegistry.registerThreadProvider({
             providerId,
             providerState: proc.identity,
-            shouldWaitForProviderIdentity: providerThreadId === undefined,
             threadId,
           });
           setThreadRuntimeConfig(threadId, {
+            bridgeLaunch,
+            skillRoots: sessionSkillRoots,
+            contributedEnv,
             dynamicTools,
-            disallowedTools,
             environmentId,
+            envVars: resolvedEnvironment.envVars,
             instructionMode,
             instructions,
-            options: effectiveExecOpts,
+            options: execOpts,
             processKey,
             projectId,
             providerId,
-            skillRoots: providerSkillRoots,
-            workspacePath: options.workspacePath,
+            sessionRestorable: false,
           });
 
           if (providerThreadId) {
             recordProviderThreadIdentity(proc, threadId, providerThreadId);
           }
-
-          const envVars = buildThreadShellEnvironment({
-            baseShellEnv: options.shellEnv,
-            environmentId,
-            projectId,
-            threadStoragePath: resolveThreadStoragePath({
-              options,
-              threadId,
-            }),
-            threadId,
-          });
 
           const adapterCommand: AdapterCommand = {
             type: "thread/resume",
@@ -1739,58 +1915,56 @@ function createAgentRuntimeInternal(
             providerThreadId:
               providerThreadId ?? requireProviderThreadId(threadId),
             options: toProviderExecutionContext({
-              envVars,
-              execOpts: effectiveExecOpts,
+              envVars: resolvedEnvironment.envVars,
+              execOpts,
               instructions,
-              skillRoots: providerSkillRoots,
             }),
             dynamicTools,
-            disallowedTools,
             instructionMode,
           };
           const plan = proc.adapter.buildCommandPlan(adapterCommand);
           if (plan.kind === "noop") {
-            const currentProviderThreadId =
-              providerThreadId ??
-              threadIdentityRegistry.getProviderThreadId(threadId);
-            if (!currentProviderThreadId) {
-              throw new Error(
-                `No provider thread id available for ${threadId}`,
-              );
-            }
-            return { providerThreadId: currentProviderThreadId };
-          }
-          const cmd = plan;
-
-          const result = await sendCommand({
-            proc,
-            message: cmd,
-            resultSchema: threadIdentityResultSchema,
-            recovery: {
-              providerId,
+            emitResolvedProviderEnvironment({
+              droppedContributions: resolvedEnvironment.droppedContributions,
+              entries: resolvedEnvironment.entries,
               providerThreadId: adapterCommand.providerThreadId,
               threadId,
-            },
-          });
-          const resolvedId =
-            resolveThreadIdentityResult({ result, threadId }) ??
-            providerThreadId ??
-            threadIdentityRegistry.getProviderThreadId(threadId);
-          if (!resolvedId) {
-            throw new Error(
-              `Provider resume did not return a thread id for ${threadId}`,
-            );
+            });
+            return { providerThreadId: adapterCommand.providerThreadId };
           }
-          recordProviderThreadIdentity(proc, threadId, resolvedId);
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
-            proc,
-            providerThreadId: resolvedId,
-            sourceThreadId: threadId,
-          });
 
+          let resolved: string;
+          try {
+            const result = await sendCommand({
+              proc,
+              message: plan,
+              resultSchema: threadIdentityResultSchema,
+              timeoutMs: threadCreationRequestTimeoutMs,
+              recovery: {
+                providerId,
+                providerThreadId: adapterCommand.providerThreadId,
+                threadId,
+              },
+            });
+            recordProviderThreadIdentity(
+              proc,
+              threadId,
+              result.providerThreadId,
+            );
+            updateSessionRestoreCapability(threadId, result.sessionRestorable);
+            resolved = result.providerThreadId;
+            emitResolvedProviderEnvironment({
+              droppedContributions: resolvedEnvironment.droppedContributions,
+              entries: resolvedEnvironment.entries,
+              providerThreadId: resolved,
+              threadId,
+            });
+          } catch (resumeError) {
+            await abandonFailedSessionConstruction({ proc, threadId });
+            throw resumeError;
+          }
           markHostedProviderSessionIdle(threadId);
-          return { providerThreadId: resolvedId };
+          return { providerThreadId: resolved };
         },
       });
     },
@@ -1798,48 +1972,59 @@ function createAgentRuntimeInternal(
     async runTurn({
       threadId,
       input,
-      inputGroups,
       clientRequestId,
       options: execOpts,
+      contributedEnv,
       instructions,
     }) {
       return runThreadOperation({
         threadId,
         work: async () => {
-          const pid = resolveProviderForThread(threadId);
-          const currentProc = requireProviderProcessForThread(threadId);
-          const effectiveExecOpts = normalizeExecutionOptions({
-            adapter: currentProc.adapter,
-            options: execOpts,
-          });
-          await restartCodexThreadForNextTurnIfNeeded({
+          const pid = threadIdentityRegistry.resolveProviderForThread(threadId);
+          requireProviderProcessForThread(threadId);
+          assertThreadCanStartTurn(threadId);
+          await restartThreadBridgeIfRecommended({
             threadId,
-            options: effectiveExecOpts,
+            options: execOpts,
             instructions,
           });
-          // An account restart replaces a thread-scoped Codex process, so
-          // resolve the process again before constructing the turn command.
           const proc = requireProviderProcessForThread(threadId);
           assertProviderSupportsExecutionOptions({
             adapter: proc.adapter,
-            options: effectiveExecOpts,
+            options: execOpts,
             providerId: pid,
           });
-          await reconfigureThreadIfNeeded({
+          const currentConfig = threadRuntimeConfigs.get(threadId);
+          if (!currentConfig) {
+            throw new Error(`No runtime configuration for thread ${threadId}`);
+          }
+          const resolvedContributedEnv =
+            contributedEnv ?? currentConfig.contributedEnv;
+          const resolvedEnvironment = resolveRuntimeThreadEnvironment({
+            contributedEnv: resolvedContributedEnv,
+            environmentId: currentConfig.environmentId,
+            projectId: currentConfig.projectId,
             threadId,
-            options: effectiveExecOpts,
+          });
+          const environmentChanged = !environmentRecordsEqual(
+            currentConfig.envVars,
+            resolvedEnvironment.envVars,
+          );
+          recordThreadExecutionOptions({
+            threadId,
+            options: execOpts,
           });
 
+          const providerThreadId = requireProviderThreadId(threadId);
           const adapterCommand: AdapterCommand = {
             type: "turn/start",
             threadId,
-            providerThreadId: requireProviderThreadId(threadId),
+            providerThreadId,
             input,
-            ...(inputGroups !== undefined ? { inputGroups } : {}),
             clientRequestId,
             options: toProviderExecutionContext({
-              envVars: {},
-              execOpts: effectiveExecOpts,
+              envVars: resolvedEnvironment.envVars,
+              execOpts,
               instructions,
             }),
           };
@@ -1848,9 +2033,11 @@ function createAgentRuntimeInternal(
             plan: proc.adapter.buildCommandPlan(adapterCommand),
             providerId: pid,
           });
-          const preparedTurnStart =
-            proc.adapter.prepareTurnStart(adapterCommand);
-          pendingTurnStartThreadIds.add(threadId);
+          assertThreadCanStartTurn(threadId);
+          pendingTurnStarts.set(threadId, {
+            sinceMs: Date.now(),
+            watchdogFired: false,
+          });
           markProviderSessionNotIdle(threadId);
           try {
             await sendCommand({
@@ -1863,17 +2050,25 @@ function createAgentRuntimeInternal(
                 threadId,
               },
             });
+            setThreadRuntimeConfig(threadId, {
+              ...currentConfig,
+              contributedEnv: resolvedContributedEnv,
+              envVars: resolvedEnvironment.envVars,
+              options: execOpts,
+            });
+            if (environmentChanged) {
+              emitResolvedProviderEnvironment({
+                droppedContributions: resolvedEnvironment.droppedContributions,
+                entries: resolvedEnvironment.entries,
+                providerThreadId,
+                threadId,
+              });
+            }
           } catch (error) {
-            pendingTurnStartThreadIds.delete(threadId);
+            pendingTurnStarts.delete(threadId);
             markHostedProviderSessionIdle(threadId);
-            preparedTurnStart?.rollback();
             throw error;
           }
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
-            proc,
-            sourceThreadId: threadId,
-          });
         },
       });
     },
@@ -1882,23 +2077,19 @@ function createAgentRuntimeInternal(
       threadId,
       expectedTurnId,
       input,
-      inputGroups,
       clientRequestId,
       options: execOpts,
+      contributedEnv,
       instructions,
     }) {
       return runThreadOperation({
         threadId,
         work: async () => {
-          const pid = resolveProviderForThread(threadId);
+          const pid = threadIdentityRegistry.resolveProviderForThread(threadId);
           const currentProc = requireProviderProcessForThread(threadId);
-          const effectiveExecOpts = normalizeExecutionOptions({
-            adapter: currentProc.adapter,
-            options: execOpts,
-          });
           assertProviderSupportsExecutionOptions({
             adapter: currentProc.adapter,
-            options: effectiveExecOpts,
+            options: execOpts,
             providerId: pid,
           });
 
@@ -1913,30 +2104,44 @@ function createAgentRuntimeInternal(
             };
           }
 
-          await restartCodexThreadForNextTurnIfNeeded({
+          await restartThreadBridgeIfRecommended({
             threadId,
-            options: effectiveExecOpts,
+            options: execOpts,
             instructions,
           });
-          // An account restart replaces a thread-scoped Codex process, so
-          // resolve the process again before constructing the steer command.
           const proc = requireProviderProcessForThread(threadId);
-          await reconfigureThreadIfNeeded({
+          const currentConfig = threadRuntimeConfigs.get(threadId);
+          if (!currentConfig) {
+            throw new Error(`No runtime configuration for thread ${threadId}`);
+          }
+          const resolvedContributedEnv =
+            contributedEnv ?? currentConfig.contributedEnv;
+          const resolvedEnvironment = resolveRuntimeThreadEnvironment({
+            contributedEnv: resolvedContributedEnv,
+            environmentId: currentConfig.environmentId,
+            projectId: currentConfig.projectId,
             threadId,
-            options: effectiveExecOpts,
+          });
+          const environmentChanged = !environmentRecordsEqual(
+            currentConfig.envVars,
+            resolvedEnvironment.envVars,
+          );
+          recordThreadExecutionOptions({
+            threadId,
+            options: execOpts,
           });
 
+          const providerThreadId = requireProviderThreadId(threadId);
           const adapterCommand: AdapterCommand = {
             type: "turn/steer",
             threadId,
-            providerThreadId: requireProviderThreadId(threadId),
+            providerThreadId,
             expectedTurnId,
             input,
-            ...(inputGroups !== undefined ? { inputGroups } : {}),
             clientRequestId,
             options: toProviderExecutionContext({
-              envVars: {},
-              execOpts: effectiveExecOpts,
+              envVars: resolvedEnvironment.envVars,
+              execOpts,
               instructions,
             }),
           };
@@ -1956,33 +2161,52 @@ function createAgentRuntimeInternal(
                 threadId,
               },
             });
+            setThreadRuntimeConfig(threadId, {
+              ...currentConfig,
+              contributedEnv: resolvedContributedEnv,
+              envVars: resolvedEnvironment.envVars,
+              options: execOpts,
+            });
+            if (environmentChanged) {
+              emitResolvedProviderEnvironment({
+                droppedContributions: resolvedEnvironment.droppedContributions,
+                entries: resolvedEnvironment.entries,
+                providerThreadId,
+                threadId,
+              });
+            }
           } catch (error) {
             if (
               error instanceof JsonRpcResponseError &&
-              isAcpProviderId(pid) &&
-              error.code === ACP_BRIDGE_NO_ACTIVE_TURN_ERROR_CODE
+              error.recovery?.kind === "staleTurn"
+            ) {
+              options.onStderr?.(
+                `Dropping stale steer for thread "${threadId}": ${error.recovery.message}`,
+                threadId,
+              );
+              turnState.clearThread(threadId);
+              return { status: "stale", activeTurnId: null };
+            }
+            if (
+              error instanceof JsonRpcResponseError &&
+              error.code === BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN
             ) {
               turnState.clearThread(threadId);
-              proc.adapter.clearActiveTurnState?.(threadId);
               return { status: "stale", activeTurnId: null };
             }
             throw error;
           }
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
-            proc,
-            sourceThreadId: threadId,
-          });
           return { status: "steered" };
         },
       });
     },
 
     async stopThread({ threadId }) {
+      toolCalls.cancelThread(threadId);
       return runThreadOperation({
         threadId,
         work: async () => {
-          const pid = resolveProviderForThread(threadId);
+          const pid = threadIdentityRegistry.resolveProviderForThread(threadId);
           const proc = requireProviderProcessForThread(threadId);
           const providerThreadId = requireProviderThreadId(threadId);
           const activeTurnId = turnState.getActiveTurnId(threadId);
@@ -2000,8 +2224,8 @@ function createAgentRuntimeInternal(
                 `Adapter "${pid}" returned no provider request for thread/stop with active turn: ${cmd.reason}`,
               );
             }
-            forgetThreadRuntimeState(proc, threadId);
-            await shutdownThreadScopedCodexProcessIfIdle(proc);
+            forgetThreadRuntimeStateForProviderState(proc.identity, threadId);
+            await releaseIdleProviderProcess(proc);
             return { providerCheckpointId: null };
           }
 
@@ -2010,13 +2234,8 @@ function createAgentRuntimeInternal(
             message: cmd,
             resultSchema: providerThreadStopResultSchema,
           });
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
-            proc,
-            sourceThreadId: threadId,
-          });
-          forgetThreadRuntimeState(proc, threadId);
-          await shutdownThreadScopedCodexProcessIfIdle(proc);
+          forgetThreadRuntimeStateForProviderState(proc.identity, threadId);
+          await releaseIdleProviderProcess(proc);
           return {
             providerCheckpointId: result.providerCheckpointId ?? null,
           };
@@ -2028,7 +2247,7 @@ function createAgentRuntimeInternal(
       return runThreadOperation({
         threadId,
         work: async () => {
-          const pid = resolveProviderForThread(threadId);
+          const pid = threadIdentityRegistry.resolveProviderForThread(threadId);
           const proc = requireProviderProcessForThread(threadId);
           const adapterCommand: AdapterCommand = {
             type: "thread/goal/clear",
@@ -2066,9 +2285,9 @@ function createAgentRuntimeInternal(
       return runThreadOperation({
         threadId,
         work: async () => {
-          const pid = resolveProviderForThread(threadId);
+          const pid = threadIdentityRegistry.resolveProviderForThread(threadId);
           const proc = requireProviderProcessForThread(threadId);
-          if (!proc.adapter.capabilities.supportsRename) {
+          if (!proc.adapter.capabilities.supportsThreadRename) {
             throw new Error(
               `Provider "${pid}" does not support thread rename.`,
             );
@@ -2085,32 +2304,31 @@ function createAgentRuntimeInternal(
             plan: proc.adapter.buildCommandPlan(adapterCommand),
             providerId: pid,
           });
-          await sendRenameWithRolloutRetries({
-            onStderr: options.onStderr,
-            providerId: pid,
-            send: async () => {
-              await sendCommand({
-                proc,
-                message: cmd,
-                resultSchema: ignoredJsonRpcResultSchema,
-              });
-            },
-            threadId,
-          });
-          emitAcceptedCommandEvents({
-            command: adapterCommand,
+          await sendCommand({
             proc,
-            sourceThreadId: threadId,
+            message: cmd,
+            resultSchema: ignoredJsonRpcResultSchema,
+            recovery: {
+              providerId: pid,
+              providerThreadId: adapterCommand.providerThreadId,
+              threadId,
+            },
           });
         },
       });
     },
 
-    async archiveThread({ threadId, providerId, providerThreadId }) {
+    async archiveThread({
+      threadId,
+      providerId,
+      providerThreadId,
+      bridgeLaunch,
+    }) {
       return runThreadOperation({
         threadId,
         work: async () => {
           await archiveOrUnarchiveThread({
+            bridgeLaunch,
             commandType: "thread/archive",
             providerId,
             providerThreadId,
@@ -2120,11 +2338,17 @@ function createAgentRuntimeInternal(
       });
     },
 
-    async unarchiveThread({ threadId, providerId, providerThreadId }) {
+    async unarchiveThread({
+      threadId,
+      providerId,
+      providerThreadId,
+      bridgeLaunch,
+    }) {
       return runThreadOperation({
         threadId,
         work: async () => {
           await archiveOrUnarchiveThread({
+            bridgeLaunch,
             commandType: "thread/unarchive",
             providerId,
             providerThreadId,
@@ -2134,16 +2358,10 @@ function createAgentRuntimeInternal(
       });
     },
 
-    async listModels({ providerId, acpLaunchSpec, cwd }) {
-      await runtime.ensureProvider({
-        providerId,
-        ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
-      });
-      const proc = requireProviderProcess({
-        processKey: resolveProviderProcessKey({
-          ...(acpLaunchSpec !== undefined ? { acpLaunchSpec } : {}),
-          providerId,
-        }),
+    async listModels({ providerId, bridgeLaunch, cwd }) {
+      await runtime.ensureProvider({ providerId, bridgeLaunch });
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: resolveProviderProcessKey({ bridgeLaunch, providerId }),
         providerId,
       });
       const command = requireProviderRequestPlan({
@@ -2160,6 +2378,97 @@ function createAgentRuntimeInternal(
         resultSchema: ignoredJsonRpcResultSchema,
       });
       return proc.adapter.parseModelListResult(result);
+    },
+
+    async providerHealth({ providerId, bridgeLaunch, cwd }) {
+      await runtime.ensureProvider({ providerId, bridgeLaunch });
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: resolveProviderProcessKey({ bridgeLaunch, providerId }),
+        providerId,
+      });
+      const plan = proc.adapter.buildCommandPlan({
+        type: "provider/health",
+        ...(cwd !== undefined ? { cwd } : {}),
+      });
+      if (plan.kind === "noop") {
+        return { supported: false };
+      }
+      return await sendCommand({
+        proc,
+        message: plan,
+        resultSchema: providerHealthResultSchema,
+      });
+    },
+
+    async providerUsage({ providerId, bridgeLaunch, cwd }) {
+      await runtime.ensureProvider({ providerId, bridgeLaunch });
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: resolveProviderProcessKey({ bridgeLaunch, providerId }),
+        providerId,
+      });
+      const plan = proc.adapter.buildCommandPlan({
+        type: "provider/usage",
+        ...(cwd !== undefined ? { cwd } : {}),
+      });
+      if (plan.kind === "noop") {
+        return { supported: false };
+      }
+      return await sendCommand({
+        proc,
+        message: plan,
+        resultSchema: providerUsageResultSchema,
+      });
+    },
+
+    async providerInstallationStatus({
+      providerId,
+      bridgeLaunch,
+      cwd,
+      requirement,
+      checkUpdates = true,
+    }) {
+      await runtime.ensureProvider({ providerId, bridgeLaunch });
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: resolveProviderProcessKey({ bridgeLaunch, providerId }),
+        providerId,
+      });
+      const plan = requireProviderRequestPlan({
+        commandType: "provider/installation/status",
+        plan: proc.adapter.buildCommandPlan({
+          type: "provider/installation/status",
+          checkUpdates,
+          ...(cwd !== undefined ? { cwd } : {}),
+          ...(requirement !== undefined ? { requirement } : {}),
+        }),
+        providerId,
+      });
+      return await sendCommand({
+        proc,
+        message: plan,
+        resultSchema: providerInstallationStatusSchema,
+      });
+    },
+
+    async providerInstallationRun({ providerId, bridgeLaunch, cwd, action }) {
+      await runtime.ensureProvider({ providerId, bridgeLaunch });
+      const proc = providerProcesses.requireProviderProcess({
+        processKey: resolveProviderProcessKey({ bridgeLaunch, providerId }),
+        providerId,
+      });
+      const plan = requireProviderRequestPlan({
+        commandType: "provider/installation/run",
+        plan: proc.adapter.buildCommandPlan({
+          type: "provider/installation/run",
+          action,
+          ...(cwd !== undefined ? { cwd } : {}),
+        }),
+        providerId,
+      });
+      return await sendCommand({
+        proc,
+        message: plan,
+        resultSchema: providerInstallationRunResultSchema,
+      });
     },
 
     listRunningProviders() {
@@ -2181,39 +2490,54 @@ function createAgentRuntimeInternal(
       return threadIdentityRegistry.getProviderSession(threadId);
     },
 
-    async reapIdleProviderSessions({ idleForMs, nowMs }) {
+    async reapIdleProviderSessions({ idleForMs, nowMs, runThreadExclusive }) {
       const reapedSessions: ReapedIdleProviderSession[] = [];
       for (const threadId of [...threadRuntimeConfigs.keys()]) {
-        const candidate = findReapableIdleProviderSession({
-          idleForMs,
-          nowMs,
-          threadId,
-        });
-        if (!candidate) {
-          continue;
-        }
-
-        let proc: ProviderProcess;
-        try {
-          proc = requireProviderProcess({
-            processKey: candidate.runtimeConfig.processKey,
-            providerId: candidate.runtimeConfig.providerId,
+        const release = async (): Promise<ReapedIdleProviderSession | null> => {
+          const candidate = findReapableIdleProviderSession({
+            idleForMs,
+            nowMs,
+            threadId,
           });
-        } catch {
-          continue;
-        }
-        if (!isThreadScopedCodexProcess(proc)) {
-          continue;
-        }
+          if (!candidate) {
+            return null;
+          }
 
-        forgetThreadRuntimeState(proc, candidate.threadId);
-        await shutdownThreadScopedCodexProcessIfIdle(proc);
-        reapedSessions.push({
-          idleForMs: Math.max(0, nowMs - candidate.idleSinceMs),
-          providerId: candidate.runtimeConfig.providerId,
-          providerThreadId: candidate.providerThreadId,
-          threadId: candidate.threadId,
-        });
+          try {
+            providerProcesses.requireProviderProcess({
+              processKey: candidate.runtimeConfig.processKey,
+              providerId: candidate.runtimeConfig.providerId,
+            });
+          } catch {
+            return null;
+          }
+          if (backgroundWorkState.hasOpenThreadWork(candidate.threadId)) {
+            return null;
+          }
+
+          try {
+            await runtime.stopThread({ threadId: candidate.threadId });
+          } catch (error) {
+            options.onStderr?.(
+              `Provider session release failed for ${candidate.threadId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return null;
+          }
+          return {
+            idleForMs: Math.max(0, nowMs - candidate.idleSinceMs),
+            providerId: candidate.runtimeConfig.providerId,
+            providerThreadId: candidate.providerThreadId,
+            threadId: candidate.threadId,
+          };
+        };
+        const reaped = runThreadExclusive
+          ? await runThreadExclusive(threadId, release)
+          : await release();
+        if (reaped) {
+          reapedSessions.push(reaped);
+        }
       }
 
       return { reapedSessions };
@@ -2227,7 +2551,7 @@ function createAgentRuntimeInternal(
       return [
         ...new Set([
           ...turnState.getActiveThreadIds(),
-          ...pendingTurnStartThreadIds,
+          ...pendingTurnStarts.keys(),
         ]),
       ];
     },
@@ -2237,18 +2561,19 @@ function createAgentRuntimeInternal(
     },
 
     async shutdown() {
+      clearInterval(turnStartWatchdogTimer);
       await Promise.all(
         [...stagedThreadRewinds.keys()].map((leaseId) =>
           discardStagedThreadRewind(leaseId),
         ),
       );
       idleProviderSessionSinceMsByThreadId.clear();
-      pendingTurnStartThreadIds.clear();
+      pendingTurnStarts.clear();
       threadOperationCounts.clear();
       threadGoalState.clear();
       turnState.clear();
       backgroundWorkState.clear();
-      turnReplayFilter.clear();
+      threadEventGrammar.clear();
       await providerProcesses.shutdown();
     },
   };

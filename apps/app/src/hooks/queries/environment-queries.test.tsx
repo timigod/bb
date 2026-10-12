@@ -10,11 +10,12 @@ import { environmentPullRequestQueryKey } from "./query-keys";
 import {
   getEnvironmentPullRequestRefetchInterval,
   getEnvironmentPullRequestStaleTime,
+  useEnvironmentMergeBaseBranches,
   useEnvironmentPullRequest,
 } from "./environment-queries";
 
 vi.mock("@/lib/sdk", () => ({
-  sdk: { environments: { pullRequest: vi.fn() } },
+  sdk: { environments: { pullRequest: vi.fn(), diffBranches: vi.fn() } },
 }));
 
 vi.mock("@/hooks/useRealtimeSubscription", () => ({
@@ -24,7 +25,7 @@ vi.mock("@/hooks/useRealtimeSubscription", () => ({
 const ENVIRONMENT_ID = "env-1";
 const ACTIVE_PULL_REQUEST_STALE_MS = 30_000;
 const SETTLED_PULL_REQUEST_STALE_MS = 60 * 60_000;
-const ACTIVE_PULL_REQUEST_REFETCH_MS = 5_000;
+const ACTIVE_PULL_REQUEST_REFETCH_MS = 30_000;
 
 const pullRequestFixture: ThreadPullRequest = {
   number: 128,
@@ -34,6 +35,8 @@ const pullRequestFixture: ThreadPullRequest = {
   baseRefName: "main",
   headRefName: "bb/pr-refresh",
   updatedAt: "2026-06-16T12:30:00Z",
+  autoMerge: false,
+  inMergeQueue: false,
   checks: {
     state: "passing",
     totalCount: 1,
@@ -134,6 +137,26 @@ describe("useEnvironmentPullRequest", () => {
     ).toBe(ACTIVE_PULL_REQUEST_REFETCH_MS);
   });
 
+  it.each([
+    { autoMerge: true, inMergeQueue: false },
+    { autoMerge: false, inMergeQueue: true },
+  ])("keeps polling automated merges after checks pass: %j", (automation) => {
+    expect(
+      getEnvironmentPullRequestRefetchInterval({
+        ...pullRequestFixture,
+        ...automation,
+      }),
+    ).toBe(ACTIVE_PULL_REQUEST_REFETCH_MS);
+    expect(
+      getEnvironmentPullRequestRefetchInterval({
+        ...pullRequestFixture,
+        ...automation,
+        state: "merged",
+        attention: "merged",
+      }),
+    ).toBe(false);
+  });
+
   it("does not poll draft or settled pull requests", () => {
     expect(
       getEnvironmentPullRequestRefetchInterval({
@@ -163,7 +186,7 @@ describe("useEnvironmentPullRequest", () => {
     ).toBe(false);
   });
 
-  it("refetches stale pull request data on mount and always refetches on window focus", async () => {
+  it("refetches on mount and refreshes stale data on window focus", async () => {
     const { wrapper, queryClient } = createQueryClientTestHarness();
     vi.mocked(sdk.environments.pullRequest).mockResolvedValue(
       pullRequestResponse(pullRequestFixture),
@@ -181,11 +204,70 @@ describe("useEnvironmentPullRequest", () => {
 
     expect(query?.options).toEqual(
       expect.objectContaining({
-        refetchOnMount: true,
-        refetchOnWindowFocus: "always",
+        refetchOnMount: "always",
+        refetchOnWindowFocus: true,
         refetchInterval: expect.any(Function),
         staleTime: expect.any(Function),
       }),
     );
+  });
+
+  it("refreshes a cached closed PR when its row returns after missing a realtime update", async () => {
+    const { wrapper } = createQueryClientTestHarness();
+    const closed = pullRequestResponse({
+      ...pullRequestFixture,
+      state: "closed",
+    });
+    const reopened = pullRequestResponse(pullRequestFixture);
+    vi.mocked(sdk.environments.pullRequest)
+      .mockResolvedValueOnce(closed)
+      .mockResolvedValueOnce(reopened);
+
+    const first = renderHook(() => useEnvironmentPullRequest(ENVIRONMENT_ID), {
+      wrapper,
+    });
+    await waitFor(() => expect(first.result.current.data).toEqual(closed));
+    expect(first.result.current.isStale).toBe(false);
+    first.unmount();
+
+    const returned = renderHook(
+      () => useEnvironmentPullRequest(ENVIRONMENT_ID),
+      { wrapper },
+    );
+    await waitFor(() => expect(returned.result.current.data).toEqual(reopened));
+    expect(sdk.environments.pullRequest).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useEnvironmentMergeBaseBranches", () => {
+  it("only requests the query a typist settles on", async () => {
+    const { wrapper } = createQueryClientTestHarness();
+    vi.mocked(sdk.environments.diffBranches).mockResolvedValue({
+      branches: ["main"],
+      branchesTruncated: false,
+      remoteBranches: [],
+      remoteBranchesTruncated: false,
+      selectedBranch: null,
+    });
+    const { rerender } = renderHook(
+      ({ query }: { query: string }) =>
+        useEnvironmentMergeBaseBranches(ENVIRONMENT_ID, { query }),
+      { wrapper, initialProps: { query: "" } },
+    );
+    await waitFor(() =>
+      expect(sdk.environments.diffBranches).toHaveBeenCalledTimes(1),
+    );
+
+    for (const query of ["m", "ma", "mai"]) {
+      rerender({ query });
+    }
+    rerender({ query: "main" });
+
+    await waitFor(() =>
+      expect(sdk.environments.diffBranches).toHaveBeenCalledWith(
+        expect.objectContaining({ query: "main" }),
+      ),
+    );
+    expect(sdk.environments.diffBranches).toHaveBeenCalledTimes(2);
   });
 });

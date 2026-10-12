@@ -1,33 +1,46 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExperimentKey } from "@bb/domain";
 import { ExperimentsSettingsSection } from "./SettingsView";
 
 afterEach(cleanup);
 
-function renderSection(overrides?: {
-  onNewOnboardingEnabledChange?: (enabled: boolean) => void;
-}) {
+function renderSection(
+  onExperimentChange: (key: ExperimentKey, enabled: boolean) => void,
+  performanceDiagnosticsAvailable = true,
+) {
   return render(
     <ExperimentsSettingsSection
-      claudeCodeMockCliTrafficEnabled={false}
       disabled={false}
-      editMessagesEnabled={false}
-      newOnboardingEnabled={false}
-      onClaudeCodeMockCliTrafficEnabledChange={vi.fn()}
-      onEditMessagesEnabledChange={vi.fn()}
-      onNewOnboardingEnabledChange={
-        overrides?.onNewOnboardingEnabledChange ?? vi.fn()
-      }
+      performanceDiagnosticsAvailable={performanceDiagnosticsAvailable}
+      experiments={{
+        changelogPreview: false,
+        serverMove: false,
+        performanceDiagnostics: false,
+      }}
+      onExperimentChange={onExperimentChange}
     />,
   );
 }
 
 describe("ExperimentsSettingsSection", () => {
-  it("reports new onboarding changes", () => {
+  it("hides performance diagnostics when startup permission is absent", () => {
+    renderSection(vi.fn(), false);
+    expect(
+      screen.queryByLabelText("Server performance diagnostics"),
+    ).toBeNull();
+    expect(screen.getByLabelText("Changelog preview")).toBeTruthy();
+    expect(screen.getByLabelText("Server move")).toBeTruthy();
+  });
+
+  it.each([
+    ["Changelog preview", "changelogPreview"],
+    ["Server performance diagnostics", "performanceDiagnostics"],
+  ])("reports %s changes", (label, key) => {
     const onChange = vi.fn();
-    renderSection({ onNewOnboardingEnabledChange: onChange });
-    fireEvent.click(screen.getByLabelText("New onboarding"));
-    expect(onChange).toHaveBeenCalledWith(true);
+    renderSection(onChange);
+    fireEvent.click(screen.getByLabelText(label));
+    expect(onChange).toHaveBeenCalledWith(key, true);
   });
 });

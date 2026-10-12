@@ -1,16 +1,18 @@
-// Regenerates src/runtime-export-manifest.ts from the repo's installed
-// shared-runtime packages. `bb plugin build` shims the shared-runtime modules
-// (react, the portaling radix families, sonner, vaul, ...) as ESM re-exports
-// over globalThis.__bbPluginRuntime, and ESM needs static named-export lists —
-// so we introspect the real modules once and check the result in. Rerun this
-// script after upgrading react or any shimmed package:
+// Regenerates src/generated/runtime-export-manifest.generated.ts from the
+// repo's installed shared-runtime packages. `bb plugin build` shims the
+// shared-runtime modules (react, the portaling radix families, sonner, vaul,
+// ...) as ESM re-exports over globalThis.__bbPluginRuntime, and ESM needs
+// static named-export lists — so we introspect the real modules once. The
+// output is not committed: turbo runs this as `@bb/plugin-build#generate`
+// (see turbo.json) before every task that resolves this package's sources.
 //
-//   node packages/plugin-build/scripts/generate-runtime-export-manifest.mjs
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+//   node packages/plugin-build/scripts/generate-runtime-export-manifest.mjs [--out <path>]
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
+import { RUNTIME_SHIM_NPM_SPECIFIERS } from "../src/runtime-shims.mjs";
 
 // Node 20 does not expose the browser-compatible Navigator global added in
 // later Node releases. Some shared browser runtimes (currently @pierre/diffs)
@@ -30,34 +32,46 @@ const appRequire = createRequire(
   path.join(scriptDir, "..", "..", "..", "apps", "app", "package.json"),
 );
 
-const RUNTIME_MODULE_IDS = [
-  "react",
-  "react-dom",
-  "react-dom/client",
-  "react/jsx-runtime",
-  "react/jsx-dev-runtime",
-  // Portaling radix families (plugin design §5.5): shimmed so vendored
-  // components share the host's dismissable-layer/focus/scroll-lock world.
-  // Non-portal radix has no singleton semantics and bundles per plugin.
-  "@radix-ui/react-alert-dialog",
-  "@radix-ui/react-context-menu",
-  "@radix-ui/react-dialog",
-  "@radix-ui/react-dropdown-menu",
-  "@radix-ui/react-hover-card",
-  "@radix-ui/react-menubar",
-  "@radix-ui/react-navigation-menu",
-  "@radix-ui/react-popover",
-  "@radix-ui/react-select",
-  "@radix-ui/react-tooltip",
-  // toast() must reach the host toaster; vaul mutates document.body styles.
-  "sonner",
-  "vaul",
-  // Diff rendering: FileDiff reads the host's WorkerPoolContextProvider
-  // (React context identity requires one module copy) and sharing keeps
-  // shiki's grammars out of plugin bundles.
-  "@pierre/diffs",
-  "@pierre/diffs/react",
-];
+// The shimmed npm modules, from the same list `bb plugin build` shims
+// (src/runtime-shims.mjs) so the manifest can never miss a slot.
+const RUNTIME_MODULE_IDS = RUNTIME_SHIM_NPM_SPECIFIERS;
+
+/**
+ * Workspace TypeScript modules exposed as slots. Not requireable, so their
+ * export lists come from esbuild metadata like the SDK facade's.
+ */
+const RUNTIME_SOURCE_MODULES = {
+  "@bb/shared-ui/question-form-host": path.join(
+    scriptDir,
+    "..",
+    "..",
+    "shared-ui",
+    "src",
+    "components",
+    "ui",
+    "question-form-host.tsx",
+  ),
+  "@bb/shared-ui/voice-input-textarea": path.join(
+    scriptDir,
+    "..",
+    "..",
+    "shared-ui",
+    "src",
+    "components",
+    "ui",
+    "voice-input-textarea.tsx",
+  ),
+  "@bb/shared-ui/icon": path.join(
+    scriptDir,
+    "..",
+    "..",
+    "shared-ui",
+    "src",
+    "components",
+    "ui",
+    "icon.tsx",
+  ),
+};
 
 const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
@@ -111,15 +125,8 @@ async function namedExportsOf(moduleId) {
     .sort();
 }
 
-async function pluginSdkAppExports() {
-  const entryPoint = path.join(
-    scriptDir,
-    "..",
-    "..",
-    "plugin-sdk",
-    "src",
-    "app.ts",
-  );
+/** Named JS exports of a TypeScript source module, per esbuild metadata. */
+async function sourceModuleExports(entryPoint) {
   const result = await build({
     entryPoints: [entryPoint],
     bundle: false,
@@ -142,51 +149,60 @@ async function pluginSdkAppExports() {
 
 const reactVersion = appRequire("react/package.json").version;
 const entryChunks = [];
-entryChunks.push(
-  `  "@bb/plugin-sdk/app": [\n${(await pluginSdkAppExports())
-    .map((name) => `    ${JSON.stringify(name)},`)
-    .join("\n")}\n  ],`,
-);
-for (const id of RUNTIME_MODULE_IDS) {
-  const names = await namedExportsOf(id);
+function pushEntry(id, names) {
   entryChunks.push(
     `  ${JSON.stringify(id)}: [\n${names
       .map((name) => `    ${JSON.stringify(name)},`)
       .join("\n")}\n  ],`,
   );
 }
+pushEntry(
+  "@get-bb/plugin-sdk/app",
+  await sourceModuleExports(
+    path.join(scriptDir, "..", "..", "plugin-sdk", "src", "app.ts"),
+  ),
+);
+for (const id of RUNTIME_MODULE_IDS) {
+  pushEntry(id, await namedExportsOf(id));
+}
+for (const [id, entryPoint] of Object.entries(RUNTIME_SOURCE_MODULES)) {
+  pushEntry(id, await sourceModuleExports(entryPoint));
+}
 const entries = entryChunks.join("\n");
 
 const output = `// GENERATED FILE — do not edit by hand.
 // Named exports of the plugin SDK app facade and shared runtime modules
-// (react@${reactVersion} + the shimmed radix/sonner/vaul packages), derived
-// from SDK source/build metadata and the host app's installed copies.
+// (react@${reactVersion}, the shimmed radix/sonner/vaul/pierre packages, the
+// host-resident clsx/tailwind-merge/cva libraries, and the shared-ui icon
+// module), derived from SDK source/build metadata and the host app's
+// installed copies.
 // Consumed by
 // \`bb plugin build\` to emit static ESM re-export shims over
-// globalThis.__bbPluginRuntime. Regenerate after upgrading a shimmed package:
-//   node packages/plugin-build/scripts/generate-runtime-export-manifest.mjs
+// globalThis.__bbPluginRuntime. Generated by
+//   packages/plugin-build/scripts/generate-runtime-export-manifest.mjs
 
 export const RUNTIME_EXPORT_MANIFEST: Record<string, readonly string[]> = {
 ${entries}
 };
 `;
 
-const outPath = path.join(scriptDir, "..", "src", "runtime-export-manifest.ts");
-if (process.argv.includes("--check")) {
-  const current = await readFile(outPath, "utf8").catch(() => "");
-  if (current !== output) {
-    throw new Error(
-      `${outPath} is stale; run node packages/plugin-build/scripts/generate-runtime-export-manifest.mjs`,
-    );
-  }
-  console.log(`checked ${outPath} (react@${reactVersion})`);
-} else {
-  const tempPath = `${outPath}.${process.pid}.tmp`;
-  try {
-    await writeFile(tempPath, output);
-    await rename(tempPath, outPath);
-  } finally {
-    await rm(tempPath, { force: true });
-  }
-  console.log(`wrote ${outPath} (react@${reactVersion})`);
+const outFlagIndex = process.argv.indexOf("--out");
+const outPath =
+  outFlagIndex === -1
+    ? path.join(
+        scriptDir,
+        "..",
+        "src",
+        "generated",
+        "runtime-export-manifest.generated.ts",
+      )
+    : path.resolve(process.argv[outFlagIndex + 1]);
+await mkdir(path.dirname(outPath), { recursive: true });
+const tempPath = `${outPath}.${process.pid}.tmp`;
+try {
+  await writeFile(tempPath, output);
+  await rename(tempPath, outPath);
+} finally {
+  await rm(tempPath, { force: true });
 }
+console.log(`wrote ${outPath} (react@${reactVersion})`);

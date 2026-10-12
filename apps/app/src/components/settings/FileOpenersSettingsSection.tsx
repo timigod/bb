@@ -13,24 +13,20 @@ import {
 } from "@/components/ui/settings-section";
 import { COARSE_POINTER_ICON_SIZE_CLASS } from "@bb/shared-ui/coarse-pointer-sizing";
 import {
+  BUILT_IN_FILE_OPENER_PREFERENCE,
   buildFileOpenerRef,
-  resolvePreferredFileOpener,
   useFileOpenerPreference,
 } from "@/lib/file-opener-preference";
 import { usePluginSlots, type PluginFileOpenerSlot } from "@/lib/plugin-slots";
 import { cn } from "@bb/shared-ui/lib/utils";
+import {
+  SETTINGS_DROPDOWN_CONTENT_CLASS,
+  SETTINGS_DROPDOWN_TRIGGER_CLASS,
+} from "./settings-dropdown";
 
-const DROPDOWN_TRIGGER_CLASS =
-  "h-7 w-full justify-between border-border/60 bg-card px-2 text-xs sm:w-44";
-const DROPDOWN_CONTENT_CLASS =
-  "min-w-[var(--radix-dropdown-menu-trigger-width)]";
+const AUTOMATIC_FILE_OPENER_PREFERENCE = "__automatic__";
+const BUILTIN_LABEL = "Built-in preview";
 
-/**
- * Default viewer per file extension (Settings → File openers). One row per
- * extension any installed plugin registers a `fileOpener` for: built-in
- * preview (the default) or a plugin opener. Hidden entirely while no plugin
- * openers are installed — the built-in preview needs no configuration.
- */
 export function FileOpenersSettingsSection() {
   const { fileOpeners } = usePluginSlots();
   const [preference, setPreference] = useFileOpenerPreference();
@@ -41,14 +37,12 @@ export function FileOpenersSettingsSection() {
     [fileOpeners],
   );
 
-  if (extensions.length === 0) {
-    return null;
-  }
+  if (extensions.length === 0) return null;
 
   return (
     <SettingsSection
       title="File openers"
-      description="Which viewer opens each file type in the right panel. Right-click a file link for a one-off choice."
+      description="Automatically use matching plugins, or choose a viewer for each file type. Right-click a file link for a one-off choice."
     >
       <div className="space-y-5">
         {extensions.map((extension) => (
@@ -58,18 +52,16 @@ export function FileOpenersSettingsSection() {
             openers={fileOpeners.filter((opener) =>
               opener.extensions.includes(extension),
             )}
-            selected={resolvePreferredFileOpener({
-              openers: fileOpeners,
-              preference,
-              path: `file.${extension}`,
-            })}
-            onSelect={(opener) =>
+            preference={
+              preference[extension] ?? AUTOMATIC_FILE_OPENER_PREFERENCE
+            }
+            onSelect={(selection) =>
               setPreference((previous) => {
                 const next = { ...previous };
-                if (opener === null) {
+                if (selection === AUTOMATIC_FILE_OPENER_PREFERENCE) {
                   delete next[extension];
                 } else {
-                  next[extension] = buildFileOpenerRef(opener);
+                  next[extension] = selection;
                 }
                 return next;
               })
@@ -81,23 +73,35 @@ export function FileOpenersSettingsSection() {
   );
 }
 
-const BUILTIN_LABEL = "Built-in preview";
-
 function ExtensionOpenerControl({
   extension,
   onSelect,
   openers,
-  selected,
+  preference,
 }: {
   extension: string;
-  onSelect: (opener: PluginFileOpenerSlot | null) => void;
+  onSelect: (selection: string) => void;
   openers: PluginFileOpenerSlot[];
-  selected: PluginFileOpenerSlot | null;
+  preference: string;
 }) {
-  const selectedLabel =
-    selected === null
-      ? BUILTIN_LABEL
-      : `${selected.title} (${selected.pluginId})`;
+  const automaticOpener = openers[0];
+  if (automaticOpener === undefined) return null;
+
+  const options = [
+    {
+      key: AUTOMATIC_FILE_OPENER_PREFERENCE,
+      label: `Automatic (${automaticOpener.title})`,
+    },
+    { key: BUILT_IN_FILE_OPENER_PREFERENCE, label: BUILTIN_LABEL },
+    ...openers.map((opener) => ({
+      key: buildFileOpenerRef(opener),
+      label: `${opener.title} (${opener.pluginId})`,
+    })),
+  ];
+  const selected =
+    options.find((option) => option.key === preference) ?? options[1];
+  if (selected === undefined) return null;
+
   return (
     <SettingsWithControl label={`.${extension} files`}>
       <DropdownMenu>
@@ -105,44 +109,31 @@ function ExtensionOpenerControl({
           <Button
             variant="outline"
             size="sm"
-            className={DROPDOWN_TRIGGER_CLASS}
+            className={SETTINGS_DROPDOWN_TRIGGER_CLASS}
             aria-label={`Default opener for .${extension} files`}
           >
-            <span className="min-w-0 truncate">{selectedLabel}</span>
+            <span className="min-w-0 truncate">{selected.label}</span>
             <Icon
               name="ChevronDown"
               className="size-3.5 text-muted-foreground"
             />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className={DROPDOWN_CONTENT_CLASS}>
-          <DropdownMenuItem onSelect={() => onSelect(null)}>
-            <span className="min-w-0 truncate">{BUILTIN_LABEL}</span>
-            <Icon
-              name="Check"
-              className={cn(
-                "ml-auto",
-                selected !== null && "opacity-0",
-                COARSE_POINTER_ICON_SIZE_CLASS,
-              )}
-            />
-          </DropdownMenuItem>
-          {openers.map((opener) => (
+        <DropdownMenuContent
+          align="end"
+          className={SETTINGS_DROPDOWN_CONTENT_CLASS}
+        >
+          {options.map((option) => (
             <DropdownMenuItem
-              key={buildFileOpenerRef(opener)}
-              onSelect={() => onSelect(opener)}
+              key={option.key}
+              onSelect={() => onSelect(option.key)}
             >
-              <span className="min-w-0 truncate">
-                {opener.title} ({opener.pluginId})
-              </span>
+              <span className="min-w-0 truncate">{option.label}</span>
               <Icon
                 name="Check"
                 className={cn(
                   "ml-auto",
-                  (selected === null ||
-                    buildFileOpenerRef(selected) !==
-                      buildFileOpenerRef(opener)) &&
-                    "opacity-0",
+                  selected.key !== option.key && "opacity-0",
                   COARSE_POINTER_ICON_SIZE_CLASS,
                 )}
               />

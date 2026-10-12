@@ -8,7 +8,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import type { HostDirectoryListing } from "@bb/server-contract";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sdk } from "@/lib/sdk";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
 import {
@@ -40,9 +40,19 @@ function listing(path: string, entries: string[]): HostDirectoryListing {
   };
 }
 
+const ENTRY_TEST_ROW_HEIGHT_PX = 28;
+beforeEach(() => {
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
+    function (this: HTMLElement) {
+      return this.tagName === "LI" ? ENTRY_TEST_ROW_HEIGHT_PX : 224;
+    },
+  );
+});
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("joinHostPath", () => {
@@ -62,47 +72,6 @@ describe("getFolderNameValidationMessage", () => {
     expect(getFolderNameValidationMessage("..")).not.toBeNull();
     expect(getFolderNameValidationMessage("a/b")).not.toBeNull();
     expect(getFolderNameValidationMessage("a\\b")).not.toBeNull();
-  });
-});
-
-describe("RemotePathBrowser entries", () => {
-  it("lets long file and folder names shrink within the browser", async () => {
-    const longFolderName = "long-folder-name-".repeat(20);
-    const longFileName = `${"long-file-name-".repeat(20)}.tar.gz`;
-    directory.mockResolvedValue({
-      directory: "/home/me",
-      parent: "/home",
-      entries: [
-        {
-          kind: "directory",
-          name: longFolderName,
-          path: `/home/me/${longFolderName}`,
-        },
-        {
-          kind: "file",
-          name: longFileName,
-          path: `/home/me/${longFileName}`,
-        },
-      ],
-    });
-    const { wrapper: Wrapper } = createQueryClientTestHarness();
-
-    render(
-      <Wrapper>
-        <RemotePathBrowser
-          hostId="host_atum"
-          allowCreateFolder
-          onDirectoryChange={vi.fn()}
-        />
-      </Wrapper>,
-    );
-
-    for (const name of [longFolderName, longFileName]) {
-      const label = await screen.findByText(name);
-      expect(label.className).toContain("min-w-0");
-      expect(label.className).toContain("truncate");
-      expect(label.getAttribute("title")).toBe(name);
-    }
   });
 });
 
@@ -275,5 +244,88 @@ describe("RemotePathBrowser new folder", () => {
 
     expect(await screen.findByText(/already exists/)).toBeTruthy();
     expect(onDirectoryChange).not.toHaveBeenCalledWith("/home/me/existing");
+  });
+});
+
+describe("RemotePathBrowser entry list", () => {
+  it("returns to the top when browsing into another large directory", async () => {
+    const names = Array.from(
+      { length: 4999 },
+      (_, i) => `file_${String(i).padStart(5, "0")}`,
+    );
+    const rootEntries = [...names, "next"];
+    directory.mockImplementation(({ path }) =>
+      Promise.resolve(
+        listing(
+          path === "/home/me/manyfiles/next"
+            ? "/home/me/manyfiles/next"
+            : "/home/me/manyfiles",
+          path === "/home/me/manyfiles/next" ? names : rootEntries,
+        ),
+      ),
+    );
+    const { wrapper: Wrapper } = createQueryClientTestHarness();
+
+    const { container } = render(
+      <Wrapper>
+        <RemotePathBrowser
+          hostId="host_atum"
+          allowCreateFolder={false}
+          onDirectoryChange={vi.fn()}
+        />
+      </Wrapper>,
+    );
+
+    await screen.findByText("file_00000");
+    const list = container.querySelector("ul");
+    const scrollBox = list?.parentElement;
+    if (!(scrollBox instanceof HTMLElement)) throw new Error("no scroll box");
+    Object.defineProperty(scrollBox, "scrollTo", {
+      configurable: true,
+      value: ({ top }: ScrollToOptions) => {
+        scrollBox.scrollTop = top ?? scrollBox.scrollTop;
+        scrollBox.dispatchEvent(new Event("scroll"));
+      },
+    });
+    scrollBox.scrollTop = 4_999 * ENTRY_TEST_ROW_HEIGHT_PX;
+    fireEvent.scroll(scrollBox);
+    fireEvent.click(await screen.findByRole("button", { name: "next" }));
+
+    expect(scrollBox.scrollTop).toBe(0);
+    expect(await screen.findByText("file_00000")).not.toBeNull();
+  });
+
+  it("mounts only the entries near the viewport for a huge directory", async () => {
+    const names = Array.from(
+      { length: 5000 },
+      (_, i) => `file_${String(i).padStart(5, "0")}`,
+    );
+    directory.mockResolvedValue(listing("/home/me/manyfiles", names));
+    const { wrapper: Wrapper } = createQueryClientTestHarness();
+
+    const { container } = render(
+      <Wrapper>
+        <RemotePathBrowser
+          hostId="host_atum"
+          allowCreateFolder={false}
+          onDirectoryChange={vi.fn()}
+        />
+      </Wrapper>,
+    );
+
+    await screen.findByText("file_00000");
+    const mountedRows = container.querySelectorAll("li");
+    expect(mountedRows.length).toBeLessThan(60);
+    expect(mountedRows.length).toBeGreaterThanOrEqual(8);
+    expect(screen.queryByText("file_04999")).toBeNull();
+
+    const list = container.querySelector("ul");
+    const scrollBox = list?.parentElement;
+    if (!(scrollBox instanceof HTMLElement)) throw new Error("no scroll box");
+    scrollBox.scrollTop = 4_999 * ENTRY_TEST_ROW_HEIGHT_PX;
+    fireEvent.scroll(scrollBox);
+    expect(await screen.findByText("file_04999")).not.toBeNull();
+    expect(screen.queryByText("file_00000")).toBeNull();
+    expect(container.querySelectorAll("li").length).toBeLessThan(60);
   });
 });

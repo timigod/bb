@@ -60,32 +60,38 @@ export function findPaneByThread(
   );
 }
 
-/** Finds the pane representing the same routable page as `content`. Plugin
- * subpaths belong to one panel identity, so navigating within a panel updates
- * that pane instead of opening duplicates. The compose page is a singleton in
- * this prototype, matching its existing shared draft/project state. */
+export function isSamePaneContent(
+  candidate: PaneContent,
+  content: PaneContent,
+): boolean {
+  if (content.kind === "new-thread") return candidate.kind === "new-thread";
+  if (content.kind === "thread") {
+    return (
+      candidate.kind === "thread" &&
+      candidate.projectId === content.projectId &&
+      candidate.threadId === content.threadId
+    );
+  }
+  if (content.kind === "plugin-detail") {
+    return (
+      candidate.kind === "plugin-detail" &&
+      candidate.pluginId === content.pluginId
+    );
+  }
+  return (
+    candidate.kind === "plugin-panel" &&
+    candidate.pluginId === content.pluginId &&
+    candidate.panelPath === content.panelPath
+  );
+}
+
 export function findPaneByContent(
   root: LayoutNode,
   content: PaneContent,
 ): PaneNode | null {
   return (
-    listPanes(root).find((pane) => {
-      const candidate = pane.content;
-      if (candidate.kind !== content.kind) return false;
-      if (content.kind === "new-thread") return true;
-      if (content.kind === "thread") {
-        return (
-          candidate.kind === "thread" &&
-          candidate.projectId === content.projectId &&
-          candidate.threadId === content.threadId
-        );
-      }
-      return (
-        candidate.kind === "plugin-panel" &&
-        candidate.pluginId === content.pluginId &&
-        candidate.panelPath === content.panelPath
-      );
-    }) ?? null
+    listPanes(root).find((pane) => isSamePaneContent(pane.content, content)) ??
+    null
   );
 }
 
@@ -462,46 +468,4 @@ export function setFocus(layout: SplitLayout, paneId: string): SplitLayout {
     return layout;
   }
   return { ...layout, focusedPaneId: paneId };
-}
-
-function normalizeNode(node: LayoutNode): LayoutNode {
-  if (node.type === "pane") {
-    return { ...node };
-  }
-  const children = node.children.map(normalizeNode);
-  if (children.length === 1) {
-    return children[0] ?? node;
-  }
-  return {
-    ...node,
-    children,
-    sizes: normalizeSizes(node.sizes, children.length),
-  };
-}
-
-function trimToPaneLimit(root: LayoutNode): LayoutNode {
-  let nextRoot = root;
-  while (countPanes(nextRoot) > MAX_PANES) {
-    const lastPane = listPanes(nextRoot).at(-1);
-    if (lastPane === undefined) {
-      break;
-    }
-    const result = detachPane(nextRoot, lastPane.paneId);
-    if (result.node === null || result.detached === null) {
-      break;
-    }
-    nextRoot = result.node;
-  }
-  return nextRoot;
-}
-
-export function normalize(layout: SplitLayout): SplitLayout {
-  const root = normalizeNode(trimToPaneLimit(layout.root));
-  const panes = listPanes(root);
-  const focusedPaneId = panes.some(
-    (pane) => pane.paneId === layout.focusedPaneId,
-  )
-    ? layout.focusedPaneId
-    : (panes[0]?.paneId ?? layout.focusedPaneId);
-  return { root, focusedPaneId };
 }

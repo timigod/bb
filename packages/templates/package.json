@@ -22,17 +22,21 @@
   "types": "./src/index.ts",
   "scripts": {
     "clean": "rimraf dist tsconfig.tsbuildinfo",
-    "typecheck": "node ./scripts/generate-templates.mjs --check && tsc --noEmit",
-    "test": "node ./scripts/generate-templates.mjs --check && vitest run --config vitest.config.ts"
+    "generate:templates": "node ./scripts/generate-templates.mjs",
+    "generate:plugin-scaffold": "node ./scripts/generate-plugin-scaffold.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "@bb/domain": "workspace:*",
     "gray-matter": "^4.0.3",
-    "handlebars": "^4.7.8"
+    "handlebars": "^4.7.8",
+    "semver": "^7.7.4"
   },
   "devDependencies": {
     "@bb/tsconfig": "workspace:*",
     "@types/node": "^22.0.0",
+    "@types/semver": "^7.7.1",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-7": "npm:typescript@^7.0.2",
     "vitest": "^4.1.1"

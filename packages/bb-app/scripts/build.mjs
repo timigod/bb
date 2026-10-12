@@ -60,6 +60,12 @@ await buildNodeEsmEntry({
   packageRoot,
 });
 await buildPublicSdkDeclarations();
+await buildNodeEsmEntry({
+  cleanDist: false,
+  entryPoint: resolve(scriptsDir, "prune-bb-chunks.mjs"),
+  outfile: resolve(packageRoot, "dist", "prune-bb-chunks.mjs"),
+  packageRoot,
+});
 
 await copyBuildOutput({
   from: resolve(workspaceRoot, "apps", "app", "dist"),
@@ -71,32 +77,28 @@ await copyBuildOutput({
   label: "@bb/server dist",
   to: resolve(packageRoot, "server", "dist"),
 });
-// Builtin plugins are bundled at packaging time (not in @bb/server's build,
-// which source checkouts don't need — the registry falls back to the repo's
-// plugins/<name> there). Runs in apps/server so tsx + workspace imports
-// resolve; writes straight into the packaged server dist.
-await execFileAsync(
-  "node",
-  [
-    "--conditions=source",
-    "--import",
-    "tsx",
-    resolve(
-      workspaceRoot,
-      "apps",
-      "server",
-      "scripts",
-      "copy-builtin-plugins.ts",
-    ),
-    "--target",
-    resolve(packageRoot, "server", "dist", "builtin-plugins"),
-  ],
-  { cwd: resolve(workspaceRoot, "apps", "server") },
-);
+await copyBuildOutput({
+  from: resolve(workspaceRoot, "packages", "bundled-plugins", "dist"),
+  label: "@bb/bundled-plugins dist",
+  to: resolve(packageRoot, "server", "dist", "builtin-plugins"),
+});
 await copyBuildOutput({
   from: resolve(workspaceRoot, "apps", "host-daemon", "dist"),
   label: "@bb/host-daemon dist",
   to: resolve(packageRoot, "host-daemon", "dist"),
 });
+// The bb CLI is code-split into host-daemon/dist/bb-chunks. A turbo cache hit
+// restores apps/host-daemon/dist without clearing it first, so the copy can
+// carry an earlier build's hashed chunks; ship only the ones `bb` reaches.
+await assertPathExists(
+  resolve(packageRoot, "host-daemon", "dist", "bb-chunks"),
+  "bundled bb CLI chunks",
+);
+const pruneRun = await execFileAsync(
+  "node",
+  [resolve(packageRoot, "dist", "prune-bb-chunks.mjs")],
+  { cwd: packageRoot },
+);
+process.stderr.write(pruneRun.stderr);
 
 process.stdout.write("bb-app: built package assets\n");

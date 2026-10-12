@@ -1,37 +1,31 @@
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ThreadEvent } from "@bb/domain";
-import type {
-  AdapterCommand,
-  ProviderCommandPlan,
-} from "./provider-adapter.js";
 import { promptTextInput } from "./test/prompt-input.js";
-import { createAgentRuntimeWithAdapters } from "./runtime.js";
 import {
-  classifyClaudeExecutionSettingsChange,
-  normalizeClaudeExecutionOptions,
-} from "./execution-options.js";
-import { fakeProviderScriptPath } from "./test/index.js";
-import {
-  createFakeAdapter,
-  createRecordingAdapter,
-  findLastRecordedCommand,
+  createScriptedEchoLaunch,
+  createScriptedEchoRequestRecord,
+  createScriptedEchoRuntime,
   fullRuntimeOptions,
   wait,
   waitForThreadAgentMessageText,
   waitForThreadTurnCompleted,
   waitForThreadTurnStarted,
+  type ScriptedEchoRequestRecord,
 } from "./test/runtime-test-harness.js";
+
+function recordedMethods(record: ScriptedEchoRequestRecord): string[] {
+  return record.read().map((request) => request.method);
+}
 
 describe("createAgentRuntime lifecycle", () => {
   let tmpDir: string;
-  let scriptPath: string;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "bb-runtime-test-"));
-    scriptPath = fakeProviderScriptPath;
   });
 
   afterEach(() => {
@@ -39,264 +33,254 @@ describe("createAgentRuntime lifecycle", () => {
   });
 
   describe("thread setup and configuration", () => {
-    it("starts a thread and receives a providerThreadId", async () => {
-      const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (e) => events.push(e),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
-      });
-
-      const { providerThreadId } = await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: fullRuntimeOptions,
-      });
-
-      expect(providerThreadId).toBe("prov-1");
-      await wait(50);
-      expect(events.some((e) => e.type === "thread/identity")).toBe(true);
-      await runtime.shutdown();
-    });
-
-    it("allows thread/start to outlive the generic JSON-RPC timeout", async () => {
-      vi.useFakeTimers();
-      const releasePath = join(tmpDir, "release-slow-thread-start");
-      const slowStartScriptPath = join(tmpDir, "slow-start-provider.cjs");
-      writeFileSync(
-        slowStartScriptPath,
-        `
-const { existsSync } = require("node:fs");
-const readline = require("node:readline");
-const releasePath = ${JSON.stringify(releasePath)};
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-function waitForRelease(callback) {
-  if (existsSync(releasePath)) {
-    callback();
-    return;
-  }
-  setImmediate(() => waitForRelease(callback));
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    return;
-  }
-
-  if (message.method === "thread/start") {
-    process.stderr.write("thread/start received\\n");
-    waitForRelease(() => {
-      send({
-        jsonrpc: "2.0",
-        id: message.id,
-        result: { threadId: "prov-slow-start" },
-      });
-    });
-  }
-});
-`,
-        "utf8",
-      );
-
-      let markThreadStartReceived: (() => void) | undefined;
-      const threadStartReceived = new Promise<void>((resolve) => {
-        markThreadStartReceived = resolve;
-      });
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onStderr: (line) => {
-          if (line === "thread/start received") {
-            markThreadStartReceived?.();
-          }
-        },
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(slowStartScriptPath),
-      });
-      const startOutcome = runtime
-        .startThread({
+    it.each([
+      {
+        method: "start",
+        requestTimeoutMs: undefined,
+        advanceMs: 30_001,
+        timesOut: false,
+      },
+      {
+        method: "resume",
+        requestTimeoutMs: undefined,
+        advanceMs: 30_001,
+        timesOut: false,
+      },
+      {
+        method: "resume",
+        requestTimeoutMs: 500,
+        advanceMs: 501,
+        timesOut: true,
+      },
+    ] as const)(
+      "uses the construction deadline for thread/$method (requestTimeoutMs=$requestTimeoutMs)",
+      async ({ method, requestTimeoutMs, advanceMs, timesOut }) => {
+        const realSetTimeout = setTimeout;
+        const sleepReal = (ms: number): Promise<void> =>
+          new Promise((resolve) => {
+            realSetTimeout(resolve, ms);
+          });
+        vi.useFakeTimers();
+        const record = createScriptedEchoRequestRecord();
+        const runtime = createScriptedEchoRuntime({
+          runtime: {
+            workspacePath: tmpDir,
+            env: record.env,
+            onEvent: () => undefined,
+            threadCreation: { requestTimeoutMs },
+          },
+          launch: { scripted: { startDelayMs: 1_500 } },
+        });
+        let settled = false;
+        const threadArgs = {
           environmentId: "env-1",
           threadId: "t1",
           projectId: "p1",
           providerId: "fake",
           options: fullRuntimeOptions,
-        })
-        .then(
+        };
+        const construction =
+          method === "start"
+            ? runtime.startThread(threadArgs)
+            : runtime.resumeThread({
+                ...threadArgs,
+                providerThreadId: "prov-1",
+              });
+        const constructionOutcome = construction.then(
           (result) => ({ status: "resolved" as const, result }),
           (error: unknown) => ({ status: "rejected" as const, error }),
         );
+        void constructionOutcome.then(() => {
+          settled = true;
+        });
+
+        try {
+          for (
+            let attempt = 0;
+            record.last(`thread/${method}`) === undefined;
+            attempt += 1
+          ) {
+            if (attempt >= 1_000) {
+              throw new Error(`The bridge never received thread/${method}`);
+            }
+            await sleepReal(10);
+          }
+          await vi.advanceTimersByTimeAsync(advanceMs);
+
+          if (timesOut) {
+            expect(await constructionOutcome).toEqual({
+              status: "rejected",
+              error: new Error(`JSON-RPC request timed out: thread/${method}`),
+            });
+            expect(runtime.hasThread("t1")).toBe(false);
+            expect(runtime.getProviderSession("t1")).toBeNull();
+          } else {
+            expect(settled).toBe(false);
+            expect(await constructionOutcome).toEqual({
+              status: "resolved",
+              result: { providerThreadId: "prov-1" },
+            });
+          }
+        } finally {
+          vi.useRealTimers();
+          await runtime.shutdown();
+        }
+      },
+    );
+
+    it("fails session construction when the thread/start result carries no providerThreadId", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => {},
+        },
+        launch: { scripted: { answerStartWithoutIdentity: true } },
+      });
 
       try {
-        await threadStartReceived;
-        await vi.advanceTimersByTimeAsync(30_001);
-        writeFileSync(releasePath, "release", "utf8");
-
-        expect(await startOutcome).toEqual({
-          status: "resolved",
-          result: { providerThreadId: "prov-slow-start" },
+        await expect(
+          runtime.startThread({
+            environmentId: "env-1",
+            threadId: "t1",
+            projectId: "p1",
+            providerId: "fake",
+            options: fullRuntimeOptions,
+          }),
+        ).rejects.toThrow(
+          /Invalid JSON-RPC result for thread\/start: providerThreadId/,
+        );
+        expect(runtime.hasThread("t1")).toBe(false);
+        expect(runtime.getProviderSession("t1")).toBeNull();
+        expect(record.last("thread/stop")?.params).toMatchObject({
+          threadId: "t1",
+          intent: "release",
         });
       } finally {
-        writeFileSync(releasePath, "release", "utf8");
-        vi.useRealTimers();
         await runtime.shutdown();
       }
     });
 
-    it("accepts thread/start results with a null providerThreadId", async () => {
-      const nullIdentityScriptPath = join(tmpDir, "null-identity-provider.cjs");
-      writeFileSync(
-        nullIdentityScriptPath,
-        `
-const readline = require("node:readline");
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    return;
-  }
-
-  if (message.method === "thread/start") {
-    send({
-      jsonrpc: "2.0",
-      id: message.id,
-      result: { threadId: "prov-thread-fallback", providerThreadId: null },
-    });
-  }
-});
-`,
-        "utf8",
-      );
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(nullIdentityScriptPath),
-      });
-
-      const { providerThreadId } = await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: fullRuntimeOptions,
-      });
-
-      expect(providerThreadId).toBe("prov-thread-fallback");
-      await runtime.shutdown();
-    });
-
-    it("passes Codex-shaped thread/start ids to accepted command translation", async () => {
-      const codexIdentityScriptPath = join(
-        tmpDir,
-        "codex-identity-provider.cjs",
-      );
-      writeFileSync(
-        codexIdentityScriptPath,
-        `
-const readline = require("node:readline");
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    return;
-  }
-
-  if (message.method === "thread/start") {
-    send({
-      jsonrpc: "2.0",
-      id: message.id,
-      result: { thread: { id: "codex-thread-nested" } },
-    });
-  }
-});
-`,
-        "utf8",
-      );
-      const acceptedProviderThreadIds = new Array<string | undefined>();
-      const baseAdapter = createFakeAdapter(codexIdentityScriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...baseAdapter,
-          translateAcceptedCommand(args) {
-            acceptedProviderThreadIds.push(args.providerThreadId);
-            return baseAdapter.translateAcceptedCommand(args);
-          },
-        }),
+    it("fails session construction when the thread/resume result carries no providerThreadId", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => {},
+        },
+        launch: { scripted: { answerStartWithoutIdentity: true } },
       });
 
       try {
-        const { providerThreadId } = await runtime.startThread({
-          environmentId: "env-1",
+        await expect(
+          runtime.resumeThread({
+            environmentId: "env-1",
+            threadId: "t1",
+            projectId: "p1",
+            providerThreadId: "old-prov-123",
+            providerId: "fake",
+            options: fullRuntimeOptions,
+          }),
+        ).rejects.toThrow(
+          /Invalid JSON-RPC result for thread\/resume: providerThreadId/,
+        );
+        expect(runtime.hasThread("t1")).toBe(false);
+        expect(runtime.getProviderSession("t1")).toBeNull();
+        expect(record.last("thread/stop")?.params).toMatchObject({
           threadId: "t1",
-          projectId: "p1",
-          providerId: "fake",
-          options: fullRuntimeOptions,
+          providerThreadId: "old-prov-123",
+          intent: "release",
+        });
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("forgets a thread whose thread/resume request was rejected", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => {},
+        },
+        launch: {
+          scripted: {
+            failMethods: [
+              { method: "thread/resume", message: "resume refused", times: 1 },
+            ],
+          },
+        },
+      });
+      const resume = {
+        environmentId: "env-1",
+        threadId: "t1",
+        projectId: "p1",
+        providerThreadId: "old-prov-123",
+        providerId: "fake",
+        options: fullRuntimeOptions,
+      };
+
+      try {
+        await expect(runtime.resumeThread(resume)).rejects.toThrow(
+          "resume refused",
+        );
+        expect(runtime.hasThread("t1")).toBe(false);
+        expect(runtime.getProviderSession("t1")).toBeNull();
+        expect(record.last("thread/stop")?.params).toMatchObject({
+          threadId: "t1",
+          providerThreadId: "old-prov-123",
+          intent: "release",
         });
 
-        expect(providerThreadId).toBe("codex-thread-nested");
-        expect(acceptedProviderThreadIds).toEqual(["codex-thread-nested"]);
+        await expect(
+          runtime.resumeThread({
+            ...resume,
+            bridgeLaunch: createScriptedEchoLaunch({
+              digest: "resume-success",
+            }),
+          }),
+        ).resolves.toEqual({ providerThreadId: "old-prov-123" });
+        expect(runtime.hasThread("t1")).toBe(true);
       } finally {
         await runtime.shutdown();
       }
     });
 
     it("merges runtime shell env with per-thread context on start", async () => {
-      const recordedCommands: AdapterCommand[] = [];
+      const record = createScriptedEchoRequestRecord();
+      const events: ThreadEvent[] = [];
       const threadStorageRootPath = join(tmpDir, "thread-storage");
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        threadStorageRootPath,
-        shellEnv: {
-          PATH: "/tmp/bb-bin:/usr/bin",
-          BB_HOST_DAEMON_PORT: "3002",
-          BB_PROJECT_ID: "wrong-project",
-          BB_SERVER_URL: "http://127.0.0.1:3334",
-          BB_THREAD_ID: "wrong-thread",
+      const contributedEnv = [
+        {
+          name: "PATH",
+          value: "/plugin/bin",
+          source: { plugin: "env-test" },
+          reason: "Use the plugin toolchain",
         },
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
+        {
+          name: "AUTH_PROXY_URL",
+          value: { serverPath: "/plugins/env-test/auth" },
+          source: { plugin: "env-test" },
+          reason: "Use the authenticated server proxy",
+        },
+      ] as const;
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          threadStorageRootPath,
+          env: record.env,
+          shellEnv: {
+            PATH: "/tmp/bb-bin:/usr/bin",
+            BB_HOST_DAEMON_PORT: "3002",
+            BB_PROJECT_ID: "wrong-project",
+            BB_SERVER_URL: "http://127.0.0.1:3334",
+            BB_THREAD_ID: "wrong-thread",
+          },
+          onEvent: (event) => events.push(event),
+        },
       });
 
       await runtime.startThread({
@@ -304,41 +288,269 @@ rl.on("line", (line) => {
         threadId: "t1",
         projectId: "p1",
         providerId: "fake",
+        contributedEnv,
         options: fullRuntimeOptions,
       });
 
-      const threadStart = recordedCommands.find(
-        (command) => command.type === "thread/start",
+      const threadStart = record.last("thread/start");
+      expect(threadStart).toBeDefined();
+      expect(threadStart?.params).toEqual(
+        expect.objectContaining({
+          threadId: "t1",
+          cwd: tmpDir,
+          options: expect.objectContaining({
+            envVars: {
+              PATH: "/plugin/bin",
+              AUTH_PROXY_URL: "http://127.0.0.1:3334/plugins/env-test/auth",
+              BB_HOST_DAEMON_PORT: "3002",
+              BB_PROJECT_ID: "p1",
+              BB_SERVER_URL: "http://127.0.0.1:3334",
+              BB_THREAD_STORAGE: join(threadStorageRootPath, "t1"),
+              BB_THREAD_ID: "t1",
+              BB_ENVIRONMENT_ID: "env-1",
+            },
+          }),
+        }),
       );
-      expect(threadStart?.type).toBe("thread/start");
-      if (!threadStart || threadStart.type !== "thread/start") {
-        throw new Error("Expected thread/start command");
-      }
-      expect(threadStart.options?.envVars).toEqual({
-        PATH: "/tmp/bb-bin:/usr/bin",
-        BB_HOST_DAEMON_PORT: "3002",
-        BB_PROJECT_ID: "p1",
-        BB_SERVER_URL: "http://127.0.0.1:3334",
-        BB_THREAD_STORAGE: join(threadStorageRootPath, "t1"),
-        BB_THREAD_ID: "t1",
-        BB_ENVIRONMENT_ID: "env-1",
+      expect(
+        events.find((event) => event.type === "provider.env-resolved"),
+      ).toMatchObject({
+        entries: expect.arrayContaining([
+          {
+            name: "PATH",
+            source: { plugin: "env-test" },
+            value: "/plugin/bin",
+            reason: "Use the plugin toolchain",
+          },
+          {
+            name: "AUTH_PROXY_URL",
+            source: { plugin: "env-test" },
+            value: "http://127.0.0.1:3334/plugins/env-test/auth",
+            reason: "Use the authenticated server proxy",
+          },
+        ]),
       });
-      expect(threadStart.cwd).toBe(tmpDir);
+      expect(JSON.stringify(events)).toContain("/plugins/env-test/auth");
+
+      await runtime.runTurn({
+        clientRequestId: "creq_222222224c",
+        threadId: "t1",
+        input: [promptTextInput({ text: "follow up" })],
+        contributedEnv,
+        options: fullRuntimeOptions,
+      });
+      expect(
+        events.filter((event) => event.type === "provider.env-resolved"),
+      ).toHaveLength(1);
+
+      await runtime.shutdown();
+    });
+
+    it("reinjects rotated machine credentials on the next turn and resume", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const events: ThreadEvent[] = [];
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: (event) => events.push(event),
+        },
+      });
+      const credentials = (value: string) => [
+        {
+          name: "GH_TOKEN",
+          value,
+          source: { core: "machine-git" as const },
+          reason: "Server gh login",
+        },
+      ];
+      try {
+        await runtime.startThread({
+          environmentId: "env-1",
+          projectId: "p1",
+          threadId: "git-thread",
+          providerId: "fake",
+          contributedEnv: credentials("first-git-token"),
+          options: fullRuntimeOptions,
+        });
+        await runtime.runTurn({
+          clientRequestId: "creq_222222224c",
+          threadId: "git-thread",
+          input: [promptTextInput({ text: "rotated-git-token" })],
+          contributedEnv: credentials("rotated-git-token"),
+          options: fullRuntimeOptions,
+        });
+        expect(record.last("turn/start")?.params).toMatchObject({
+          options: { envVars: { GH_TOKEN: "rotated-git-token" } },
+        });
+        await waitForThreadAgentMessageText({
+          events,
+          providerId: "fake",
+          runtime,
+          text: "rotated-git-token",
+          threadId: "git-thread",
+        });
+        await runtime.resumeThread({
+          environmentId: "env-1",
+          threadId: "git-resumed",
+          providerId: "fake",
+          providerThreadId: "old-git-thread",
+          contributedEnv: credentials("resumed-git-token"),
+          options: fullRuntimeOptions,
+        });
+        expect(record.last("thread/resume")?.params).toMatchObject({
+          options: { envVars: { GH_TOKEN: "resumed-git-token" } },
+        });
+        expect(
+          JSON.stringify(
+            events.filter((event) => event.type === "provider.env-resolved"),
+          ),
+        ).not.toContain("first-git-token");
+        expect(
+          JSON.stringify(
+            events.filter((event) => event.type === "provider.env-resolved"),
+          ),
+        ).not.toContain("resumed-git-token");
+        expect(
+          events.filter((event) => event.type === "provider.env-resolved"),
+        ).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              entries: expect.arrayContaining([
+                expect.objectContaining({
+                  name: "GH_TOKEN",
+                  value: { masked: true },
+                }),
+              ]),
+            }),
+          ]),
+        );
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("removes project overrides from a reused runtime on the next turn", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const events: ThreadEvent[] = [];
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: (event) => events.push(event),
+        },
+      });
+      try {
+        await runtime.startThread({
+          environmentId: "env-project",
+          projectId: "project-a",
+          threadId: "project-thread",
+          providerId: "fake",
+          options: fullRuntimeOptions,
+          contributedEnv: [
+            {
+              name: "PROJECT_SECRET",
+              value: "project-private",
+              reason: "Project",
+              source: { core: "project-environment" },
+            },
+          ],
+        });
+        expect(record.last("thread/start")?.params).toMatchObject({
+          options: { envVars: { PROJECT_SECRET: "project-private" } },
+        });
+        await runtime.runTurn({
+          threadId: "project-thread",
+          clientRequestId: "creq_222222224d",
+          input: [promptTextInput({ text: "removed" })],
+          options: fullRuntimeOptions,
+          contributedEnv: [],
+        });
+        const options = record.last("turn/start")?.params?.options;
+        expect(options).toHaveProperty("envVars.BB_PROJECT_ID", "project-a");
+        expect(options).not.toHaveProperty("envVars.PROJECT_SECRET");
+        expect(
+          JSON.stringify(
+            events.filter((event) => event.type === "provider.env-resolved"),
+          ),
+        ).not.toContain("project-private");
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("drops unresolved server paths without preventing thread start", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const events: ThreadEvent[] = [];
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          shellEnv: { PATH: "/usr/bin" },
+          onEvent: (event) => events.push(event),
+        },
+      });
+
+      await runtime.startThread({
+        environmentId: "env-1",
+        threadId: "t1",
+        projectId: "p1",
+        providerId: "fake",
+        contributedEnv: [
+          {
+            name: "AUTH_PROXY_URL",
+            value: { serverPath: "/plugins/env-test/auth" },
+            source: { plugin: "env-test" },
+            reason: "Use the authenticated server proxy",
+          },
+        ],
+        options: fullRuntimeOptions,
+      });
+
+      const threadStart = record.last("thread/start");
+      expect(threadStart).toBeDefined();
+      expect(threadStart?.params).toEqual(
+        expect.objectContaining({
+          options: expect.objectContaining({
+            envVars: expect.not.objectContaining({
+              AUTH_PROXY_URL: expect.anything(),
+            }),
+          }),
+        }),
+      );
+      expect(
+        events.find((event) => event.type === "provider.env-resolved"),
+      ).toMatchObject({
+        entries: expect.arrayContaining([
+          {
+            name: "AUTH_PROXY_URL",
+            source: { plugin: "env-test" },
+            value: { masked: true },
+            reason:
+              "Use the authenticated server proxy (dropped: no BB_SERVER_URL)",
+          },
+        ]),
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "provider/warning",
+          category: "config",
+          summary:
+            'Dropped environment variable "AUTH_PROXY_URL" from plugin "env-test".',
+        }),
+      );
 
       await runtime.shutdown();
     });
 
     it("does not configure provider skills unless skill roots are supplied", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => undefined,
+        },
       });
 
       await runtime.startThread({
@@ -349,32 +561,28 @@ rl.on("line", (line) => {
         options: fullRuntimeOptions,
       });
 
-      expect(
-        recordedCommands.some((command) => command.type === "skills/configure"),
-      ).toBe(false);
+      expect(recordedMethods(record)).toContain("thread/start");
+      expect(recordedMethods(record)).not.toContain("skills/configure");
 
       await runtime.shutdown();
     });
 
     it("configures provider skills from runtime skill roots before thread start", async () => {
-      const recordedCommands: AdapterCommand[] = [];
+      const record = createScriptedEchoRequestRecord();
       const skillRootPath = join(tmpDir, "skill-root");
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        skillRoots: [
-          {
-            id: "bb-cli",
-            providerId: "codex",
-            skillDirectoryRootPath: skillRootPath,
-          },
-        ],
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          skillRoots: [
+            {
+              id: "bb-cli",
+              path: skillRootPath,
+              skills: [{ name: "bb-cli", description: "Use the bb CLI." }],
+            },
+          ],
+          onEvent: () => undefined,
+        },
       });
 
       await runtime.startThread({
@@ -385,139 +593,33 @@ rl.on("line", (line) => {
         options: fullRuntimeOptions,
       });
 
-      const configureCommand = recordedCommands.find(
-        (command) => command.type === "skills/configure",
-      );
-      expect(configureCommand?.type).toBe("skills/configure");
-      if (!configureCommand || configureCommand.type !== "skills/configure") {
-        throw new Error("Expected skills/configure command");
-      }
-      expect(configureCommand.skillRoots).toEqual([
-        {
-          id: "bb-cli",
-          providerId: "codex",
-          skillDirectoryRootPath: skillRootPath,
-        },
-      ]);
-      expect(
-        recordedCommands.findIndex(
-          (command) => command.type === "skills/configure",
-        ),
-      ).toBeLessThan(
-        recordedCommands.findIndex(
-          (command) => command.type === "thread/start",
-        ),
-      );
-
-      await runtime.shutdown();
-    });
-
-    it("does not configure skill roots filtered out for the provider", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        skillRoots: [
+      expect(record.last("skills/configure")?.params).toEqual({
+        roots: [
           {
             id: "bb-cli",
-            providerId: "pi",
-            skillDirectoryRootPath: join(tmpDir, "skill-root"),
+            path: skillRootPath,
+            skills: [{ name: "bb-cli", description: "Use the bb CLI." }],
           },
         ],
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
       });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "codex",
-        options: fullRuntimeOptions,
-      });
-
-      expect(
-        recordedCommands.some((command) => command.type === "skills/configure"),
-      ).toBe(false);
-
-      await runtime.shutdown();
-    });
-
-    it("preserves merged shell env when reconfiguring a thread", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        shellEnv: {
-          PATH: "/tmp/bb-bin:/usr/bin",
-          BB_HOST_DAEMON_PORT: "3002",
-          BB_SERVER_URL: "http://127.0.0.1:3334",
-        },
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
-      });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        instructions: "Initial instructions",
-        options: fullRuntimeOptions,
-      });
-
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223h",
-        threadId: "t1",
-        input: [promptTextInput({ text: "follow up" })],
-        instructions: "Initial instructions",
-        options: { ...fullRuntimeOptions, model: "test-model-2" },
-      });
-
-      const reconfigureCommand = findLastRecordedCommand(
-        recordedCommands,
-        "thread/resume",
+      const methods = recordedMethods(record);
+      expect(methods.indexOf("skills/configure")).toBeGreaterThan(-1);
+      expect(methods.indexOf("thread/start")).toBeGreaterThan(-1);
+      expect(methods.indexOf("skills/configure")).toBeLessThan(
+        methods.indexOf("thread/start"),
       );
-      expect(reconfigureCommand?.type).toBe("thread/resume");
-      if (!reconfigureCommand || reconfigureCommand.type !== "thread/resume") {
-        throw new Error("Expected thread/resume command");
-      }
-      expect(reconfigureCommand.options?.envVars).toEqual({
-        PATH: "/tmp/bb-bin:/usr/bin",
-        BB_HOST_DAEMON_PORT: "3002",
-        BB_SERVER_URL: "http://127.0.0.1:3334",
-        BB_PROJECT_ID: "p1",
-        BB_THREAD_ID: "t1",
-        BB_ENVIRONMENT_ID: "env-1",
-      });
-      expect(reconfigureCommand.cwd).toBe(tmpDir);
 
       await runtime.shutdown();
     });
 
-    it("skips session reconfigure when the adapter classifies settings as live", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...createRecordingAdapter({ recordedCommands, scriptPath }),
-          classifyExecutionSettingsChange:
-            classifyClaudeExecutionSettingsChange,
-          normalizeExecutionOptions: normalizeClaudeExecutionOptions,
-        }),
+    it("carries changed settings on the next turn without rebuilding the session", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => undefined,
+        },
       });
 
       await runtime.startThread({
@@ -528,13 +630,14 @@ rl.on("line", (line) => {
         instructions: "Initial instructions",
         options: {
           ...fullRuntimeOptions,
-          memoryEnabled: true,
           permissionMode: "auto",
           permissionScope: "workspace",
           approvalReviewer: "automatic",
           permissionEscalation: "ask",
-          providerSubagentsEnabled: true,
-          serviceTier: "fast",
+          providerOptions: {
+            memoryEnabled: true,
+            providerSubagentsEnabled: true,
+          },
         },
       });
 
@@ -545,38 +648,50 @@ rl.on("line", (line) => {
         instructions: "Initial instructions",
         options: {
           ...fullRuntimeOptions,
-          memoryEnabled: false,
           model: "test-model-2",
-          permissionMode: "auto",
+          permissionMode: "accept-edits",
           permissionScope: "workspace",
-          approvalReviewer: "automatic",
+          approvalReviewer: "user",
           permissionEscalation: "deny",
-          providerSubagentsEnabled: false,
           reasoningLevel: "high",
-          serviceTier: "fast",
-          workflowsEnabled: true,
+          providerOptions: {
+            memoryEnabled: false,
+            providerSubagentsEnabled: false,
+            workflowsEnabled: true,
+          },
         },
       });
 
-      expect(
-        recordedCommands.some((command) => command.type === "thread/resume"),
-      ).toBe(false);
-      expect(
-        findLastRecordedCommand(recordedCommands, "thread/start"),
-      ).toMatchObject({
-        options: { serviceTier: "default" },
-      });
-      expect(
-        findLastRecordedCommand(recordedCommands, "turn/start"),
-      ).toMatchObject({
+      expect(recordedMethods(record)).not.toContain("thread/resume");
+      expect(record.last("thread/start")?.params).toMatchObject({
         options: {
-          memoryEnabled: false,
+          model: "test-model",
+          permissionMode: "auto",
+          permissionScope: "workspace",
+          approvalReviewer: "automatic",
+          permissionEscalation: "ask",
+          reasoningLevel: "medium",
+          providerOptions: {
+            memoryEnabled: true,
+            providerSubagentsEnabled: true,
+          },
+        },
+      });
+      expect(record.last("turn/start")?.params).toMatchObject({
+        clientRequestId: "creq_222222224h",
+        options: {
           model: "test-model-2",
+          permissionMode: "accept-edits",
+          permissionScope: "workspace",
+          approvalReviewer: "user",
           permissionEscalation: "deny",
-          providerSubagentsEnabled: false,
           reasoningLevel: "high",
           serviceTier: "default",
-          workflowsEnabled: true,
+          providerOptions: {
+            memoryEnabled: false,
+            providerSubagentsEnabled: false,
+            workflowsEnabled: true,
+          },
         },
       });
 
@@ -584,21 +699,18 @@ rl.on("line", (line) => {
     });
 
     it("passes the workspace cwd when resuming a thread", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        shellEnv: {
-          PATH: "/tmp/bb-bin:/usr/bin",
-          BB_HOST_DAEMON_PORT: "3002",
-          BB_SERVER_URL: "http://127.0.0.1:3334",
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          shellEnv: {
+            PATH: "/tmp/bb-bin:/usr/bin",
+            BB_HOST_DAEMON_PORT: "3002",
+            BB_SERVER_URL: "http://127.0.0.1:3334",
+          },
+          onEvent: () => undefined,
         },
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
       });
 
       await runtime.resumeThread({
@@ -610,265 +722,47 @@ rl.on("line", (line) => {
         options: fullRuntimeOptions,
       });
 
-      const resumeCommand = findLastRecordedCommand(
-        recordedCommands,
-        "thread/resume",
-      );
-      expect(resumeCommand?.type).toBe("thread/resume");
-      if (!resumeCommand || resumeCommand.type !== "thread/resume") {
-        throw new Error("Expected thread/resume command");
-      }
-      expect(resumeCommand.options?.envVars).toEqual({
-        PATH: "/tmp/bb-bin:/usr/bin",
-        BB_HOST_DAEMON_PORT: "3002",
-        BB_SERVER_URL: "http://127.0.0.1:3334",
-        BB_PROJECT_ID: "p1",
-        BB_THREAD_ID: "t1",
-        BB_ENVIRONMENT_ID: "env-1",
-      });
-      expect(resumeCommand.cwd).toBe(tmpDir);
-
-      await runtime.shutdown();
-    });
-
-    it("passes permission mode through to adapter commands", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
+      const resume = record.last("thread/resume");
+      expect(resume).toBeDefined();
+      expect(resume?.params).toEqual(
+        expect.objectContaining({
+          threadId: "t1",
+          providerThreadId: "prov-1",
+          cwd: tmpDir,
+          options: expect.objectContaining({
+            envVars: {
+              PATH: "/tmp/bb-bin:/usr/bin",
+              BB_HOST_DAEMON_PORT: "3002",
+              BB_SERVER_URL: "http://127.0.0.1:3334",
+              BB_PROJECT_ID: "p1",
+              BB_THREAD_ID: "t1",
+              BB_ENVIRONMENT_ID: "env-1",
+            },
+          }),
         }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
-      });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: {
-          ...fullRuntimeOptions,
-          permissionMode: "accept-edits",
-          permissionScope: "workspace",
-          approvalReviewer: "user",
-          permissionEscalation: "ask",
-        },
-      });
-
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223i",
-        threadId: "t1",
-        input: [promptTextInput({ text: "follow up" })],
-        options: fullRuntimeOptions,
-      });
-
-      const threadStart = recordedCommands.find(
-        (command) => command.type === "thread/start",
       );
-      expect(threadStart?.type).toBe("thread/start");
-      if (!threadStart || threadStart.type !== "thread/start") {
-        throw new Error("Expected thread/start command");
-      }
-      expect(threadStart.options).toMatchObject({
-        permissionMode: "accept-edits",
-        permissionScope: "workspace",
-        approvalReviewer: "user",
-      });
-
-      const reconfigureCommand = findLastRecordedCommand(
-        recordedCommands,
-        "thread/resume",
-      );
-      expect(reconfigureCommand?.type).toBe("thread/resume");
-      if (!reconfigureCommand || reconfigureCommand.type !== "thread/resume") {
-        throw new Error("Expected thread/resume command");
-      }
-      expect(reconfigureCommand.options?.permissionMode).toBe("full");
-
-      const turnStart = findLastRecordedCommand(recordedCommands, "turn/start");
-      expect(turnStart?.type).toBe("turn/start");
-      if (!turnStart || turnStart.type !== "turn/start") {
-        throw new Error("Expected turn/start command");
-      }
-      expect(turnStart.options?.permissionMode).toBe("full");
-
-      await runtime.shutdown();
-    });
-
-    it("reconfigures permission policy before starting a turn when options change", async () => {
-      const recordedCommands: AdapterCommand[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => undefined,
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () =>
-          createRecordingAdapter({ recordedCommands, scriptPath }),
-      });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: {
-          ...fullRuntimeOptions,
-          permissionEscalation: "ask",
-          permissionMode: "accept-edits",
-          permissionScope: "workspace",
-          approvalReviewer: "user",
-        },
-      });
-
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223j",
-        threadId: "t1",
-        input: [promptTextInput({ text: "follow up" })],
-        options: {
-          ...fullRuntimeOptions,
-          permissionEscalation: "deny",
-          permissionMode: "auto",
-          permissionScope: "workspace",
-          approvalReviewer: "automatic",
-        },
-      });
-
-      const resumeIndex = recordedCommands.findIndex(
-        (command) => command.type === "thread/resume",
-      );
-      const turnStartIndex = recordedCommands.findIndex(
-        (command) => command.type === "turn/start",
-      );
-      expect(resumeIndex).toBeGreaterThan(-1);
-      expect(turnStartIndex).toBeGreaterThan(-1);
-      expect(resumeIndex).toBeLessThan(turnStartIndex);
-
-      const resumeCommand = recordedCommands[resumeIndex];
-      if (!resumeCommand || resumeCommand.type !== "thread/resume") {
-        throw new Error("Expected thread/resume command");
-      }
-      expect(resumeCommand.options).toMatchObject({
-        permissionMode: "auto",
-        permissionScope: "workspace",
-        approvalReviewer: "automatic",
-        permissionEscalation: "deny",
-      });
-
-      const turnStartCommand = recordedCommands[turnStartIndex];
-      if (!turnStartCommand || turnStartCommand.type !== "turn/start") {
-        throw new Error("Expected turn/start command");
-      }
-      expect(turnStartCommand.options).toMatchObject({
-        permissionMode: "auto",
-        permissionScope: "workspace",
-        approvalReviewer: "automatic",
-        permissionEscalation: "deny",
-      });
 
       await runtime.shutdown();
     });
   });
 
   describe("turn execution and thread commands", () => {
-    it("runs a turn and receives turn/started + turn/completed events", async () => {
-      const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (e) => events.push(e),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
-      });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: fullRuntimeOptions,
-      });
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223k",
-        threadId: "t1",
-        input: [promptTextInput({ text: "hello" })],
-        options: fullRuntimeOptions,
-      });
-      await waitForThreadTurnCompleted({
-        events,
-        runtime,
-        threadId: "t1",
-      });
-
-      expect(events.some((e) => e.type === "turn/started")).toBe(true);
-      expect(events.some((e) => e.type === "turn/completed")).toBe(true);
-      await runtime.shutdown();
-    });
-
     it("drops replayed completed turn starts before emitting to consumers", async () => {
-      const replayScriptPath = join(tmpDir, "replayed-turn-provider.cjs");
-      writeFileSync(
-        replayScriptPath,
-        `
-const readline = require("node:readline");
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
-    return;
-  }
-  if (message.method === "thread/start") {
-    send({ jsonrpc: "2.0", id: message.id, result: { providerThreadId: "prov-replay" } });
-    send({
-      jsonrpc: "2.0",
-      method: "thread/identity",
-      params: { threadId: message.params.threadId, providerThreadId: "prov-replay" },
-    });
-    return;
-  }
-  if (message.method === "turn/start") {
-    send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
-    send({
-      jsonrpc: "2.0",
-      method: "turn/started",
-      params: { threadId: message.params.threadId, providerThreadId: "prov-replay", turnId: "turn-1" },
-    });
-    send({
-      jsonrpc: "2.0",
-      method: "turn/completed",
-      params: { threadId: message.params.threadId, providerThreadId: "prov-replay", turnId: "turn-1" },
-    });
-    send({
-      jsonrpc: "2.0",
-      method: "turn/started",
-      params: { threadId: message.params.threadId, providerThreadId: "prov-replay", turnId: "turn-1" },
-    });
-  }
-});
-`,
-        "utf8",
-      );
       const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (event) => events.push(event),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(replayScriptPath),
+      const stderr: string[] = [];
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: (event) => events.push(event),
+          onStderr: (line) => stderr.push(line),
+        },
+        launch: {
+          pluginId: "provider-replayed-turn",
+          digest: "replayed-turn",
+          modulePath: fileURLToPath(
+            new URL("./test/bridges/replayed-turn-bridge.ts", import.meta.url),
+          ),
+        },
       });
 
       await runtime.startThread({
@@ -889,23 +783,28 @@ rl.on("line", (line) => {
         runtime,
         threadId: "t1",
       });
+      await wait(50);
 
       expect(
         events.filter((event) => event.type === "turn/started"),
       ).toHaveLength(1);
+      expect(stderr.some((line) => line.includes("turn/starts-once"))).toBe(
+        true,
+      );
+      expect(runtime.getActiveTurnId("t1")).toBeNull();
+      expect(events.some((event) => event.type === "item/completed")).toBe(
+        true,
+      );
       await runtime.shutdown();
     });
 
     it("runs the initial turn when startThread includes input", async () => {
       const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (e) => events.push(e),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: (e) => events.push(e),
+        },
       });
 
       await runtime.startThread({
@@ -931,14 +830,11 @@ rl.on("line", (line) => {
 
     it("does not start a turn until input is sent separately", async () => {
       const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (event) => events.push(event),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: (event) => events.push(event),
+        },
       });
 
       await runtime.startThread({
@@ -977,65 +873,22 @@ rl.on("line", (line) => {
       await runtime.shutdown();
     });
 
-    it("resumes a thread", async () => {
+    it("preserves active turn state when the stop request fails", async () => {
       const events: ThreadEvent[] = [];
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (e) => events.push(e),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
-      });
-
-      const { providerThreadId } = await runtime.resumeThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        providerThreadId: "old-prov-123",
-        providerId: "fake",
-        options: fullRuntimeOptions,
-      });
-
-      expect(providerThreadId).toBe("old-prov-123");
-
-      // Should be able to run a turn on the resumed thread
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223p",
-        threadId: "t1",
-        input: [promptTextInput({ text: "after resume" })],
-        options: fullRuntimeOptions,
-      });
-      await waitForThreadTurnCompleted({
-        events,
-        runtime,
-        threadId: "t1",
-      });
-      expect(events.some((e) => e.type === "turn/completed")).toBe(true);
-      await runtime.shutdown();
-    });
-
-    it("preserves active turn state when stop command construction fails", async () => {
-      const builtCommands: AdapterCommand[] = [];
-      const events: ThreadEvent[] = [];
-      const baseAdapter = createFakeAdapter(scriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (event) => events.push(event),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...baseAdapter,
-          buildCommandPlan(command): ProviderCommandPlan {
-            if (command.type === "thread/stop") {
-              throw new Error("stop command failed to build");
-            }
-            builtCommands.push(command);
-            return baseAdapter.buildCommandPlan(command);
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: (event) => events.push(event),
+        },
+        launch: {
+          scripted: {
+            failMethods: [
+              { method: "thread/stop", message: "stop command failed" },
+            ],
           },
-        }),
+        },
       });
 
       await runtime.startThread({
@@ -1051,44 +904,42 @@ rl.on("line", (line) => {
         input: [promptTextInput({ text: "delay:500" })],
         options: fullRuntimeOptions,
       });
-      await waitForThreadTurnStarted({
+      const { turnId } = await waitForThreadTurnStarted({
         events,
         providerId: "fake",
         runtime,
         threadId: "t1",
-        turnId: "turn-1",
       });
 
       await expect(runtime.stopThread({ threadId: "t1" })).rejects.toThrow(
-        /stop command failed to build/,
+        /stop command failed/,
       );
+      expect(runtime.getActiveTurnId("t1")).toBe(turnId);
 
-      await runtime.steerTurn({
-        clientRequestId: "creq_222222223r",
+      await expect(
+        runtime.steerTurn({
+          clientRequestId: "creq_222222223r",
+          threadId: "t1",
+          expectedTurnId: turnId,
+          input: [promptTextInput({ text: "still active" })],
+          options: fullRuntimeOptions,
+        }),
+      ).resolves.toEqual({ status: "steered" });
+      expect(record.last("turn/steer")?.params).toMatchObject({
         threadId: "t1",
-        expectedTurnId: "turn-1",
-        input: [promptTextInput({ text: "still active" })],
-        options: fullRuntimeOptions,
+        clientRequestId: "creq_222222223r",
       });
-
-      expect(
-        builtCommands.some((command) => command.type === "turn/steer"),
-      ).toBe(true);
 
       await runtime.shutdown();
     });
 
-    it("keeps the provider running after thread stop", async () => {
+    it("retires the provider after thread stop and starts it for resume", async () => {
       const events: ThreadEvent[] = [];
-      const adapter = createFakeAdapter(scriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (event) => events.push(event),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => adapter,
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: (event) => events.push(event),
+        },
       });
 
       const startResult = await runtime.startThread({
@@ -1106,9 +957,7 @@ rl.on("line", (line) => {
       });
 
       await runtime.stopThread({ threadId: "t1" });
-      expect(runtime.listRunningProviders()).toEqual(["fake"]);
-      // Stop removes the thread from the runtime; the follow-up below must
-      // resume it before running another turn.
+      expect(runtime.listRunningProviders()).toEqual([]);
       expect(runtime.hasThread("t1")).toBe(false);
       expect(runtime.getProviderSession("t1")).toBeNull();
       expect(runtime.getActiveTurnId("t1")).toBeNull();
@@ -1138,15 +987,15 @@ rl.on("line", (line) => {
       await runtime.shutdown();
     });
 
-    it("resolves waitForActiveTurn from the turn/started observation", async () => {
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
+    it("resolves waitForActiveTurn and rejects a competing start while active", async () => {
+      const events: ThreadEvent[] = [];
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: (event) => events.push(event),
+        },
       });
 
       await runtime.startThread({
@@ -1167,56 +1016,39 @@ rl.on("line", (line) => {
         input: [promptTextInput({ text: "delay:500" })],
         options: fullRuntimeOptions,
       });
+      const { turnId } = await waitForThreadTurnStarted({
+        events,
+        providerId: "fake",
+        runtime,
+        threadId: "t1",
+      });
 
-      await expect(pendingTurnId).resolves.toBe("turn-1");
-      expect(runtime.getActiveTurnId("t1")).toBe("turn-1");
+      await expect(pendingTurnId).resolves.toBe(turnId);
+      expect(runtime.getActiveTurnId("t1")).toBe(turnId);
       expect(runtime.getLiveThreadIds()).toEqual(["t1"]);
+      await expect(
+        runtime.runTurn({
+          clientRequestId: "creq_222222224a",
+          threadId: "t1",
+          input: [promptTextInput({ text: "competing active turn" })],
+          options: fullRuntimeOptions,
+        }),
+      ).rejects.toThrow(/active or starting/);
+      expect(
+        recordedMethods(record).filter((method) => method === "turn/start"),
+      ).toHaveLength(1);
       await runtime.shutdown();
     });
 
-    it("reports pending work before an accepted turn emits its first event", async () => {
-      const pendingTurnScriptPath = join(tmpDir, "pending-turn-provider.cjs");
-      writeFileSync(
-        pendingTurnScriptPath,
-        `
-const readline = require("node:readline");
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    return;
-  }
-
-  if (message.method === "thread/start") {
-    send({
-      jsonrpc: "2.0",
-      id: message.id,
-      result: { providerThreadId: "prov-pending-turn" },
-    });
-    return;
-  }
-
-  if (message.method === "turn/start") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-  }
-});
-`,
-        "utf8",
-      );
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(pendingTurnScriptPath),
+    it("reports pending work and rejects a competing start before the first event", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => {},
+        },
+        launch: { scripted: { swallowTurnStart: true } },
       });
 
       try {
@@ -1236,41 +1068,29 @@ rl.on("line", (line) => {
 
         expect(runtime.getActiveTurnId("t1")).toBeNull();
         expect(runtime.getLiveThreadIds()).toEqual(["t1"]);
+        await expect(
+          runtime.runTurn({
+            clientRequestId: "creq_222222224b",
+            threadId: "t1",
+            input: [promptTextInput({ text: "competing pending turn" })],
+            options: fullRuntimeOptions,
+          }),
+        ).rejects.toThrow(/active or starting/);
+        expect(
+          recordedMethods(record).filter((method) => method === "turn/start"),
+        ).toHaveLength(1);
       } finally {
         await runtime.shutdown();
       }
     });
 
     it("resolves pending waitForActiveTurn waiters with null when the provider crashes", async () => {
-      const crashAfterStartScript = join(tmpDir, "crash-after-start.cjs");
-      writeFileSync(
-        crashAfterStartScript,
-        `const rl = require("readline").createInterface({ input: process.stdin });
-        rl.on("line", (line) => {
-          const msg = JSON.parse(line);
-          if (msg.method === "initialize") {
-            process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
-          } else if (msg.method === "thread/start") {
-            process.stdout.write(JSON.stringify({
-              jsonrpc: "2.0", id: msg.id,
-              result: { providerThreadId: "prov-crash-waiter" }
-            }) + "\\n");
-            process.stdout.write(JSON.stringify({
-              jsonrpc: "2.0", method: "thread/identity",
-              params: { threadId: msg.params?.threadId, providerThreadId: "prov-crash-waiter" }
-            }) + "\\n");
-            setTimeout(() => process.exit(13), 50);
-          }
-        });`,
-      );
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(crashAfterStartScript),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: () => {},
+        },
+        launch: { scripted: { exitAfter: "thread/start" } },
       });
 
       await runtime.startThread({
@@ -1290,23 +1110,14 @@ rl.on("line", (line) => {
       await runtime.shutdown();
     });
 
-    it("reconfigures the thread before later run turns when settings change", async () => {
-      const builtCommands: AdapterCommand[] = [];
-      const baseAdapter = createFakeAdapter(scriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...baseAdapter,
-          buildCommandPlan(command) {
-            builtCommands.push(command);
-            return baseAdapter.buildCommandPlan(command);
-          },
-        }),
+    it("carries changed settings and instructions on later run turns", async () => {
+      const record = createScriptedEchoRequestRecord();
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: () => {},
+        },
       });
 
       await runtime.startThread({
@@ -1317,7 +1128,7 @@ rl.on("line", (line) => {
         options: { ...fullRuntimeOptions, model: "fake-model" },
         instructions: "Initial instructions",
       });
-      builtCommands.length = 0;
+      const methodsBeforeTurn = recordedMethods(record).length;
 
       await runtime.runTurn({
         clientRequestId: "creq_222222223v",
@@ -1327,18 +1138,10 @@ rl.on("line", (line) => {
         instructions: "Updated instructions",
       });
 
-      expect(builtCommands).toHaveLength(2);
-      expect(builtCommands[0]).toMatchObject({
-        type: "thread/resume",
-        options: {
-          // The resume keeps the session's frozen instructions; drifted
-          // instructions apply only when the next session is constructed.
-          instructions: "Initial instructions",
-          model: "fake-model-2",
-        },
-      });
-      expect(builtCommands[1]).toMatchObject({
-        type: "turn/start",
+      expect(recordedMethods(record).slice(methodsBeforeTurn)).toEqual([
+        "turn/start",
+      ]);
+      expect(record.last("turn/start")?.params).toMatchObject({
         clientRequestId: "creq_222222223v",
         options: {
           instructions: "Updated instructions",
@@ -1348,70 +1151,15 @@ rl.on("line", (line) => {
       await runtime.shutdown();
     });
 
-    it("does not resume the thread when only instructions change", async () => {
-      const builtCommands: AdapterCommand[] = [];
-      const baseAdapter = createFakeAdapter(scriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...baseAdapter,
-          buildCommandPlan(command) {
-            builtCommands.push(command);
-            return baseAdapter.buildCommandPlan(command);
-          },
-        }),
-      });
-
-      await runtime.startThread({
-        environmentId: "env-1",
-        threadId: "t1",
-        projectId: "p1",
-        providerId: "fake",
-        options: fullRuntimeOptions,
-        instructions: "Initial instructions",
-      });
-      builtCommands.length = 0;
-
-      await runtime.runTurn({
-        clientRequestId: "creq_222222223y",
-        threadId: "t1",
-        input: [promptTextInput({ text: "follow up" })],
-        options: fullRuntimeOptions,
-        instructions: "Updated instructions",
-      });
-
-      // A resume would replace the live provider session and kill its
-      // running background tasks, so instruction drift alone must not
-      // reconfigure the thread.
-      expect(builtCommands.map((command) => command.type)).toEqual([
-        "turn/start",
-      ]);
-      await runtime.shutdown();
-    });
-
-    it("reconfigures the thread before steer turns when settings change", async () => {
-      const builtCommands: AdapterCommand[] = [];
+    it("carries changed settings and instructions on steer turns", async () => {
+      const record = createScriptedEchoRequestRecord();
       const events: ThreadEvent[] = [];
-      const baseAdapter = createFakeAdapter(scriptPath);
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: (event) => events.push(event),
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => ({
-          ...baseAdapter,
-          buildCommandPlan(command) {
-            builtCommands.push(command);
-            return baseAdapter.buildCommandPlan(command);
-          },
-        }),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          env: record.env,
+          onEvent: (event) => events.push(event),
+        },
       });
 
       await runtime.startThread({
@@ -1429,75 +1177,64 @@ rl.on("line", (line) => {
         options: { ...fullRuntimeOptions, model: "fake-model" },
         instructions: "Initial instructions",
       });
-      await waitForThreadTurnStarted({
+      const { turnId } = await waitForThreadTurnStarted({
         events,
         providerId: "fake",
         runtime,
         threadId: "t1",
-        turnId: "turn-1",
       });
-      builtCommands.length = 0;
+      const methodsBeforeSteer = recordedMethods(record).length;
 
       await runtime.steerTurn({
         clientRequestId: "creq_222222223x",
         threadId: "t1",
-        expectedTurnId: "turn-1",
+        expectedTurnId: turnId,
         input: [promptTextInput({ text: "apply a new setup now" })],
         options: { ...fullRuntimeOptions, model: "fake-model-2" },
         instructions: "Updated instructions",
       });
 
-      expect(builtCommands).toHaveLength(2);
-      expect(builtCommands[0]).toMatchObject({
-        type: "thread/resume",
-        options: {
-          instructions: "Initial instructions",
-          model: "fake-model-2",
-        },
-      });
-      expect(builtCommands[1]).toMatchObject({
+      expect(recordedMethods(record).slice(methodsBeforeSteer)).toEqual([
+        "turn/steer",
+      ]);
+      expect(record.last("turn/steer")?.params).toMatchObject({
+        threadId: "t1",
         expectedTurnId: "turn-1",
-        type: "turn/steer",
         clientRequestId: "creq_222222223x",
         options: {
           instructions: "Updated instructions",
           model: "fake-model-2",
         },
       });
+      expect(turnId).not.toBe("turn-1");
       await runtime.shutdown();
     });
   });
 
   describe("models", () => {
     it("lists models", async () => {
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: () => {},
+        },
       });
 
       const { models } = await runtime.listModels({ providerId: "fake" });
       expect(models).toHaveLength(1);
-      expect(models[0].id).toBe("fake-model");
-      expect(models[0].isDefault).toBe(true);
+      expect(models[0]?.id).toBe("fake-model");
+      expect(models[0]?.isDefault).toBe(true);
       await runtime.shutdown();
     });
   });
 
   describe("errors", () => {
     it("rejects runTurn for unknown thread", async () => {
-      const runtime = createAgentRuntimeWithAdapters({
-        workspacePath: tmpDir,
-        onEvent: () => {},
-        onToolCall: async () => ({
-          contentItems: [{ type: "inputText", text: "ok" }],
-          success: true,
-        }),
-        adapterFactory: () => createFakeAdapter(scriptPath),
+      const runtime = createScriptedEchoRuntime({
+        runtime: {
+          workspacePath: tmpDir,
+          onEvent: () => {},
+        },
       });
 
       await expect(

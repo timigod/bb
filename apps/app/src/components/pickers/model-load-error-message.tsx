@@ -5,6 +5,7 @@ import { useUrlAnchorClickHandler } from "@/lib/url-open-routing";
 interface ModelLoadErrorMessageProps {
   error: SystemExecutionOptionsModelLoadError;
   providerLabel: string;
+  installUrl?: string;
 }
 
 interface FormatModelLoadErrorTextArgs {
@@ -12,85 +13,85 @@ interface FormatModelLoadErrorTextArgs {
   providerLabel: string;
 }
 
-const PROVIDER_CLI_HELP_LINKS: Partial<
-  Record<string, { label: string; url: string }>
-> = {
-  codex: {
-    label: "Codex CLI",
-    url: "https://developers.openai.com/codex/cli",
-  },
-  "acp-cursor": {
-    label: "Cursor CLI",
-    url: "https://cursor.com/docs/cli/installation",
-  },
-};
-
-function providerCliLabel({
-  error,
+export function formatModelLoadErrorSummary({
   providerLabel,
-}: FormatModelLoadErrorTextArgs): string {
-  return (
-    PROVIDER_CLI_HELP_LINKS[error.providerId]?.label ?? `${providerLabel} CLI`
-  );
+}: Pick<FormatModelLoadErrorTextArgs, "providerLabel">): string {
+  return `Could not load models for ${providerLabel}.`;
 }
 
-export function formatModelLoadErrorText({
+export function formatModelLoadErrorReason({
   error,
-  providerLabel,
-}: FormatModelLoadErrorTextArgs): string {
-  if (error.code === "timeout") {
-    return `Timed out loading models for ${providerLabel}.`;
+}: Pick<FormatModelLoadErrorTextArgs, "error">): string | null {
+  switch (error.code) {
+    case "provider_unavailable":
+      return "Provider plugin failed to load";
+    case "missing_executable":
+      return "CLI not found";
+    case "auth_required":
+      return "Not signed in";
+    case "timeout":
+      return "Timed out";
+    case "failed":
+      return error.detail;
   }
+}
 
-  if (error.code === "missing_executable") {
-    return `Could not load models for ${providerLabel}. Please make sure the ${providerCliLabel({ error, providerLabel })} is installed.`;
-  }
+export function formatModelLoadErrorText(
+  args: FormatModelLoadErrorTextArgs,
+): string {
+  const summary = formatModelLoadErrorSummary(args);
+  const reason = formatModelLoadErrorReason(args);
+  return reason === null ? summary : `${summary} ${reason}.`;
+}
 
-  if (error.code === "auth_required") {
-    return `Could not load models for ${providerLabel}. Authentication is required.`;
-  }
-
-  return `Could not load models for ${providerLabel}.`;
+export function formatModelLoadErrorTitle(
+  args: FormatModelLoadErrorTextArgs,
+): string {
+  const summary = formatModelLoadErrorSummary(args);
+  const detail = args.error.detail ?? formatModelLoadErrorReason(args);
+  return detail === null ? summary : `${summary}\n${detail}`;
 }
 
 export function ModelLoadErrorMessage({
   error,
   providerLabel,
+  installUrl,
 }: ModelLoadErrorMessageProps): ReactNode {
-  const helpLink =
-    error.code === "missing_executable"
-      ? PROVIDER_CLI_HELP_LINKS[error.providerId]
-      : undefined;
-  const handleHelpLinkClick = useUrlAnchorClickHandler(helpLink?.url);
+  const helpUrl = error.code === "missing_executable" ? installUrl : undefined;
+  const handleHelpLinkClick = useUrlAnchorClickHandler(helpUrl);
+  const reason = formatModelLoadErrorReason({ error });
+  const signInGuidance =
+    error.code === "auth_required" && error.detail !== reason
+      ? error.detail
+      : null;
 
-  if (error.code === "missing_executable") {
-    if (!helpLink) {
-      return formatModelLoadErrorText({ error, providerLabel });
-    }
-    return (
-      <>
-        Could not load models for {providerLabel}. Please make sure the{" "}
-        <a
-          href={helpLink.url}
-          target="_blank"
-          rel="noreferrer"
-          onClick={handleHelpLinkClick}
-          className="underline underline-offset-2 hover:text-foreground"
-        >
-          {helpLink.label}
-        </a>{" "}
-        is installed.
-      </>
-    );
-  }
-
-  if (error.code === "auth_required") {
-    return (
-      <>
-        Could not load models for {providerLabel}. Authentication is required.
-      </>
-    );
-  }
-
-  return formatModelLoadErrorText({ error, providerLabel });
+  return (
+    <>
+      <span className="block">
+        {formatModelLoadErrorSummary({ providerLabel })}
+      </span>
+      {reason === null ? null : (
+        <span className="mt-1 line-clamp-3 block break-words opacity-80 [overflow-wrap:anywhere]">
+          {helpUrl === undefined ? (
+            reason
+          ) : (
+            <a
+              href={helpUrl}
+              target="_blank"
+              rel="noreferrer"
+              onClick={handleHelpLinkClick}
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              {reason}
+            </a>
+          )}
+        </span>
+      )}
+      {signInGuidance === null ? null : (
+        <span className="mt-1 block break-words opacity-80 [overflow-wrap:anywhere]">
+          {signInGuidance}
+        </span>
+      )}
+    </>
+  );
 }

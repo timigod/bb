@@ -28,7 +28,6 @@ import {
 import { readJson } from "../helpers/json.js";
 import { withTestHarness } from "../helpers/test-app.js";
 
-/** Write a custom theme's `theme.css` under `<dataDir>/theme/<name>/`. */
 async function writeCustomTheme(
   dataDir: string,
   name: string,
@@ -79,13 +78,14 @@ describe("appearance settings", () => {
       const put = await harness.app.request("/api/v1/settings/appearance", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ themeId: "midnight", faviconColor: "default" }),
+        body: JSON.stringify({ themeId: "midnight", faviconColor: "teal" }),
       });
       expect(put.status).toBe(200);
       expect(appThemeSchema.parse(await readJson(put))).toEqual({
         ...defaultAppTheme,
         themeId: "midnight",
         customCss: css,
+        faviconColor: "teal",
       });
       expect(getStoredThemeId(harness.db)).toBe("midnight");
 
@@ -96,6 +96,7 @@ describe("appearance settings", () => {
         ...defaultAppTheme,
         themeId: "midnight",
         customCss: css,
+        faviconColor: "teal",
       });
       expect(config.customThemes).toEqual(["midnight"]);
     });
@@ -176,7 +177,6 @@ describe("appearance settings", () => {
     await withTestHarness(async (harness) => {
       await writeCustomTheme(harness.config.dataDir, "zephyr", ":root {}");
       await writeCustomTheme(harness.config.dataDir, "amber", ":root {}");
-      // A directory without a theme.css is not a theme.
       await mkdir(join(harness.config.dataDir, "theme", "incomplete"), {
         recursive: true,
       });
@@ -282,7 +282,6 @@ describe("appearance settings", () => {
       const config = systemConfigResponseSchema.parse(
         await readJson(await harness.app.request("/api/v1/system/config")),
       );
-      // The selection is still stored, but resolution falls back gracefully.
       expect(getStoredThemeId(harness.db)).toBe("ghost");
       expect(config.appearance).toEqual(defaultAppTheme);
       expect(config.customThemes).toEqual([]);
@@ -350,19 +349,6 @@ describe("appearance settings", () => {
           files: { "bb:ocean:dark": { ...darkTheme, name: "bb:ocean:dark" } },
         },
       });
-    });
-  });
-
-  it("follows a built-in palette's matching Shiki pair", async () => {
-    await withTestHarness(async (harness) => {
-      const put = await harness.app.request("/api/v1/settings/appearance", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ themeId: "dracula", faviconColor: "default" }),
-      });
-      expect(appThemeSchema.parse(await readJson(put))).toEqual(
-        appearanceForPalette("dracula"),
-      );
     });
   });
 });

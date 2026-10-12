@@ -4,6 +4,7 @@ import type {
   TimelineApprovalWorkRow,
   TimelineCommandWorkRow,
   TimelineFileChangeWorkRow,
+  TimelineFileReadWorkRow,
   TimelineImageViewWorkRow,
   TimelineParentChange,
   TimelineRowBase,
@@ -23,7 +24,6 @@ import {
 import { formatTimelineDecorationText } from "../src/timeline-row-title.js";
 import type {
   TimelineViewDelegationWorkRow,
-  TimelineWorkSummaryKind,
   TimelineWorkSummaryRow,
 } from "../src/timeline-view.js";
 
@@ -54,18 +54,10 @@ interface PermissionGrantApprovalRowArgs {
 interface ParentChangeSystemRowArgs {
   parentChange: TimelineParentChange;
   status?: TimelineRowStatus;
-  /**
-   * The thread name carried in the flat title; the App splits this back out of
-   * `title` to render the linked thread-name segment. Defaults to "Worker 3".
-   */
   threadName?: string;
-  /** Override the row's thread id (defaults to the base row's thread id). */
   threadId?: string;
 }
 
-// The ownership verbs the projection interpolates into the flat title. Mirrors
-// `OWNERSHIP_CHANGE_VERBS` so the test builds the same `"{name} {verb} {parent}"`
-// title the server emits, which the App re-splits.
 const PARENT_CHANGE_VERB: Record<TimelineParentChange["action"], string> = {
   assign: "assigned to",
   release: "released from",
@@ -125,14 +117,24 @@ function toolRow(): TimelineToolWorkRow {
     workKind: "tool",
     status: "completed",
     callId: "tool-call-1",
-    toolName: "Read",
-    toolArgs: {
-      file_path: "/repo/src/app.ts",
-    },
+    toolName: "LookupTool",
+    toolArgs: { query: "select:TodoWrite" },
     output: "",
     completedAt: 2_101,
     approvalStatus: null,
-    activityIntents: [readIntent("/repo/src/app.ts")],
+  };
+}
+
+function fileReadRow(path: string): TimelineFileReadWorkRow {
+  return {
+    ...baseRow("file-read-1"),
+    kind: "work",
+    workKind: "file-read",
+    status: "completed",
+    callId: "file-read-call-1",
+    path,
+    cmd: null,
+    completedAt: 2_101,
   };
 }
 
@@ -150,6 +152,14 @@ function searchIntent(query: string, path: string): TimelineActivityIntent {
     type: "search",
     command: `rg ${query} ${path}`,
     query,
+    path,
+  };
+}
+
+function listFilesIntent(path: string): TimelineActivityIntent {
+  return {
+    type: "list_files",
+    command: `ls ${path}`,
     path,
   };
 }
@@ -269,6 +279,8 @@ function delegationRow(): TimelineViewDelegationWorkRow {
     status: "completed",
     callId: "delegation-call-1",
     toolName: "spawnAgent",
+    childRef: null,
+    background: false,
     subagentType: "general-purpose-review-agent-with-a-long-name",
     description: "Review correctness + plan adherence",
     output: "",
@@ -366,7 +378,7 @@ function parentChangeSystemRow({
 
 function workSummaryRow(
   children: TimelineViewWorkRow[],
-  kind: TimelineWorkSummaryKind = "step-summary",
+  kind: TimelineWorkSummaryRow["kind"] = "step-summary",
 ): TimelineWorkSummaryRow {
   return {
     ...baseRow("summary-1"),
@@ -406,11 +418,6 @@ describe("buildTimelineRowTitle", () => {
   });
 
   it("collapses newlines in multi-line command content to single-line title segments", () => {
-    // Command content can include literal newlines (heredocs, scripts pasted
-    // as a single argument, etc.). The App renders segments with
-    // `whitespace-pre`, which would honor `\n` as a line break, and the
-    // plain text feeds CLI rendering and HTML title attributes. Both must
-    // be single-line, so segment construction normalizes newlines.
     const row = {
       ...commandRow(),
       command: "node <<'EOF'\nconst x = 1;\nconsole.log(x);\nEOF",
@@ -425,9 +432,6 @@ describe("buildTimelineRowTitle", () => {
   });
 
   it("emits a live-tick duration decoration on pending command rows", () => {
-    // Pending rows carry `completedAt: null`. The renderer emits a decoration
-    // sourced from `startedAt`; the App ticks `now - startedAt` locally and
-    // CLI prints nothing (no captured end yet).
     const title = buildTimelineRowTitle(
       {
         ...commandRow(),
@@ -448,128 +452,17 @@ describe("buildTimelineRowTitle", () => {
     ]);
   });
 
-  it("keeps elapsed duration visible on interrupted command rows", () => {
-    const title = buildTimelineRowTitle(
-      {
-        ...commandRow(),
-        status: "interrupted",
-        exitCode: null,
-        completedAt: 3_001,
-      },
-      DEFAULT_OPTIONS,
-    );
-
-    expect(title.plain).toBe(
-      "Ran pnpm exec turbo run test --filter=@bb/app (3s, interrupted)",
-    );
-    expect(title.decorations).toEqual([
-      {
-        kind: "status",
-        status: "interrupted",
-        durationMs: 3_000,
-        emphasis: false,
-      },
-    ]);
-  });
-
-  it("keeps elapsed duration visible on interrupted tool rows", () => {
-    const title = buildTimelineRowTitle(
-      {
-        ...toolRow(),
-        activityIntents: [],
-        status: "interrupted",
-        toolArgs: { query: "select:TodoWrite" },
-        toolName: "LookupTool",
-        completedAt: 3_001,
-      },
-      DEFAULT_OPTIONS,
-    );
-
-    expect(title.plain).toBe(
-      "Ran tool LookupTool { query: select:TodoWrite } (3s, interrupted)",
-    );
-    expect(title.decorations).toEqual([
-      {
-        kind: "status",
-        status: "interrupted",
-        durationMs: 3_000,
-        emphasis: false,
-      },
-    ]);
-  });
-
-  it("uses native plugin status labels while preserving the generic fallback", () => {
-    const completed = buildTimelineRowTitle(
-      {
-        ...toolRow(),
-        statusLabels: {
-          pending: "Reading project overview",
-          completed: "Read project overview",
-        },
-      },
-      DEFAULT_OPTIONS,
-    );
-    const pending = buildTimelineRowTitle(
-      {
-        ...toolRow(),
-        status: "pending",
-        completedAt: null,
-        statusLabels: {
-          pending: "Reading project overview",
-          completed: "Read project overview",
-        },
-      },
-      DEFAULT_OPTIONS,
-    );
-
-    expect(completed.plain).toBe("Read project overview (2s)");
-    expect(pending.plain).toBe("Reading project overview");
+  it("titles a generic tool row from its name and arguments, not from a label table", () => {
     expect(
       buildTimelineRowTitle(
         {
           ...toolRow(),
-          activityIntents: [],
           toolName: "repository_context",
           toolArgs: null,
         },
         DEFAULT_OPTIONS,
       ).plain,
     ).toBe("Ran tool repository_context (2s)");
-  });
-
-  // The labels deliberately cover only pending and completed. Every other
-  // state must fall back to the tool's own identity, or a failing plugin tool
-  // would render as a success sentence and the failure would be unreadable.
-  it("ignores plugin status labels outside pending and completed", () => {
-    const statusLabels = {
-      pending: "Reading project overview",
-      completed: "Read project overview",
-    };
-    const render = (overrides: Partial<ReturnType<typeof toolRow>>): string =>
-      buildTimelineRowTitle(
-        {
-          ...toolRow(),
-          activityIntents: [],
-          toolName: "repository_context",
-          toolArgs: null,
-          statusLabels,
-          ...overrides,
-        },
-        DEFAULT_OPTIONS,
-      ).plain;
-
-    expect(render({ status: "error" })).toContain("repository_context");
-    expect(render({ status: "error" })).not.toContain("Read project overview");
-    expect(render({ status: "interrupted" })).toContain("repository_context");
-    expect(render({ status: "interrupted" })).not.toContain(
-      "Read project overview",
-    );
-    expect(
-      render({ status: "pending", approvalStatus: "waiting_for_approval" }),
-    ).not.toContain("Reading project overview");
-    expect(
-      render({ status: "pending", approvalStatus: "denied" }),
-    ).not.toContain("Reading project overview");
   });
 
   it("can render completed work leaves with muted summary title treatment", () => {
@@ -581,8 +474,6 @@ describe("buildTimelineRowTitle", () => {
     expect(title.plain).toBe(
       "Ran pnpm exec turbo run test --filter=@bb/app (2s)",
     );
-    // Summary work-style mutes via tone; per-segment em is preserved so
-    // content emphasis stays visible inside the muted wrapper.
     expect(title.tone).toBe("summary");
     expect(title.segments.find((s) => s.em)?.text).toBe(
       "pnpm exec turbo run test --filter=@bb/app",
@@ -599,6 +490,15 @@ describe("buildTimelineRowTitle", () => {
       } satisfies TimelineCommandWorkRow,
     },
     {
+      expectedPlain: "Permission denied: Read /repo/src/app.ts",
+      row: {
+        ...commandRow(),
+        command: "cat /repo/src/app.ts",
+        activityIntents: [readIntent("/repo/src/app.ts")],
+        approvalStatus: "denied",
+      } satisfies TimelineCommandWorkRow,
+    },
+    {
       expectedPlain: "Permission denied: src/existing-file.ts +1 -1",
       row: {
         ...editedFileRow(),
@@ -606,7 +506,8 @@ describe("buildTimelineRowTitle", () => {
       } satisfies TimelineFileChangeWorkRow,
     },
     {
-      expectedPlain: "Permission denied: Read /repo/src/app.ts",
+      expectedPlain:
+        "Permission denied: LookupTool { query: select:TodoWrite } (2s)",
       row: {
         ...toolRow(),
         approvalStatus: "denied",
@@ -703,28 +604,18 @@ describe("buildTimelineRowTitle", () => {
     },
   );
 
-  it.each([
-    {
-      expectedPlain:
-        "Permission grant interrupted: Bash (Thread stopped by user request)",
-      lifecycle: "interrupted",
-    },
-  ] satisfies Array<{
-    expectedPlain: string;
-    lifecycle: Extract<PermissionGrantApprovalLifecycle, "interrupted">;
-  }>)(
-    "renders permission grant $lifecycle status reason",
-    ({ expectedPlain, lifecycle }) => {
-      const statusReason = "Thread stopped by user request";
-      const title = buildTimelineRowTitle(
-        permissionGrantApprovalRow({ lifecycle, statusReason }),
-        DEFAULT_OPTIONS,
-      );
+  it("renders permission grant interrupted status reason", () => {
+    const statusReason = "Thread stopped by user request";
+    const title = buildTimelineRowTitle(
+      permissionGrantApprovalRow({ lifecycle: "interrupted", statusReason }),
+      DEFAULT_OPTIONS,
+    );
 
-      expect(title.plain).toBe(expectedPlain);
-      expect(title.segments.map((s) => s.text)).toContain(`(${statusReason})`);
-    },
-  );
+    expect(title.plain).toBe(
+      "Permission grant interrupted: Bash (Thread stopped by user request)",
+    );
+    expect(title.segments.map((s) => s.text)).toContain(`(${statusReason})`);
+  });
 
   it("uses a permissions fallback for grant requests without a tool name", () => {
     const title = buildTimelineRowTitle(
@@ -849,8 +740,6 @@ describe("buildTimelineRowTitle", () => {
       expect(title.plain).toBe(expectedPlain);
       expect(title.segments.map((s) => s.text)).toEqual(expectedSegments);
 
-      // The leading thread-name segment is emphasized and linked to the row's
-      // own thread, matching the agent "Message from [thread]" treatment.
       const threadSegment = title.segments[0];
       expect(threadSegment?.em).toBe(true);
       expect(threadSegment?.link).toEqual({
@@ -858,11 +747,9 @@ describe("buildTimelineRowTitle", () => {
         threadId: "thread-1",
       });
 
-      // The verb is a muted, unlinked connector.
       expect(title.segments[1]?.link).toBeUndefined();
       expect(title.segments[1]?.accent).toBe("muted");
 
-      // The trailing parent segment links to the (new/previous) parent.
       const parentSegment = title.segments[2];
       expect(parentSegment?.em).toBe(true);
       expect(parentSegment?.link).toEqual({
@@ -979,7 +866,6 @@ describe("buildTimelineRowTitle", () => {
       DEFAULT_OPTIONS,
     );
 
-    // Null parent → literal "parent" with no link, never a dangling verb.
     expect(title.plain).toBe("Worker 3 assigned to parent");
     expect(title.segments.map((s) => s.text)).toEqual([
       "Worker 3",
@@ -993,8 +879,6 @@ describe("buildTimelineRowTitle", () => {
     const title = buildTimelineRowTitle(
       parentChangeSystemRow({
         threadName: "Worker 3",
-        // A null title with a present id keeps the parent linkable, falling
-        // back to the id as the visible label.
         parentChange: {
           action: "assign",
           previousParentThreadId: null,
@@ -1050,8 +934,6 @@ describe("buildTimelineRowTitle", () => {
         DEFAULT_OPTIONS,
       );
 
-      // The thread name leads the title and carries the shimmer when pending.
-      // (`plain` also folds in any status decoration, so compare the segments.)
       expect(title.segments.map((s) => s.text)).toEqual([
         "Worker 3",
         "assigned to",
@@ -1071,9 +953,9 @@ describe("buildTimelineRowTitle", () => {
 
   it("renders failed exploration intents using the intent verb", () => {
     const row = {
-      ...toolRow(),
+      ...fileReadRow("/repo/src/app.ts"),
       status: "error",
-    } satisfies TimelineToolWorkRow;
+    } satisfies TimelineFileReadWorkRow;
 
     const title = buildTimelineRowTitle(row, DEFAULT_OPTIONS);
 
@@ -1182,6 +1064,41 @@ describe("buildTimelineRowTitle", () => {
       { kind: "duration", startedAt: 1, completedAt: 45_001, em: false },
     ]);
   });
+
+  it.each([
+    {
+      status: "pending" as const,
+      output: "",
+      expectedPlain: "Running skill code-review",
+    },
+    {
+      status: "completed" as const,
+      output: 'Skill "code-review" completed (forked execution).',
+      expectedPlain: "Ran skill code-review (45s)",
+    },
+  ])(
+    "titles a $status tool call promoted to a delegation by its presentation title",
+    ({ status, output, expectedPlain }) => {
+      const row = {
+        ...delegationRow(),
+        status,
+        completedAt: status === "pending" ? null : 45_001,
+        toolName: "Skill",
+        subagentType: null,
+        description: null,
+        output,
+        presentation: {
+          label: { pending: "Running skill", completed: "Ran skill" },
+          icon: { glyph: "Zap" },
+          title: "code-review",
+        },
+      } satisfies TimelineViewDelegationWorkRow;
+
+      const title = buildTimelineRowTitle(row, DEFAULT_OPTIONS);
+
+      expect(title.plain).toBe(expectedPlain);
+    },
+  );
 
   it.each([
     {
@@ -1339,10 +1256,6 @@ describe("buildTimelineRowTitle", () => {
   });
 
   it("emits a live duration decoration for pending turns so the App ticks elapsed", () => {
-    // Pending turns carry `completedAt: null`; the CLI prints just "Working"
-    // (no captured duration to format), but the renderer still emits the
-    // duration decoration so the App's `LiveDurationText` can tick `now -
-    // startedAt` once the elapsed time crosses the visible threshold.
     const row = {
       ...turnRow(),
       completedAt: null,
@@ -1371,6 +1284,25 @@ describe("buildTimelineRowTitle", () => {
   });
 
   it.each([
+    {
+      row: {
+        ...commandRow(),
+        status: "interrupted",
+        exitCode: null,
+        completedAt: 3_001,
+      } satisfies TimelineCommandWorkRow,
+      expectedPlain:
+        "Ran pnpm exec turbo run test --filter=@bb/app (3s, interrupted)",
+    },
+    {
+      row: {
+        ...toolRow(),
+        status: "interrupted",
+        completedAt: 3_001,
+      } satisfies TimelineToolWorkRow,
+      expectedPlain:
+        "Ran tool LookupTool { query: select:TodoWrite } (3s, interrupted)",
+    },
     {
       row: {
         ...webSearchRow(),
@@ -1569,7 +1501,7 @@ describe("buildTimelineRowTitle", () => {
       ...workSummaryRow(
         [
           {
-            ...toolRow(),
+            ...fileReadRow("/repo/src/app.ts"),
             status: "pending",
           },
           {
@@ -1588,32 +1520,6 @@ describe("buildTimelineRowTitle", () => {
     });
 
     expect(title.plain).toBe("Exploring 1 file, running 1 command");
-    expect(title.segments.some((s) => s.shimmer)).toBe(true);
-  });
-
-  it("uses active wording for tool-only bundle summaries", () => {
-    const row = {
-      ...workSummaryRow(
-        [
-          {
-            ...toolRow(),
-            activityIntents: [],
-            toolName: "UnknownTool",
-            toolArgs: null,
-            status: "pending",
-          },
-        ],
-        "bundle-summary",
-      ),
-      status: "pending",
-    } satisfies TimelineWorkSummaryRow;
-    const title = buildTimelineRowTitle(row, {
-      summaryStyle: "bundle",
-      workStyle: "default",
-      isActiveLatestBundle: true,
-    });
-
-    expect(title.plain).toBe("Running 1 tool");
     expect(title.segments.some((s) => s.shimmer)).toBe(true);
   });
 
@@ -1643,13 +1549,11 @@ describe("buildTimelineRowTitle", () => {
   it("includes the skill name when compacting SKILL.md read titles", () => {
     const skillPath =
       "/Users/brsbl/.codex/plugins/cache/openai-bundled/browser/26.608.12217/skills/control-in-app-browser/SKILL.md";
-    const row = {
-      ...toolRow(),
-      toolArgs: { file_path: skillPath },
-      activityIntents: [readIntent(skillPath)],
-    } satisfies TimelineToolWorkRow;
 
-    const title = buildTimelineRowTitle(row, DEFAULT_OPTIONS);
+    const title = buildTimelineRowTitle(
+      fileReadRow(skillPath),
+      DEFAULT_OPTIONS,
+    );
 
     expect(title.segments.map((segment) => segment.text)).toEqual([
       "Read",
@@ -1661,13 +1565,11 @@ describe("buildTimelineRowTitle", () => {
   it("uses the plugin name when compacting plugin-root SKILL.md read titles", () => {
     const skillPath =
       "/Users/brsbl/.codex/plugins/cache/openai-bundled/browser/26.608.12217/SKILL.md";
-    const row = {
-      ...toolRow(),
-      toolArgs: { file_path: skillPath },
-      activityIntents: [readIntent(skillPath)],
-    } satisfies TimelineToolWorkRow;
 
-    const title = buildTimelineRowTitle(row, DEFAULT_OPTIONS);
+    const title = buildTimelineRowTitle(
+      fileReadRow(skillPath),
+      DEFAULT_OPTIONS,
+    );
 
     expect(title.segments.map((segment) => segment.text)).toEqual([
       "Read",
@@ -1710,6 +1612,69 @@ describe("buildTimelineRowTitle", () => {
     expect(titles[0]?.title.decorations).toEqual([
       { kind: "status", status: "error", durationMs: null, emphasis: false },
     ]);
+  });
+
+  it("carries a presentation badge onto command and exploration titles", () => {
+    const badge = {
+      glyph: "SquareUnlock02",
+      label: "Outside of sandbox",
+      hint: "Outside of sandbox",
+      tone: "destructive",
+    } as const;
+    const presentation = {
+      label: { pending: "Running command", completed: "Ran command" },
+      icon: { glyph: "Terminal" },
+      badge,
+    };
+    const badgeDecoration = {
+      kind: "badge",
+      glyph: "SquareUnlock02",
+      label: "Outside of sandbox",
+      hint: "Outside of sandbox",
+      tone: "destructive",
+    };
+
+    const plainCommand = buildTimelineRowTitle(
+      { ...commandRow(), presentation } satisfies TimelineCommandWorkRow,
+      DEFAULT_OPTIONS,
+    );
+    expect(plainCommand.decorations[0]).toEqual(badgeDecoration);
+    expect(plainCommand.plain).toContain("(Outside of sandbox)");
+
+    const explorationTitles = buildTimelineActivityIntentTitles({
+      ...commandRow(),
+      presentation,
+      activityIntents: [searchIntent("TODO", "src"), listFilesIntent("test")],
+    } satisfies TimelineCommandWorkRow);
+    expect(explorationTitles[0]?.title.decorations).toEqual([badgeDecoration]);
+    expect(explorationTitles[1]?.title.decorations).toEqual([]);
+
+    for (const [approvalStatus, status, expected] of [
+      ["waiting_for_approval", "pending", true],
+      ["denied", "interrupted", true],
+      [null, "pending", true],
+      [null, "error", true],
+      [null, "interrupted", true],
+      [null, "completed", true],
+    ] as const) {
+      const row = {
+        ...commandRow(),
+        approvalStatus,
+        status,
+        presentation,
+        activityIntents: [searchIntent("TODO", "src")],
+      } satisfies TimelineCommandWorkRow;
+      expect(
+        buildTimelineRowTitle(row, DEFAULT_OPTIONS).decorations.some(
+          (decoration) => decoration.kind === "badge",
+        ),
+      ).toBe(expected);
+      expect(
+        buildTimelineActivityIntentTitles(row)[0]?.title.decorations.some(
+          (decoration) => decoration.kind === "badge",
+        ),
+      ).toBe(expected);
+    }
   });
 
   it("appends an (interrupted) decoration to compact exploration intents on interrupted rows", () => {
@@ -1780,6 +1745,56 @@ const testsQuestion = {
     { value: "no", label: "No" },
   ],
 };
+
+describe("buildTimelineRowTitle form rows", () => {
+  const formRow = (
+    lifecycle: "pending" | "submitted" | "cancelled",
+    title?: string,
+  ): Extract<TimelineViewWorkRow, { workKind: "form" }> => ({
+    ...baseRow("form-1"),
+    kind: "work",
+    workKind: "form",
+    status: lifecycle === "pending" ? "pending" : "completed",
+    interactionId: "pi-form",
+    pluginId: "secrets",
+    rendererId: "secret-request",
+    title: "Add secrets to .env",
+    lifecycle,
+    statusReason: null,
+    presentation: {
+      label: {
+        pending: "Waiting for Add secrets to .env",
+        completed: "Submitted Add secrets to .env",
+      },
+      icon: { glyph: "Toolbox" },
+      ...(title === undefined ? {} : { title }),
+    },
+    payload: null,
+  });
+
+  it("names the form while it waits and once it is submitted", () => {
+    expect(
+      buildTimelineRowTitle(formRow("pending"), DEFAULT_OPTIONS).plain,
+    ).toBe("Waiting for Add secrets to .env");
+    expect(
+      buildTimelineRowTitle(formRow("submitted"), DEFAULT_OPTIONS).plain,
+    ).toBe("Submitted Add secrets to .env");
+    expect(
+      buildTimelineRowTitle(
+        formRow("submitted", "Added API_KEY to .env"),
+        DEFAULT_OPTIONS,
+      ).plain,
+    ).toBe("Added API_KEY to .env");
+    const cancelled = buildTimelineRowTitle(
+      formRow("cancelled"),
+      DEFAULT_OPTIONS,
+    );
+    expect(cancelled.plain).toBe("Submitted Add secrets to .env (interrupted)");
+    expect(cancelled.decorations).toEqual([
+      expect.objectContaining({ kind: "status", status: "interrupted" }),
+    ]);
+  });
+});
 
 describe("buildTimelineRowTitle question rows", () => {
   it("shows the prompt for a single pending question", () => {

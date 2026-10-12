@@ -2,6 +2,7 @@ import type { ApiClient } from "@bb/server-contract";
 import type {
   FetchImplementation,
   JsonBodyOf,
+  SdkResponseLike,
 } from "./response.js";
 
 export type BbSdkRuntime = "node" | "browser";
@@ -12,32 +13,22 @@ export interface BbSdkTransport {
   fetch: FetchImplementation;
   realtimeUrl?: string;
   runtime: BbSdkRuntime;
-  readJson<TResponse extends Response>(
+  readJson<TResponse extends SdkResponseLike>(
     response: Promise<TResponse>,
   ): Promise<JsonBodyOf<TResponse>>;
-  readVoid<TResponse extends Response>(
+  readVoid<TResponse extends SdkResponseLike>(
     response: Promise<TResponse>,
   ): Promise<void>;
-  resolve<TResponse extends Response>(
+  resolve<TResponse extends SdkResponseLike>(
     response: Promise<TResponse>,
   ): Promise<TResponse>;
   websocket?: BbRealtimeSocketFactory;
 }
 
-/**
- * Raw socket payload. Treated as opaque until decoded — realtime ignores
- * non-string frames.
- */
 export interface BbRealtimeSocketMessageEvent {
   data: unknown;
 }
 
-/**
- * Minimal runtime-agnostic socket shape consumed by the realtime client.
- * Default factories adapt the environment's WebSocket (browser/Node global,
- * or the `ws` package on older Node) to this interface; custom `websocket`
- * factories can wrap any implementation the same way.
- */
 export interface BbRealtimeSocket {
   close(): void;
   onclose: (() => void) | null;

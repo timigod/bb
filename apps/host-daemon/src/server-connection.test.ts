@@ -8,6 +8,7 @@ import { ServerConnection } from "./server-connection.js";
 import type {
   CreateReconnectingWebSocket,
   ReconnectingWebSocketLike,
+  ServerMovedNotice,
 } from "./server-connection-support.js";
 
 interface CreateServerClientFixtureArgs {
@@ -23,10 +24,14 @@ interface CreateWebSocketFixtureArgs {
 
 interface ConnectionFixtureArgs extends CreateServerClientFixtureArgs {
   autoReconnect?: boolean;
-  connectMachineId?: string;
-  machineCredential?: string;
+  serverHeaders?: Record<string, string>;
   protocolSelfUpdater?: ProtocolSelfUpdater;
   onSelfUpdateInstalled?: () => void | Promise<void>;
+  onMachineShutdown?: () => void | Promise<void>;
+  onServerMoved?: (notice: ServerMovedNotice) => Promise<void>;
+  onMachineEnvironment?: (
+    environment: HostDaemonSessionOpenResponse["machineEnvironment"],
+  ) => void;
   startupTimeoutMs?: number;
 }
 
@@ -48,9 +53,11 @@ function createLogger() {
 function createSession(args: CreateSessionArgs): HostDaemonSessionOpenResponse {
   return {
     heartbeatIntervalMs: args.heartbeatIntervalMs,
+    machineEnvironment: { revision: 0, entries: [] },
     leaseTimeoutMs: args.leaseTimeoutMs,
     retiredEnvironmentIds: [],
     connectShares: { generation: 0, ports: [] },
+    pluginHostGenerations: [],
     sessionId: args.sessionId,
     watchSet: {
       generation: 0,
@@ -85,6 +92,7 @@ function createServerClientFixture(args: CreateServerClientFixtureArgs = {}) {
     openSession,
     fetchProjectAttachment: unused,
     fetchSkillTree: unused,
+    fetchPluginHostArtifact: unused,
     postEvents: unused,
     callTool: unused,
     registerInteractiveRequest: unused,
@@ -168,19 +176,19 @@ function createConnectionFixture(args: ConnectionFixtureArgs = {}) {
     hostId: "host-server-connection-test",
     hostKey: "host-key-server-connection-test",
     hostName: "Server Connection Test Host",
-    hostType: "persistent",
     instanceId: "instance-server-connection-test",
+    localApiPort: 38_887,
     logger,
-    ...(args.machineCredential !== undefined
-      ? { machineCredential: args.machineCredential }
-      : {}),
-    ...(args.connectMachineId !== undefined
-      ? { connectMachineId: args.connectMachineId }
+    ...(args.serverHeaders !== undefined
+      ? { serverHeaders: args.serverHeaders }
       : {}),
     serverClient: serverClient.serverClient,
     serverUrl: "http://127.0.0.1:3334",
     protocolSelfUpdater: args.protocolSelfUpdater,
     onSelfUpdateInstalled: args.onSelfUpdateInstalled,
+    onMachineShutdown: args.onMachineShutdown,
+    onServerMoved: args.onServerMoved,
+    onMachineEnvironment: args.onMachineEnvironment,
     startupTimeoutMs: args.startupTimeoutMs,
     setSession,
     createWebSocket: webSocket.createWebSocket,
@@ -201,6 +209,160 @@ afterEach(() => {
 });
 
 describe("ServerConnection", () => {
+  it("applies initial and replacement machine environments, ignores stale updates and resets revisions after reconnect", async () => {
+    const onMachineEnvironment = vi.fn();
+    const { connection, webSocket } = createConnectionFixture({
+      onMachineEnvironment,
+      sessionIds: ["first", "second"],
+    });
+    try {
+      await connection.start();
+      expect(onMachineEnvironment).toHaveBeenLastCalledWith({
+        revision: 0,
+        entries: [],
+      });
+      const socket = webSocket.sockets[0];
+      if (!socket) throw new Error("Expected test socket");
+      const send = (revision: number) =>
+        socket.onmessage?.({
+          data: JSON.stringify({
+            type: "machine-environment.replace",
+            environment: { revision, entries: [] },
+          }),
+        });
+      send(3);
+      send(2);
+      expect(onMachineEnvironment).toHaveBeenCalledTimes(2);
+      expect(onMachineEnvironment).toHaveBeenLastCalledWith({
+        revision: 3,
+        entries: [],
+      });
+      socket.reconnect();
+      await vi.waitFor(() => expect(connection.sessionId).toBe("second"));
+      send(1);
+      expect(onMachineEnvironment).toHaveBeenLastCalledWith({
+        revision: 1,
+        entries: [],
+      });
+    } finally {
+      await connection.shutdown();
+    }
+  });
+
+  it("dispatches the machine shutdown command", async () => {
+    const onMachineShutdown = vi.fn(async () => undefined);
+    const { connection, webSocket } = createConnectionFixture({
+      onMachineShutdown,
+    });
+    await connection.start();
+    const socket = webSocket.sockets[0];
+    if (!socket) throw new Error("Expected test socket");
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "machine.shutdown",
+      }),
+    });
+
+    await vi.waitFor(() => {
+      expect(onMachineShutdown).toHaveBeenCalledOnce();
+    });
+    await connection.shutdown();
+  });
+
+  it("hands a server.moved message to the move handler", async () => {
+    const onServerMoved = vi.fn(async () => undefined);
+    const { connection, webSocket } = createConnectionFixture({
+      onServerMoved,
+    });
+    await connection.start();
+    const socket = webSocket.sockets[0];
+    if (!socket) throw new Error("Expected test socket");
+
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "server.moved",
+        serverUrl: "https://new-server.example.test",
+        headers: { "x-bb-connect-machine": "bbcm_new" },
+      }),
+    });
+
+    await vi.waitFor(() => {
+      expect(onServerMoved).toHaveBeenCalledWith({
+        serverUrl: "https://new-server.example.test",
+        headers: { "x-bb-connect-machine": "bbcm_new" },
+        source: "message",
+      });
+    });
+    await connection.shutdown();
+  });
+
+  it("switches servers instead of failing startup when session open answers 410 server_moved", async () => {
+    const onServerMoved = vi.fn(async () => undefined);
+    const movedError = new ServerResponseError({
+      action: "open session",
+      bodyMessage: "This bb server moved to studio",
+      code: "server_moved",
+      retryable: false,
+      serverMoved: {
+        serverUrl: "http://studio.local:38886",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+      },
+      status: 410,
+      statusText: "Gone",
+    });
+    const { connection, logger, webSocket } = createConnectionFixture({
+      onServerMoved,
+      openSessionError: movedError,
+    });
+
+    const started = connection.start();
+    started.catch(() => undefined);
+    await vi.waitFor(() => {
+      expect(onServerMoved).toHaveBeenCalledWith({
+        source: "session-open",
+        serverUrl: "http://studio.local:38886",
+        headers: null,
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+      });
+      expect(logger.info).toHaveBeenCalledWith(
+        { serverUrl: "http://127.0.0.1:3334" },
+        "Waiting for server...",
+      );
+    });
+
+    expect(webSocket.sockets[0]?.close).not.toHaveBeenCalled();
+    await connection.shutdown();
+  });
+
+  it("fails startup on 410 server_moved when switching servers fails", async () => {
+    const onServerMoved = vi.fn(async () => {
+      throw new Error("config.json is invalid");
+    });
+    const movedError = new ServerResponseError({
+      action: "open session",
+      bodyMessage: "This bb server moved to studio",
+      code: "server_moved",
+      retryable: false,
+      serverMoved: {
+        serverUrl: "http://studio.local:38886",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+      },
+      status: 410,
+      statusText: "Gone",
+    });
+    const { connection } = createConnectionFixture({
+      onServerMoved,
+      openSessionError: movedError,
+    });
+
+    await expect(connection.start()).rejects.toBe(movedError);
+    expect(onServerMoved).toHaveBeenCalledOnce();
+  });
+
   it("runs protocol self-update handling only for protocol mismatch rejection", async () => {
     const handleProtocolMismatch = vi.fn(async () => "updated" as const);
     const onSelfUpdateInstalled = vi.fn();
@@ -277,7 +439,10 @@ describe("ServerConnection", () => {
 
   it("adds the machine credential to WS dial headers only when configured", async () => {
     const configured = createConnectionFixture({
-      machineCredential: "bbcm_machine",
+      serverHeaders: {
+        "x-bb-connect-machine": "bbcm_machine",
+        "x-test-access": "opaque",
+      },
     });
     const plain = createConnectionFixture();
     try {
@@ -286,6 +451,7 @@ describe("ServerConnection", () => {
       expect(configured.webSocket.headers[0]).toEqual({
         authorization: "Bearer host-key-server-connection-test",
         "x-bb-connect-machine": "bbcm_machine",
+        "x-test-access": "opaque",
       });
       expect(plain.webSocket.headers[0]).toEqual({
         authorization: "Bearer host-key-server-connection-test",
@@ -293,20 +459,6 @@ describe("ServerConnection", () => {
     } finally {
       await configured.connection.shutdown();
       await plain.connection.shutdown();
-    }
-  });
-
-  it("reports the connect machine id when opening a session", async () => {
-    const fixture = createConnectionFixture({
-      connectMachineId: "machine-cloud-1",
-    });
-    try {
-      await fixture.connection.start();
-      expect(fixture.openSession).toHaveBeenCalledWith(
-        expect.objectContaining({ connectMachineId: "machine-cloud-1" }),
-      );
-    } finally {
-      await fixture.connection.shutdown();
     }
   });
 
@@ -347,6 +499,107 @@ describe("ServerConnection", () => {
     }
   });
 
+  it("reports a system-suspension gap without calling it a heartbeat stall", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { connection, logger, webSocket } = createConnectionFixture({
+      heartbeatIntervalMs: 5_000,
+      leaseTimeoutMs: 30_000,
+    });
+    try {
+      await connection.start();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      vi.setSystemTime(300_000);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        "Host daemon heartbeat timer delayed",
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ gapMs: 300_000 }),
+        "Host daemon resumed after likely system suspension",
+      );
+      expect(webSocket.sockets[0]?.reconnect).not.toHaveBeenCalled();
+    } finally {
+      await connection.shutdown();
+    }
+  });
+
+  it("grants a fresh acknowledgement lease after a shorter heartbeat delay", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { connection, logger, webSocket } = createConnectionFixture({
+      heartbeatIntervalMs: 5_000,
+      leaseTimeoutMs: 30_000,
+    });
+    try {
+      await connection.start();
+      const socket = webSocket.sockets[0];
+      if (!socket) {
+        throw new Error("Expected test socket");
+      }
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      vi.setSystemTime(35_000);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ gapMs: 35_000 }),
+        "Host daemon heartbeat timer delayed",
+      );
+      expect(socket.reconnect).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(socket.reconnect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(socket.reconnect).toHaveBeenCalledWith(
+        1013,
+        "heartbeat-ack-timeout",
+      );
+    } finally {
+      await connection.shutdown();
+    }
+  });
+
+  it("reconnects when server heartbeat acknowledgements stop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { connection, logger, webSocket } = createConnectionFixture({
+      heartbeatIntervalMs: 5_000,
+      leaseTimeoutMs: 30_000,
+    });
+    try {
+      await connection.start();
+      const socket = webSocket.sockets[0];
+      if (!socket) {
+        throw new Error("Expected test socket");
+      }
+
+      await vi.advanceTimersByTimeAsync(25_000);
+      socket.onmessage?.({ data: JSON.stringify({ type: "heartbeat-ack" }) });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(socket.reconnect).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(socket.reconnect).toHaveBeenCalledWith(
+        1013,
+        "heartbeat-ack-timeout",
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          lastAcknowledgedAt: 25_000,
+          leaseTimeoutMs: 30_000,
+          sessionId: "session-1",
+        }),
+        "Server heartbeat acknowledgements stopped; reconnecting",
+      );
+    } finally {
+      await connection.shutdown();
+    }
+  });
+
   it("queues output above high water and flushes it before lifecycle messages", async () => {
     vi.useFakeTimers();
     const { connection, webSocket } = createConnectionFixture();
@@ -378,6 +631,36 @@ describe("ServerConnection", () => {
       expect(connection.sendMessage(exited)).toBe(true);
       expect(socket.send).toHaveBeenNthCalledWith(1, JSON.stringify(output));
       expect(socket.send).toHaveBeenNthCalledWith(2, JSON.stringify(exited));
+    } finally {
+      await connection.shutdown();
+    }
+  });
+
+  it("delivers a terminal exit that happened while disconnected once the socket reopens", async () => {
+    const { connection, webSocket } = createConnectionFixture({
+      sessionIds: ["first", "second"],
+    });
+    try {
+      await connection.start();
+      const socket = webSocket.sockets[0];
+      if (!socket) {
+        throw new Error("Expected test socket");
+      }
+      const exited = {
+        type: "terminal.exited" as const,
+        terminalId: "term-1",
+        exitCode: 0,
+        closeReason: "process-exit" as const,
+      };
+
+      socket.reconnect();
+      expect(connection.sendMessage(exited)).toBe(false);
+      expect(socket.send).not.toHaveBeenCalled();
+
+      await vi.waitFor(() => expect(connection.sessionId).toBe("second"));
+      await vi.waitFor(() =>
+        expect(socket.send).toHaveBeenCalledWith(JSON.stringify(exited)),
+      );
     } finally {
       await connection.shutdown();
     }
@@ -426,13 +709,10 @@ describe("ServerConnection", () => {
           type: "host-rpc.request",
           requestId: "invalid-transcription",
           command: {
-            type: "codex.voice.transcribe",
-            model: "gpt-4o-mini-transcribe",
-            audioBase64: "",
-            mimeType: "audio/webm",
-            filename: "prompt.webm",
-            prompt: null,
-            timeoutMs: 10_000,
+            type: "thread.stop",
+            intent: "interrupt",
+            environmentId: "",
+            threadId: "",
           },
         }),
       });
@@ -441,7 +721,7 @@ describe("ServerConnection", () => {
         JSON.stringify({
           type: "host-rpc.response",
           requestId: "invalid-transcription",
-          commandType: "codex.voice.transcribe",
+          commandType: "thread.stop",
           ok: false,
           errorCode: "invalid_command",
           errorMessage: "Invalid host RPC command",
@@ -451,7 +731,7 @@ describe("ServerConnection", () => {
       expect(setSession).not.toHaveBeenLastCalledWith(null);
       expect(logger.warn).toHaveBeenCalledWith(
         expect.objectContaining({
-          commandType: "codex.voice.transcribe",
+          commandType: "thread.stop",
           requestId: "invalid-transcription",
         }),
         "Rejected invalid host RPC command",

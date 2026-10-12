@@ -5,8 +5,6 @@ import {
   type HostDaemonConnectSharesReplaceMessage,
   type HostDaemonOnlineRpcRequestMessage,
   type HostDaemonServerWsMessage,
-  type HostDaemonSessionCloseReason,
-  type HostDaemonSessionOpenRequest,
   type HostDaemonSessionOpenResponse,
   type HostDaemonWatchSetReplaceMessage,
 } from "@bb/host-daemon-contract";
@@ -44,30 +42,48 @@ export type CreateReconnectingWebSocket = (
 
 export type HostDaemonServerTerminalMessage = Exclude<
   HostDaemonServerWsMessage,
+  | { type: "machine.shutdown" }
+  | { type: "server.moved" }
   | { type: "session-close" }
+  | { type: "heartbeat-ack" }
+  | { type: "machine-environment.replace" }
   | HostDaemonOnlineRpcRequestMessage
   | HostDaemonWatchSetReplaceMessage
   | HostDaemonConnectSharesReplaceMessage
 >;
 
+export type ServerMovedNotice =
+  | {
+      source: "message";
+      serverUrl: string;
+      headers: Record<string, string>;
+    }
+  | {
+      source: "session-open";
+      serverUrl: string;
+      headers: Record<string, string> | null;
+      toHostName: string;
+      movedAt: number;
+    };
+
 export interface ServerConnectionOptions {
   serverUrl: string;
   hostKey: string;
   logger: HostDaemonLogger;
-  machineCredential?: string;
-  connectMachineId?: string;
+  serverHeaders?: Record<string, string>;
   serverClient: ServerClient;
   protocolSelfUpdater?: ProtocolSelfUpdater;
   onSelfUpdateInstalled?: () => void | Promise<void>;
   hostId: string;
   hostName: string;
-  hostType: HostDaemonSessionOpenRequest["hostType"];
   dataDir: string;
   instanceId: string;
+  localApiPort: number | null;
   setSession?: (session: HostDaemonSessionOpenResponse | null) => void;
   getActiveThreads?: () =>
     | HostDaemonActiveThread[]
     | Promise<HostDaemonActiveThread[]>;
+  getUndeliveredEventThreadIds?: () => string[];
   getLoadedEnvironments?: () =>
     | HostDaemonLoadedEnvironment[]
     | Promise<HostDaemonLoadedEnvironment[]>;
@@ -83,26 +99,20 @@ export interface ServerConnectionOptions {
   onConnectSharesReplace?: (
     message: HostDaemonConnectSharesReplaceMessage,
   ) => void | Promise<void>;
-  onSessionClose?: (
-    reason: HostDaemonSessionCloseReason,
-  ) => void | Promise<void>;
   onSessionOpened?: (
     session: HostDaemonSessionOpenResponse,
   ) => void | Promise<void>;
+  onMachineEnvironment?: (
+    environment: HostDaemonSessionOpenResponse["machineEnvironment"],
+  ) => void;
+  onMachineShutdown?: () => void | Promise<void>;
+  onServerMoved?: (move: ServerMovedNotice) => Promise<void>;
   createWebSocket?: CreateReconnectingWebSocket;
-  minReconnectionDelay?: number;
-  maxReconnectionDelay?: number;
-  reconnectionDelayGrowFactor?: number;
-  connectionTimeout?: number;
   startupTimeoutMs?: number;
-  setTimeoutFn?: typeof setTimeout;
-  clearTimeoutFn?: typeof clearTimeout;
-  setIntervalFn?: typeof setInterval;
-  clearIntervalFn?: typeof clearInterval;
 }
 
 export const DEFAULT_MIN_RECONNECTION_DELAY = 1_000;
-export const DEFAULT_MAX_RECONNECTION_DELAY = 30_000;
+export const DEFAULT_MAX_RECONNECTION_DELAY = 10_000;
 export const DEFAULT_RECONNECTION_DELAY_GROW_FACTOR = 2;
 export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
 export const DEFAULT_STARTUP_TIMEOUT_MS = 60_000;

@@ -1,6 +1,7 @@
 import type { EventMeta } from "./event-decode.js";
 import type { ToolActivityProjectionState } from "./tool-activity-projection.js";
 import type { WebActivityLifecycleEvent } from "./web-activity-lifecycle.js";
+import { itemStatusToExecStatus } from "./exec-lifecycle.js";
 import { messageId } from "./format-helpers.js";
 import {
   areThreadEventScopesEqual,
@@ -20,6 +21,25 @@ function buildWebActivityKey(kind: WebActivityKind, callId: string): string {
   return `${kind}:${callId}`;
 }
 
+function settledStatus(
+  payload: WebActivityLifecycleEvent,
+): ViewWebActivityMessage["status"] {
+  switch (payload.itemKind) {
+    case "web-search":
+    case "web-fetch":
+    case "image-view":
+      return "completed";
+    case "image-generation":
+    case "file-read":
+    case "search":
+    case "plan-steps":
+    case "extension": {
+      const status = itemStatusToExecStatus(payload.status);
+      return status === "pending" ? "completed" : status;
+    }
+  }
+}
+
 function createWebActivityMessage(
   threadId: string,
   meta: EventMeta,
@@ -27,54 +47,10 @@ function createWebActivityMessage(
   payload: WebActivityLifecycleEvent,
   status: ViewWebActivityMessage["status"],
 ): ViewWebActivityMessage {
-  if (payload.itemKind === "web-search") {
-    return {
-      kind: "web-search",
-      id: messageId(threadId, "web-search", payload.callId),
-      threadId,
-      sourceSeqStart: meta.seq,
-      sourceSeqEnd: meta.seq,
-      createdAt: meta.createdAt,
-      startedAt: meta.createdAt,
-      ...(turnId
-        ? eventProjectionMessageTurnScopeFields(turnId)
-        : eventProjectionMessageThreadScopeFields()),
-      ...(payload.parentToolCallId
-        ? { parentToolCallId: payload.parentToolCallId }
-        : {}),
-      callId: payload.callId,
-      queries: payload.queries,
-      completedAt: status === "pending" ? null : meta.createdAt,
-      status,
-    };
-  }
-
-  if (payload.itemKind === "image-view") {
-    return {
-      kind: "image-view",
-      id: messageId(threadId, "image-view", payload.callId),
-      threadId,
-      sourceSeqStart: meta.seq,
-      sourceSeqEnd: meta.seq,
-      createdAt: meta.createdAt,
-      startedAt: meta.createdAt,
-      ...(turnId
-        ? eventProjectionMessageTurnScopeFields(turnId)
-        : eventProjectionMessageThreadScopeFields()),
-      ...(payload.parentToolCallId
-        ? { parentToolCallId: payload.parentToolCallId }
-        : {}),
-      callId: payload.callId,
-      path: payload.path,
-      completedAt: status === "pending" ? null : meta.createdAt,
-      status,
-    };
-  }
-
-  return {
-    kind: "web-fetch",
-    id: messageId(threadId, "web-fetch", payload.callId),
+  const base = {
+    id: messageId(threadId, payload.itemKind, payload.callId),
     threadId,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -85,13 +61,81 @@ function createWebActivityMessage(
     ...(payload.parentToolCallId
       ? { parentToolCallId: payload.parentToolCallId }
       : {}),
+    ...(payload.presentation ? { presentation: payload.presentation } : {}),
     callId: payload.callId,
-    url: payload.url,
-    prompt: payload.prompt,
-    pattern: payload.pattern,
     completedAt: status === "pending" ? null : meta.createdAt,
-    status,
   };
+
+  switch (payload.itemKind) {
+    case "web-search":
+      return {
+        ...base,
+        kind: "web-search",
+        queries: payload.queries,
+        status: status === "error" ? "completed" : status,
+      };
+    case "image-view":
+      return {
+        ...base,
+        kind: "image-view",
+        path: payload.path,
+        status: status === "error" ? "completed" : status,
+      };
+    case "image-generation":
+      return {
+        ...base,
+        kind: "image-generation",
+        prompt: payload.prompt,
+        path: payload.path,
+        error: payload.error,
+        transparentBackground: payload.transparentBackground,
+        status,
+      };
+    case "web-fetch":
+      return {
+        ...base,
+        kind: "web-fetch",
+        url: payload.url,
+        prompt: payload.prompt,
+        pattern: payload.pattern,
+        status: status === "error" ? "completed" : status,
+      };
+    case "file-read":
+      return {
+        ...base,
+        kind: "file-read",
+        path: payload.path,
+        cmd: payload.cmd,
+        status,
+      };
+    case "search":
+      return {
+        ...base,
+        kind: "search",
+        mode: payload.mode,
+        query: payload.query,
+        path: payload.path,
+        cmd: payload.cmd,
+        status,
+      };
+    case "plan-steps":
+      return {
+        ...base,
+        kind: "plan-steps",
+        steps: payload.steps,
+        explanation: payload.explanation,
+        status,
+      };
+    case "extension":
+      return {
+        ...base,
+        kind: "extension",
+        extensionKind: payload.extensionKind,
+        payload: payload.payload,
+        presentation: payload.presentation,
+        status,
+      };
+  }
 }
 
 function mergeWebActivityMessage(
@@ -113,6 +157,9 @@ function mergeWebActivityMessage(
   if (!target.parentToolCallId && payload.parentToolCallId) {
     target.parentToolCallId = payload.parentToolCallId;
   }
+  if (payload.presentation) {
+    target.presentation = payload.presentation;
+  }
 
   if (target.kind === "web-search" && payload.itemKind === "web-search") {
     target.queries = payload.queries;
@@ -128,19 +175,73 @@ function mergeWebActivityMessage(
 
   if (target.kind === "image-view" && payload.itemKind === "image-view") {
     target.path = payload.path;
+    return;
+  }
+
+  if (
+    target.kind === "image-generation" &&
+    payload.itemKind === "image-generation"
+  ) {
+    target.prompt = payload.prompt;
+    target.path = payload.path;
+    target.error = payload.error;
+    target.transparentBackground = payload.transparentBackground;
+    return;
+  }
+
+  if (target.kind === "file-read" && payload.itemKind === "file-read") {
+    target.path = payload.path;
+    target.cmd = payload.cmd;
+    return;
+  }
+
+  if (target.kind === "search" && payload.itemKind === "search") {
+    target.mode = payload.mode;
+    target.query = payload.query;
+    target.path = payload.path;
+    target.cmd = payload.cmd;
+    return;
+  }
+
+  if (target.kind === "plan-steps" && payload.itemKind === "plan-steps") {
+    target.steps = payload.steps;
+    target.explanation = payload.explanation;
+    return;
+  }
+
+  if (target.kind === "extension" && payload.itemKind === "extension") {
+    target.extensionKind = payload.extensionKind;
+    target.payload = payload.payload;
+    target.presentation = payload.presentation;
   }
 }
 
-export function onWebActivityBegin(
-  state: ToolActivityProjectionState,
+function settleWebActivityMessage(
+  target: ViewWebActivityMessage,
   meta: EventMeta,
-  threadId: string,
-  turnId: string | undefined,
   payload: WebActivityLifecycleEvent,
 ): void {
+  const status = settledStatus(payload);
+  if (
+    target.kind === "web-search" ||
+    target.kind === "web-fetch" ||
+    target.kind === "image-view"
+  ) {
+    target.status = status === "error" ? "completed" : status;
+  } else {
+    target.status = status;
+  }
+  target.completedAt = meta.createdAt;
+}
+
+function resolveActiveWebActivity(
+  state: ToolActivityProjectionState,
+  meta: EventMeta,
+  payload: WebActivityLifecycleEvent,
+): { activityKey: string; active: ViewWebActivityMessage | null } | null {
   const activityKey = buildWebActivityKey(payload.itemKind, payload.callId);
   if (state.toolActivity.finalizedWebActivityCallIds.has(activityKey)) {
-    return;
+    return null;
   }
 
   const active = state.toolActivity.activeCell;
@@ -158,7 +259,25 @@ export function onWebActivityBegin(
     active.kind === payload.itemKind &&
     active.callId === payload.callId
   ) {
-    mergeWebActivityMessage(active, meta, turnId, payload);
+    return { activityKey, active };
+  }
+  return { activityKey, active: null };
+}
+
+export function onWebActivityBegin(
+  state: ToolActivityProjectionState,
+  meta: EventMeta,
+  threadId: string,
+  turnId: string | undefined,
+  payload: WebActivityLifecycleEvent,
+): void {
+  const resolved = resolveActiveWebActivity(state, meta, payload);
+  if (!resolved) {
+    return;
+  }
+
+  if (resolved.active) {
+    mergeWebActivityMessage(resolved.active, meta, turnId, payload);
     return;
   }
 
@@ -179,29 +298,15 @@ export function onWebActivityEnd(
   turnId: string | undefined,
   payload: WebActivityLifecycleEvent,
 ): void {
-  const activityKey = buildWebActivityKey(payload.itemKind, payload.callId);
-  if (state.toolActivity.finalizedWebActivityCallIds.has(activityKey)) {
+  const resolved = resolveActiveWebActivity(state, meta, payload);
+  if (!resolved) {
     return;
   }
 
-  const active = state.toolActivity.activeCell;
-  if (
-    isWebActivityMessage(active) &&
-    active.callId === payload.callId &&
-    active.kind !== payload.itemKind
-  ) {
-    interruptWebActivityMessage(active, meta.createdAt);
-    flushActiveToolCell(state);
-  }
-
-  if (
-    active &&
-    active.kind === payload.itemKind &&
-    active.callId === payload.callId
-  ) {
+  const { activityKey, active } = resolved;
+  if (active) {
     mergeWebActivityMessage(active, meta, turnId, payload);
-    active.status = "completed";
-    active.completedAt = meta.createdAt;
+    settleWebActivityMessage(active, meta, payload);
     flushActiveToolCell(state);
     state.toolActivity.finalizedWebActivityCallIds.add(activityKey);
     return;
@@ -225,8 +330,7 @@ export function onWebActivityEnd(
   });
   if (historyMatch) {
     mergeWebActivityMessage(historyMatch, meta, turnId, payload);
-    historyMatch.status = "completed";
-    historyMatch.completedAt = meta.createdAt;
+    settleWebActivityMessage(historyMatch, meta, payload);
     state.toolActivity.finalizedWebActivityCallIds.add(activityKey);
     return;
   }
@@ -236,7 +340,7 @@ export function onWebActivityEnd(
     meta,
     turnId,
     payload,
-    "completed",
+    settledStatus(payload),
   );
   completedMessage.id = messageId(
     threadId,

@@ -1,33 +1,15 @@
-import type { BbDesktopBrowserApi } from "@bb/desktop-contract";
+import type {
+  BbDesktopBrowserApi,
+  BbDesktopBrowserTarget,
+} from "@bb/desktop-contract";
 
-/**
- * Owns the "only one browser view is visible at a time" invariant for a panel's
- * browser-tab deck. A native `WebContentsView` is an OS-level overlay that
- * `display:none` cannot hide, so when the active tab changes the previously
- * shown view MUST be hidden before the next one is shown — otherwise two views
- * briefly overlap.
- *
- * Each `BrowserTabContent` only declares intent (`show`/`hide` itself); the
- * coordinator — owned by the deck — decides ordering. Because `show` always
- * hides the currently-visible tab first, the hide-before-show guarantee holds
- * regardless of the order in which the children's effects run (e.g. switching to
- * an earlier tab in the list still hides the later one first).
- */
 export interface BrowserViewVisibilityCoordinator {
-  /**
-   * Make `tabId` the single visible view: hide whichever other tab is currently
-   * visible, then sync bounds and show this one (bounds before show so it never
-   * appears at stale/zero bounds). `BrowserTabContent` calls this only after the
-   * hidden attach has been issued, making this the first-show path too.
-   */
-  show(tabId: string, syncBounds: () => void): void;
-  /** Hide `tabId`'s view (no-op overlay-wise if it was already hidden). */
+  show(
+    tabId: string,
+    syncBounds: () => void,
+    options?: { focus?: boolean },
+  ): void;
   hide(tabId: string): void;
-  /**
-   * Forget `tabId` without touching its view — used when the tab unmounts and
-   * its view is about to be destroyed, so a later `show` does not try to hide a
-   * gone view.
-   */
   release(tabId: string): void;
 }
 
@@ -59,20 +41,51 @@ interface DestroyPersistedBrowserViewsForEnvironmentArgs {
 }
 
 const browserViewRecords = new Map<string, BrowserViewRecord>();
+const browserViewRecreationTargets = new Map<string, BbDesktopBrowserTarget>();
+
+export function allowBrowserViewRecreation(
+  tabId: string,
+  target: BbDesktopBrowserTarget,
+): void {
+  browserViewRecreationTargets.set(tabId, target);
+}
+
+export function takeBrowserViewRecreation(
+  tabId: string,
+  target: BbDesktopBrowserTarget,
+): boolean {
+  const allowedTarget = browserViewRecreationTargets.get(tabId);
+  if (
+    allowedTarget?.hostId !== target.hostId ||
+    allowedTarget.instanceId !== target.instanceId ||
+    allowedTarget.generation !== target.generation
+  ) {
+    return false;
+  }
+  browserViewRecreationTargets.delete(tabId);
+  return true;
+}
 
 export function createBrowserViewVisibilityCoordinator(
   desktopBrowser: BbDesktopBrowserApi,
 ): BrowserViewVisibilityCoordinator {
-  // The browser tab whose native view is currently shown, or null when none is.
   let visibleTabId: string | null = null;
   return {
-    show(tabId, syncBounds) {
+    show(tabId, syncBounds, options) {
       if (visibleTabId !== null && visibleTabId !== tabId) {
         desktopBrowser.setVisible({ tabId: visibleTabId, visible: false });
       }
       visibleTabId = tabId;
       syncBounds();
-      desktopBrowser.setVisible({ tabId, visible: true });
+      const request = { tabId, visible: true };
+      if (
+        options?.focus === false &&
+        desktopBrowser.setVisibleWithoutFocus !== undefined
+      ) {
+        desktopBrowser.setVisibleWithoutFocus(request);
+      } else {
+        desktopBrowser.setVisible(request);
+      }
     },
     hide(tabId) {
       if (visibleTabId === tabId) {
@@ -103,6 +116,7 @@ export function destroyPersistedBrowserView({
   desktopBrowser.setVisible({ tabId, visible: false });
   desktopBrowser.detach(tabId);
   browserViewRecords.delete(tabId);
+  browserViewRecreationTargets.delete(tabId);
 }
 
 export function destroyPersistedBrowserViewsForThread({
@@ -137,4 +151,5 @@ export function destroyPersistedBrowserViewsForEnvironment({
 
 export function resetBrowserViewPersistence(): void {
   browserViewRecords.clear();
+  browserViewRecreationTargets.clear();
 }

@@ -1,10 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  formatBbAppConfigPath,
-  formatBbAppEnvPath,
-} from "@bb/config/bb-app-managed-config";
+import { formatBbAppConfigPath } from "@bb/config/bb-app-managed-config";
 import { defaultFeatureFlags } from "@bb/domain";
 import { describe, expect, it } from "vitest";
 import {
@@ -61,24 +58,18 @@ function createCountingLogger(): CountingLogger {
 function createRuntimeConfig(): ServerRuntimeConfig {
   return {
     appUrl: "https://ambient-app.example.test",
-    appSurface: "web",
     appVersion: "0.0.0-test",
     builtinSkillsRootPath: "/tmp/bb-test/builtin-skills",
-    customAcpAgents: [],
     customModels: [],
     dataDir: "/tmp/bb-test",
+    marketplaceUrl: "https://marketplace.invalid/marketplace.json",
     featureFlags: defaultFeatureFlags,
     hostDaemonPort: 38887,
     inheritedSkillsRootPaths: [],
-    inferenceFallbackModel: "openai/gpt-4o-mini-fallback",
-    inferenceModel: "openai/gpt-4o-mini",
     isDevelopment: false,
-    managedEnvironmentRetireGraceMs: 5 * 60_000,
-    openAiApiKey: "ambient-openai-key",
+    performanceDiagnosticsAvailable: false,
     serverPort: 38886,
     sharedSkillRoots: { user: [], project: [] },
-    threadStorageRootPath: "/tmp/bb-test/thread-storage",
-    transcriptionModel: "openai/gpt-4o-transcribe",
   };
 }
 
@@ -92,14 +83,6 @@ describe("bb-app managed config", () => {
       managedConfig: {
         config: {
           BB_APP_URL: "https://stored-app.example.test",
-          BB_INFERENCE: "anthropic/claude-sonnet-4-5",
-          BB_INFERENCE_FALLBACK: "openai/gpt-5.4-mini",
-          BB_TRANSCRIPTION: "openai/gpt-4o-transcribe",
-        },
-      },
-      managedEnvFile: {
-        env: {
-          OPENAI_API_KEY: "stored-openai-key",
         },
       },
       targetConfig,
@@ -107,10 +90,6 @@ describe("bb-app managed config", () => {
 
     expect(targetConfig).toMatchObject({
       appUrl: "https://stored-app.example.test",
-      inferenceFallbackModel: "openai/gpt-5.4-mini",
-      inferenceModel: "anthropic/claude-sonnet-4-5",
-      openAiApiKey: "stored-openai-key",
-      transcriptionModel: "openai/gpt-4o-transcribe",
     });
   });
 
@@ -125,22 +104,15 @@ describe("bb-app managed config", () => {
           BB_APP_URL: "https://stored-app.example.test",
         },
       },
-      managedEnvFile: {
-        env: {
-          OPENAI_API_KEY: "stored-openai-key",
-        },
-      },
       targetConfig,
     });
     applyBbAppManagedConfig({
       baseConfig,
       managedConfig: {},
-      managedEnvFile: {},
       targetConfig,
     });
 
     expect(targetConfig.appUrl).toBe("https://ambient-app.example.test");
-    expect(targetConfig.openAiApiKey).toBe("ambient-openai-key");
   });
 
   it("applies custom models over the ambient runtime config", () => {
@@ -158,7 +130,6 @@ describe("bb-app managed config", () => {
           },
         ],
       },
-      managedEnvFile: {},
       targetConfig,
     });
 
@@ -183,7 +154,6 @@ describe("bb-app managed config", () => {
           project: [".agents/skills"],
         },
       },
-      managedEnvFile: {},
       targetConfig,
     });
 
@@ -191,68 +161,6 @@ describe("bb-app managed config", () => {
       user: [".agents/skills"],
       project: [".agents/skills"],
     });
-  });
-
-  it("applies custom ACP agents over the ambient runtime config", () => {
-    const baseConfig = createRuntimeConfig();
-    const targetConfig = createRuntimeConfig();
-
-    applyBbAppManagedConfig({
-      baseConfig,
-      managedConfig: {
-        customAcpAgents: [
-          {
-            id: "my-agent",
-            displayName: "My Agent",
-            command: "my-agent",
-            args: ["acp"],
-            env: { MY_AGENT_HOME: "/tmp/my-agent" },
-          },
-        ],
-      },
-      managedEnvFile: {},
-      targetConfig,
-    });
-
-    expect(targetConfig.customAcpAgents).toEqual([
-      {
-        id: "my-agent",
-        displayName: "My Agent",
-        command: "my-agent",
-        args: ["acp"],
-        env: { MY_AGENT_HOME: "/tmp/my-agent" },
-      },
-    ]);
-  });
-
-  it("restores base custom ACP agents when the key is removed", () => {
-    const baseConfig = createRuntimeConfig();
-    const targetConfig = createRuntimeConfig();
-
-    applyBbAppManagedConfig({
-      baseConfig,
-      managedConfig: {
-        customAcpAgents: [
-          {
-            id: "my-agent",
-            displayName: "My Agent",
-            command: "my-agent",
-            args: [],
-            env: {},
-          },
-        ],
-      },
-      managedEnvFile: {},
-      targetConfig,
-    });
-    applyBbAppManagedConfig({
-      baseConfig,
-      managedConfig: {},
-      managedEnvFile: {},
-      targetConfig,
-    });
-
-    expect(targetConfig.customAcpAgents).toEqual([]);
   });
 
   it("restores base custom models when the key is removed", () => {
@@ -266,98 +174,56 @@ describe("bb-app managed config", () => {
           { providerId: "claude-code", model: "claude-example-preview" },
         ],
       },
-      managedEnvFile: {},
       targetConfig,
     });
     applyBbAppManagedConfig({
       baseConfig,
       managedConfig: {},
-      managedEnvFile: {},
       targetConfig,
     });
 
     expect(targetConfig.customModels).toEqual([]);
   });
 
-  it("rejects invalid inference model config", () => {
-    const baseConfig = createRuntimeConfig();
-    const targetConfig = createRuntimeConfig();
-
-    expect(() =>
-      applyBbAppManagedConfig({
-        baseConfig,
-        managedConfig: {
-          config: {
-            BB_INFERENCE: "gpt-4o-mini",
-          },
-        },
-        managedEnvFile: {},
-        targetConfig,
-      }),
-    ).toThrow(/BB_INFERENCE/u);
-  });
-
-  it("rejects invalid inference fallback model config", () => {
-    const baseConfig = createRuntimeConfig();
-    const targetConfig = createRuntimeConfig();
-
-    expect(() =>
-      applyBbAppManagedConfig({
-        baseConfig,
-        managedConfig: {
-          config: {
-            BB_INFERENCE_FALLBACK: "gpt-5.4-mini",
-          },
-        },
-        managedEnvFile: {},
-        targetConfig,
-      }),
-    ).toThrow(/BB_INFERENCE_FALLBACK/u);
-  });
-
-  it("reloads config file changes and notifies clients", async () => {
+  it("ignores removed AI service keys with a warning on reload", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "bb-managed-config-"));
-    const socket = createMockHubSocket();
     const config = {
       ...createRuntimeConfig(),
       dataDir,
     };
-    const hub = new NotificationHub();
-    hub.subscribe(socket, { kind: "system" });
-
+    const logger = createCountingLogger();
     const reloader = await createBbAppManagedConfigReloader({
       config,
-      hub,
-      logger: createTestLogger(),
+      hub: new NotificationHub(),
+      logger: logger.logger,
     });
 
     try {
       writeFileSync(
         formatBbAppConfigPath(dataDir),
         `${JSON.stringify({
-          config: { BB_INFERENCE_FALLBACK: "codex/gpt-5.4-mini" },
+          config: {
+            BB_APP_URL: "https://live-app.example.test",
+            BB_INFERENCE: "codex/gpt-5.6-luna",
+          },
         })}\n`,
         "utf8",
       );
-      writeFileSync(
-        formatBbAppEnvPath(dataDir),
-        `${JSON.stringify({ env: { OPENAI_API_KEY: "live-openai-key" } })}\n`,
-        "utf8",
-      );
 
-      await reloader.reload({ notify: true });
-      expect(config.inferenceFallbackModel).toBe("codex/gpt-5.4-mini");
-      expect(config.openAiApiKey).toBe("live-openai-key");
-      expect(
-        socket.messages.some((message) => message.includes("config-changed")),
-      ).toBe(true);
+      await reloader.reload({ notify: false });
+      expect(config.appUrl).toBe("https://live-app.example.test");
+      expect(logger.warnings()).toEqual([
+        expect.objectContaining({
+          fields: { keys: ["BB_INFERENCE"] },
+          message: expect.stringContaining("Settings → AI services"),
+        }),
+      ]);
     } finally {
-      hub.unregisterClient(socket);
       rmSync(dataDir, { force: true, recursive: true });
     }
   });
 
-  it("reloads mixed valid and invalid custom ACP agents with per-entry warnings and notification", async () => {
+  it("reloads a config that still carries the removed customAcpAgents array", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "bb-managed-config-"));
     const socket = createMockHubSocket();
     const config = {
@@ -390,26 +256,21 @@ describe("bb-app managed config", () => {
               command: "bad-agent",
             },
           ],
+          customModels: [{ providerId: "codex", model: "gpt-5.5-codex" }],
         })}\n`,
         "utf8",
       );
 
       await reloader.reload({ notify: true });
 
-      expect(config.customAcpAgents).toEqual([
-        {
-          id: "valid-agent",
-          displayName: "Valid Agent",
-          command: "valid-agent",
-          args: [],
-          env: {},
-        },
+      expect(config.customModels).toEqual([
+        { providerId: "codex", model: "gpt-5.5-codex" },
       ]);
       expect(logger.warnings()).toEqual([
-        expect.objectContaining({
-          fields: expect.objectContaining({ index: 1 }),
-          message: "Ignoring invalid custom ACP agent config entry",
-        }),
+        {
+          fields: { key: "customAcpAgents" },
+          message: expect.stringContaining("customAcpAgents"),
+        },
       ]);
       expect(
         socket.messages.some((message) => message.includes("config-changed")),
@@ -439,8 +300,7 @@ describe("bb-app managed config", () => {
         }),
       ).resolves.toBeDefined();
 
-      expect(config.openAiApiKey).toBe("ambient-openai-key");
-      expect(config.inferenceModel).toBe("openai/gpt-4o-mini");
+      expect(config.appUrl).toBe("https://ambient-app.example.test");
       expect(logger.warningCount()).toBe(1);
     } finally {
       rmSync(dataDir, { force: true, recursive: true });
@@ -462,14 +322,14 @@ describe("bb-app managed config", () => {
     try {
       writeFileSync(
         formatBbAppConfigPath(dataDir),
-        `${JSON.stringify({ config: { BB_INFERENCE: "gpt-4o-mini" } })}\n`,
+        `${JSON.stringify({ config: { BB_APP_URL: "not-a-url" } })}\n`,
         "utf8",
       );
 
       await expect(reloader.reload({ notify: true })).rejects.toThrow(
-        /BB_INFERENCE/u,
+        /BB_APP_URL/u,
       );
-      expect(config.inferenceModel).toBe("openai/gpt-4o-mini");
+      expect(config.appUrl).toBe("https://ambient-app.example.test");
     } finally {
       rmSync(dataDir, { force: true, recursive: true });
     }

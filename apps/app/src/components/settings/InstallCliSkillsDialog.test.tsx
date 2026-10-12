@@ -2,6 +2,7 @@
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Host } from "@bb/domain";
+import { makeHost } from "@bb/test-helpers/domain-fixtures";
 import type { CliSkillMachineStatus } from "@bb/server-contract";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InstallCliSkillsDialog } from "./InstallCliSkillsDialog";
@@ -11,16 +12,12 @@ afterEach(() => {
 });
 
 function host(overrides: Partial<Host> & Pick<Host, "id" | "name">): Host {
-  return {
-    type: "persistent",
-    status: "connected",
+  return makeHost({
     lastSeenAt: 1,
-    maxPermissionMode: "full",
-    lastRejectedProtocolVersion: null,
     createdAt: 1,
     updatedAt: 1,
     ...overrides,
-  };
+  });
 }
 
 const hosts: Host[] = [
@@ -43,25 +40,6 @@ function checkbox(name: string): HTMLInputElement {
 }
 
 describe("InstallCliSkillsDialog", () => {
-  it("preselects the connected machines and installs exactly those", () => {
-    const onInstall = vi.fn();
-    render(
-      <InstallCliSkillsDialog
-        open={true}
-        onOpenChange={() => undefined}
-        hosts={hosts}
-        statusByHostId={statuses}
-        onCancel={() => undefined}
-        onInstall={onInstall}
-        pending={false}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Install" }));
-
-    expect(onInstall).toHaveBeenCalledWith(["host-laptop", "host-studio"]);
-  });
-
   it("installs only the machines left selected", () => {
     const onInstall = vi.fn();
     render(

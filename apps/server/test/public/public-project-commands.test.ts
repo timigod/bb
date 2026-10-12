@@ -7,8 +7,15 @@ import type {
   HostDaemonOnlineRpcRequestMessage,
 } from "@bb/host-daemon-contract";
 import { commandListResponseSchema } from "@bb/server-contract";
-import { describe, expect, it } from "vitest";
+import type { ExperimentalNativeRootsResolveAnswer } from "@get-bb/plugin-sdk/host";
+import { describe, expect, it, vi } from "vitest";
+import { COMMAND_TIMEOUT_MS } from "../../src/constants.js";
 import { registerHostRpcResponder } from "../helpers/host-rpc.js";
+import {
+  configuredAcpProvider,
+  declaredNativeRootSet,
+  stubHostArtifact,
+} from "../helpers/provider-registry.js";
 import { readJson } from "../helpers/json.js";
 import {
   seedEnvironment,
@@ -18,11 +25,45 @@ import {
   seedProjectWithSource,
 } from "../helpers/seed.js";
 import { withTestHarness } from "../helpers/test-app.js";
+import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
+
+const NO_RESOLVED_ROOTS = { skills: [], commands: [] };
+
+function root(path: string) {
+  return { path, recursive: false, ancestors: false, namePrefix: "" };
+}
+
+function resolvingProvider(id: string): {
+  declaration: PluginProviderDeclaration;
+  pluginId: string;
+} {
+  return {
+    pluginId: `provider-${id}`,
+    declaration: {
+      id,
+      displayName: id,
+      maintenance: { health: false, usage: false, installation: false },
+      capabilities: {
+        supportsServiceTier: false,
+        supportsNativeUserQuestion: false,
+        fork: "none",
+        supportsManualCompaction: false,
+        supportsThreadArchive: false,
+        supportsThreadRename: false,
+        permissionModes: ["full"],
+        reasoningLevels: ["medium"],
+      },
+      composerActions: [],
+      experimental_resolvesNativeRoots: true,
+    },
+  };
+}
 
 interface CommandRpcStub {
   commands: HostProviderCommand[];
   requests: HostDaemonOnlineRpcRequestMessage[];
   skillRequests: HostDaemonOnlineRpcRequestMessage[];
+  resolveRequests: HostDaemonOnlineRpcRequestMessage[];
 }
 
 interface RegisterCommandRpcArgs {
@@ -30,12 +71,10 @@ interface RegisterCommandRpcArgs {
   sessionId: string;
   commands: HostProviderCommand[];
   skills?: DiscoveredSkill[];
+  resolved?: ExperimentalNativeRootsResolveAnswer;
+  resolveDelayMs?: number;
 }
 
-/**
- * Mocks provider-native command discovery and an empty project skill root.
- * Only list-commands requests are recorded for concise assertions.
- */
 function registerCommandRpc(
   harness: Parameters<typeof registerHostRpcResponder>[0],
   args: RegisterCommandRpcArgs,
@@ -44,13 +83,39 @@ function registerCommandRpc(
     commands: args.commands,
     requests: [],
     skillRequests: [],
+    resolveRequests: [],
   };
   registerHostRpcResponder(harness, {
     hostId: args.hostId,
     sessionId: args.sessionId,
     handle: (request) => {
-      if (request.command.type === "host.list_files") {
-        return { ok: true, result: { files: [], truncated: false } };
+      if (request.command.type === "host.read_workspace_agent_context") {
+        stub.skillRequests.push(request);
+        return {
+          ok: true,
+          result: {
+            agentInstructions: null,
+            projectSkills: [],
+            projectSkillsTruncated: false,
+            sharedSkills: args.skills ?? [],
+          },
+        };
+      }
+      if (request.command.type === "plugin.host.call") {
+        if (request.command.method !== "resolveNativeRoots") {
+          throw new Error(
+            `Unexpected plugin host call ${request.command.method} in command typeahead test`,
+          );
+        }
+        stub.resolveRequests.push(request);
+        const answer = {
+          ok: true as const,
+          result: { output: args.resolved ?? NO_RESOLVED_ROOTS },
+        };
+        if (args.resolveDelayMs === undefined) return answer;
+        return new Promise((settle) =>
+          setTimeout(() => settle(answer), args.resolveDelayMs),
+        );
       }
       if (request.command.type === "host.list_commands") {
         stub.requests.push(request);
@@ -109,6 +174,7 @@ describe("public project command typeahead route", () => {
         const { host, session } = seedHostSession(harness.deps, {
           id: "host-shared-skills",
         });
+        seedPrimaryHost(harness.deps, host.id);
         const { project } = seedProjectWithSource(harness.deps, {
           hostId: host.id,
           path: "/tmp/shared-skills",
@@ -142,40 +208,39 @@ describe("public project command typeahead route", () => {
           description: "Review code from one shared source.",
           argumentHint: null,
         });
-        expect(stub.skillRequests[0]?.command).toEqual({
-          type: "host.list_skills",
-          providerId: "bb-shared",
-          cwd: "/tmp/shared-skills",
-          nativeSkillRoots: {
-            user: [".agents/skills"],
-            project: [".agents/skills"],
+        expect(stub.skillRequests[0]?.command).toMatchObject({
+          includeAgentInstructions: false,
+          type: "host.read_workspace_agent_context",
+          rootPath: "/tmp/shared-skills",
+          sharedSkillRoots: {
+            user: [root(".agents/skills")],
+            project: [root(".agents/skills")],
           },
         });
       },
     );
   });
 
-  it("passes custom ACP native skill roots to the target host", async () => {
+  it("passes a provider's declared native skill roots to the target host", async () => {
     await withTestHarness(
       {
-        customAcpAgents: [
-          {
+        extraProviders: [
+          await configuredAcpProvider({
             id: "amp",
             displayName: "Amp",
             command: "amp-acp",
-            args: [],
-            env: {},
             nativeSkillRoots: {
               user: [".agents/skills"],
               project: [".agents/skills"],
             },
-          },
+          }),
         ],
       },
       async (harness) => {
         const { host, session } = seedHostSession(harness.deps, {
           id: "host-custom-acp-skills",
         });
+        seedPrimaryHost(harness.deps, host.id);
         const { project } = seedProjectWithSource(harness.deps, {
           hostId: host.id,
           path: "/tmp/custom-acp-skills",
@@ -195,11 +260,212 @@ describe("public project command typeahead route", () => {
           type: "host.list_commands",
           providerId: "acp-amp",
           cwd: "/tmp/custom-acp-skills",
-          nativeSkillRoots: {
-            user: [".agents/skills"],
-            project: [".agents/skills"],
+          nativeRoots: {
+            skills: {
+              user: [root(".agents/skills")],
+              project: [root(".agents/skills")],
+            },
+            commands: { user: [], project: [] },
+            resolved: NO_RESOLVED_ROOTS,
           },
         });
+      },
+    );
+  });
+
+  it("asks a resolving plugin for roots on the workspace host and forwards them", async () => {
+    const provider = resolvingProvider("resolving");
+    await withTestHarness({ extraProviders: [provider] }, async (harness) => {
+      harness.deps.pluginHostArtifacts.set(
+        provider.pluginId,
+        stubHostArtifact(provider.pluginId),
+      );
+      const { host, session } = seedHostSession(harness.deps, {
+        id: "host-commands-resolving",
+      });
+      seedPrimaryHost(harness.deps, host.id);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/resolving-project",
+      });
+      const stub = registerCommandRpc(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        commands: [skill("vendor:review", "user")],
+        resolved: {
+          skills: [
+            { path: "/home/me/.vendor/skills", origin: "user" },
+            {
+              path: "/home/me/.vendor/plugins/tools/skills",
+              origin: "user",
+              namePrefix: "tools:",
+              recursive: true,
+            },
+          ],
+          commands: [
+            {
+              path: "/tmp/resolving-project/.vendor/commands",
+              origin: "project",
+              ancestors: true,
+            },
+          ],
+        },
+      });
+
+      const response = await harness.app.request(
+        `/api/v1/projects/${project.id}/commands?provider=resolving`,
+      );
+
+      expect(response.status).toBe(200);
+      const body = commandListResponseSchema.parse(await readJson(response));
+      expect(body.commands.map((command) => command.name)).toEqual([
+        "clear",
+        "vendor:review",
+      ]);
+      expect(stub.resolveRequests.map((request) => request.command)).toEqual([
+        expect.objectContaining({
+          type: "plugin.host.call",
+          contributedEnv: [],
+          pluginId: provider.pluginId,
+          method: "resolveNativeRoots",
+          input: { providerId: "resolving", cwd: "/tmp/resolving-project" },
+        }),
+      ]);
+      expect(stub.requests[0]?.command).toEqual({
+        type: "host.list_commands",
+        providerId: "resolving",
+        cwd: "/tmp/resolving-project",
+        nativeRoots: {
+          skills: { user: [], project: [] },
+          commands: { user: [], project: [] },
+          resolved: {
+            skills: [
+              {
+                path: "/home/me/.vendor/skills",
+                origin: "user",
+                recursive: false,
+                ancestors: false,
+                namePrefix: "",
+                shape: "skills",
+              },
+              {
+                path: "/home/me/.vendor/plugins/tools/skills",
+                origin: "user",
+                recursive: true,
+                ancestors: false,
+                namePrefix: "tools:",
+                shape: "skills",
+              },
+            ],
+            commands: [
+              {
+                path: "/tmp/resolving-project/.vendor/commands",
+                origin: "project",
+                recursive: false,
+                ancestors: true,
+                namePrefix: "",
+                shape: "commands",
+              },
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  it("shares one command timeout between the resolver call and the daemon scan", async () => {
+    const provider = resolvingProvider("slow-resolver");
+    const resolveDelayMs = 200;
+    await withTestHarness({ extraProviders: [provider] }, async (harness) => {
+      harness.deps.pluginHostArtifacts.set(
+        provider.pluginId,
+        stubHostArtifact(provider.pluginId),
+      );
+      const { host, session } = seedHostSession(harness.deps, {
+        id: "host-commands-slow-resolver",
+      });
+      seedPrimaryHost(harness.deps, host.id);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/slow-resolver-project",
+      });
+      const stub = registerCommandRpc(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        commands: [skill("after-the-wait", "user")],
+        resolved: {
+          skills: [{ path: "/home/me/.slow/skills", origin: "user" }],
+        },
+        resolveDelayMs,
+      });
+      const hubRpc = vi.spyOn(harness.hub, "requestHostOnlineRpc");
+
+      const response = await harness.app.request(
+        `/api/v1/projects/${project.id}/commands?provider=slow-resolver`,
+      );
+
+      expect(response.status).toBe(200);
+      const body = commandListResponseSchema.parse(await readJson(response));
+      expect(body.commands.map((command) => command.name)).toEqual([
+        "clear",
+        "after-the-wait",
+      ]);
+      const resolverCommand = stub.resolveRequests[0]?.command;
+      if (resolverCommand?.type !== "plugin.host.call") {
+        throw new Error("expected the resolver call");
+      }
+      expect(resolverCommand.timeoutMs).toBeLessThanOrEqual(COMMAND_TIMEOUT_MS);
+      expect(resolverCommand.timeoutMs).toBeGreaterThan(
+        COMMAND_TIMEOUT_MS - 1_000,
+      );
+      const scan = hubRpc.mock.calls
+        .map(([args]) => args)
+        .find((args) => args.message.command.type === "host.list_commands");
+      expect(scan).toBeDefined();
+      expect(scan?.timeoutMs).toBeGreaterThan(0);
+      expect(scan?.timeoutMs).toBeLessThanOrEqual(
+        COMMAND_TIMEOUT_MS - resolveDelayMs + 50,
+      );
+    });
+  });
+
+  it("skips the daemon roundtrip for a provider with no native roots and no resolver", async () => {
+    await withTestHarness(
+      {
+        extraProviders: [
+          await configuredAcpProvider({
+            id: "rootless",
+            displayName: "Rootless",
+            command: "rootless-acp",
+          }),
+        ],
+      },
+      async (harness) => {
+        const { host, session } = seedHostSession(harness.deps, {
+          id: "host-commands-rootless",
+        });
+        seedPrimaryHost(harness.deps, host.id);
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+          path: "/tmp/rootless-project",
+        });
+        const stub = registerCommandRpc(harness, {
+          hostId: host.id,
+          sessionId: session.id,
+          commands: [skill("never-asked", "user")],
+        });
+
+        const response = await harness.app.request(
+          `/api/v1/projects/${project.id}/commands?provider=acp-rootless`,
+        );
+
+        expect(response.status).toBe(200);
+        const body = commandListResponseSchema.parse(await readJson(response));
+        expect(body.commands.map((command) => command.name)).not.toContain(
+          "never-asked",
+        );
+        expect(stub.requests).toEqual([]);
+        expect(stub.resolveRequests).toEqual([]);
       },
     );
   });
@@ -256,6 +522,10 @@ describe("public project command typeahead route", () => {
         type: "host.list_commands",
         providerId: "codex",
         cwd: "/tmp/remote-commands-env",
+        nativeRoots: declaredNativeRootSet(
+          harness.deps.providerRegistry,
+          "codex",
+        ),
       });
     });
   });
@@ -278,13 +548,11 @@ describe("public project command typeahead route", () => {
         hostId: host.id,
         sessionId: session.id,
         commands: [
-          // (skill, review) collision: user first, project second → project wins.
           skill("review", "user", { description: "User review skill" }),
           skill("review", "project", {
             description: "Project review skill",
             argumentHint: "<path>",
           }),
-          // Same name as the skill but different source → both retained.
           legacyCommand("review", "project", {
             description: "Legacy review command",
           }),
@@ -299,12 +567,14 @@ describe("public project command typeahead route", () => {
 
       expect(response.status).toBe(200);
       const body = commandListResponseSchema.parse(await readJson(response));
-      // Section rank is primary (built-ins, skills, then legacy commands),
-      // with alphabetical ordering inside each section. The (skill review)
-      // collision keeps the
-      // project-origin entry over the user-origin one, while the cross-source
-      // (command review) is retained as a distinct invocation.
       expect(body.commands).toEqual([
+        {
+          name: "clear",
+          source: "command",
+          origin: "builtin",
+          description: "Start fresh context in this thread",
+          argumentHint: null,
+        },
         {
           name: "compact",
           source: "command",
@@ -342,56 +612,17 @@ describe("public project command typeahead route", () => {
         },
       ]);
 
-      // Exactly one RPC, carrying the requested provider + resolved env cwd.
       expect(stub.requests.map((request) => request.command)).toEqual([
         {
           type: "host.list_commands",
           providerId: "claude-code",
           cwd: "/tmp/claude-commands-env",
+          nativeRoots: declaredNativeRootSet(
+            harness.deps.providerRegistry,
+            "claude-code",
+          ),
         },
       ]);
-    });
-  });
-
-  it("returns codex skills for a codex request", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps, {
-        id: "host-commands-codex",
-      });
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-        path: "/tmp/codex-commands-project",
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/codex-commands-env",
-      });
-      const stub = registerCommandRpc(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        commands: [
-          skill("prd", "user", { description: "Product requirements" }),
-          skill("skill-installer", "project"),
-        ],
-      });
-
-      const response = await harness.app.request(
-        `/api/v1/projects/${project.id}/commands?provider=codex&environmentId=${environment.id}`,
-      );
-
-      expect(response.status).toBe(200);
-      const body = commandListResponseSchema.parse(await readJson(response));
-      expect(body.commands.map((command) => command.name)).toEqual([
-        "compact",
-        "prd",
-        "skill-installer",
-      ]);
-      expect(stub.requests[0]?.command).toEqual({
-        type: "host.list_commands",
-        providerId: "codex",
-        cwd: "/tmp/codex-commands-env",
-      });
     });
   });
 
@@ -426,6 +657,7 @@ describe("public project command typeahead route", () => {
         expect(response.status).toBe(200);
         const body = commandListResponseSchema.parse(await readJson(response));
         expect(body.commands.map((command) => command.name)).toEqual([
+          "clear",
           "compact",
           "stories",
         ]);
@@ -433,48 +665,13 @@ describe("public project command typeahead route", () => {
           type: "host.list_commands",
           providerId: "codex",
           cwd: "/tmp/inherited-skills-project",
+          nativeRoots: declaredNativeRootSet(
+            harness.deps.providerRegistry,
+            "codex",
+          ),
         });
       },
     );
-  });
-
-  it("returns the complete snapshot for local composer filtering", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps, {
-        id: "host-commands-direct-skill",
-      });
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-        path: "/tmp/direct-skill-project",
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/direct-skill-env",
-      });
-      registerCommandRpc(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        commands: [
-          skill("alpha-review-notes", "user"),
-          skill("ottonomous:review", "user"),
-          skill("zeta-review", "user"),
-        ],
-      });
-
-      const response = await harness.app.request(
-        `/api/v1/projects/${project.id}/commands?provider=codex&environmentId=${environment.id}`,
-      );
-
-      expect(response.status).toBe(200);
-      const body = commandListResponseSchema.parse(await readJson(response));
-      expect(body.commands.map((command) => command.name)).toEqual([
-        "compact",
-        "alpha-review-notes",
-        "ottonomous:review",
-        "zeta-review",
-      ]);
-    });
   });
 
   it("returns an empty list without an RPC for a provider with no command surface", async () => {
@@ -502,83 +699,7 @@ describe("public project command typeahead route", () => {
       expect(response.status).toBe(200);
       const body = commandListResponseSchema.parse(await readJson(response));
       expect(body).toEqual({ commands: [] });
-      // No daemon roundtrip for a provider without a command surface.
       expect(stub.requests).toEqual([]);
-    });
-  });
-
-  it("lists skills for pi via the shared command surface", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps, {
-        id: "host-commands-pi",
-      });
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/pi-commands-env",
-      });
-      const stub = registerCommandRpc(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        commands: [skill("bb-cli", "user", { description: "Use the bb CLI" })],
-      });
-
-      const response = await harness.app.request(
-        `/api/v1/projects/${project.id}/commands?provider=pi&environmentId=${environment.id}`,
-      );
-
-      expect(response.status).toBe(200);
-      const body = commandListResponseSchema.parse(await readJson(response));
-      expect(body.commands.map((command) => command.name)).toEqual([
-        "compact",
-        "bb-cli",
-      ]);
-      expect(stub.requests[0]?.command).toEqual({
-        type: "host.list_commands",
-        providerId: "pi",
-        cwd: "/tmp/pi-commands-env",
-      });
-    });
-  });
-
-  it("falls back to the project source (cwd) with no environmentId and returns user-origin entries", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps, {
-        id: "host-commands-no-env",
-      });
-      seedPrimaryHost(harness.deps, host.id);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-        path: "/tmp/no-env-project",
-      });
-      const stub = registerCommandRpc(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        commands: [skill("user-only", "user", { description: "Home skill" })],
-      });
-
-      // environmentId="" encodes null on the wire → the new-thread composer
-      // path, which has no environment yet.
-      const response = await harness.app.request(
-        `/api/v1/projects/${project.id}/commands?provider=claude-code&environmentId=`,
-      );
-
-      expect(response.status).toBe(200);
-      const body = commandListResponseSchema.parse(await readJson(response));
-      expect(body.commands.map((command) => command.name)).toEqual([
-        "compact",
-        "user-only",
-      ]);
-      // Falls back to the project source path on the primary host, since the
-      // project has a local-path source even though no environment is given.
-      expect(stub.requests[0]?.command).toEqual({
-        type: "host.list_commands",
-        providerId: "claude-code",
-        cwd: "/tmp/no-env-project",
-      });
     });
   });
 
@@ -592,9 +713,6 @@ describe("public project command typeahead route", () => {
         hostId: host.id,
         path: "/tmp/provisioning-project",
       });
-      // Environment exists but is NOT ready — a freshly-created thread whose
-      // worktree is still provisioning. The route must not 409; it degrades to
-      // the project source path and still returns user-home entries.
       const environment = seedEnvironment(harness.deps, {
         hostId: host.id,
         projectId: project.id,
@@ -614,14 +732,18 @@ describe("public project command typeahead route", () => {
       expect(response.status).toBe(200);
       const body = commandListResponseSchema.parse(await readJson(response));
       expect(body.commands.map((command) => command.name)).toEqual([
+        "clear",
         "compact",
         "user-only",
       ]);
-      // Not the provisioning env path; the project source path on the primary host.
       expect(stub.requests[0]?.command).toEqual({
         type: "host.list_commands",
         providerId: "claude-code",
         cwd: "/tmp/provisioning-project",
+        nativeRoots: declaredNativeRootSet(
+          harness.deps.providerRegistry,
+          "claude-code",
+        ),
       });
     });
   });
@@ -632,8 +754,6 @@ describe("public project command typeahead route", () => {
         id: "host-commands-no-source",
       });
       seedPrimaryHost(harness.deps, host.id);
-      // Source-less (for the primary host) project: seed the project's source
-      // on a different host so the primary host has no local-path source.
       const otherHost = seedHost(harness.deps, { id: "host-commands-other" });
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: otherHost.id,
@@ -652,6 +772,7 @@ describe("public project command typeahead route", () => {
       expect(response.status).toBe(200);
       const body = commandListResponseSchema.parse(await readJson(response));
       expect(body.commands.map((command) => command.name)).toEqual([
+        "clear",
         "compact",
         "user-only",
       ]);
@@ -659,6 +780,10 @@ describe("public project command typeahead route", () => {
         type: "host.list_commands",
         providerId: "claude-code",
         cwd: null,
+        nativeRoots: declaredNativeRootSet(
+          harness.deps.providerRegistry,
+          "claude-code",
+        ),
       });
     });
   });
@@ -682,6 +807,7 @@ describe("public project command typeahead route", () => {
       expect(response.status).toBe(200);
       const body = commandListResponseSchema.parse(await readJson(response));
       expect(body.commands.map((command) => command.name)).toEqual([
+        "clear",
         "compact",
         "home-skill",
       ]);
@@ -689,6 +815,10 @@ describe("public project command typeahead route", () => {
         type: "host.list_commands",
         providerId: "codex",
         cwd: null,
+        nativeRoots: declaredNativeRootSet(
+          harness.deps.providerRegistry,
+          "codex",
+        ),
       });
     });
   });
@@ -712,48 +842,6 @@ describe("public project command typeahead route", () => {
       await expect(readJson(response)).resolves.toMatchObject({
         code: "host_unavailable",
       });
-    });
-  });
-
-  it("returns the full command catalog in one snapshot", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps, {
-        id: "host-commands-limit",
-      });
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-        path: "/tmp/limit-project",
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/limit-env",
-      });
-      registerCommandRpc(harness, {
-        hostId: host.id,
-        sessionId: session.id,
-        commands: [
-          skill("alpha", "project"),
-          skill("bravo", "project"),
-          skill("charlie", "project"),
-          skill("delta", "project"),
-        ],
-      });
-
-      const fullResponse = await harness.app.request(
-        `/api/v1/projects/${project.id}/commands?provider=claude-code&environmentId=${environment.id}`,
-      );
-      expect(fullResponse.status).toBe(200);
-      const full = commandListResponseSchema.parse(
-        await readJson(fullResponse),
-      );
-      expect(full.commands.map((command) => command.name)).toEqual([
-        "compact",
-        "alpha",
-        "bravo",
-        "charlie",
-        "delta",
-      ]);
     });
   });
 });

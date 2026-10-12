@@ -24,6 +24,7 @@ import {
 } from "@/hooks/cache-owners/thread-list-cache-data";
 
 export interface SenderThreadMetadata {
+  projectId: string;
   title: string | null;
   originKind: ThreadOriginKind | null;
   originPluginId: string | null;
@@ -37,6 +38,7 @@ interface SenderThreadTitleSource {
 
 interface SenderThreadMetadataSource extends SenderThreadTitleSource {
   id: string;
+  projectId: string;
   originKind: ThreadOriginKind | null;
   originPluginId: string | null;
   visibility: ThreadVisibility;
@@ -61,6 +63,7 @@ function addSenderThreadMetadata(
     return;
   }
   metadataById.set(thread.id, {
+    projectId: thread.projectId,
     title,
     originKind: thread.originKind,
     originPluginId: thread.originPluginId,
@@ -76,9 +79,6 @@ function buildSenderThreadMetadataById(
     return metadataById;
   }
 
-  // Prefer the sidebar snapshot for visible threads. It is actively observed
-  // and refetched after title changes, while broader thread-list caches can be
-  // present but inactive and therefore retain an older non-null title.
   for (const thread of getCachedSidebarNavigationThreads(queryClient)) {
     addSenderThreadMetadata(metadataById, thread);
   }
@@ -103,10 +103,6 @@ function buildSenderThreadMetadataById(
 }
 
 function shouldSyncSenderThreadMetadata(event: QueryCacheNotifyEvent): boolean {
-  // The map is built from `query.state.data`, which only changes through
-  // "updated" dispatches. "observerResultsUpdated" fires on observer churn
-  // (subscription changes, tracked-prop recomputes) without a data change, so
-  // reacting to it would only rebuild identical maps.
   return (
     event.type === "updated" &&
     (event.query.queryKey[0] === SIDEBAR_NAVIGATION_QUERY_KEY ||
@@ -120,6 +116,7 @@ function areSenderThreadMetadataEntriesEqual(
   right: SenderThreadMetadata,
 ): boolean {
   return (
+    left.projectId === right.projectId &&
     left.title === right.title &&
     left.originKind === right.originKind &&
     left.originPluginId === right.originPluginId &&
@@ -149,11 +146,6 @@ function areSenderThreadMetadataMapsEqual(
   return true;
 }
 
-/**
- * Resolves agent-message source titles from thread data already held in React
- * Query. Both the timeline and its table of contents use this so their source
- * labels stay in sync without issuing one request per sender thread.
- */
 export function useSenderThreadMetadataById(): ReadonlyMap<
   string,
   SenderThreadMetadata
@@ -171,12 +163,6 @@ export function useSenderThreadMetadataById(): ReadonlyMap<
     let subscribed = true;
     const syncMetadataById = () => {
       if (subscribed) {
-        // QueryClient has stable identity while the data inside its cache is
-        // mutable. Store the rebuilt map itself so consumers receive a new
-        // state value instead of relying on render-time reads of that object.
-        // Keep the previous map when the rebuild is value-equal: the timeline
-        // feeds this map into context, so a fresh-but-equal reference would
-        // re-render every row on every matching cache event.
         setMetadataById((current) => {
           const next = buildSenderThreadMetadataById(queryClient);
           return areSenderThreadMetadataMapsEqual(current, next)

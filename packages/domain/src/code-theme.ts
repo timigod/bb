@@ -6,7 +6,6 @@ import { jsonObjectSchema, type JsonObject } from "./json-value.js";
 export const DEFAULT_CODE_THEME_DARK = "pierre-dark";
 export const DEFAULT_CODE_THEME_LIGHT = "pierre-light";
 
-/** Safe Shiki / Pierre / registered theme name. Paths are not allowed. */
 export const codeThemeNameSchema = z
   .string()
   .min(1)
@@ -16,7 +15,7 @@ export const codeThemeNameSchema = z
     "Code theme names may use letters, digits, '.', '_', ':', and '-' and cannot start with '.'",
   );
 
-export const codeThemePairSchema = z
+const codeThemePairSchema = z
   .object({
     dark: codeThemeNameSchema,
     light: codeThemeNameSchema,
@@ -24,11 +23,11 @@ export const codeThemePairSchema = z
   .strict();
 export type CodeThemePair = z.infer<typeof codeThemePairSchema>;
 
-export const vscodeThemeJsonSchema = jsonObjectSchema.refine(
+const vscodeThemeJsonSchema = jsonObjectSchema.refine(
   (value) => typeof value.name === "string" && value.name.length > 0,
   { message: "Code theme JSON must include a non-empty name" },
 );
-export type VscodeThemeJson = JsonObject & { name: string };
+type VscodeThemeJson = JsonObject & { name: string };
 
 export const resolvedCodeThemeSchema = z
   .object({
@@ -45,7 +44,6 @@ export const defaultResolvedCodeTheme: ResolvedCodeTheme = {
   files: {},
 };
 
-/** Optional declaration a UI theme ships for its matching code colors. */
 export const uiCodeThemeDeclarationSchema = z
   .object({
     dark: z.string().min(1).max(256).optional(),
@@ -56,12 +54,6 @@ export type UiCodeThemeDeclaration = z.infer<
   typeof uiCodeThemeDeclarationSchema
 >;
 
-/**
- * Code-theme pair that follows each built-in appearance palette. Custom and
- * plugin palettes use their declared Pierre / VS Code files when present.
- * Palettes Shiki only ships as dark (Nord, Dracula) use a first-party light
- * file under `bb:<id>:light`; the rest use the bundled light/dark names.
- */
 export const builtInPaletteCodeThemes = {
   default: {
     dark: DEFAULT_CODE_THEME_DARK,
@@ -86,7 +78,6 @@ export interface DeclaredCodeTheme {
 
 export const CUSTOM_CODE_THEME_JSON_MAX_LENGTH = 256_000;
 
-/** True when a UI-theme declaration points at a JSON file rather than a bundled name. */
 export function isCodeThemeFilePath(value: string): boolean {
   return value.includes("/") || value.toLowerCase().endsWith(".json");
 }
@@ -123,7 +114,7 @@ export function parseVscodeThemeJson(value: unknown): VscodeThemeJson | null {
   }
 }
 
-export function paletteCodeThemeFallback(paletteId: string): CodeThemePair {
+function paletteCodeThemeFallback(paletteId: string): CodeThemePair {
   if (Object.hasOwn(builtInPaletteCodeThemes, paletteId)) {
     return builtInPaletteCodeThemes[
       paletteId as keyof typeof builtInPaletteCodeThemes
@@ -139,11 +130,6 @@ const builtInPaletteCodeThemeFiles: Partial<
   dracula: { "bb:dracula:light": draculaLightCodeTheme },
 };
 
-/**
- * Pierre's `resolveTheme` requires `theme.name` to equal the registered id.
- * Author files keep a display name ("Ocean Dark"); stamp the wire id before
- * `registerCustomTheme` so the highlighter does not fall back to pierre-light.
- */
 export function stampRegisteredThemeName(
   name: string,
   file: JsonObject,

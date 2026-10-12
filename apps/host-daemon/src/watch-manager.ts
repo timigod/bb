@@ -1,6 +1,5 @@
 import type { DiscoveredWorkspaceProperties } from "@bb/domain";
 import {
-  getPersonalWorkspaceRoot,
   provisionWorkspace,
   type HostWorkspace,
   type ProvisionWorkspaceArgs,
@@ -17,7 +16,7 @@ import type {
   WorkspaceStatusWatchChangeKind,
   WorkspaceWatchError,
 } from "@bb/host-watcher";
-import { reconnectProvisionArgsFromWorkspaceContext } from "./workspace-provision-target.js";
+import { userExecutableProcessOptions } from "./user-executable-env.js";
 
 type StopWatching = () => void | Promise<void>;
 
@@ -50,12 +49,12 @@ interface RefreshWorkspaceArgs {
 }
 
 export interface WatchManagerOptions {
-  dataDir?: string;
   hostWatcher?: HostWatcher;
   provisionWorkspace?: (
     options: ProvisionWorkspaceArgs,
   ) => Promise<HostWorkspace>;
   refreshWorkspace?: (args: RefreshWorkspaceArgs) => Promise<HostWorkspace>;
+  shellEnv?: () => NodeJS.ProcessEnv;
   threadStorageRootPath?: string | null;
   onThreadStorageChanged?: (args: {
     environmentId: string;
@@ -89,12 +88,6 @@ function workspaceWatchKindsIncludeLocalState(
   );
 }
 
-function workspaceWatchKindsIncludeSharedRefs(
-  changeKinds: readonly WorkspaceStatusWatchChangeKind[],
-): boolean {
-  return changeKinds.includes("shared-git-refs-changed");
-}
-
 function sameWorkspaceTarget(
   current: HostDaemonWatchSetWorkspaceTarget,
   next: HostDaemonWatchSetWorkspaceTarget,
@@ -102,9 +95,7 @@ function sameWorkspaceTarget(
   return (
     current.environmentId === next.environmentId &&
     current.workspaceContext.workspacePath ===
-      next.workspaceContext.workspacePath &&
-    current.workspaceContext.workspaceProvisionType ===
-      next.workspaceContext.workspaceProvisionType
+      next.workspaceContext.workspacePath
   );
 }
 
@@ -123,11 +114,15 @@ export class WatchManager {
 
   constructor(private readonly options: WatchManagerOptions = {}) {
     this.hostWatcher = options.hostWatcher;
-    this.provisionWorkspace = options.provisionWorkspace ?? provisionWorkspace;
+    const provision = options.provisionWorkspace ?? provisionWorkspace;
+    this.provisionWorkspace = (args: ProvisionWorkspaceArgs) =>
+      provision({
+        ...args,
+        ...userExecutableProcessOptions(options.shellEnv?.() ?? {}),
+      });
     this.refreshWorkspace =
       options.refreshWorkspace ??
-      ((args: RefreshWorkspaceArgs) =>
-        this.provisionWorkspace(args.provision));
+      ((args: RefreshWorkspaceArgs) => this.provisionWorkspace(args.provision));
   }
 
   async replaceWatchSet(watchSet: HostDaemonWatchSet): Promise<void> {
@@ -144,12 +139,6 @@ export class WatchManager {
   ): Promise<void> {
     await this.enqueueWatchSetMutation(async () => {
       await this.applyWatchSet(watchSet);
-    });
-  }
-
-  async removeEnvironmentWorkspaceWatch(environmentId: string): Promise<void> {
-    await this.enqueueWatchSetMutation(async () => {
-      await this.removeWorkspaceWatch(environmentId);
     });
   }
 
@@ -231,19 +220,9 @@ export class WatchManager {
     }
 
     try {
-      const workspace = await this.provisionWorkspace(
-        reconnectProvisionArgsFromWorkspaceContext({
-          environmentId: target.environmentId,
-          ...(this.options.dataDir
-            ? {
-                personalWorkspaceRoot: getPersonalWorkspaceRoot(
-                  this.options.dataDir,
-                ),
-              }
-            : {}),
-          workspaceContext: target.workspaceContext,
-        }),
-      );
+      const workspace = await this.provisionWorkspace({
+        path: target.workspaceContext.workspacePath,
+      });
       const entry: WorkspaceWatchEntry = {
         stopWatchingStatus: STOP_WATCHING,
         target,
@@ -265,9 +244,6 @@ export class WatchManager {
             entry,
           });
         },
-        // Parcel subscriptions are established asynchronously. Reconcile once
-        // the workspace-root subscription is live so an edit made between the
-        // initial preview fetch and watcher readiness cannot remain stale.
         onReady: () => {
           this.queueWorkspaceWatchChange({
             changeKinds: ["workspace-content-changed"],
@@ -330,9 +306,6 @@ export class WatchManager {
       return;
     }
     if (args.changeKinds.includes("workspace-content-changed")) {
-      // The filesystem event itself is sufficient evidence that live content
-      // is stale. Notify before any Git fingerprint work: large diffs can make
-      // status/numstat slow or fail, but previews must still refresh.
       this.options.onWorkspaceStatusChanged?.({
         changeKinds: ["work-status-changed"],
         environmentId: args.entry.target.environmentId,
@@ -392,7 +365,7 @@ export class WatchManager {
       }
       if (
         args.entry.workspace.isGitRepo &&
-        workspaceWatchKindsIncludeSharedRefs(pendingKinds)
+        pendingKinds.includes("shared-git-refs-changed")
       ) {
         const nextSharedRefsFingerprint =
           await args.entry.workspace.getSharedGitRefsFingerprint();
@@ -440,17 +413,7 @@ export class WatchManager {
     if (entry.workspace.isGitRepo) {
       return;
     }
-    const provision = reconnectProvisionArgsFromWorkspaceContext({
-      environmentId: entry.target.environmentId,
-      ...(this.options.dataDir
-        ? {
-            personalWorkspaceRoot: getPersonalWorkspaceRoot(
-              this.options.dataDir,
-            ),
-          }
-        : {}),
-      workspaceContext: entry.target.workspaceContext,
-    });
+    const provision = { path: entry.target.workspaceContext.workspacePath };
     const workspace = await this.refreshWorkspace({
       environmentId: entry.target.environmentId,
       provision,
@@ -484,15 +447,6 @@ export class WatchManager {
     const stopWatchingStatus = entry.stopWatchingStatus;
     entry.stopWatchingStatus = STOP_WATCHING;
     await stopWatchingStatus();
-  }
-
-  private async removeWorkspaceWatch(environmentId: string): Promise<void> {
-    const entry = this.workspaceEntries.get(environmentId);
-    if (!entry) {
-      return;
-    }
-    this.workspaceEntries.delete(environmentId);
-    await this.stopWorkspaceWatch(entry);
   }
 
   private ensureThreadStorageWatcher(): void {

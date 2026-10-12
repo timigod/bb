@@ -5,24 +5,31 @@ import { formatPendingInteractionSummary } from "../src/pending-interaction-pres
 function createInteraction(
   payload: PendingInteractionPayload,
 ): PendingInteraction {
-  return {
+  const base = {
     id: "pint_123456789a",
     threadId: "thr_123",
     turnId: "turn_123",
     providerId: "codex",
     providerThreadId: "provider-thread-123",
     providerRequestId: "request-123",
-    status: "pending",
-    payload,
+    status: "pending" as const,
     resolution: null,
     statusReason: null,
     createdAt: 1,
     resolvedAt: null,
   };
+  switch (payload.kind) {
+    case "approval":
+      return { ...base, payload };
+    case "user_question":
+      return { ...base, payload };
+    default:
+      return { ...base, payload };
+  }
 }
 
 describe("pending interaction presentation", () => {
-  it("formats command approval summaries differently per surface", () => {
+  it("formats command approval summaries from the approval reason", () => {
     const interaction = createInteraction({
       kind: "approval",
       subject: {
@@ -37,21 +44,12 @@ describe("pending interaction presentation", () => {
       availableDecisions: ["allow_once", "deny"],
     });
 
-    expect(
-      formatPendingInteractionSummary({
-        interaction,
-        surface: "app",
-      }),
-    ).toBe("Needs approval to publish");
-    expect(
-      formatPendingInteractionSummary({
-        interaction,
-        surface: "cli",
-      }),
-    ).toBe("Needs approval to publish");
+    expect(formatPendingInteractionSummary({ interaction })).toBe(
+      "Needs approval to publish",
+    );
   });
 
-  it("formats permission request summaries differently per surface", () => {
+  it("formats permission request summaries from the tool name", () => {
     const interaction = createInteraction({
       kind: "approval",
       subject: {
@@ -70,17 +68,6 @@ describe("pending interaction presentation", () => {
       availableDecisions: ["allow_once", "allow_for_session", "deny"],
     });
 
-    expect(
-      formatPendingInteractionSummary({
-        interaction,
-        surface: "app",
-      }),
-    ).toBe("Network access . Read 2 paths");
-    expect(
-      formatPendingInteractionSummary({
-        interaction,
-        surface: "cli",
-      }),
-    ).toBe("WebFetch");
+    expect(formatPendingInteractionSummary({ interaction })).toBe("WebFetch");
   });
 });

@@ -1,20 +1,15 @@
-import { threadScope, turnScope } from "@bb/domain";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { JsonObject, ProviderRecoveryKind } from "@bb/domain";
+import { createAgentRuntime } from "../runtime.js";
 import type {
-  AdapterCommand,
-  DecodedInteractiveRequest,
-  DecodedToolCallRequest,
-  ProviderAdapter,
-  ProviderCommandPlan,
-} from "../provider-adapter.js";
-import { noPreparedProviderCommandDispatch } from "../provider-adapter.js";
-import { classifySessionExecutionSettingsChange } from "../execution-options.js";
-import { ProviderRequestDecodeError } from "../runtime-json-rpc.js";
-import { parseAvailableModelList } from "../shared/available-models.js";
-import type { AgentRuntimeExecutionOptions } from "../types.js";
-import {
-  buildNodeScriptArgs,
-  createFakeAdapter as createSharedFakeAdapter,
-} from "./fake-adapter.js";
+  AgentRuntime,
+  AgentRuntimeBridgeLaunch,
+  AgentRuntimeExecutionOptions,
+  AgentRuntimeOptions,
+} from "../types.js";
 export {
   waitForRuntimeState,
   waitForRuntimeThreadEvent,
@@ -27,414 +22,251 @@ export const fullRuntimeOptions = {
   model: "test-model",
   serviceTier: "default",
   reasoningLevel: "medium",
-  workflowsEnabled: false,
+  providerOptions: {},
   permissionMode: "full",
   permissionScope: "full",
   approvalReviewer: null,
   permissionEscalation: null,
 } satisfies AgentRuntimeExecutionOptions;
 
-interface CreateRecordingAdapterArgs {
-  recordedCommands: AdapterCommand[];
-  scriptPath: string;
-}
-
-type RuntimeTestRecord = Record<string, unknown>;
-
 export function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isRecord(value: unknown): value is RuntimeTestRecord {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+const prebuiltTestBridgeDir = fileURLToPath(
+  new URL("../../dist/test-bridges/", import.meta.url),
+);
+
+export const scriptedEchoBridgeModulePath = join(
+  prebuiltTestBridgeDir,
+  "scripted-echo-provider.mjs",
+);
+
+export interface ScriptedEchoLaunchScript {
+  startDelayMs?: number;
+  turnStartResponseDelayMs?: number;
+  answerStartWithoutIdentity?: boolean;
+  identityAfterResponse?: boolean;
+  identityNotificationsBeforeTurn?: {
+    threadId: string;
+    providerThreadId: string;
+    asDelta?: boolean;
+  }[];
+  completionIdentity?: string;
+  archivedSession?: boolean;
+  unarchiveFails?: boolean;
+  exitAfterArchivedError?: boolean;
+  discardFailsOnce?: boolean;
+  crashOn?: string;
+  exitAfter?: string;
+  unsupportedMethods?: string[];
+  failMethods?: {
+    method: string;
+    message: string;
+    code?: number;
+    times?: number;
+    recovery?: { kind: ProviderRecoveryKind; retryable: boolean };
+  }[];
+  goalClearNotifyDelayMs?: number;
+  goalClearReportsCleared?: boolean;
+  swallowTurnStart?: boolean;
+  sessionRestorable?: boolean;
+  toolCallThreadIdHint?: string;
+  recoveryThreadIdHint?: string;
+  approvalEnforcedBy?: "runtime" | "provider";
+  identifyProcess?: boolean;
+  failStopForThreadIds?: string[];
+  emitIdentityOnSigterm?: boolean;
 }
 
-function unsupportedRuntimeTestCommand(
-  command: AdapterCommand,
-): ProviderCommandPlan {
-  return { kind: "noop", reason: `${command.type} unsupported` };
+export interface CreateScriptedEchoLaunchOptions {
+  pluginId?: string;
+  digest?: string;
+  scripted?: ScriptedEchoLaunchScript;
+  providerOptions?: JsonObject;
+  capabilities?: Partial<AgentRuntimeBridgeLaunch["capabilities"]>;
+  modulePath?: string;
 }
 
-export function findLastRecordedCommand(
-  commands: AdapterCommand[],
-  type: AdapterCommand["type"],
-): AdapterCommand | undefined {
-  for (let index = commands.length - 1; index >= 0; index -= 1) {
-    if (commands[index]?.type === type) {
-      return commands[index];
-    }
-  }
-  return undefined;
-}
-
-export function createFakeAdapter(scriptPath: string): ProviderAdapter {
-  return createSharedFakeAdapter({ scriptPath });
-}
-
-export function createRecordingAdapter(
-  args: CreateRecordingAdapterArgs,
-): ProviderAdapter {
-  const adapter = createFakeAdapter(args.scriptPath);
+export function createScriptedEchoLaunch(
+  options: CreateScriptedEchoLaunchOptions = {},
+): AgentRuntimeBridgeLaunch {
+  const pluginId = options.pluginId ?? "provider-scripted-echo";
   return {
-    ...adapter,
-    buildCommandPlan(command) {
-      args.recordedCommands.push(command);
-      return adapter.buildCommandPlan(command);
+    pluginId,
+    dataDir: mkdtempSync(join(tmpdir(), `bb-${pluginId}-data-`)),
+    source: {
+      kind: "artifact",
+      digest: options.digest ?? "scripted-echo",
+      artifactPath: options.modulePath ?? scriptedEchoBridgeModulePath,
     },
-  };
-}
-
-export function createThreadHintMismatchAdapter(
-  scriptPath: string,
-): ProviderAdapter {
-  const adapter = createFakeAdapter(scriptPath);
-  return {
-    ...adapter,
-    decodeToolCallRequest(request): DecodedToolCallRequest | null {
-      const decoded = adapter.decodeToolCallRequest(request);
-      if (!decoded) {
-        return null;
-      }
-      return {
-        ...decoded,
-        threadId: "thr_wrong",
-      };
-    },
-  };
-}
-
-export function createInteractiveRequestAdapter(
-  scriptPath: string,
-): ProviderAdapter {
-  const adapter = createFakeAdapter(scriptPath);
-  return {
-    ...adapter,
-    decodeInteractiveRequest(request): DecodedInteractiveRequest | null {
-      if (request.method !== "request_interaction") {
-        return null;
-      }
-      if (typeof request.id !== "string" && typeof request.id !== "number") {
-        return null;
-      }
-      if (!isRecord(request.params)) {
-        return null;
-      }
-
-      const params = request.params;
-      if (
-        typeof params.threadId !== "string" ||
-        typeof params.turnId !== "string" ||
-        typeof params.itemId !== "string" ||
-        typeof params.kind !== "string"
-      ) {
-        return null;
-      }
-
-      if (params.kind === "command_approval") {
-        const command =
-          typeof params.command === "string" ? params.command : "";
-        return {
-          requestId: request.id,
-          method: request.method,
-          providerThreadId: params.threadId,
-          turnId: params.turnId,
-          payload: {
-            kind: "approval",
-            subject: {
-              kind: "command",
-              itemId: params.itemId,
-              command,
-              cwd: typeof params.cwd === "string" ? params.cwd : null,
-              actions: [],
-              sessionGrant: null,
-            },
-            reason: typeof params.reason === "string" ? params.reason : null,
-            availableDecisions: ["allow_once", "allow_for_session", "deny"],
-          },
-        };
-      }
-
-      if (params.kind === "file_change_approval") {
-        return {
-          requestId: request.id,
-          method: request.method,
-          providerThreadId: params.threadId,
-          turnId: params.turnId,
-          payload: {
-            kind: "approval",
-            subject: {
-              kind: "file_change",
-              itemId: params.itemId,
-              writeScope: null,
-              sessionGrant: null,
-            },
-            reason: null,
-            availableDecisions: ["allow_once", "deny"],
-          },
-        };
-      }
-
-      return null;
-    },
-    buildInteractiveResponse({ resolution }) {
-      return { resolution };
-    },
-  };
-}
-
-export function createInvalidInteractiveRequestAdapter(
-  scriptPath: string,
-): ProviderAdapter {
-  const adapter = createFakeAdapter(scriptPath);
-  return {
-    ...adapter,
-    decodeInteractiveRequest(request): DecodedInteractiveRequest | null {
-      if (request.method !== "request_interaction") {
-        return null;
-      }
-      throw new ProviderRequestDecodeError(
-        "Invalid interactive request params",
-      );
-    },
-    buildInteractiveResponse({ resolution }) {
-      return { resolution };
-    },
-  };
-}
-
-export function createWarningEventAdapter(scriptPath: string): ProviderAdapter {
-  return {
-    id: "warning-fake",
-    displayName: "Warning Fake",
-    approvalRequestPolicy: "runtime",
     capabilities: {
-      supportsArchive: false,
-      supportsRename: false,
+      providerInstallation: false,
       supportsServiceTier: false,
-      supportsUserQuestion: false,
-      supportsFork: false,
-      supportedPermissionModes: ["accept-edits", "auto", "full"],
+      permissionModes: ["accept-edits", "auto", "full"],
+      supportsThreadArchive: true,
+      supportsThreadRename: true,
+      fork: "checkpoint",
+      ...options.capabilities,
     },
-    classifyExecutionSettingsChange: classifySessionExecutionSettingsChange,
-    process: {
-      command: "node",
-      args: buildNodeScriptArgs(scriptPath),
+    providerOptions: {
+      ...options.providerOptions,
+      ...(options.scripted === undefined
+        ? {}
+        : { scripted: scriptToJson(options.scripted) }),
     },
-    buildCommandPlan(command) {
-      switch (command.type) {
-        case "initialize":
-          return {
-            kind: "request",
-            method: "initialize",
-          };
-        case "model/list":
-          return {
-            kind: "request",
-            method: "model/list",
-            params: {},
-          };
-        case "thread/start":
-          return {
-            kind: "request",
-            method: "thread/start",
-            params: {
-              threadId: command.threadId,
-            },
-          };
-        case "turn/start":
-          return {
-            kind: "request",
-            method: "turn/start",
-            params: {
-              threadId: command.providerThreadId,
-            },
-          };
-        case "thread/resume":
-        case "thread/fork":
-        case "skills/configure":
-        case "turn/steer":
-        case "thread/stop":
-        case "thread/discard":
-        case "thread/goal/clear":
-        case "thread/name/set":
-        case "thread/archive":
-        case "thread/unarchive":
-          return unsupportedRuntimeTestCommand(command);
-      }
-    },
-    prepareTurnStart: noPreparedProviderCommandDispatch,
-    translateEvent(event) {
-      if (!isRuntimeTestEvent(event)) {
+    envPassthrough: [],
+  };
+}
+
+function scriptToJson(script: ScriptedEchoLaunchScript): JsonObject {
+  return JSON.parse(JSON.stringify(script)) as JsonObject;
+}
+
+export function scriptedEchoProcessEnv(
+  script: ScriptedEchoLaunchScript,
+): Record<string, string> {
+  return { SCRIPTED_ECHO_OPTIONS: JSON.stringify(script) };
+}
+
+type LaunchBearingMethod =
+  | "ensureProvider"
+  | "startThread"
+  | "prepareThreadRewind"
+  | "resumeThread"
+  | "archiveThread"
+  | "unarchiveThread"
+  | "listModels"
+  | "providerHealth"
+  | "providerUsage"
+  | "providerInstallationStatus"
+  | "providerInstallationRun";
+
+type WithDefaultBridgeLaunch<TMethod extends (args: never) => unknown> = (
+  args: Omit<Parameters<TMethod>[0], "bridgeLaunch"> & {
+    bridgeLaunch?: AgentRuntimeBridgeLaunch;
+  },
+) => ReturnType<TMethod>;
+
+export type LaunchBoundAgentRuntime = Omit<
+  AgentRuntime,
+  LaunchBearingMethod
+> & {
+  [TMethod in LaunchBearingMethod]: WithDefaultBridgeLaunch<
+    AgentRuntime[TMethod]
+  >;
+};
+
+export function withBridgeLaunch(
+  runtime: AgentRuntime,
+  bridgeLaunch: AgentRuntimeBridgeLaunch,
+): LaunchBoundAgentRuntime {
+  return {
+    ...runtime,
+    ensureProvider: (args) => runtime.ensureProvider({ bridgeLaunch, ...args }),
+    startThread: (args) => runtime.startThread({ bridgeLaunch, ...args }),
+    prepareThreadRewind: (args) =>
+      runtime.prepareThreadRewind({ bridgeLaunch, ...args }),
+    resumeThread: (args) => runtime.resumeThread({ bridgeLaunch, ...args }),
+    archiveThread: (args) => runtime.archiveThread({ bridgeLaunch, ...args }),
+    unarchiveThread: (args) =>
+      runtime.unarchiveThread({ bridgeLaunch, ...args }),
+    listModels: (args) => runtime.listModels({ bridgeLaunch, ...args }),
+    providerHealth: (args) => runtime.providerHealth({ bridgeLaunch, ...args }),
+    providerUsage: (args) => runtime.providerUsage({ bridgeLaunch, ...args }),
+    providerInstallationStatus: (args) =>
+      runtime.providerInstallationStatus({ bridgeLaunch, ...args }),
+    providerInstallationRun: (args) =>
+      runtime.providerInstallationRun({ bridgeLaunch, ...args }),
+  };
+}
+
+export interface CreateScriptedEchoRuntimeArgs {
+  runtime: Omit<AgentRuntimeOptions, "onToolCall"> &
+    Partial<Pick<AgentRuntimeOptions, "onToolCall">>;
+  launch?: CreateScriptedEchoLaunchOptions;
+}
+
+export function createScriptedEchoRuntime(
+  args: CreateScriptedEchoRuntimeArgs,
+): LaunchBoundAgentRuntime {
+  const runtime = createAgentRuntime({
+    onToolCall: async () => ({ contentItems: [], success: true }),
+    ...(args.launch?.modulePath === undefined
+      ? { bridgeBundleDir: prebuiltTestBridgeDir }
+      : {}),
+    ...args.runtime,
+  });
+  return withBridgeLaunch(runtime, createScriptedEchoLaunch(args.launch));
+}
+
+export interface ScriptedEchoProcessLog {
+  env: Record<string, string>;
+  path: string;
+  read(): string[];
+}
+
+export function createScriptedEchoProcessLog(): ScriptedEchoProcessLog {
+  const path = join(
+    mkdtempSync(join(tmpdir(), "bb-scripted-echo-process-log-")),
+    "process.log",
+  );
+  return {
+    env: { SCRIPTED_ECHO_PROCESS_LOG_PATH: path },
+    path,
+    read() {
+      let raw: string;
+      try {
+        raw = readFileSync(path, "utf8");
+      } catch {
         return [];
       }
-
-      switch (event.method) {
-        case "warning":
-          return [
-            {
-              type: "provider/warning",
-              threadId: "",
-              providerThreadId: "",
-              scope: threadScope(),
-              category: "config",
-              summary: "provider warning",
-            },
-          ];
-        case "turn/started":
-          return [
-            {
-              type: "turn/started",
-              threadId: stringParam(event, "threadId"),
-              providerThreadId: stringParam(event, "providerThreadId"),
-              turnId: stringParam(event, "turnId"),
-              scope: turnScope(stringParam(event, "turnId")),
-            },
-          ];
-        case "turn/completed":
-          return [
-            {
-              type: "turn/completed",
-              threadId: stringParam(event, "threadId"),
-              providerThreadId: stringParam(event, "providerThreadId"),
-              turnId: stringParam(event, "turnId"),
-              scope: turnScope(stringParam(event, "turnId")),
-              status: "completed",
-            },
-          ];
-        default:
-          return [];
-      }
-    },
-    translateAcceptedCommand() {
-      return [];
-    },
-    decodeToolCallRequest() {
-      return null;
-    },
-    parseModelListResult(result) {
-      return parseAvailableModelList(result);
+      return raw.split("\n").filter((line) => line.length > 0);
     },
   };
 }
 
-export function createStartedEventAdapter(scriptPath: string): ProviderAdapter {
-  return {
-    id: "started-fake",
-    displayName: "Started Fake",
-    approvalRequestPolicy: "runtime",
-    capabilities: {
-      supportsArchive: false,
-      supportsRename: false,
-      supportsServiceTier: false,
-      supportsUserQuestion: false,
-      supportsFork: false,
-      supportedPermissionModes: ["accept-edits", "auto", "full"],
-    },
-    classifyExecutionSettingsChange: classifySessionExecutionSettingsChange,
-    process: {
-      command: "node",
-      args: buildNodeScriptArgs(scriptPath),
-    },
-    buildCommandPlan(command) {
-      switch (command.type) {
-        case "initialize":
-          return {
-            kind: "request",
-            method: "initialize",
-          };
-        case "model/list":
-          return {
-            kind: "request",
-            method: "model/list",
-            params: {},
-          };
-        case "thread/start":
-          return {
-            kind: "request",
-            method: "thread/start",
-            params: {
-              threadId: command.threadId,
-            },
-          };
-        case "thread/resume":
-        case "thread/fork":
-        case "skills/configure":
-        case "turn/start":
-        case "turn/steer":
-        case "thread/stop":
-        case "thread/discard":
-        case "thread/goal/clear":
-        case "thread/name/set":
-        case "thread/archive":
-        case "thread/unarchive":
-          return unsupportedRuntimeTestCommand(command);
-      }
-    },
-    prepareTurnStart: noPreparedProviderCommandDispatch,
-    translateEvent(event) {
-      if (!isStartedThreadEvent(event)) {
-        return [];
-      }
-
-      return [
-        {
-          type: "thread/started",
-          threadId: event.params.thread.id,
-          scope: threadScope(),
-        },
-        {
-          type: "thread/identity",
-          threadId: event.params.thread.id,
-          providerThreadId: event.params.thread.id,
-          scope: threadScope(),
-        },
-      ];
-    },
-    translateAcceptedCommand() {
-      return [];
-    },
-    decodeToolCallRequest() {
-      return null;
-    },
-    parseModelListResult(result) {
-      return parseAvailableModelList(result);
-    },
-  };
-}
-
-interface RuntimeTestEvent {
+export interface RecordedBridgeRequest {
   method: string;
-  params?: RuntimeTestRecord;
+  params: Record<string, unknown> | null;
 }
 
-interface StartedThreadEvent {
-  method: "thread/started";
-  params: {
-    thread: {
-      id: string;
-      preview?: string;
-    };
+export interface ScriptedEchoRequestRecord {
+  env: Record<string, string>;
+  path: string;
+  read(): RecordedBridgeRequest[];
+  last(method: string): RecordedBridgeRequest | undefined;
+}
+
+export function createScriptedEchoRequestRecord(): ScriptedEchoRequestRecord {
+  const path = join(
+    mkdtempSync(join(tmpdir(), "bb-scripted-echo-record-")),
+    "requests.jsonl",
+  );
+  const read = (): RecordedBridgeRequest[] => {
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch {
+      return [];
+    }
+    return raw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as RecordedBridgeRequest);
   };
-}
-
-function isRuntimeTestEvent(event: unknown): event is RuntimeTestEvent {
-  return isRecord(event) && typeof event.method === "string";
-}
-
-function stringParam(event: RuntimeTestEvent, key: string): string {
-  if (!isRecord(event.params)) {
-    return "";
-  }
-  const value = event.params[key];
-  return typeof value === "string" ? value : "";
-}
-
-function isStartedThreadEvent(event: unknown): event is StartedThreadEvent {
-  if (!isRecord(event) || event.method !== "thread/started") {
-    return false;
-  }
-  if (!isRecord(event.params) || !isRecord(event.params.thread)) {
-    return false;
-  }
-  return typeof event.params.thread.id === "string";
+  return {
+    env: { SCRIPTED_ECHO_RECORD_PATH: path },
+    path,
+    read,
+    last(method) {
+      const requests = read();
+      for (let index = requests.length - 1; index >= 0; index -= 1) {
+        if (requests[index]?.method === method) {
+          return requests[index];
+        }
+      }
+      return undefined;
+    },
+  };
 }

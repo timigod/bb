@@ -1,39 +1,33 @@
-// bb-plugin-github — the frontend bundle.
-//
-// A GitHub panel: Issues / Pull Requests as a filterable table (state chips,
-// "Assigned to me", text search), inline status + assignee editing, issue and
-// pull-request detail views with a metadata sidebar (the PR view covers
-// checks, reviews, inline review threads, and per-file diffs — VS Code's
-// GitHub integration, shrunk to a panel). "Send agent" buttons everywhere an
-// issue or PR shows up. Deep links use the URL hash
-// (#/issues/<owner>/<repo>/<n>, #/pulls/<owner>/<repo>/<n>) since navPanel
-// owns /plugins/github/github/* via subPath routing. A threadPanelAction opens the same PR view in a
-// thread's right panel, auto-resolved to that thread's PR.
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   definePluginApp,
+  experimental_Diff as Diff,
+  experimental_FileLink as FileLink,
+  experimental_copyToClipboard,
+  UrlLink,
   useBbNavigate,
   useRealtime,
   useRpc,
   type PluginNavPanelProps,
+  type PluginRpcResult,
   type PluginThreadPanelProps,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
+import {
+  buildSuggestions,
+  matchesQuery,
+  parseQuery,
+  parseSubPath,
+  routeToSubPath,
+  type Item,
+  type Route,
+  type Suggestion,
+  type SuggestionIcon,
+} from "./app-logic.js";
 import type { githubRpcContract } from "./server.js";
-// Shimmed to the host's copy at build time (shared worker-pool context +
-// shiki stays out of the plugin bundle) — diffs render with the same syntax
-// highlighting as the app's own diff panel.
-import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
-import { FileDiff as PierreFileDiff } from "@pierre/diffs/react";
 import { toast } from "sonner";
-import { Badge } from "@bb/shared-ui/badge";
-import { Button } from "@bb/shared-ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,120 +36,36 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
-import { Input } from "@bb/shared-ui/input";
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@bb/shared-ui/select";
-import { Skeleton } from "@bb/shared-ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@bb/shared-ui/tabs";
-import { Textarea } from "@bb/shared-ui/textarea";
-import { EmptyState } from "@/components/empty-state";
-import { Markdown } from "@/components/markdown-lite";
-import { PageBody } from "@/components/page-body";
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { EmptyState } from "./components/empty-state.js";
+import { Markdown } from "./components/markdown-lite.js";
 
-interface Item {
-  repo: string;
-  number: number;
-  kind: "issue" | "pr";
-  title: string;
-  state: string;
-  author: string;
-  labels: string[];
-  assignees: string[];
-  url: string;
-  body: string;
-  updatedAt: string;
-}
-
-interface IssueComment {
-  author: string;
-  body: string;
-  createdAt: string;
-}
-
-interface IssueDetail extends Omit<Item, "kind"> {
-  comments: IssueComment[];
-}
-
-interface PullCheck {
-  name: string;
-  status: "success" | "failure" | "pending" | "neutral";
-  url: string;
-}
-
-interface PullReview {
-  author: string;
-  state: string;
-  body: string;
-  createdAt: string;
-}
-
-interface ReviewThread {
-  path: string;
-  line: number | null;
-  diffHunk: string;
-  comments: IssueComment[];
-}
-
-interface PullFile {
-  path: string;
-  status: string;
-  additions: number;
-  deletions: number;
-  patch: string | null;
-}
-
-interface PullDetail {
-  repo: string;
-  number: number;
-  title: string;
-  state: string; // OPEN | DRAFT | MERGED | CLOSED
-  author: string;
-  body: string;
-  url: string;
-  createdAt: string;
-  updatedAt: string;
-  baseRefName: string;
-  headRefName: string;
-  additions: number;
-  deletions: number;
-  changedFiles: number;
-  labels: string[];
-  assignees: string[];
-  reviewDecision: string;
-  mergeStateStatus: string;
-  reviewRequests: string[];
-  checks: PullCheck[];
-  comments: IssueComment[];
-  reviews: PullReview[];
-  reviewThreads: ReviewThread[];
-  files: PullFile[];
-}
-
-interface RepoInfo {
-  repo: string;
-  projectId: string | null;
-}
-
-interface ThreadLink {
-  kind: "issue" | "pr";
-  repo: string;
-  number: number;
-  threadId: string;
-  createdAt: string;
-}
-
-type LinksMap = Record<string, ThreadLink[]>;
-
-function asItems(result: unknown): Item[] {
-  const items = (result as { items?: unknown })?.items;
-  return Array.isArray(items) ? (items as Item[]) : [];
-}
+type IssueDetail = PluginRpcResult<
+  (typeof githubRpcContract)["getIssue"]
+>["issue"];
+type PullDetail = PluginRpcResult<
+  (typeof githubRpcContract)["getPull"]
+>["pull"];
+type PullCheck = PullDetail["checks"][number];
+type ReviewThread = PullDetail["reviewThreads"][number];
+type PullFile = PullDetail["files"][number];
+type Status = PluginRpcResult<(typeof githubRpcContract)["status"]>;
+type RepoInfo = Status["repos"][number];
+type LinksMap = PluginRpcResult<
+  (typeof githubRpcContract)["listLinks"]
+>["links"];
+type ThreadLink = LinksMap[string][number];
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -170,55 +80,7 @@ function relativeTime(iso: string): string {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-// ---------------------------------------------------------------------------
-// Sub-routing — the navPanel owns /plugins/github/github/*, so sub-navigation
-// lives in the route's subPath: "issues", "pulls", "new",
-// "issues/<owner>/<repo>/<number>". Deep-linkable, and browser back/forward
-// walks panel history.
-// ---------------------------------------------------------------------------
-
 const PANEL_PATH = "github";
-
-type Route =
-  | { view: "issues" }
-  | { view: "pulls" }
-  | { view: "new" }
-  | { view: "issue"; repo: string; number: number }
-  | { view: "pull"; repo: string; number: number };
-
-function parseSubPath(subPath: string): Route {
-  const parts = subPath.split("/").filter((p) => p.length > 0);
-  if (parts[0] === "pulls" && parts.length === 4) {
-    const number = Number(parts[3]);
-    if (Number.isFinite(number)) {
-      return { view: "pull", repo: `${parts[1]}/${parts[2]}`, number };
-    }
-  }
-  if (parts[0] === "pulls") return { view: "pulls" };
-  if (parts[0] === "new") return { view: "new" };
-  if (parts[0] === "issues" && parts.length === 4) {
-    const number = Number(parts[3]);
-    if (Number.isFinite(number)) {
-      return { view: "issue", repo: `${parts[1]}/${parts[2]}`, number };
-    }
-  }
-  return { view: "issues" };
-}
-
-function routeToSubPath(route: Route): string {
-  switch (route.view) {
-    case "issues":
-      return "issues";
-    case "pulls":
-      return "pulls";
-    case "new":
-      return "new";
-    case "issue":
-      return `issues/${route.repo}/${route.number}`;
-    case "pull":
-      return `pulls/${route.repo}/${route.number}`;
-  }
-}
 
 function useSubPathRoute(subPath: string): [Route, (route: Route) => void] {
   const bbNavigate = useBbNavigate();
@@ -232,24 +94,21 @@ function useSubPathRoute(subPath: string): [Route, (route: Route) => void] {
   return [route, navigate];
 }
 
-// ---------------------------------------------------------------------------
-// Data hooks.
-// ---------------------------------------------------------------------------
-
-// All cached items of a kind — filtering happens client-side in the filter
-// bar's query engine, so keystrokes never round-trip to the server.
 function useItems(kind: "issue" | "pr"): {
   items: Item[] | null;
   error: string | null;
 } {
   const rpc = useRpc<typeof githubRpcContract>();
-  const [state, setState] = useState<{ items: Item[] | null; error: string | null }>({
+  const [state, setState] = useState<{
+    items: Item[] | null;
+    error: string | null;
+  }>({
     items: null,
     error: null,
   });
   const refetch = useCallback(() => {
     rpc.call("listItems", { kind }).then(
-      (result) => setState({ items: asItems(result), error: null }),
+      (result) => setState({ items: result.items, error: null }),
       (error: unknown) => setState({ items: null, error: errorText(error) }),
     );
   }, [rpc, kind]);
@@ -265,10 +124,7 @@ function useLinks(): LinksMap {
   const [links, setLinks] = useState<LinksMap>({});
   const refetch = useCallback(() => {
     rpc.call("listLinks").then(
-      (result) => {
-        const map = (result as { links?: unknown })?.links;
-        if (map !== null && typeof map === "object") setLinks(map as LinksMap);
-      },
+      (result) => setLinks(result.links),
       () => {},
     );
   }, [rpc]);
@@ -280,7 +136,11 @@ function useLinks(): LinksMap {
 }
 
 function useSpawn(): {
-  spawn: (method: "startWork" | "startReview", repo: string, number: number) => void;
+  spawn: (
+    method: "startWork" | "startReview",
+    repo: string,
+    number: number,
+  ) => void;
   spawningKey: string | null;
 } {
   const rpc = useRpc<typeof githubRpcContract>();
@@ -292,9 +152,7 @@ function useSpawn(): {
       rpc
         .call(method, { repo, number })
         .then((result) => {
-          const threadId = (result as { threadId?: unknown })?.threadId;
-          if (typeof threadId !== "string") throw new Error("malformed spawn result");
-          navigate.toThread(threadId);
+          navigate.toThread(result.threadId);
         })
         .catch((error: unknown) => toast.error(errorText(error)))
         .finally(() => setSpawningKey(null));
@@ -304,7 +162,6 @@ function useSpawn(): {
   return { spawn, spawningKey };
 }
 
-// The gh viewer login, cached at module level — one fetch per page load.
 let viewerLogin: string | null = null;
 
 function useViewer(): string | null {
@@ -314,11 +171,8 @@ function useViewer(): string | null {
     if (viewerLogin !== null) return;
     rpc.call("viewer").then(
       (result) => {
-        const value = (result as { login?: unknown })?.login;
-        if (typeof value === "string" && value.length > 0) {
-          viewerLogin = value;
-          setLogin(value);
-        }
+        viewerLogin = result.login;
+        setLogin(result.login);
       },
       () => {},
     );
@@ -326,11 +180,6 @@ function useViewer(): string | null {
   return login;
 }
 
-// ---------------------------------------------------------------------------
-// Shared bits.
-// ---------------------------------------------------------------------------
-
-/** GitHub avatar by login — github.com serves these without auth. */
 function Avatar({
   login,
   size = "size-5",
@@ -399,7 +248,11 @@ function stateDotClass(kind: "issue" | "pr", state: string): string {
 }
 
 function StateDot({ kind, state }: { kind: "issue" | "pr"; state: string }) {
-  return <span className={`size-2 shrink-0 rounded-full ${stateDotClass(kind, state)}`} />;
+  return (
+    <span
+      className={`size-2 shrink-0 rounded-full ${stateDotClass(kind, state)}`}
+    />
+  );
 }
 
 function StateBadge({ kind, state }: { kind: "issue" | "pr"; state: string }) {
@@ -434,12 +287,22 @@ function ThreadPills({ links }: { links: ThreadLink[] | undefined }) {
   );
 }
 
-function LabelChips({ labels, className }: { labels: string[]; className?: string }) {
+function LabelChips({
+  labels,
+  className,
+}: {
+  labels: string[];
+  className?: string;
+}) {
   if (labels.length === 0) return null;
   return (
     <span className={`items-center gap-1 ${className ?? "flex shrink-0"}`}>
       {labels.slice(0, 3).map((label) => (
-        <Badge key={label} variant="secondary" className="font-normal text-muted-foreground">
+        <Badge
+          key={label}
+          variant="secondary"
+          className="font-normal text-muted-foreground"
+        >
           {label}
         </Badge>
       ))}
@@ -447,17 +310,17 @@ function LabelChips({ labels, className }: { labels: string[]; className?: strin
   );
 }
 
-// ---------------------------------------------------------------------------
-// Mutations (status, assignees, labels) with optimistic-friendly callbacks.
-// ---------------------------------------------------------------------------
-
 function useIssueMutations() {
   const rpc = useRpc<typeof githubRpcContract>();
   const setIssueState = useCallback(
     (repo: string, number: number, state: "open" | "closed") =>
       rpc
         .call("setIssueState", { repo, number, state })
-        .then(() => toast.success(state === "closed" ? `#${number} closed` : `#${number} reopened`)),
+        .then(() =>
+          toast.success(
+            state === "closed" ? `#${number} closed` : `#${number} reopened`,
+          ),
+        ),
     [rpc],
   );
   const setAssignees = useCallback(
@@ -473,187 +336,11 @@ function useIssueMutations() {
   return { setIssueState, setAssignees, setLabels };
 }
 
-// ---------------------------------------------------------------------------
-// Query engine — GitHub-style qualifiers parsed and matched client-side.
-//   is:open · is:closed · is:merged · assignee:<login> · assignee:@me
-//   author:<login> · label:<name> ("quoted" for spaces) · repo:<owner/name>
-//   no:assignee · no:label · anything else matches title / number / repo
-// ---------------------------------------------------------------------------
-
-interface ParsedQuery {
-  states: string[];
-  assignees: string[];
-  authors: string[];
-  labels: string[];
-  repos: string[];
-  noAssignee: boolean;
-  noLabel: boolean;
-  text: string[];
-}
-
-function tokenizeQuery(query: string): string[] {
-  return query.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
-}
-
-function unquote(value: string): string {
-  return value.replace(/"/g, "");
-}
-
-const STATE_VALUES: Record<string, string> = {
-  open: "OPEN",
-  closed: "CLOSED",
-  merged: "MERGED",
-};
-
-function parseQuery(query: string): ParsedQuery {
-  const parsed: ParsedQuery = {
-    states: [],
-    assignees: [],
-    authors: [],
-    labels: [],
-    repos: [],
-    noAssignee: false,
-    noLabel: false,
-    text: [],
-  };
-  for (const token of tokenizeQuery(query)) {
-    const idx = token.indexOf(":");
-    const key = idx > 0 ? token.slice(0, idx).toLowerCase() : "";
-    const value = idx > 0 ? unquote(token.slice(idx + 1)) : "";
-    // A dangling "key:" (still being typed) filters nothing.
-    if (idx > 0 && value.length === 0) continue;
-    if (key === "is" || key === "state") {
-      parsed.states.push(STATE_VALUES[value.toLowerCase()] ?? value.toUpperCase());
-    } else if (key === "assignee") {
-      parsed.assignees.push(value.toLowerCase());
-    } else if (key === "author") {
-      parsed.authors.push(value.toLowerCase());
-    } else if (key === "label") {
-      parsed.labels.push(value.toLowerCase());
-    } else if (key === "repo") {
-      parsed.repos.push(value.toLowerCase());
-    } else if (key === "no") {
-      if (value.toLowerCase() === "assignee") parsed.noAssignee = true;
-      if (value.toLowerCase() === "label") parsed.noLabel = true;
-    } else {
-      parsed.text.push(unquote(token).toLowerCase());
-    }
+function FilterSuggestionIcon({ icon }: { icon: SuggestionIcon }) {
+  if (icon.kind === "state") {
+    return <StateDot kind={icon.itemKind} state={icon.state} />;
   }
-  return parsed;
-}
-
-function matchesQuery(item: Item, query: ParsedQuery, viewer: string | null): boolean {
-  if (query.states.length > 0 && !query.states.includes(item.state)) return false;
-  if (query.assignees.length > 0) {
-    const wanted = query.assignees.map((login) =>
-      login === "@me" ? (viewer?.toLowerCase() ?? "\u0000") : login,
-    );
-    if (!item.assignees.some((login) => wanted.includes(login.toLowerCase()))) return false;
-  }
-  if (query.authors.length > 0) {
-    const author = item.author.toLowerCase();
-    const wanted = query.authors.map((login) =>
-      login === "@me" ? (viewer?.toLowerCase() ?? "\u0000") : login,
-    );
-    if (!wanted.includes(author)) return false;
-  }
-  if (query.labels.length > 0) {
-    const labels = item.labels.map((label) => label.toLowerCase());
-    if (!query.labels.some((label) => labels.includes(label))) return false;
-  }
-  if (query.repos.length > 0 && !query.repos.includes(item.repo.toLowerCase())) return false;
-  if (query.noAssignee && item.assignees.length > 0) return false;
-  if (query.noLabel && item.labels.length > 0) return false;
-  if (query.text.length > 0) {
-    const haystack = `${item.title} #${item.number} ${item.repo}`.toLowerCase();
-    if (!query.text.every((term) => haystack.includes(term))) return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// The filter bar: one input, GitHub-style typeahead over keys and values.
-// ---------------------------------------------------------------------------
-
-interface Suggestion {
-  /** Replaces the token being typed. */
-  insert: string;
-  label: string;
-  hint?: string;
-  icon?: React.ReactNode;
-}
-
-const QUALIFIER_KEYS: Array<{ key: string; hint: string }> = [
-  { key: "is:", hint: "state — open, closed, merged" },
-  { key: "assignee:", hint: "assigned user, or @me" },
-  { key: "author:", hint: "opened by" },
-  { key: "label:", hint: "has label" },
-  { key: "repo:", hint: "in repository" },
-  { key: "no:", hint: "missing — assignee, label" },
-];
-
-function quoteValue(value: string): string {
-  return /\s/.test(value) ? `"${value}"` : value;
-}
-
-function buildSuggestions(
-  token: string,
-  vocab: { users: string[]; labels: string[]; repos: string[] },
-  kind: "issue" | "pr",
-  viewer: string | null,
-): Suggestion[] {
-  const idx = token.indexOf(":");
-  if (idx <= 0) {
-    const prefix = token.toLowerCase();
-    return QUALIFIER_KEYS.filter((entry) => entry.key.startsWith(prefix)).map((entry) => ({
-      insert: entry.key,
-      label: entry.key,
-      hint: entry.hint,
-    }));
-  }
-  const key = token.slice(0, idx).toLowerCase();
-  const partial = unquote(token.slice(idx + 1)).toLowerCase();
-  const matches = (value: string) => value.toLowerCase().includes(partial);
-  if (key === "is" || key === "state") {
-    const states = kind === "pr" ? ["open", "closed", "merged"] : ["open", "closed"];
-    return states.filter(matches).map((state) => ({
-      insert: `${key}:${state} `,
-      label: state,
-      icon: <StateDot kind={kind} state={STATE_VALUES[state] ?? "OPEN"} />,
-    }));
-  }
-  if (key === "assignee" || key === "author") {
-    const users = ["@me", ...vocab.users];
-    return users.filter(matches).map((login) => ({
-      insert: `${key}:${login} `,
-      label: login === "@me" && viewer !== null ? `@me (${viewer})` : login,
-      icon:
-        login === "@me" ? (
-          viewer !== null ? <Avatar login={viewer} size="size-4" /> : undefined
-        ) : (
-          <Avatar login={login} size="size-4" />
-        ),
-    }));
-  }
-  if (key === "label") {
-    return vocab.labels.filter(matches).map((label) => ({
-      insert: `${key}:${quoteValue(label)} `,
-      label,
-    }));
-  }
-  if (key === "repo") {
-    return vocab.repos.filter(matches).map((repo) => ({
-      insert: `${key}:${repo} `,
-      label: repo,
-    }));
-  }
-  if (key === "no") {
-    return ["assignee", "label"].filter(matches).map((field) => ({
-      insert: `${key}:${field} `,
-      label: `no:${field}`,
-    }));
-  }
-  return [];
+  return <Avatar login={icon.login} size="size-4" />;
 }
 
 function FilterBar({
@@ -690,7 +377,6 @@ function FilterBar({
     };
   }, [items, repos]);
 
-  // The token under the caret is what suggestions complete.
   const upToCaret = value.slice(0, caret);
   const tokenStart = upToCaret.lastIndexOf(" ") + 1;
   const token = upToCaret.slice(tokenStart);
@@ -700,10 +386,12 @@ function FilterBar({
   );
   const active = Math.min(highlight, Math.max(0, suggestions.length - 1));
 
-  const syncCaret = () => setCaret(inputRef.current?.selectionStart ?? value.length);
+  const syncCaret = () =>
+    setCaret(inputRef.current?.selectionStart ?? value.length);
 
   const accept = (suggestion: Suggestion) => {
-    const next = value.slice(0, tokenStart) + suggestion.insert + value.slice(caret);
+    const next =
+      value.slice(0, tokenStart) + suggestion.insert + value.slice(caret);
     onChange(next);
     const position = tokenStart + suggestion.insert.length;
     setCaret(position);
@@ -737,8 +425,6 @@ function FilterBar({
 
   return (
     <div className="relative">
-      {/* Plain <input> (not the SDK Input): the typeahead needs a ref for
-          caret positioning, which the SDK component doesn't forward. */}
       <input
         ref={inputRef}
         value={value}
@@ -787,8 +473,12 @@ function FilterBar({
               }}
               onMouseEnter={() => setHighlight(index)}
             >
-              {suggestion.icon}
-              <span className="min-w-0 truncate font-medium">{suggestion.label}</span>
+              {suggestion.icon !== undefined ? (
+                <FilterSuggestionIcon icon={suggestion.icon} />
+              ) : null}
+              <span className="min-w-0 truncate font-medium">
+                {suggestion.label}
+              </span>
               {suggestion.hint !== undefined ? (
                 <span className="ml-auto shrink-0 pl-4 text-xs text-muted-foreground">
                   {suggestion.hint}
@@ -802,18 +492,13 @@ function FilterBar({
   );
 }
 
-// ---------------------------------------------------------------------------
-// The list: a column-headed table.
-// ---------------------------------------------------------------------------
-
-// Shared column widths so the header row lines up with item rows. The table
-// switches modes against its own width, not the browser viewport.
 const COL = {
   id: "shrink-0 @[48rem]:w-12",
   assignee: "shrink-0 @[48rem]:w-20",
   status: "shrink-0 @[48rem]:w-24",
   updated: "hidden w-14 shrink-0 text-right @[48rem]:block",
-  actions: "ml-auto flex shrink-0 items-center justify-end gap-1 @[48rem]:ml-0 @[48rem]:w-24",
+  actions:
+    "ml-auto flex shrink-0 items-center justify-end gap-1 @[48rem]:ml-0 @[48rem]:w-24",
 } as const;
 
 function AssigneeCell({ assignees }: { assignees: string[] }) {
@@ -821,18 +506,22 @@ function AssigneeCell({ assignees }: { assignees: string[] }) {
     return <span className="text-muted-foreground/50">—</span>;
   }
   return (
-    <span className="flex items-center -space-x-1.5" title={assignees.join(", ")}>
+    <span
+      className="flex items-center -space-x-1.5"
+      title={assignees.join(", ")}
+    >
       {assignees.slice(0, 3).map((login) => (
         <Avatar key={login} login={login} className="ring-1 ring-card" />
       ))}
       {assignees.length > 3 ? (
-        <span className="pl-2.5 text-xs text-muted-foreground">+{assignees.length - 3}</span>
+        <span className="pl-2.5 text-xs text-muted-foreground">
+          +{assignees.length - 3}
+        </span>
       ) : null}
     </span>
   );
 }
 
-/** Inline status control: a dropdown for issues, a static badge for PRs. */
 function StatusCell({ item }: { item: Item }) {
   const { setIssueState } = useIssueMutations();
   const [pending, setPending] = useState(false);
@@ -877,6 +566,7 @@ function StatusCell({ item }: { item: Item }) {
 }
 
 function RowMenu({ item }: { item: Item }) {
+  const navigate = useBbNavigate();
   const viewer = useViewer();
   const { setIssueState, setAssignees } = useIssueMutations();
   const assignedToMe = viewer !== null && item.assignees.includes(viewer);
@@ -887,7 +577,13 @@ function RowMenu({ item }: { item: Item }) {
       ? item.assignees.filter((login) => login !== viewer)
       : [...item.assignees, viewer];
     setAssignees(item.repo, item.number, next)
-      .then(() => toast.success(assignedToMe ? `Unassigned from #${item.number}` : `Assigned to #${item.number}`))
+      .then(() =>
+        toast.success(
+          assignedToMe
+            ? `Unassigned from #${item.number}`
+            : `Assigned to #${item.number}`,
+        ),
+      )
       .catch((error: unknown) => toast.error(errorText(error)));
   };
 
@@ -912,23 +608,31 @@ function RowMenu({ item }: { item: Item }) {
         {item.kind === "issue" ? (
           <DropdownMenuItem
             onSelect={() =>
-              setIssueState(item.repo, item.number, item.state === "OPEN" ? "closed" : "open").catch(
-                (error: unknown) => toast.error(errorText(error)),
-              )
+              setIssueState(
+                item.repo,
+                item.number,
+                item.state === "OPEN" ? "closed" : "open",
+              ).catch((error: unknown) => toast.error(errorText(error)))
             }
           >
             {item.state === "OPEN" ? "Close issue" : "Reopen issue"}
           </DropdownMenuItem>
         ) : null}
         {item.kind === "issue" ? <DropdownMenuSeparator /> : null}
-        <DropdownMenuItem onSelect={() => window.open(item.url, "_blank")}>
+        <DropdownMenuItem
+          onSelect={() => {
+            navigate.openUrl(item.url);
+          }}
+        >
           Open on GitHub ↗
         </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={() => {
-            navigator.clipboard.writeText(item.url).then(
-              () => toast.success("Link copied"),
-              () => toast.error("Could not copy the link"),
+            void experimental_copyToClipboard({ text: item.url }).then(
+              (copied) => {
+                if (copied) toast.success("Link copied");
+                else toast.error("Could not copy the link");
+              },
             );
           }}
         >
@@ -959,11 +663,16 @@ function ItemRow({
         <span className="min-w-0 flex-1 line-clamp-3 text-sm font-medium leading-snug text-foreground @[48rem]:line-clamp-1 @[48rem]:leading-normal">
           {item.title}
         </span>
-        <LabelChips labels={item.labels} className="hidden shrink-0 @[60rem]:flex" />
+        <LabelChips
+          labels={item.labels}
+          className="hidden shrink-0 @[60rem]:flex"
+        />
         <ThreadPills links={links} />
       </span>
       <span className="flex min-w-0 items-center gap-2 @[48rem]:contents">
-        <span className={`${COL.id} font-mono text-xs text-muted-foreground @[48rem]:order-1`}>
+        <span
+          className={`${COL.id} font-mono text-xs text-muted-foreground @[48rem]:order-1`}
+        >
           #{item.number}
         </span>
         <span
@@ -974,7 +683,9 @@ function ItemRow({
         <span className={`${COL.status} @[48rem]:order-4`}>
           <StatusCell item={item} />
         </span>
-        <span className={`${COL.updated} text-xs text-muted-foreground @[48rem]:order-5`}>
+        <span
+          className={`${COL.updated} text-xs text-muted-foreground @[48rem]:order-5`}
+        >
           {relativeTime(item.updatedAt)}
         </span>
         <span className={`${COL.actions} @[48rem]:order-6`}>
@@ -985,7 +696,11 @@ function ItemRow({
             disabled={spawningKey !== null}
             onClick={(event) => {
               event.stopPropagation();
-              spawn(item.kind === "issue" ? "startWork" : "startReview", item.repo, item.number);
+              spawn(
+                item.kind === "issue" ? "startWork" : "startReview",
+                item.repo,
+                item.number,
+              );
             }}
           >
             {busy ? "…" : item.kind === "issue" ? "Start" : "Review"}
@@ -999,33 +714,47 @@ function ItemRow({
 
 function TableSkeleton() {
   return (
-    <div className="divide-y divide-border">
-      {[0, 1, 2, 3].map((row) => (
-        <div
-          key={row}
-          className="grid grid-cols-1 gap-y-3 px-3 py-3 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3"
-        >
-          <Skeleton className="h-3 w-4/5 @[48rem]:order-2 @[48rem]:flex-1" />
-          <span className="flex items-center gap-2 @[48rem]:contents">
-            <span className={`${COL.id} @[48rem]:order-1`}>
-              <Skeleton className="h-3 w-10" />
+    <DelayedLoading>
+      <div className="divide-y divide-border">
+        {[0, 1, 2, 3].map((row) => (
+          <div
+            key={row}
+            className="grid grid-cols-1 gap-y-3 px-3 py-3 @[48rem]:flex @[48rem]:items-center @[48rem]:gap-3"
+          >
+            <Skeleton className="h-3 w-4/5 @[48rem]:order-2 @[48rem]:flex-1" />
+            <span className="flex items-center gap-2 @[48rem]:contents">
+              <span className={`${COL.id} @[48rem]:order-1`}>
+                <Skeleton className="h-3 w-10" />
+              </span>
+              <span className={`${COL.assignee} flex @[48rem]:order-3`}>
+                <Skeleton className="size-5 rounded-full @[48rem]:h-3 @[48rem]:w-16" />
+              </span>
+              <span className={`${COL.status} @[48rem]:order-4`}>
+                <Skeleton className="h-3 w-16" />
+              </span>
+              <span className={`${COL.updated} @[48rem]:order-5`}>
+                <Skeleton className="ml-auto h-3 w-12" />
+              </span>
+              <span className={`${COL.actions} @[48rem]:order-6`}>
+                <Skeleton className="h-7 w-20" />
+              </span>
             </span>
-            <span className={`${COL.assignee} flex @[48rem]:order-3`}>
-              <Skeleton className="size-5 rounded-full @[48rem]:h-3 @[48rem]:w-16" />
-            </span>
-            <span className={`${COL.status} @[48rem]:order-4`}>
-              <Skeleton className="h-3 w-16" />
-            </span>
-            <span className={`${COL.updated} @[48rem]:order-5`}>
-              <Skeleton className="ml-auto h-3 w-12" />
-            </span>
-            <span className={`${COL.actions} @[48rem]:order-6`}>
-              <Skeleton className="h-7 w-20" />
-            </span>
-          </span>
-        </div>
-      ))}
-    </div>
+          </div>
+        ))}
+      </div>
+    </DelayedLoading>
+  );
+}
+
+function DetailSkeleton() {
+  return (
+    <DelayedLoading>
+      <div className="flex flex-col gap-4">
+        <Skeleton className="h-4 w-40" />
+        <Skeleton className="h-7 w-2/3" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+    </DelayedLoading>
   );
 }
 
@@ -1089,10 +818,6 @@ function ItemsTable({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Issue detail: body + comments on the left, metadata sidebar on the right.
-// ---------------------------------------------------------------------------
-
 function SidebarHeading({ children }: { children: React.ReactNode }) {
   return (
     <h3 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -1118,15 +843,11 @@ function AssigneePicker({
   const load = useCallback(() => {
     if (users !== null) return;
     rpc.call("assignableUsers", { repo }).then(
-      (result) => {
-        const list = (result as { users?: unknown })?.users;
-        setUsers(Array.isArray(list) ? list.map(String) : []);
-      },
+      (result) => setUsers(result.users),
       (error: unknown) => setLoadError(errorText(error)),
     );
   }, [rpc, repo, users]);
 
-  // The viewer floats to the top of the picker.
   const ordered =
     users === null
       ? null
@@ -1135,11 +856,18 @@ function AssigneePicker({
   return (
     <DropdownMenu onOpenChange={(open) => open && load()}>
       <DropdownMenuTrigger asChild>
-        <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-muted-foreground">
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 px-2 text-xs text-muted-foreground"
+        >
           Edit
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-72 w-56 overflow-y-auto">
+      <DropdownMenuContent
+        align="end"
+        className="max-h-72 w-56 overflow-y-auto"
+      >
         <DropdownMenuLabel>Assignees</DropdownMenuLabel>
         {loadError !== null ? (
           <DropdownMenuItem disabled>{loadError}</DropdownMenuItem>
@@ -1186,10 +914,7 @@ function LabelPicker({
   const load = useCallback(() => {
     if (available !== null) return;
     rpc.call("repositoryLabels", { repo }).then(
-      (result) => {
-        const list = (result as { labels?: unknown })?.labels;
-        setAvailable(Array.isArray(list) ? list.map(String) : []);
-      },
+      (result) => setAvailable(result.labels),
       (error: unknown) => setLoadError(errorText(error)),
     );
   }, [rpc, repo, available]);
@@ -1197,16 +922,25 @@ function LabelPicker({
   const ordered =
     available === null
       ? null
-      : [...new Set([...labels, ...available])].sort((a, b) => a.localeCompare(b));
+      : [...new Set([...labels, ...available])].sort((a, b) =>
+          a.localeCompare(b),
+        );
 
   return (
     <DropdownMenu onOpenChange={(open) => open && load()}>
       <DropdownMenuTrigger asChild>
-        <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-muted-foreground">
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 px-2 text-xs text-muted-foreground"
+        >
           Edit
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-72 w-56 overflow-y-auto">
+      <DropdownMenuContent
+        align="end"
+        className="max-h-72 w-56 overflow-y-auto"
+      >
         <DropdownMenuLabel>Labels</DropdownMenuLabel>
         {loadError !== null ? (
           <DropdownMenuItem disabled>{loadError}</DropdownMenuItem>
@@ -1252,9 +986,7 @@ function IssueDetailView({
   const load = useCallback(() => {
     rpc.call("getIssue", { repo, number }).then(
       (result) => {
-        const issue = (result as { issue?: IssueDetail })?.issue;
-        if (issue === undefined) throw new Error("malformed getIssue result");
-        setDetail(issue);
+        setDetail(result.issue);
         setError(null);
       },
       (err: unknown) => setError(errorText(err)),
@@ -1268,7 +1000,9 @@ function IssueDetailView({
   const changeState = useCallback(
     (next: "open" | "closed") => {
       setDetail((prev) =>
-        prev === null ? prev : { ...prev, state: next === "closed" ? "CLOSED" : "OPEN" },
+        prev === null
+          ? prev
+          : { ...prev, state: next === "closed" ? "CLOSED" : "OPEN" },
       );
       setIssueState(repo, number, next).catch((err: unknown) => {
         toast.error(errorText(err));
@@ -1329,18 +1063,12 @@ function IssueDetailView({
 
   if (error !== null) return <EmptyState message={error} />;
   if (detail === null) {
-    return (
-      <div className="flex flex-col gap-4">
-        <Skeleton className="h-4 w-40" />
-        <Skeleton className="h-7 w-2/3" />
-        <Skeleton className="h-32 w-full" />
-      </div>
-    );
+    return <DetailSkeleton />;
   }
 
   const issueLinks = links[`issue:${repo}#${number}`];
   return (
-    <div className="flex flex-col gap-4">
+    <div className="@container/github-detail flex flex-col gap-4">
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
           ← Issues
@@ -1349,20 +1077,17 @@ function IssueDetailView({
           {repo} · #{number}
         </span>
         <span className="flex-1" />
-        <a
-          href={detail.url}
-          target="_blank"
-          rel="noreferrer"
-          className="underline hover:text-foreground"
-        >
+        <UrlLink href={detail.url} className="underline hover:text-foreground">
           Open on GitHub ↗
-        </a>
+        </UrlLink>
       </div>
 
       <div className="flex items-start gap-3">
         <h2 className="min-w-0 flex-1 text-xl font-semibold text-foreground">
           {detail.title}{" "}
-          <span className="font-normal text-muted-foreground">#{detail.number}</span>
+          <span className="font-normal text-muted-foreground">
+            #{detail.number}
+          </span>
         </h2>
         <Button
           size="sm"
@@ -1373,19 +1098,23 @@ function IssueDetailView({
         </Button>
       </div>
 
-      <div className="flex flex-col gap-6 lg:flex-row">
+      <div className="flex flex-col gap-6 @min-[56rem]/github-detail:flex-row">
         <div className="flex min-w-0 flex-1 flex-col gap-4">
           <div className="overflow-hidden rounded-lg border border-border bg-card">
             <div className="flex items-center gap-2 border-b border-border bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
               <Avatar login={detail.author} />
-              <span className="font-medium text-foreground">{detail.author}</span>
+              <span className="font-medium text-foreground">
+                {detail.author}
+              </span>
               opened this issue · updated {relativeTime(detail.updatedAt)}
             </div>
             <div className="p-4">
               {detail.body.length > 0 ? (
                 <Markdown content={detail.body} className="text-sm" />
               ) : (
-                <p className="text-sm text-muted-foreground">(no description)</p>
+                <p className="text-sm text-muted-foreground">
+                  (no description)
+                </p>
               )}
             </div>
           </div>
@@ -1396,11 +1125,16 @@ function IssueDetailView({
                 Activity · {detail.comments.length}
               </h3>
               {detail.comments.map((entry, index) => (
-                <div key={index} className="rounded-lg border border-border bg-card p-3">
+                <div
+                  key={index}
+                  className="rounded-lg border border-border bg-card p-3"
+                >
                   <p className="mb-1.5 flex items-center gap-2 text-xs text-muted-foreground">
                     <Avatar login={entry.author} />
-                    <span className="font-medium text-foreground">{entry.author}</span> ·{" "}
-                    {relativeTime(entry.createdAt)}
+                    <span className="font-medium text-foreground">
+                      {entry.author}
+                    </span>{" "}
+                    · {relativeTime(entry.createdAt)}
                   </p>
                   <Markdown content={entry.body} className="text-sm" />
                 </div>
@@ -1427,12 +1161,14 @@ function IssueDetailView({
           </div>
         </div>
 
-        <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+        <aside className="flex w-full shrink-0 flex-col gap-5 @min-[56rem]/github-detail:w-56">
           <div className="flex flex-col gap-2">
             <SidebarHeading>Status</SidebarHeading>
             <Select
               value={detail.state === "OPEN" ? "open" : "closed"}
-              onValueChange={(value) => changeState(value === "closed" ? "closed" : "open")}
+              onValueChange={(value) =>
+                changeState(value === "closed" ? "closed" : "open")
+              }
             >
               <SelectTrigger className="h-8 w-full text-sm">
                 <SelectValue />
@@ -1455,13 +1191,20 @@ function IssueDetailView({
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between">
               <SidebarHeading>Assignees</SidebarHeading>
-              <AssigneePicker repo={repo} assignees={detail.assignees} onToggle={toggleAssignee} />
+              <AssigneePicker
+                repo={repo}
+                assignees={detail.assignees}
+                onToggle={toggleAssignee}
+              />
             </div>
             {detail.assignees.length === 0 ? (
               <p className="text-sm text-muted-foreground">No one assigned</p>
             ) : (
               detail.assignees.map((login) => (
-                <p key={login} className="flex items-center gap-2 text-sm text-foreground">
+                <p
+                  key={login}
+                  className="flex items-center gap-2 text-sm text-foreground"
+                >
                   <Avatar login={login} />
                   <span className="truncate">{login}</span>
                 </p>
@@ -1472,7 +1215,11 @@ function IssueDetailView({
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between">
               <SidebarHeading>Labels</SidebarHeading>
-              <LabelPicker repo={repo} labels={detail.labels} onToggle={toggleLabel} />
+              <LabelPicker
+                repo={repo}
+                labels={detail.labels}
+                onToggle={toggleLabel}
+              />
             </div>
             {detail.labels.length === 0 ? (
               <p className="text-sm text-muted-foreground">None yet</p>
@@ -1493,14 +1240,9 @@ function IssueDetailView({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Pull request detail — the VS Code-style PR view. One component serves both
-// the nav panel (two-column with a metadata sidebar) and the thread side
-// panel (compact single column via `compact`).
-// ---------------------------------------------------------------------------
-
 function pullStateBadgeParts(state: string): { dot: string; label: string } {
-  if (state === "DRAFT") return { dot: "bg-muted-foreground/60", label: "draft" };
+  if (state === "DRAFT")
+    return { dot: "bg-muted-foreground/60", label: "draft" };
   if (state === "OPEN") return { dot: "bg-green-500", label: "open" };
   if (state === "MERGED") return { dot: "bg-purple-500", label: "merged" };
   return { dot: "bg-red-500", label: "closed" };
@@ -1532,7 +1274,11 @@ function reviewStateClass(state: string): string {
 
 function ReviewDecisionBadge({ decision }: { decision: string }) {
   if (decision === "APPROVED") {
-    return <Badge className="bg-green-600 text-white hover:bg-green-600">approved</Badge>;
+    return (
+      <Badge className="bg-green-600 text-white hover:bg-green-600">
+        approved
+      </Badge>
+    );
   }
   if (decision === "CHANGES_REQUESTED") {
     return <Badge variant="destructive">changes requested</Badge>;
@@ -1551,7 +1297,9 @@ function checkDotClass(status: PullCheck["status"]): string {
 }
 
 function ChecksSection({ checks }: { checks: PullCheck[] }) {
-  const [open, setOpen] = useState(() => checks.some((check) => check.status === "failure"));
+  const [open, setOpen] = useState(() =>
+    checks.some((check) => check.status === "failure"),
+  );
   if (checks.length === 0) return null;
   const passing = checks.filter((check) => check.status === "success").length;
   const failing = checks.filter((check) => check.status === "failure").length;
@@ -1563,30 +1311,42 @@ function ChecksSection({ checks }: { checks: PullCheck[] }) {
       >
         <span
           className={`size-2 shrink-0 rounded-full ${
-            failing > 0 ? "bg-red-500" : passing === checks.length ? "bg-green-500" : "animate-pulse bg-yellow-500"
+            failing > 0
+              ? "bg-red-500"
+              : passing === checks.length
+                ? "bg-green-500"
+                : "animate-pulse bg-yellow-500"
           }`}
         />
         <span className="font-medium text-foreground">Checks</span>
         <span className="text-xs text-muted-foreground">
-          {passing}/{checks.length} passing{failing > 0 ? ` · ${failing} failing` : ""}
+          {passing}/{checks.length} passing
+          {failing > 0 ? ` · ${failing} failing` : ""}
         </span>
-        <span className="ml-auto text-xs text-muted-foreground">{open ? "▾" : "▸"}</span>
+        <span className="ml-auto text-xs text-muted-foreground">
+          {open ? "▾" : "▸"}
+        </span>
       </button>
       {open ? (
         <div className="divide-y divide-border border-t border-border">
           {checks.map((check, index) => (
-            <div key={`${check.name}-${index}`} className="flex items-center gap-2 px-3 py-1.5 text-xs">
-              <span className={`size-2 shrink-0 rounded-full ${checkDotClass(check.status)}`} />
-              <span className="min-w-0 flex-1 truncate text-foreground">{check.name}</span>
+            <div
+              key={`${check.name}-${index}`}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs"
+            >
+              <span
+                className={`size-2 shrink-0 rounded-full ${checkDotClass(check.status)}`}
+              />
+              <span className="min-w-0 flex-1 truncate text-foreground">
+                {check.name}
+              </span>
               {check.url.length > 0 ? (
-                <a
+                <UrlLink
                   href={check.url}
-                  target="_blank"
-                  rel="noreferrer"
                   className="shrink-0 text-muted-foreground underline hover:text-foreground"
                 >
                   details ↗
-                </a>
+                </UrlLink>
               ) : null}
             </div>
           ))}
@@ -1596,130 +1356,48 @@ function ChecksSection({ checks }: { checks: PullCheck[] }) {
   );
 }
 
-function readHostCodeTheme(): { dark: string; light: string } {
-  const root = document.documentElement.dataset;
-  return {
-    dark: root.bbCodeThemeDark ?? "pierre-dark",
-    light: root.bbCodeThemeLight ?? "pierre-light",
-  };
-}
-
-/** Read lazily: this module also loads outside a DOM, such as in the plugin
-    bundle tests, where a module-eval `document` access throws. */
-let hostCodeTheme: { dark: string; light: string } | null = null;
-const hostCodeThemeListeners = new Set<() => void>();
-let hostCodeThemeObserver: MutationObserver | null = null;
-
-function getHostCodeTheme(): { dark: string; light: string } {
-  hostCodeTheme ??= readHostCodeTheme();
-  return hostCodeTheme;
-}
-
-function subscribeHostCodeTheme(onStoreChange: () => void): () => void {
-  hostCodeThemeListeners.add(onStoreChange);
-  if (hostCodeThemeObserver === null) {
-    hostCodeThemeObserver = new MutationObserver(() => {
-      const next = readHostCodeTheme();
-      const current = getHostCodeTheme();
-      if (next.dark === current.dark && next.light === current.light) {
-        return;
-      }
-      hostCodeTheme = next;
-      for (const listener of hostCodeThemeListeners) listener();
-    });
-    hostCodeThemeObserver.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["data-bb-code-theme-dark", "data-bb-code-theme-light"],
-    });
-  }
-  return () => {
-    hostCodeThemeListeners.delete(onStoreChange);
-  };
-}
-
-function useHostCodeTheme(): { dark: string; light: string } {
-  return useSyncExternalStore(
-    subscribeHostCodeTheme,
-    getHostCodeTheme,
-    getHostCodeTheme,
-  );
-}
-
-/** The host toggles dark mode via a `dark` class on <html>; pierre's diff
-    themes are picked per render, so track it live. */
-function useIsDarkTheme(): boolean {
-  const [dark, setDark] = useState(() =>
-    document.documentElement.classList.contains("dark"),
-  );
-  useEffect(() => {
-    const observer = new MutationObserver(() =>
-      setDark(document.documentElement.classList.contains("dark")),
-    );
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-    return () => observer.disconnect();
-  }, []);
-  return dark;
-}
-
-/**
- * A patch (or single `@@` hunk) rendered through the host's @pierre/diffs —
- * syntax highlighting included (the host provides the worker pool via
- * context). GitHub's REST patches lack the `diff --git` header, so one is
- * synthesized; unparseable input falls back to plain mono text.
- */
-function DiffPatch({ path, patch }: { path: string; patch: string }) {
-  const dark = useIsDarkTheme();
-  const codeTheme = useHostCodeTheme();
-  const fileDiff = useMemo<FileDiffMetadata | null>(() => {
-    const normalized = patch.replace(/\r\n/g, "\n").trimEnd();
-    if (normalized.length === 0) return null;
-    const text = normalized.startsWith("diff --git")
-      ? `${normalized}\n`
-      : `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n${normalized}\n`;
-    try {
-      return parsePatchFiles(text)[0]?.files[0] ?? null;
-    } catch {
-      return null;
-    }
-  }, [path, patch]);
-  const options = useMemo(
-    () =>
-      ({
-        diffStyle: "unified",
-        overflow: "scroll",
-        disableFileHeader: true,
-        themeType: dark ? "dark" : "light",
-        theme: codeTheme,
-      }) as const,
-    [codeTheme, dark],
-  );
-  if (fileDiff === null) {
-    return (
-      <pre className="overflow-x-auto px-3 py-2 font-mono text-xs leading-5 text-foreground/80">
-        {patch}
-      </pre>
-    );
-  }
-  return <PierreFileDiff fileDiff={fileDiff} options={options} />;
-}
-
-function FileDiffCard({ file, url }: { file: PullFile; url: string }) {
+function FileDiffCard({
+  environmentId,
+  file,
+  url,
+}: {
+  environmentId: string | null;
+  file: PullFile;
+  url: string;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
-      <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent/50"
-        onClick={() => setOpen((prev) => !prev)}
-      >
-        <span className="shrink-0 text-xs text-muted-foreground">{open ? "▾" : "▸"}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
-          {file.path}
-        </span>
+      <div className="flex w-full items-center gap-2 px-3 py-2 hover:bg-accent/50">
+        <button
+          type="button"
+          className="shrink-0 text-xs text-muted-foreground"
+          aria-label={`${open ? "Collapse" : "Expand"} ${file.path} diff`}
+          onClick={() => setOpen((prev) => !prev)}
+        >
+          {open ? "▾" : "▸"}
+        </button>
+        {environmentId === null || file.status === "removed" ? (
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
+            {file.path}
+          </span>
+        ) : (
+          <FileLink
+            className="min-w-0 flex-1 truncate font-mono text-xs text-foreground hover:underline"
+            target={{
+              kind: "workspace",
+              environmentId,
+              path: file.path,
+            }}
+          >
+            {file.path}
+          </FileLink>
+        )}
         {file.status !== "modified" ? (
-          <Badge variant="secondary" className="shrink-0 font-normal text-muted-foreground">
+          <Badge
+            variant="secondary"
+            className="shrink-0 font-normal text-muted-foreground"
+          >
             {file.status}
           </Badge>
         ) : null}
@@ -1729,18 +1407,18 @@ function FileDiffCard({ file, url }: { file: PullFile; url: string }) {
         <span className="shrink-0 text-xs text-red-600 dark:text-red-400">
           −{file.deletions}
         </span>
-      </button>
+      </div>
       {open ? (
         file.patch !== null ? (
           <div className="border-t border-border">
-            <DiffPatch path={file.path} patch={file.patch} />
+            <Diff patch={file.patch} path={file.path} />
           </div>
         ) : (
           <p className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
             Diff too large to inline —{" "}
-            <a href={`${url}/files`} target="_blank" rel="noreferrer" className="underline">
+            <UrlLink href={`${url}/files`} className="underline">
               view on GitHub ↗
-            </a>
+            </UrlLink>
           </p>
         )
       ) : null}
@@ -1748,18 +1426,18 @@ function FileDiffCard({ file, url }: { file: PullFile; url: string }) {
   );
 }
 
-/** An inline review thread: file/line header, the tail of its diff hunk for
-    context, then the comment chain. */
 function ReviewThreadCard({ thread }: { thread: ReviewThread }) {
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-card">
       <p className="flex items-center gap-2 border-b border-border bg-muted/50 px-3 py-1.5 font-mono text-xs text-muted-foreground">
         <span className="min-w-0 truncate">{thread.path}</span>
-        {thread.line !== null ? <span className="shrink-0">:{thread.line}</span> : null}
+        {thread.line !== null ? (
+          <span className="shrink-0">:{thread.line}</span>
+        ) : null}
       </p>
       {thread.diffHunk.length > 0 ? (
         <div className="border-b border-border">
-          <DiffPatch path={thread.path} patch={thread.diffHunk} />
+          <Diff patch={thread.diffHunk} path={thread.path} />
         </div>
       ) : null}
       <div className="flex flex-col gap-3 p-3">
@@ -1767,8 +1445,10 @@ function ReviewThreadCard({ thread }: { thread: ReviewThread }) {
           <div key={index}>
             <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
               <Avatar login={entry.author} size="size-4" />
-              <span className="font-medium text-foreground">{entry.author}</span> ·{" "}
-              {relativeTime(entry.createdAt)}
+              <span className="font-medium text-foreground">
+                {entry.author}
+              </span>{" "}
+              · {relativeTime(entry.createdAt)}
             </p>
             <Markdown content={entry.body} className="text-sm" />
           </div>
@@ -1780,16 +1460,25 @@ function ReviewThreadCard({ thread }: { thread: ReviewThread }) {
 
 type PullTimelineEntry =
   | { type: "comment"; author: string; body: string; createdAt: string }
-  | { type: "review"; author: string; state: string; body: string; createdAt: string };
+  | {
+      type: "review";
+      author: string;
+      state: string;
+      body: string;
+      createdAt: string;
+    };
 
 function PullTimeline({ pull }: { pull: PullDetail }) {
   const entries = useMemo<PullTimelineEntry[]>(() => {
     const merged: PullTimelineEntry[] = [
-      ...pull.comments.map((comment) => ({ type: "comment" as const, ...comment })),
-      // Body-less COMMENTED reviews are the containers of inline threads
-      // (rendered separately below); showing them here would be noise.
+      ...pull.comments.map((comment) => ({
+        type: "comment" as const,
+        ...comment,
+      })),
       ...pull.reviews
-        .filter((review) => review.body.length > 0 || review.state !== "COMMENTED")
+        .filter(
+          (review) => review.body.length > 0 || review.state !== "COMMENTED",
+        )
         .map((review) => ({ type: "review" as const, ...review })),
     ];
     return merged.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -1801,7 +1490,10 @@ function PullTimeline({ pull }: { pull: PullDetail }) {
         Activity · {entries.length + pull.reviewThreads.length}
       </h3>
       {entries.map((entry, index) => (
-        <div key={index} className="rounded-lg border border-border bg-card p-3">
+        <div
+          key={index}
+          className="rounded-lg border border-border bg-card p-3"
+        >
           <p className="mb-1.5 flex items-center gap-2 text-xs text-muted-foreground">
             <Avatar login={entry.author} />
             <span className="font-medium text-foreground">{entry.author}</span>
@@ -1812,7 +1504,9 @@ function PullTimeline({ pull }: { pull: PullDetail }) {
             ) : null}
             · {relativeTime(entry.createdAt)}
           </p>
-          {entry.body.length > 0 ? <Markdown content={entry.body} className="text-sm" /> : null}
+          {entry.body.length > 0 ? (
+            <Markdown content={entry.body} className="text-sm" />
+          ) : null}
         </div>
       ))}
       {pull.reviewThreads.map((thread, index) => (
@@ -1827,7 +1521,10 @@ function PullReviewersList({ pull }: { pull: PullDetail }) {
     const latest = new Map<string, { login: string; state: string }>();
     for (const review of pull.reviews) {
       if (review.author.length > 0) {
-        latest.set(review.author, { login: review.author, state: review.state });
+        latest.set(review.author, {
+          login: review.author,
+          state: review.state,
+        });
       }
     }
     for (const login of pull.reviewRequests) {
@@ -1835,14 +1532,20 @@ function PullReviewersList({ pull }: { pull: PullDetail }) {
     }
     return [...latest.values()];
   }, [pull]);
-  if (rows.length === 0) return <p className="text-sm text-muted-foreground">No reviewers</p>;
+  if (rows.length === 0)
+    return <p className="text-sm text-muted-foreground">No reviewers</p>;
   return (
     <>
       {rows.map((row) => (
-        <p key={row.login} className="flex items-center gap-2 text-sm text-foreground">
+        <p
+          key={row.login}
+          className="flex items-center gap-2 text-sm text-foreground"
+        >
           <Avatar login={row.login} />
           <span className="min-w-0 truncate">{row.login}</span>
-          <span className={`ml-auto shrink-0 text-xs ${reviewStateClass(row.state)}`}>
+          <span
+            className={`ml-auto shrink-0 text-xs ${reviewStateClass(row.state)}`}
+          >
             {REVIEW_STATE_LABELS[row.state] ?? row.state.toLowerCase()}
           </span>
         </p>
@@ -1884,7 +1587,11 @@ function PullCommentBox({
         rows={3}
       />
       <div className="flex justify-end">
-        <Button size="sm" disabled={posting || comment.trim().length === 0} onClick={post}>
+        <Button
+          size="sm"
+          disabled={posting || comment.trim().length === 0}
+          onClick={post}
+        >
           {posting ? "Posting…" : "Comment"}
         </Button>
       </div>
@@ -1898,12 +1605,14 @@ function PullDetailView({
   onBack,
   backLabel = "Pull requests",
   compact = false,
+  workspaceEnvironmentId = null,
 }: {
   repo: string;
   number: number;
   onBack?: () => void;
   backLabel?: string;
   compact?: boolean;
+  workspaceEnvironmentId?: string | null;
 }) {
   const rpc = useRpc<typeof githubRpcContract>();
   const links = useLinks();
@@ -1914,9 +1623,7 @@ function PullDetailView({
   const load = useCallback(() => {
     rpc.call("getPull", { repo, number }).then(
       (result) => {
-        const detail = (result as { pull?: PullDetail })?.pull;
-        if (detail === undefined) throw new Error("malformed getPull result");
-        setPull(detail);
+        setPull(result.pull);
         setError(null);
       },
       (err: unknown) => setError(errorText(err)),
@@ -1929,13 +1636,7 @@ function PullDetailView({
 
   if (error !== null) return <EmptyState message={error} />;
   if (pull === null) {
-    return (
-      <div className="flex flex-col gap-4">
-        <Skeleton className="h-4 w-40" />
-        <Skeleton className="h-7 w-2/3" />
-        <Skeleton className="h-32 w-full" />
-      </div>
-    );
+    return <DetailSkeleton />;
   }
 
   const pullLinks = links[`pr:${repo}#${number}`];
@@ -1965,12 +1666,21 @@ function PullDetailView({
           <h3 className="text-xs font-semibold text-muted-foreground">
             Files changed · {pull.files.length}
             <span className="ml-2 font-normal">
-              <span className="text-green-600 dark:text-green-400">+{pull.additions}</span>{" "}
-              <span className="text-red-600 dark:text-red-400">−{pull.deletions}</span>
+              <span className="text-green-600 dark:text-green-400">
+                +{pull.additions}
+              </span>{" "}
+              <span className="text-red-600 dark:text-red-400">
+                −{pull.deletions}
+              </span>
             </span>
           </h3>
           {pull.files.map((file) => (
-            <FileDiffCard key={file.path} file={file} url={pull.url} />
+            <FileDiffCard
+              key={file.path}
+              environmentId={workspaceEnvironmentId}
+              file={file}
+              url={pull.url}
+            />
           ))}
         </div>
       ) : null}
@@ -1980,10 +1690,15 @@ function PullDetailView({
   );
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="@container/github-detail flex flex-col gap-4">
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         {onBack !== undefined ? (
-          <Button size="sm" variant="ghost" className="h-7 px-2" onClick={onBack}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2"
+            onClick={onBack}
+          >
             ← {backLabel}
           </Button>
         ) : null}
@@ -1991,21 +1706,22 @@ function PullDetailView({
           {repo} · #{number}
         </span>
         <span className="flex-1" />
-        <a
+        <UrlLink
           href={pull.url}
-          target="_blank"
-          rel="noreferrer"
           className="shrink-0 underline hover:text-foreground"
         >
           Open on GitHub ↗
-        </a>
+        </UrlLink>
       </div>
 
       <div className="flex items-start gap-3">
         <h2
           className={`min-w-0 flex-1 font-semibold text-foreground ${compact ? "text-base" : "text-xl"}`}
         >
-          {pull.title} <span className="font-normal text-muted-foreground">#{pull.number}</span>
+          {pull.title}{" "}
+          <span className="font-normal text-muted-foreground">
+            #{pull.number}
+          </span>
         </h2>
         <Button
           size="sm"
@@ -2023,9 +1739,13 @@ function PullDetailView({
           {pull.baseRefName} ← {pull.headRefName}
         </span>
         <span>
-          <span className="text-green-600 dark:text-green-400">+{pull.additions}</span>{" "}
-          <span className="text-red-600 dark:text-red-400">−{pull.deletions}</span> ·{" "}
-          {pull.changedFiles} file{pull.changedFiles === 1 ? "" : "s"}
+          <span className="text-green-600 dark:text-green-400">
+            +{pull.additions}
+          </span>{" "}
+          <span className="text-red-600 dark:text-red-400">
+            −{pull.deletions}
+          </span>{" "}
+          · {pull.changedFiles} file{pull.changedFiles === 1 ? "" : "s"}
         </span>
         <LabelChips labels={pull.labels} className="flex flex-wrap" />
         <ThreadPills links={pullLinks} />
@@ -2034,9 +1754,9 @@ function PullDetailView({
       {compact ? (
         mainColumn
       ) : (
-        <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="flex flex-col gap-6 @min-[56rem]/github-detail:flex-row">
           {mainColumn}
-          <aside className="flex w-full shrink-0 flex-col gap-5 lg:w-56">
+          <aside className="flex w-full shrink-0 flex-col gap-5 @min-[56rem]/github-detail:w-56">
             <div className="flex flex-col gap-1">
               <SidebarHeading>Reviewers</SidebarHeading>
               <PullReviewersList pull={pull} />
@@ -2047,7 +1767,10 @@ function PullDetailView({
                 <p className="text-sm text-muted-foreground">No one assigned</p>
               ) : (
                 pull.assignees.map((login) => (
-                  <p key={login} className="flex items-center gap-2 text-sm text-foreground">
+                  <p
+                    key={login}
+                    className="flex items-center gap-2 text-sm text-foreground"
+                  >
                     <Avatar login={login} />
                     <span className="truncate">{login}</span>
                   </p>
@@ -2075,22 +1798,22 @@ function PullDetailView({
   );
 }
 
-// ---------------------------------------------------------------------------
-// The thread side panel (threadPanelAction): auto-resolve the thread's own PR
-// (its environment branch's PR, else the PR it was spawned to review) and
-// show the compact PR view; fall back to a picker over cached open PRs.
-// ---------------------------------------------------------------------------
-
-function PullPickerList({ onPick }: { onPick: (repo: string, number: number) => void }) {
+function PullPickerList({
+  onPick,
+}: {
+  onPick: (repo: string, number: number) => void;
+}) {
   const { items, error } = useItems("pr");
   if (error !== null) return <EmptyState message={error} />;
   if (items === null) {
     return (
-      <div className="flex flex-col gap-2">
-        <Skeleton className="h-5 w-full" />
-        <Skeleton className="h-5 w-5/6" />
-        <Skeleton className="h-5 w-2/3" />
-      </div>
+      <DelayedLoading>
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="h-5 w-5/6" />
+          <Skeleton className="h-5 w-2/3" />
+        </div>
+      </DelayedLoading>
     );
   }
   const open = items.filter((item) => item.state === "OPEN");
@@ -2098,7 +1821,7 @@ function PullPickerList({ onPick }: { onPick: (repo: string, number: number) => 
     return <EmptyState message="No open pull requests in the tracked repos." />;
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-card">
+    <div className="@container/github-picker overflow-hidden rounded-lg border border-border bg-card">
       <div className="divide-y divide-border">
         {open.map((item) => (
           <button
@@ -2110,8 +1833,10 @@ function PullPickerList({ onPick }: { onPick: (repo: string, number: number) => 
             <span className="shrink-0 font-mono text-xs text-muted-foreground">
               #{item.number}
             </span>
-            <span className="min-w-0 flex-1 truncate text-sm text-foreground">{item.title}</span>
-            <span className="hidden shrink-0 text-xs text-muted-foreground sm:block">
+            <span className="min-w-0 flex-1 truncate text-sm text-foreground">
+              {item.title}
+            </span>
+            <span className="hidden shrink-0 text-xs text-muted-foreground @min-[32rem]/github-picker:block">
               {item.repo}
             </span>
           </button>
@@ -2124,17 +1849,18 @@ function PullPickerList({ onPick }: { onPick: (repo: string, number: number) => 
 function PullPanelTab({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof githubRpcContract>();
   const [resolved, setResolved] = useState(false);
-  const [selected, setSelected] = useState<{ repo: string; number: number } | null>(null);
+  const [selected, setSelected] = useState<{
+    repo: string;
+    number: number;
+    environmentId: string | null;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     rpc.call("pullForThread", { threadId }).then(
       (result) => {
         if (cancelled) return;
-        const pull = (result as { pull?: { repo?: unknown; number?: unknown } | null })?.pull;
-        if (pull && typeof pull.repo === "string" && typeof pull.number === "number") {
-          setSelected({ repo: pull.repo, number: pull.number });
-        }
+        if (result.pull !== null) setSelected(result.pull);
         setResolved(true);
       },
       () => {
@@ -2147,13 +1873,7 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
   }, [rpc, threadId]);
 
   if (!resolved) {
-    return (
-      <div className="flex flex-col gap-4">
-        <Skeleton className="h-4 w-40" />
-        <Skeleton className="h-7 w-2/3" />
-        <Skeleton className="h-32 w-full" />
-      </div>
-    );
+    return <DetailSkeleton />;
   }
   if (selected === null) {
     return (
@@ -2161,7 +1881,11 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
         <p className="text-xs text-muted-foreground">
           No pull request is linked to this thread yet — pick one:
         </p>
-        <PullPickerList onPick={(repo, number) => setSelected({ repo, number })} />
+        <PullPickerList
+          onPick={(repo, number) =>
+            setSelected({ repo, number, environmentId: null })
+          }
+        />
       </div>
     );
   }
@@ -2170,15 +1894,12 @@ function PullPanelTab({ threadId }: PluginThreadPanelProps) {
       repo={selected.repo}
       number={selected.number}
       compact
+      workspaceEnvironmentId={selected.environmentId}
       backLabel="All PRs"
       onBack={() => setSelected(null)}
     />
   );
 }
-
-// ---------------------------------------------------------------------------
-// New issue form.
-// ---------------------------------------------------------------------------
 
 function NewIssueForm({
   repos,
@@ -2200,9 +1921,8 @@ function NewIssueForm({
     rpc
       .call("createIssue", { repo, title, body })
       .then((result) => {
-        const number = (result as { number?: unknown })?.number;
         toast.success("Issue created");
-        onCreated(repo, typeof number === "number" ? number : null);
+        onCreated(repo, result.number);
       })
       .catch((err: unknown) => toast.error(errorText(err)))
       .finally(() => setCreating(false));
@@ -2250,23 +1970,12 @@ function NewIssueForm({
   );
 }
 
-// ---------------------------------------------------------------------------
-// The panel: tab bar + filters + routed body.
-// ---------------------------------------------------------------------------
-
-interface Status {
-  ghOk: boolean;
-  ghError: string | null;
-  repos: RepoInfo[];
-  lastSyncedAt: string | null;
-}
-
 function useStatus(): { status: Status | null; refetch: () => void } {
   const rpc = useRpc<typeof githubRpcContract>();
   const [status, setStatus] = useState<Status | null>(null);
   const refetch = useCallback(() => {
     rpc.call("status").then(
-      (result) => setStatus(result as Status),
+      (result) => setStatus(result),
       () => {},
     );
   }, [rpc]);
@@ -2292,27 +2001,35 @@ function PanelHeader() {
   }, [rpc]);
   return (
     <>
-      <span className="hidden text-xs text-muted-foreground sm:inline">
-        {failed
-          ? "Sync failed — check `gh auth status`"
-          : status === null
-            ? "Loading…"
-            : status.ghOk
-              ? `${status.repos.length} repo${status.repos.length === 1 ? "" : "s"} · synced ${
-                  status.lastSyncedAt !== null ? relativeTime(status.lastSyncedAt) : "never"
-                }`
-              : "GitHub CLI not authenticated"}
+      <span className="hidden text-xs text-muted-foreground @min-[40rem]/page-header:inline">
+        {failed ? (
+          "Sync failed — check `gh auth status`"
+        ) : status === null ? (
+          <DelayedLoading>Loading…</DelayedLoading>
+        ) : status.ghOk ? (
+          `${status.repos.length} repo${status.repos.length === 1 ? "" : "s"} · synced ${
+            status.lastSyncedAt !== null
+              ? relativeTime(status.lastSyncedAt)
+              : "never"
+          }`
+        ) : status.ghState === "unavailable" ? (
+          "GitHub CLI unavailable — retrying"
+        ) : (
+          "GitHub CLI not authenticated"
+        )}
       </span>
       <Button
         size="sm"
         variant="outline"
-        className="size-8 gap-1.5 px-0 sm:h-8 sm:w-auto sm:px-3"
+        className="size-8 gap-1.5 px-0 @min-[32rem]/page-header:h-8 @min-[32rem]/page-header:w-auto @min-[32rem]/page-header:px-3"
         disabled={syncing}
         onClick={refresh}
         aria-label={syncing ? "Syncing GitHub data" : "Refresh GitHub data"}
       >
         <RefreshIcon className={syncing ? "animate-spin" : undefined} />
-        <span className="hidden sm:inline">{syncing ? "Syncing…" : "Refresh"}</span>
+        <span className="hidden @min-[32rem]/page-header:inline">
+          {syncing ? "Syncing…" : "Refresh"}
+        </span>
       </Button>
     </>
   );
@@ -2335,14 +2052,12 @@ function GithubPanel({ subPath }: PluginNavPanelProps) {
     setQueryState(next);
     try {
       window.localStorage.setItem(QUERY_KEY, next);
-    } catch {
-      // private mode / storage disabled — the filter just won't persist
-    }
+    } catch {}
   }, []);
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4 md:p-5">
-      <PageBody className="max-w-5xl">
+    <div className="min-h-0 flex-1 overflow-y-auto p-4 md:p-5">
+      <div className="mx-auto w-full max-w-5xl space-y-4">
         <GithubPanelBody
           route={route}
           navigate={navigate}
@@ -2350,7 +2065,7 @@ function GithubPanel({ subPath }: PluginNavPanelProps) {
           query={query}
           setQuery={setQuery}
         />
-      </PageBody>
+      </div>
     </div>
   );
 }
@@ -2372,12 +2087,21 @@ function ListView({
   const viewer = useViewer();
   const parsed = useMemo(() => parseQuery(query), [query]);
   const filtered = useMemo(
-    () => (items === null ? null : items.filter((item) => matchesQuery(item, parsed, viewer))),
+    () =>
+      items === null
+        ? null
+        : items.filter((item) => matchesQuery(item, parsed, viewer)),
     [items, parsed, viewer],
   );
   return (
     <>
-      <FilterBar value={query} onChange={setQuery} items={items} repos={repos} kind={kind} />
+      <FilterBar
+        value={query}
+        onChange={setQuery}
+        items={items}
+        repos={repos}
+        kind={kind}
+      />
       <ItemsTable
         kind={kind}
         items={filtered}
@@ -2402,6 +2126,23 @@ function GithubPanelBody({
   query: string;
   setQuery: (query: string) => void;
 }) {
+  const openItem = useCallback(
+    (itemKind: "issue" | "pr", repo: string, number: number) => {
+      navigate(
+        itemKind === "pr"
+          ? { view: "pull", repo, number }
+          : { view: "issue", repo, number },
+      );
+    },
+    [navigate],
+  );
+  if (status !== null && status.ghState === "unavailable") {
+    return (
+      <EmptyState
+        message={`GitHub CLI could not reach GitHub. Check your network or keychain; the plugin retries by itself. (${status.ghError ?? ""})`}
+      />
+    );
+  }
   if (status !== null && !status.ghOk) {
     return (
       <EmptyState
@@ -2438,7 +2179,11 @@ function GithubPanelBody({
       <NewIssueForm
         repos={status?.repos ?? []}
         onCreated={(repo, number) =>
-          navigate(number !== null ? { view: "issue", repo, number } : { view: "issues" })
+          navigate(
+            number !== null
+              ? { view: "issue", repo, number }
+              : { view: "issues" },
+          )
         }
         onCancel={() => navigate({ view: "issues" })}
       />
@@ -2452,7 +2197,9 @@ function GithubPanelBody({
         <Tabs
           value={route.view}
           onValueChange={(value) => {
-            navigate(value === "pulls" ? { view: "pulls" } : { view: "issues" });
+            navigate(
+              value === "pulls" ? { view: "pulls" } : { view: "issues" },
+            );
           }}
         >
           <TabsList>
@@ -2473,9 +2220,7 @@ function GithubPanelBody({
         query={query}
         setQuery={setQuery}
         repos={status?.repos ?? []}
-        onOpenItem={(repo, number) =>
-          navigate(kind === "pr" ? { view: "pull", repo, number } : { view: "issue", repo, number })
-        }
+        onOpenItem={(repo, number) => openItem(kind, repo, number)}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { useCallback, type ReactNode, type UIEvent } from "react";
+import { useMemo, type ReactNode } from "react";
 import { useComposedRefs } from "@radix-ui/react-compose-refs";
 import { cn } from "@bb/shared-ui/lib/utils";
 import {
@@ -7,44 +7,22 @@ import {
 } from "../../ui/detail-scroll-size.js";
 import { useStickyBottomScroll } from "./useStickyBottomScroll.js";
 import { useScrollOverflowState } from "./useScrollOverflowState.js";
+import {
+  TimelineWindowingScrollRootContext,
+  type TimelineWindowingScrollRoot,
+} from "./TimelineWindowedItemsLoader.js";
 
-export interface TimelineDetailScrollProps {
+interface TimelineDetailScrollProps {
   size: DetailScrollSize;
-  /** Hide the outer x-axis when a child owns horizontal scrolling. */
   overflowX?: "auto" | "hidden";
-  /**
-   * When true, the scroll container sticks to the bottom as `contentKey`
-   * changes — for incremental streams (command/tool output, growing bundle).
-   * When false, the user's scroll position is preserved across content
-   * updates and the container does not auto-scroll.
-   */
   streaming?: boolean;
-  /**
-   * Identity string for the rendered content. Required when `streaming` is
-   * true so sticky-bottom fires after each chunk. Unused when `streaming` is
-   * false — overflow-fade affordances react to actual scroll position via
-   * `IntersectionObserver` and don't need a content key.
-   */
   contentKey: string;
   className?: string;
-  /**
-   * Class names applied to the inner scroll element. Use this to add the
-   * caller's content padding/typography — `TimelineDetailScroll` itself owns
-   * only the scroll mechanics (max-height, overflow, fade affordances).
-   */
   scrollClassName?: string;
   showAboveFade?: boolean;
   children: ReactNode;
 }
 
-// Single component for both streaming and static modes. The previous design
-// rendered separate `<StreamingDetailScroll>` / `<StaticDetailScroll>`
-// subtrees, but flipping `streaming` on completion swapped one for the other,
-// remounting a fresh scroll container with `scrollTop: 0` and snapping the
-// view back to the top. `useStickyBottomScroll` is already dormant when
-// `streaming === false` (see its `if (!streaming) return;` guards), so the
-// hook can stay wired through the lifecycle while the auto-scroll effect
-// flips off without remounting.
 export function TimelineDetailScroll({
   size,
   overflowX = "auto",
@@ -63,16 +41,13 @@ export function TimelineDetailScroll({
   const maxHeightClassName = getDetailScrollMaxHeightClass(size);
   const { aboveOverflow, belowOverflow } = overflow;
 
-  const handleScroll = useCallback(
-    (event: UIEvent<HTMLDivElement>) => {
-      sticky.onScroll(event);
-    },
-    [sticky],
-  );
-
   const refCallback = useComposedRefs<HTMLDivElement>(
     sticky.ref,
     overflow.scrollRef,
+  );
+  const windowingScrollRoot = useMemo<TimelineWindowingScrollRoot>(
+    () => ({ getScrollElement: () => sticky.ref.current }),
+    [sticky.ref],
   );
 
   return (
@@ -82,7 +57,7 @@ export function TimelineDetailScroll({
     >
       <div
         ref={refCallback}
-        onScroll={handleScroll}
+        onScroll={sticky.onScroll}
         onPointerDown={sticky.onPointerDown}
         onTouchMove={sticky.onTouchMove}
         onTouchStart={sticky.onTouchStart}
@@ -100,10 +75,13 @@ export function TimelineDetailScroll({
           aria-hidden
           className="-mb-px h-px w-full"
         />
-        {/* Content-only height changes (image loads, disclosure toggles)
-            never resize the scroll port; this wrapper gives the sticky
-            hook's ResizeObserver a box that tracks them. */}
-        <div ref={sticky.contentRef}>{children}</div>
+        <div ref={sticky.contentRef}>
+          <TimelineWindowingScrollRootContext.Provider
+            value={windowingScrollRoot}
+          >
+            {children}
+          </TimelineWindowingScrollRootContext.Provider>
+        </div>
         <div
           ref={overflow.bottomSentinelRef}
           aria-hidden

@@ -13,15 +13,14 @@ import {
   schema,
   server,
   session,
+  sha256Hex,
   user,
 } from "@bb/connect-db";
 
 import {
-  createDesktopSessionCookie,
   listAccountServers,
-  resolveAccountUserId,
+  resolveAccount,
   revokeServerCredential,
-  verifyDesktopSessionCookie,
   verifyServerCredential,
 } from "./servers.js";
 import {
@@ -32,7 +31,6 @@ import {
 import { SECURE_SESSION_COOKIE } from "./cloud-dev.js";
 import { verifyMachineCredential } from "./session.js";
 
-// Real in-memory SQLite (never mock the DB). Same harness as session.test.ts.
 const MIGRATIONS_DIR = fileURLToPath(
   new URL("../../../packages/connect-db/migrations", import.meta.url),
 );
@@ -56,16 +54,6 @@ afterEach(() => {
 });
 
 const now = new Date("2026-07-01T12:00:00.000Z");
-
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
-  return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 
 function seedUser(id: string): void {
   db.insert(user)
@@ -102,30 +90,6 @@ function seedServer(over: {
     })
     .run();
 }
-
-describe("desktop session cookie", () => {
-  it("round-trips account identity until expiry and rejects tampering", async () => {
-    const expiresAt = now.getTime() + 60_000;
-    const cookie = await createDesktopSessionCookie(
-      "acct-a",
-      "test-secret",
-      expiresAt,
-    );
-    await expect(
-      verifyDesktopSessionCookie(cookie, "test-secret", now.getTime()),
-    ).resolves.toBe("acct-a");
-    await expect(
-      verifyDesktopSessionCookie(cookie, "test-secret", expiresAt),
-    ).resolves.toBeNull();
-    await expect(
-      verifyDesktopSessionCookie(
-        `${cookie.slice(0, -1)}x`,
-        "test-secret",
-        now.getTime(),
-      ),
-    ).resolves.toBeNull();
-  });
-});
 
 describe("listAccountServers", () => {
   it("returns only the authenticated account's rows with live from last_seen_at", async () => {
@@ -167,6 +131,67 @@ describe("listAccountServers", () => {
     expect(listed.find((s) => s.handle === "other")).toBeUndefined();
   });
 
+  it("takes live from each paired server's tunnel object when a lookup is given, and the timestamp when it is unknown", async () => {
+    seedUser("acct-a");
+    const liveAt = new Date(now.getTime() - 30_000);
+    const staleAt = new Date(now.getTime() - SERVER_OFFLINE_AFTER_MS - 1_000);
+    seedServer({
+      id: "s1",
+      userId: "acct-a",
+      name: "connected",
+      subdomain: "connected",
+      lastSeenAt: staleAt,
+    });
+    seedServer({
+      id: "s2",
+      userId: "acct-a",
+      name: "dropped",
+      subdomain: "dropped",
+      lastSeenAt: liveAt,
+    });
+    seedServer({
+      id: "s3",
+      userId: "acct-a",
+      name: "unknown",
+      subdomain: "unknown",
+      lastSeenAt: liveAt,
+    });
+    seedServer({
+      id: "s4",
+      userId: "acct-a",
+      name: "revoked",
+      subdomain: "revoked-box",
+      revokedAt: new Date(now.getTime() - 5_000),
+      lastSeenAt: liveAt,
+    });
+    const asked: string[] = [];
+    const answers: Record<string, boolean | null> = {
+      connected: true,
+      dropped: false,
+      unknown: null,
+    };
+
+    const listed = await listAccountServers(
+      db,
+      "acct-a",
+      now.getTime(),
+      async (routingKey) => {
+        asked.push(routingKey);
+        return answers[routingKey] ?? null;
+      },
+    );
+
+    expect(listed).toEqual(
+      expect.arrayContaining([
+        { handle: "connected", name: "connected", live: true },
+        { handle: "dropped", name: "dropped", live: false },
+        { handle: "unknown", name: "unknown", live: true },
+        { handle: "revoked-box", name: "revoked", live: false },
+      ]),
+    );
+    expect(asked.sort()).toEqual(["connected", "dropped", "unknown"]);
+  });
+
   it("falls back name to handle and treats unpaired/revoked as not live", async () => {
     seedUser("acct-a");
     seedServer({
@@ -206,7 +231,7 @@ describe("listAccountServers", () => {
   });
 });
 
-describe("verifyServerCredential / resolveAccountUserId", () => {
+describe("verifyServerCredential / resolveAccount", () => {
   it("authenticates a non-revoked server tunnel credential to its owner", async () => {
     seedUser("acct-a");
     const plaintext = "bbcred_server_secret";
@@ -240,7 +265,6 @@ describe("verifyServerCredential / resolveAccountUserId", () => {
       credentialHash: await sha256Hex("bbcred_keep_this_server"),
     });
 
-    // Prime the warm-isolate credential cache before revoking.
     expect(await verifyServerCredential(plaintext, db)).toBe("acct-a");
     await expect(revokeServerCredential(plaintext, db)).resolves.toEqual({
       subdomain: "sawyer",
@@ -300,28 +324,32 @@ describe("verifyServerCredential / resolveAccountUserId", () => {
     const req = new Request("https://sawyer.getbb.app/api/connect/servers", {
       headers: { "x-bb-connect-machine": machinePlain },
     });
-    const userId = await resolveAccountUserId(
+    const account = await resolveAccount(
       req,
       "secret",
       db,
       SECURE_SESSION_COOKIE,
     );
-    expect(userId).toBe("acct-a");
-    const listed = await listAccountServers(db, userId!, now.getTime());
+    expect(account).toEqual({
+      userId: "acct-a",
+      grant: {
+        kind: "machine",
+        credentialHash: await sha256Hex(machinePlain),
+      },
+    });
+    const listed = await listAccountServers(db, account!.userId, now.getTime());
     expect(listed.map((s) => s.handle)).toEqual(["sawyer"]);
   });
 
   it("returns null (unauthorized) when no credential or session is presented", async () => {
     const req = new Request("https://sawyer.getbb.app/api/connect/servers");
     expect(
-      await resolveAccountUserId(req, "secret", db, SECURE_SESSION_COOKIE),
+      await resolveAccount(req, "secret", db, SECURE_SESSION_COOKIE),
     ).toBeNull();
   });
 
   it("accepts a valid owner session cookie", async () => {
     seedUser("acct-a");
-    // verifySessionCookie checks HMAC(token, secret) then session row by token.
-    // Use a real HMAC so the signature path succeeds.
     const token = "sess_token_abc";
     const secret = "test-better-auth-secret";
     const key = await crypto.subtle.importKey(
@@ -343,7 +371,6 @@ describe("verifyServerCredential / resolveAccountUserId", () => {
       .values({
         id: "sess1",
         token,
-        // Must be relative to wall clock: verifySessionCookie uses Date.now().
         expiresAt: new Date(Date.now() + 60_000),
         userId: "acct-a",
         createdAt: now,
@@ -357,8 +384,11 @@ describe("verifyServerCredential / resolveAccountUserId", () => {
       },
     });
     expect(
-      await resolveAccountUserId(req, secret, db, SECURE_SESSION_COOKIE),
-    ).toBe("acct-a");
+      await resolveAccount(req, secret, db, SECURE_SESSION_COOKIE),
+    ).toEqual({
+      userId: "acct-a",
+      grant: { kind: "session", sessionId: "sess1" },
+    });
 
     const localRequest = new Request(
       "http://sawyer.bb.localhost:8787/api/connect/servers",
@@ -367,12 +397,14 @@ describe("verifyServerCredential / resolveAccountUserId", () => {
       },
     );
     expect(
-      await resolveAccountUserId(
-        localRequest,
-        secret,
-        db,
-        "better-auth.session_token",
-      ),
+      (
+        await resolveAccount(
+          localRequest,
+          secret,
+          db,
+          "better-auth.session_token",
+        )
+      )?.userId,
     ).toBe("acct-a");
   });
 });
@@ -562,10 +594,7 @@ describe("machine label assignment", () => {
     );
 
     await attaching;
-    // The machine update has not begun, so neither source nor claim exists.
     expect(db.select().from(labelClaim).all()).toEqual([]);
-    // Simulate an old web worker: it inserts only the server source row. The
-    // migration trigger claims the label in that same statement.
     seedServer({
       id: "old-writer-server",
       userId: "acct-b",

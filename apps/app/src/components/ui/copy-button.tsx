@@ -4,6 +4,7 @@ import {
   type ReactNode,
 } from "react";
 import { useClipboardCopy, type ClipboardCopyOptions } from "@/lib/clipboard";
+import { HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS } from "@bb/shared-ui/hover-reveal";
 import { cn } from "@bb/shared-ui/lib/utils";
 import { Icon } from "@bb/shared-ui/icon";
 import { CONTROL_HOVER_TRANSITION } from "@bb/shared-ui/motion";
@@ -16,8 +17,6 @@ interface CopyButtonProps
   label?: string;
 }
 
-// forwardRef + prop spreading so it can act as a Radix `asChild` trigger (e.g.
-// wrapped in a Tooltip) without also creating a native browser tooltip.
 export const CopyButton = forwardRef<HTMLButtonElement, CopyButtonProps>(
   function CopyButton(
     {
@@ -27,6 +26,7 @@ export const CopyButton = forwardRef<HTMLButtonElement, CopyButtonProps>(
       label = "Copy to clipboard",
       successMessage,
       errorMessage,
+      imageUrl,
       ...rest
     },
     ref,
@@ -35,6 +35,7 @@ export const CopyButton = forwardRef<HTMLButtonElement, CopyButtonProps>(
       text,
       successMessage,
       errorMessage,
+      imageUrl,
     });
 
     return (
@@ -64,8 +65,6 @@ export const CopyButton = forwardRef<HTMLButtonElement, CopyButtonProps>(
 interface CopyableInlineLabelProps extends ClipboardCopyOptions {
   label: string;
   title?: string;
-  className?: string;
-  iconClassName?: string;
   children?: ReactNode;
 }
 
@@ -73,8 +72,6 @@ export function CopyableInlineLabel({
   text,
   label,
   title,
-  className,
-  iconClassName,
   successMessage,
   errorMessage,
   children,
@@ -88,10 +85,7 @@ export function CopyableInlineLabel({
   return (
     <button
       type="button"
-      className={cn(
-        `inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-md text-left text-foreground ${CONTROL_HOVER_TRANSITION} hover:text-foreground/80`,
-        className,
-      )}
+      className={`group/copy inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-md text-left text-foreground ${CONTROL_HOVER_TRANSITION} hover:text-foreground/80`}
       onClick={() => {
         void copy();
       }}
@@ -102,7 +96,11 @@ export function CopyableInlineLabel({
       </span>
       <Icon
         name={copied ? "Check" : "Copy"}
-        className={cn("size-3.5 shrink-0 text-muted-foreground", iconClassName)}
+        className={cn(
+          "size-3 shrink-0 text-subtle-foreground transition-opacity group-hover/copy:opacity-100 group-focus-visible/copy:opacity-100",
+          HOVER_REVEAL_NO_HOVER_VISIBLE_CLASS,
+          copied ? "opacity-100" : "opacity-0",
+        )}
       />
     </button>
   );

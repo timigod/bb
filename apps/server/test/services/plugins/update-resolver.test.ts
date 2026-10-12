@@ -7,13 +7,22 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PLUGIN_SDK_VERSION } from "@bb/domain";
 import {
   createNpmResolverRun,
+  listGitSemverTags,
+  resolveGitRange,
   resolveGitRef,
   resolveGitUpdate,
   resolveNpmUpdate,
+  selectGitSemverTag,
+  type GitCandidateProbe,
 } from "../../../src/services/plugins/update-resolver.js";
 
 const run = promisify(execFile);
 const cleanup: string[] = [];
+const compatibleProbe: GitCandidateProbe = async () => ({
+  outcome: "compatible",
+  devMode: false,
+  packagedBuildProblems: [],
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -192,6 +201,28 @@ describe("npm update candidate selection", () => {
       current: { version: "1.0.0", display: "bb-plugin-matrix@1.0.0" },
     });
   });
+
+  it("binds a registry version when the registry omits integrity", async () => {
+    const resolution = await resolveNpmUpdate({
+      intent: npmIntent("next", "tag"),
+      current: { version: "1.0.0", display: "bb-plugin-matrix@1.0.0" },
+      appVersion: "1.0.0",
+      run: createNpmResolverRun({
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              versions: { "2.0.0": { version: "2.0.0", dist: {} } },
+              "dist-tags": { next: "2.0.0" },
+            }),
+          ),
+      }),
+    });
+
+    expect(resolution).toMatchObject({
+      outcome: "update-available",
+      candidate: { version: "2.0.0", integrity: "" },
+    });
+  });
 });
 
 describe("git update resolution", () => {
@@ -230,9 +261,9 @@ describe("git update resolution", () => {
     expect(
       await resolveGitUpdate({
         url: repo,
-        ref: "main",
-        refKind: "branch",
+        intent: { kind: "ref", ref: "main", refKind: "branch" },
         currentCommit: first,
+        probeCandidate: compatibleProbe,
       }),
     ).toMatchObject({ outcome: "current" });
 
@@ -244,9 +275,9 @@ describe("git update resolution", () => {
     expect(
       await resolveGitUpdate({
         url: repo,
-        ref: "main",
-        refKind: "branch",
+        intent: { kind: "ref", ref: "main", refKind: "branch" },
         currentCommit: first,
+        probeCandidate: compatibleProbe,
       }),
     ).toMatchObject({
       outcome: "update-available",
@@ -255,18 +286,342 @@ describe("git update resolution", () => {
     expect(
       await resolveGitUpdate({
         url: repo,
-        ref: "v1",
-        refKind: "tag",
+        intent: { kind: "ref", ref: "v1", refKind: "tag" },
         currentCommit: first,
+        probeCandidate: compatibleProbe,
       }),
     ).toMatchObject({ outcome: "pinned" });
     expect(
       await resolveGitUpdate({
         url: repo,
-        ref: first,
-        refKind: "commit",
+        intent: { kind: "ref", ref: first, refKind: "commit" },
         currentCommit: first,
+        probeCandidate: compatibleProbe,
       }),
     ).toMatchObject({ outcome: "pinned" });
+  });
+});
+
+describe("git semver tag resolution", () => {
+  async function tagRepo(): Promise<{
+    repo: string;
+    commitOf: Map<string, string>;
+  }> {
+    const repo = await mkdtemp(join(tmpdir(), "bb-git-tags-"));
+    cleanup.push(repo);
+    await run("git", ["init", "-q", "-b", "main"], { cwd: repo });
+    await run("git", ["config", "user.email", "test@example.com"], {
+      cwd: repo,
+    });
+    await run("git", ["config", "user.name", "Test"], { cwd: repo });
+    const commitOf = new Map<string, string>();
+    const releases: Array<{ tag: string; annotated: boolean }> = [
+      { tag: "v1.0.0", annotated: false },
+      { tag: "v1.1.0", annotated: true },
+      { tag: "v1.2.0-beta.1", annotated: false },
+      { tag: "v2.0.0", annotated: true },
+      { tag: "v1.2", annotated: false },
+      { tag: "release-3", annotated: false },
+      { tag: "notes/v0.9.0", annotated: false },
+      { tag: "notes/v1.0.0", annotated: true },
+    ];
+    for (const release of releases) {
+      await writeFile(join(repo, "file.txt"), release.tag);
+      await run("git", ["add", "."], { cwd: repo });
+      await run("git", ["commit", "-qm", release.tag], { cwd: repo });
+      await run(
+        "git",
+        release.annotated
+          ? ["tag", "-a", release.tag, "-m", release.tag]
+          : ["tag", release.tag],
+        { cwd: repo },
+      );
+      commitOf.set(
+        release.tag,
+        (await run("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim(),
+      );
+    }
+    return { repo, commitOf };
+  }
+
+  it("lists only [prefix]vX.Y.Z tags, peels annotated ones, and orders them", async () => {
+    const { repo, commitOf } = await tagRepo();
+
+    const repoWide = await listGitSemverTags({ url: repo, tagPrefix: "" });
+    expect(repoWide.map((tag) => tag.tag)).toEqual([
+      "v2.0.0",
+      "v1.2.0-beta.1",
+      "v1.1.0",
+      "v1.0.0",
+    ]);
+    expect(repoWide.map((tag) => tag.version)).toEqual([
+      "2.0.0",
+      "1.2.0-beta.1",
+      "1.1.0",
+      "1.0.0",
+    ]);
+    expect(repoWide.find((tag) => tag.tag === "v2.0.0")?.commit).toBe(
+      commitOf.get("v2.0.0"),
+    );
+
+    const prefixed = await listGitSemverTags({
+      url: repo,
+      tagPrefix: "notes/",
+    });
+    expect(prefixed.map((tag) => tag.tag)).toEqual([
+      "notes/v1.0.0",
+      "notes/v0.9.0",
+    ]);
+    expect(prefixed.find((tag) => tag.tag === "notes/v1.0.0")?.commit).toBe(
+      commitOf.get("notes/v1.0.0"),
+    );
+  });
+
+  it("asks the remote for release tags only, so unrelated tags cost nothing", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "bb-git-many-tags-"));
+    cleanup.push(repo);
+    await run("git", ["init", "-q", "-b", "main"], { cwd: repo });
+    await run("git", ["config", "user.email", "test@example.com"], {
+      cwd: repo,
+    });
+    await run("git", ["config", "user.name", "Test"], { cwd: repo });
+    await writeFile(join(repo, "file.txt"), "release");
+    await run("git", ["add", "."], { cwd: repo });
+    await run("git", ["commit", "-qm", "release"], { cwd: repo });
+    const commit = (
+      await run("git", ["rev-parse", "HEAD"], { cwd: repo })
+    ).stdout.trim();
+    const lines = ["# pack-refs with: peeled fully-peeled sorted \n"];
+    lines.push(`${commit} refs/tags/notes/v1.0.0\n`);
+    for (let index = 0; index < 150_000; index += 1) {
+      lines.push(`${commit} refs/tags/unrelated-${String(index)}\n`);
+    }
+    await writeFile(join(repo, ".git", "packed-refs"), lines.join(""));
+
+    const tags = await listGitSemverTags({ url: repo, tagPrefix: "notes/" });
+    expect(tags.map((tag) => tag.tag)).toEqual(["notes/v1.0.0"]);
+  });
+
+  it("selects the highest satisfying release and excludes prereleases", async () => {
+    const { repo } = await tagRepo();
+    const tags = await listGitSemverTags({ url: repo, tagPrefix: "" });
+
+    expect(selectGitSemverTag({ tags, range: "^1.0.0" })?.tag).toBe("v1.1.0");
+    expect(selectGitSemverTag({ tags, range: "*" })?.tag).toBe("v2.0.0");
+    expect(selectGitSemverTag({ tags, range: "~1.0.0" })?.tag).toBe("v1.0.0");
+    expect(selectGitSemverTag({ tags, range: ">=1.2.0" })?.tag).toBe("v2.0.0");
+    expect(selectGitSemverTag({ tags, range: ">=1.2.0-0 <2.0.0" })?.tag).toBe(
+      "v1.2.0-beta.1",
+    );
+    expect(selectGitSemverTag({ tags, range: "^3.0.0" })).toBeNull();
+  });
+
+  it("resolves a range for an install and reports a range with no match", async () => {
+    const { repo, commitOf } = await tagRepo();
+
+    expect(
+      await resolveGitRange({
+        url: repo,
+        range: "^1.0.0",
+        tagPrefix: "",
+        probeCandidate: compatibleProbe,
+      }),
+    ).toEqual({
+      outcome: "resolved",
+      tag: "v1.1.0",
+      version: "1.1.0",
+      commit: commitOf.get("v1.1.0"),
+    });
+    expect(
+      await resolveGitRange({
+        url: repo,
+        range: "^9.0.0",
+        tagPrefix: "notes/",
+        probeCandidate: compatibleProbe,
+      }),
+    ).toMatchObject({
+      outcome: "unavailable",
+      detail: expect.stringContaining('"notes/vX.Y.Z"'),
+    });
+  });
+
+  it("offers newer satisfying tags and refuses a tag that moved", async () => {
+    const { repo, commitOf } = await tagRepo();
+    const installed = commitOf.get("v1.0.0") ?? "";
+
+    expect(
+      await resolveGitUpdate({
+        url: repo,
+        intent: {
+          kind: "range",
+          range: "^1.0.0",
+          tagPrefix: "",
+          resolvedTag: "v1.0.0",
+        },
+        currentCommit: installed,
+        probeCandidate: compatibleProbe,
+      }),
+    ).toMatchObject({
+      outcome: "update-available",
+      candidate: { version: commitOf.get("v1.1.0") },
+    });
+    expect(
+      await resolveGitUpdate({
+        url: repo,
+        intent: {
+          kind: "range",
+          range: "~1.0.0",
+          tagPrefix: "",
+          resolvedTag: "v1.0.0",
+        },
+        currentCommit: installed,
+        probeCandidate: compatibleProbe,
+      }),
+    ).toMatchObject({ outcome: "current" });
+
+    await run("git", ["tag", "-f", "v1.0.0", "HEAD"], { cwd: repo });
+    const moved = (
+      await run("git", ["rev-parse", "HEAD"], { cwd: repo })
+    ).stdout.trim();
+    for (const intent of [
+      {
+        kind: "range" as const,
+        range: "^1.0.0",
+        tagPrefix: "",
+        resolvedTag: "v1.0.0",
+      },
+      { kind: "ref" as const, ref: "v1.0.0", refKind: "tag" as const },
+    ]) {
+      expect(
+        await resolveGitUpdate({
+          url: repo,
+          intent,
+          currentCommit: installed,
+          probeCandidate: compatibleProbe,
+        }),
+      ).toMatchObject({
+        outcome: "unavailable",
+        detail: expect.stringContaining(
+          `security check failed: git tag "v1.0.0"`,
+        ),
+      });
+      expect(
+        await resolveGitUpdate({
+          url: repo,
+          intent,
+          currentCommit: installed,
+          probeCandidate: compatibleProbe,
+        }),
+      ).toMatchObject({
+        detail: expect.stringContaining(`${installed} to ${moved}`),
+      });
+    }
+  });
+
+  it("walks down to the newest release this bb can run", async () => {
+    const { repo, commitOf } = await tagRepo();
+    const probed: string[] = [];
+
+    const resolution = await resolveGitUpdate({
+      url: repo,
+      intent: {
+        kind: "range",
+        range: "*",
+        tagPrefix: "",
+        resolvedTag: "v1.0.0",
+      },
+      currentCommit: commitOf.get("v1.0.0") ?? "",
+      probeCandidate: async (candidate) => {
+        probed.push(candidate.tag);
+        return candidate.tag === "v2.0.0"
+          ? {
+              outcome: "incompatible",
+              devMode: false,
+              reasons: [
+                {
+                  engine: "bb",
+                  required: ">=99.0.0",
+                  actual: "1.0.0",
+                  message: "requires bb >=99.0.0, running bb is 1.0.0",
+                },
+              ],
+            }
+          : {
+              outcome: "compatible",
+              devMode: false,
+              packagedBuildProblems: [],
+            };
+      },
+    });
+
+    expect(probed).toEqual(["v2.0.0", "v1.1.0"]);
+    expect(resolution).toMatchObject({
+      outcome: "update-available",
+      candidateGitTag: "v1.1.0",
+      candidate: { version: commitOf.get("v1.1.0") },
+      blocked: {
+        version: { version: commitOf.get("v2.0.0") },
+        reasons: [{ engine: "bb" }],
+      },
+    });
+  });
+
+  it("stays current and reports the blocked release when nothing newer runs", async () => {
+    const { repo, commitOf } = await tagRepo();
+
+    expect(
+      await resolveGitUpdate({
+        url: repo,
+        intent: {
+          kind: "range",
+          range: "^1.0.0",
+          tagPrefix: "",
+          resolvedTag: "v1.0.0",
+        },
+        currentCommit: commitOf.get("v1.0.0") ?? "",
+        probeCandidate: async () => ({
+          outcome: "incompatible",
+          devMode: false,
+          reasons: [
+            {
+              engine: "bb",
+              required: ">=99.0.0",
+              actual: "1.0.0",
+              message: "requires bb >=99.0.0, running bb is 1.0.0",
+            },
+          ],
+        }),
+      }),
+    ).toMatchObject({
+      outcome: "current",
+      blocked: {
+        version: { version: commitOf.get("v1.1.0") },
+        reasons: [{ engine: "bb" }],
+      },
+    });
+  });
+
+  it("refuses to downgrade when the recorded range tag disappeared", async () => {
+    const { repo, commitOf } = await tagRepo();
+    await run("git", ["tag", "-d", "v1.1.0"], { cwd: repo });
+
+    expect(
+      await resolveGitUpdate({
+        url: repo,
+        intent: {
+          kind: "range",
+          range: "^1.0.0",
+          tagPrefix: "",
+          resolvedTag: "v1.1.0",
+        },
+        currentCommit: commitOf.get("v1.1.0") ?? "",
+        probeCandidate: compatibleProbe,
+      }),
+    ).toMatchObject({
+      outcome: "unavailable",
+      detail: expect.stringContaining(
+        'recorded git tag "v1.1.0" no longer exists',
+      ),
+    });
   });
 });

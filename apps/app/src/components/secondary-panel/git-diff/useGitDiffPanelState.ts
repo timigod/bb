@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useEnvironmentWorkStatus } from "../../../hooks/queries/environment-queries";
-import { type GitDiffSelectionOption } from "../ThreadSecondaryPanel";
+import type { GitDiffSelectionOption } from "../GitDiffToolbar";
 import {
   ALL_GIT_DIFF_SELECTION,
   buildGitDiffSelectionOptions,
@@ -18,18 +18,6 @@ interface UseGitDiffPanelStateParams {
   pendingGitDiffScrollPath?: string | null;
 }
 
-/**
- * Owns the diff tab's *target selection* — the requested merge-base branch and
- * the chosen selection (all changes / committed changes / uncommitted changes /
- * a specific commit) — and the derived {@link buildGitDiffTarget} that the TOC +
- * patch fetches key on. The diff body ({@link GitDiffTabContent}) and the
- * per-file cards do all diff fetching, parsing, virtualization, and collapse
- * state themselves; this hook holds none of that. It reacts to the info-tab /
- * prompt-banner intents (`pendingGitDiffCommitSha` to scope to a commit,
- * `pendingGitDiffScrollPath` to reset the diff to all-changes so the opened file
- * is in the slice) and resets a stale selection when the workspace's commit list
- * changes.
- */
 export function useGitDiffPanelState({
   environmentId,
   isDiffPanelActive,
@@ -40,6 +28,9 @@ export function useGitDiffPanelState({
 }: UseGitDiffPanelStateParams) {
   const [selectedGitDiffSelection, setSelectedGitDiffSelection] =
     useState<GitDiffSelectionValue>(null);
+  const [gitDiffFileFilter, setGitDiffFileFilter] = useState<string | null>(
+    null,
+  );
 
   const gitDiffTarget = useMemo(
     () =>
@@ -61,25 +52,17 @@ export function useGitDiffPanelState({
       ? gitDiffWorkspaceStatus.workspace
       : undefined;
 
-  // --- Reset on environment change ---
-
   useEffect(() => {
     setSelectedGitDiffSelection(null);
+    setGitDiffFileFilter(null);
   }, [environmentId]);
-
-  // --- Reset the diff to all-changes when an open-file intent arrives
-  // (openDiffFile) so the opened file is in the slice. The scroll consumer
-  // (DiffFilesPanel) clears `pendingGitDiffScrollPath` once it scrolls the file
-  // into view. Clearing the intent also lets re-opening the same path re-fire
-  // this effect. ---
 
   useEffect(() => {
     if (pendingGitDiffScrollPath) {
       setSelectedGitDiffSelection(null);
+      setGitDiffFileFilter(null);
     }
   }, [pendingGitDiffScrollPath]);
-
-  // --- Apply the commit selection requested from the info tab (openCommitDiff) ---
 
   useEffect(() => {
     if (pendingGitDiffCommitSha) {
@@ -107,8 +90,6 @@ export function useGitDiffPanelState({
     workspaceStatus?.mergeBase?.commits,
   ]);
 
-  // --- Derived selection options ---
-
   const diffCommits = useMemo(
     () => workspaceStatus?.mergeBase?.commits ?? [],
     [workspaceStatus?.mergeBase?.commits],
@@ -126,9 +107,11 @@ export function useGitDiffPanelState({
   }, []);
 
   return {
+    gitDiffFileFilter,
     gitDiffTarget,
     gitDiffSelectOptions,
     gitDiffSelectValue,
     onGitDiffSelectionChange,
+    setGitDiffFileFilter,
   };
 }

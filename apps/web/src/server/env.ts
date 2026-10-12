@@ -3,6 +3,7 @@ import { env as workerEnv } from "cloudflare:workers";
 export interface Env {
   DB: D1Database;
   TUNNEL_DO: DurableObjectNamespace;
+  LINK_START_RATE_LIMITER: RateLimit;
   BASE_DOMAIN: string;
   APP_URL: string;
   CONNECT_SERVER_URL_TEMPLATE?: string;
@@ -10,14 +11,12 @@ export interface Env {
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   BETTER_AUTH_SECRET: string;
-  /**
-   * Marketing-page endpoints (see src/landing/endpoints.ts). Unset on forks
-   * and local dev: /api/subscribe reports signup as not configured, and the
-   * download redirect skips server-side click tracking.
-   */
   LANDING_POSTHOG_KEY?: string;
   RESEND_API_KEY?: string;
   RESEND_AUDIENCE_ID?: string;
+  MARKETPLACE?: R2Bucket;
+  ASSETLINKS_SHA256_FINGERPRINTS?: string;
+  PRESENCE_WRITES?: string;
 }
 
 export function getEnv(): Env {

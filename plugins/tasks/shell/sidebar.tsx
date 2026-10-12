@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type {
   Folder,
   Preset,
@@ -12,47 +12,20 @@ import {
   PresetDialog,
   savePresetDraft,
 } from "../views/manage/preset-dialog.js";
-import { Icon } from "@bb/shared-ui/icon";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { Icon } from "@/components/ui/icon";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
-import { cn } from "@bb/shared-ui/lib/utils";
-
-const SIDEBAR_WIDTH_KEY = "bb-tasks:sidebar-width";
-const SIDEBAR_DEFAULT_WIDTH = 208; // matches the old fixed w-52
-const SIDEBAR_MIN_WIDTH = 180;
-const SIDEBAR_MAX_WIDTH = 340;
-
-function clampSidebarWidth(width: number): number {
-  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width));
-}
-
-function loadSidebarWidth(): number {
-  try {
-    const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_KEY));
-    return Number.isFinite(stored) && stored > 0
-      ? clampSidebarWidth(stored)
-      : SIDEBAR_DEFAULT_WIDTH;
-  } catch {
-    return SIDEBAR_DEFAULT_WIDTH;
-  }
-}
-
-function storeSidebarWidth(width: number): void {
-  try {
-    window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
-  } catch {
-    // Persistence is best-effort (e.g. sandboxed iframes without storage).
-  }
-}
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 interface SidebarRowProps {
   active?: boolean;
-  onClick?: () => void;
+  onClick: () => void;
   children: ReactNode;
   title?: string;
 }
@@ -65,11 +38,11 @@ function SidebarRow({ active, onClick, children, title }: SidebarRowProps) {
       title={title}
       className={cn(
         "flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-md:pointer-coarse:h-9",
-        onClick ? "cursor-pointer" : "cursor-default",
+        "cursor-pointer",
         active
           ? "bg-sidebar-accent font-medium text-foreground"
           : "text-muted-foreground",
-        onClick && !active && "hover:bg-state-hover hover:text-foreground",
+        !active && "hover:bg-state-hover hover:text-foreground",
       )}
     >
       {children}
@@ -120,8 +93,6 @@ function SectionHeader({
 }
 
 function ProjectDot({ color }: { color: string }) {
-  // Project colors are user data, not theme tokens, so an inline style is the
-  // only way to render them.
   return (
     <span
       aria-hidden
@@ -171,18 +142,20 @@ function ProjectRow({
 
 function SidebarSkeleton() {
   return (
-    <div className="space-y-2 px-2 pt-2">
-      {["w-3/4", "w-2/3", "w-4/5", "w-3/5", "w-2/3"].map((width, index) => (
-        <div className="flex h-7 items-center gap-2 px-2" key={index}>
-          <Skeleton className="size-3 rounded-sm" />
-          <Skeleton className={cn("h-3", width)} />
-        </div>
-      ))}
-    </div>
+    <DelayedLoading>
+      <div className="space-y-2 px-2 pt-2">
+        {["w-3/4", "w-2/3", "w-4/5", "w-3/5", "w-2/3"].map((width, index) => (
+          <div className="flex h-7 items-center gap-2 px-2" key={index}>
+            <Skeleton className="size-3 rounded-sm" />
+            <Skeleton className={cn("h-3", width)} />
+          </div>
+        ))}
+      </div>
+    </DelayedLoading>
   );
 }
 
-export interface TasksSidebarProps {
+interface TasksSidebarProps {
   route: TasksRoute;
   folders: Folder[] | undefined;
   projects: Project[] | undefined;
@@ -190,12 +163,6 @@ export interface TasksSidebarProps {
   presets: Preset[] | undefined;
   activeTasks: Task[] | undefined;
   isLoading: boolean;
-  /**
-   * Rendered as an overlay drawer over the list (narrow containers). Uses a
-   * fixed drawer width and hides the resize handle; the stored desktop width
-   * is left untouched.
-   */
-  overlay?: boolean;
   onNavigate: (route: TasksRoute) => void;
   onNewProject: () => void;
 }
@@ -208,7 +175,6 @@ export function TasksSidebar({
   presets,
   activeTasks,
   isLoading,
-  overlay = false,
   onNavigate,
   onNewProject,
 }: TasksSidebarProps) {
@@ -216,43 +182,10 @@ export function TasksSidebar({
     new Set(),
   );
   const rpc = useTasksRpc();
-  // Keyed remount resets the dialog draft per open/target. Saving publishes
-  // projects:changed, which refreshes the shell's presets query.
   const [presetDialog, setPresetDialog] = useState<{
     key: number;
     editing: Preset | null;
   } | null>(null);
-  const [width, setWidth] = useState(loadSidebarWidth);
-  const [resizing, setResizing] = useState(false);
-  const asideRef = useRef<HTMLElement>(null);
-  const widthRef = useRef(width);
-  widthRef.current = width;
-
-  const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    // The sidebar sits on the right, so width is measured from its right
-    // edge (fixed during the drag) back to the pointer.
-    const rightEdge = asideRef.current?.getBoundingClientRect().right;
-    if (rightEdge === undefined) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setResizing(true);
-  };
-  const moveResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!resizing) return;
-    const rightEdge = asideRef.current?.getBoundingClientRect().right;
-    if (rightEdge === undefined) return;
-    setWidth(clampSidebarWidth(Math.round(rightEdge - event.clientX)));
-  };
-  const endResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!resizing) return;
-    event.currentTarget.releasePointerCapture(event.pointerId);
-    setResizing(false);
-    storeSidebarWidth(widthRef.current);
-  };
-  const resetWidth = () => {
-    setWidth(SIDEBAR_DEFAULT_WIDTH);
-    storeSidebarWidth(SIDEBAR_DEFAULT_WIDTH);
-  };
   const summaryByProject = useMemo(
     () => new Map((summaries ?? []).map((entry) => [entry.projectId, entry])),
     [summaries],
@@ -263,11 +196,7 @@ export function TasksSidebar({
   );
   const activeProjectId = route.kind === "project" ? route.projectId : null;
   const openProject = (projectId: string) =>
-    onNavigate({
-      kind: "project",
-      projectId,
-      view: route.kind === "project" ? route.view : "list",
-    });
+    onNavigate({ kind: "project", projectId, view: null });
   const toggleFolder = (folderId: string) =>
     setCollapsedFolders((current) => {
       const next = new Set(current);
@@ -276,9 +205,12 @@ export function TasksSidebar({
       return next;
     });
 
-  const ungrouped = (projects ?? []).filter((p) => p.folderId === null);
   const rootFolders = (folders ?? []).filter((f) => f.parentFolderId === null);
   const childFolders = (folders ?? []).filter((f) => f.parentFolderId !== null);
+  const knownFolderIds = new Set((folders ?? []).map((f) => f.id));
+  const ungrouped = (projects ?? []).filter(
+    (p) => p.folderId === null || !knownFolderIds.has(p.folderId),
+  );
 
   const renderFolder = (folder: Folder, indent: boolean) => {
     const collapsed = collapsedFolders.has(folder.id);
@@ -304,7 +236,6 @@ export function TasksSidebar({
                 onClick={() => openProject(project.id)}
               />
             ))}
-            {/* Folders nest one level; children only render under roots. */}
             {!indent
               ? children.map((child) => renderFolder(child, true))
               : null}
@@ -315,32 +246,7 @@ export function TasksSidebar({
   };
 
   return (
-    <aside
-      ref={asideRef}
-      style={overlay ? undefined : { width }}
-      className={cn(
-        "relative flex h-full shrink-0 flex-col border-l border-border-seam bg-sidebar",
-        overlay && "w-72 min-w-0 max-w-full shrink shadow-lg",
-        resizing && "select-none",
-      )}
-    >
-      {!overlay ? (
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize sidebar"
-          title="Drag to resize · double-click to reset"
-          className={cn(
-            "absolute inset-y-0 -left-px z-10 w-1 cursor-col-resize transition-colors",
-            resizing ? "bg-primary/50" : "hover:bg-primary/30",
-          )}
-          onPointerDown={startResize}
-          onPointerMove={moveResize}
-          onPointerUp={endResize}
-          onPointerCancel={endResize}
-          onDoubleClick={resetWidth}
-        />
-      ) : null}
+    <div className="flex h-full min-h-0 flex-col bg-sidebar">
       <nav className="min-h-0 flex-1 overflow-y-auto px-2 pb-4 pt-2">
         <div className="space-y-px">
           <SidebarRow
@@ -382,8 +288,6 @@ export function TasksSidebar({
               </>
             ) : null}
             {rootFolders.map((folder) => renderFolder(folder, false))}
-            {/* With zero projects the main pane's empty-state CTA is the
-                single New-project affordance. */}
             {(projects ?? []).length > 0 ? (
               <div className="mt-1.5">
                 <SidebarRow onClick={onNewProject} title="New project">
@@ -404,7 +308,7 @@ export function TasksSidebar({
                         setPresetDialog({ key: Date.now(), editing: preset })
                       }
                     >
-                      <Icon name="Brain" className="size-3.5 shrink-0" />
+                      <Icon name="Bot" className="size-3.5 shrink-0" />
                       <span className="min-w-0 flex-1 truncate">
                         {preset.name}
                       </span>
@@ -467,6 +371,6 @@ export function TasksSidebar({
           onSave={(draft) => savePresetDraft(rpc, presetDialog.editing, draft)}
         />
       ) : null}
-    </aside>
+    </div>
   );
 }

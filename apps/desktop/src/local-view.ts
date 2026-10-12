@@ -1,31 +1,40 @@
 import { stripVTControlCharacters } from "node:util";
-import { escapeHtmlText } from "@bb/domain";
+import { escapeHtmlText } from "@bb/text-utils";
+import { z } from "zod";
 
-export type LocalViewModel =
-  | InfoViewModel
-  | LoadingViewModel
-  | StartupErrorViewModel;
+export const STARTUP_ACTION_CHANNEL = "bb-desktop:startup-action";
 
-export interface LoadingViewModel {
+export const startupActionIdSchema = z.enum([
+  "choose-server",
+  "open-moved-server",
+  "reconnect-connect",
+  "retry",
+]);
+
+export type StartupActionId = z.infer<typeof startupActionIdSchema>;
+
+export interface StartupAction {
+  id: StartupActionId;
+  label: string;
+}
+
+export type LocalViewModel = LoadingViewModel | StartupErrorViewModel;
+
+interface LoadingViewModel {
   kind: "loading";
   message: string;
   title: string;
 }
 
-export interface InfoViewModel {
-  kind: "info";
-  message: string;
-  title: string;
-}
-
-export interface StartupErrorViewModel {
+interface StartupErrorViewModel {
+  actions: StartupAction[];
   details: string;
   kind: "error";
   logText: string;
   title: string;
 }
 
-export interface CreateLocalViewUrlArgs {
+interface CreateLocalViewUrlArgs {
   viewModel: LocalViewModel;
 }
 
@@ -36,16 +45,9 @@ function formatPlainLogText(value: string): string {
 function renderLoadingView(viewModel: LoadingViewModel): string {
   return `
     <main class="shell">
-      <div class="spinner"></div>
-      <h1>${escapeHtmlText(viewModel.title)}</h1>
-      <p>${escapeHtmlText(viewModel.message)}</p>
-    </main>
-  `;
-}
-
-function renderInfoView(viewModel: InfoViewModel): string {
-  return `
-    <main class="shell">
+      <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" aria-hidden="true">
+        <path d="M12 3V6M12 18V21M21 12L18 12M6 12L3 12M18.3635 5.63672L16.2422 7.75804M7.75804 16.2422L5.63672 18.3635M18.3635 18.3635L16.2422 16.2422M7.75804 7.75804L5.63672 5.63672" />
+      </svg>
       <h1>${escapeHtmlText(viewModel.title)}</h1>
       <p>${escapeHtmlText(viewModel.message)}</p>
     </main>
@@ -56,24 +58,29 @@ function renderErrorView(viewModel: StartupErrorViewModel): string {
   const logText = formatPlainLogText(viewModel.logText);
   const logs =
     logText.trim().length > 0 ? `<pre>${escapeHtmlText(logText)}</pre>` : "";
+  const buttons = viewModel.actions
+    .map(
+      (action) =>
+        `<button type="button" data-startup-action="${action.id}">${escapeHtmlText(action.label)}</button>`,
+    )
+    .join("");
+  const actions =
+    buttons.length > 0 ? `<div class="actions">${buttons}</div>` : "";
   return `
     <main class="shell shell-error">
       <h1>${escapeHtmlText(viewModel.title)}</h1>
       <p>${escapeHtmlText(viewModel.details)}</p>
+      ${actions}
       ${logs}
     </main>
   `;
 }
 
 function renderLocalView(viewModel: LocalViewModel): string {
-  let body: string;
-  if (viewModel.kind === "loading") {
-    body = renderLoadingView(viewModel);
-  } else if (viewModel.kind === "info") {
-    body = renderInfoView(viewModel);
-  } else {
-    body = renderErrorView(viewModel);
-  }
+  const body =
+    viewModel.kind === "loading"
+      ? renderLoadingView(viewModel)
+      : renderErrorView(viewModel);
   return `<!doctype html>
 <html>
 <head>
@@ -147,6 +154,30 @@ function renderLocalView(viewModel: LocalViewModel): string {
       margin: 0;
     }
 
+    button {
+      background: CanvasText;
+      border: 0;
+      border-radius: 6px;
+      color: Canvas;
+      cursor: pointer;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 8px 14px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 18px 0 0;
+    }
+
+    .actions button + button {
+      background: color-mix(in srgb, CanvasText 10%, transparent);
+      color: CanvasText;
+    }
+
     pre {
       background: color-mix(in srgb, CanvasText 8%, transparent);
       border-radius: 6px;
@@ -161,13 +192,18 @@ function renderLocalView(viewModel: LocalViewModel): string {
     }
 
     .spinner {
-      animation: spin 0.9s linear infinite;
-      border: 2px solid color-mix(in srgb, CanvasText 16%, transparent);
-      border-top-color: CanvasText;
-      border-radius: 999px;
+      animation: spin 1s linear infinite;
+      color: color-mix(in srgb, CanvasText 60%, transparent);
+      display: block;
       height: 24px;
       margin: 0 auto;
       width: 24px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .spinner {
+        animation: none;
+      }
     }
 
     @keyframes spin {

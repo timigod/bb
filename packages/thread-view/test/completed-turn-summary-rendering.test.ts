@@ -1,7 +1,9 @@
 import type { TimelineRow } from "@bb/server-contract";
 import { describe, expect, it } from "vitest";
+import { buildThreadTimelineTurnDetailsFromEvents } from "../src/index.js";
 import {
   createTimelineEventFactory,
+  fromRows,
   renderTimelineFixture,
 } from "./timeline-test-harness.js";
 import type { TimelineEventFactory } from "./timeline-test-harness.js";
@@ -14,14 +16,12 @@ type TimelineWorkRow = Extract<TimelineRow, { kind: "work" }>;
 
 interface RenderCompletedTimelineArgs {
   events: TimelineFixtureEvent[];
-  includeDebugRawEvents?: boolean;
 }
 
 function renderCompletedTimeline(args: RenderCompletedTimelineArgs) {
   return renderTimelineFixture({
     events: args.events,
     projectionOptions: {
-      includeDebugRawEvents: args.includeDebugRawEvents,
       threadStatus: "idle",
       turnMessageDetail: "summary",
     },
@@ -64,27 +64,67 @@ function requireOnlyTurnRow(rows: readonly TimelineRow[]): TimelineTurnRow {
 }
 
 describe("completed turn summary rendering", () => {
-  it("emits a summary row for a completed final turn after accepted user input", () => {
+  it("keeps an assistant answer visible when the provider re-queries and the model answers again", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
     const request = event.clientTurnRequested({
       target: { kind: "new-turn" },
-      text: "got it lets work on the daemon command blobs",
+      text: "SQLite vs Postgres for a desktop app? End with a question.",
+    });
+    const answer =
+      "- SQLite is a file, zero ops.\n- Postgres needs a server.\n**Question for you**: multi-user someday?";
+    const hookReply =
+      "The verify gate is open: no fresh fast-loop verdict for HEAD, nothing actionable this turn.";
+
+    const timeline = renderCompletedTimeline({
+      events: [
+        request,
+        event.turnStarted(),
+        event.inputAccepted({ clientRequestId: request.data.requestId }),
+        event.assistantCompleted({ itemId: "assistant-1", text: answer }),
+        event.assistantCompleted({ itemId: "assistant-2", text: hookReply }),
+        event.turnCompleted(),
+      ],
+    });
+
+    expect(rowSignatures(timeline.rows)).toEqual([
+      "conversation:user",
+      "conversation:assistant",
+      "conversation:assistant",
+    ]);
+    expect(
+      timeline.rows.flatMap((row) =>
+        row.kind === "conversation" && row.role === "assistant"
+          ? [row.text]
+          : [],
+      ),
+    ).toEqual([answer, hookReply]);
+    expect(turnRows(timeline.rows)).toHaveLength(0);
+  });
+
+  it("folds narration before work but keeps the answer that precedes a hook reply", () => {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const request = event.clientTurnRequested({
+      target: { kind: "new-turn" },
+      text: "Is the daemon command blob pruning durable?",
     });
 
     const timeline = renderCompletedTimeline({
       events: [
         request,
         event.turnStarted(),
-        event.inputAccepted({
-          clientRequestId: request.data.requestId,
-        }),
-        event.commandCompleted({
-          itemId: "tool-1",
-          command: "pnpm test",
-        }),
+        event.inputAccepted({ clientRequestId: request.data.requestId }),
         event.assistantCompleted({
           itemId: "assistant-1",
-          text: "Implemented durable daemon command blob pruning.",
+          text: "Let me check the pruning code.",
+        }),
+        event.commandCompleted({ itemId: "tool-1", command: "rg prune" }),
+        event.assistantCompleted({
+          itemId: "assistant-2",
+          text: "Yes: pruning runs inside the daemon transaction, so it is durable.",
+        }),
+        event.assistantCompleted({
+          itemId: "assistant-3",
+          text: "The verify gate is still open for HEAD.",
         }),
         event.turnCompleted(),
       ],
@@ -92,21 +132,20 @@ describe("completed turn summary rendering", () => {
 
     expect(rowSignatures(timeline.rows)).toEqual([
       "conversation:user",
-      "turn:4-4",
+      "turn:4-5",
+      "conversation:assistant",
       "conversation:assistant",
     ]);
-    expect(topLevelWorkRows(timeline.rows)).toHaveLength(0);
-
     const turnRow = requireOnlyTurnRow(timeline.rows);
     expect(turnRow).toMatchObject({
-      completedAt: 6,
-      sourceSeqEnd: 4,
-      sourceSeqStart: 4,
       startedAt: 2,
-      status: "completed",
-      summaryCount: 1,
+      completedAt: 8,
+      summaryCount: 2,
     });
-    expect(rowSignatures(turnRow.children ?? [])).toEqual(["work:command"]);
+    expect(rowSignatures(turnRow.children ?? [])).toEqual([
+      "conversation:assistant",
+      "work:command",
+    ]);
   });
 
   it("keeps turn-scoped environment directory update operations inside the completed turn summary", () => {
@@ -490,101 +529,67 @@ describe("completed turn summary rendering", () => {
     ]);
   });
 
-  it("does not split completed turn summaries around accepted assistant steers", () => {
-    const event = createTimelineEventFactory({ threadId: "thread-1" });
-    const events: TimelineFixtureEvent[] = [
-      event.turnStarted(),
-      event.commandCompleted({
-        itemId: "tool-before-steer",
-        command: "pnpm test",
-      }),
-    ];
-    const steerRequest = event.clientTurnRequested({
+  it.each([
+    {
       initiator: "agent",
       senderThreadId: "thr_parent",
-      target: { kind: "auto", expectedTurnId: "turn-1" },
       text: "Please account for the restart",
-    });
-    events.push(
-      steerRequest,
-      event.inputAccepted({
-        clientRequestId: steerRequest.data.requestId,
-      }),
-      event.commandCompleted({
-        itemId: "tool-after-steer",
-        command: "sqlite3 ~/.bb-dev/bb.db '.tables'",
-      }),
-      event.assistantCompleted({
-        itemId: "assistant-1",
-        text: "Done.",
-      }),
-      event.turnCompleted(),
-    );
-
-    const timeline = renderCompletedTimeline({ events });
-
-    expect(rowSignatures(timeline.rows)).toEqual([
-      "turn:1-7",
-      "conversation:assistant",
-    ]);
-    expect(topLevelWorkRows(timeline.rows)).toHaveLength(0);
-
-    const turnRow = requireOnlyTurnRow(timeline.rows);
-    expect(turnRow.summaryCount).toBe(3);
-    expect(rowSignatures(turnRow.children ?? [])).toEqual([
-      "work:command",
-      "conversation:user",
-      "work:command",
-    ]);
-  });
-
-  it("does not split completed turn summaries around accepted system steers", () => {
-    const event = createTimelineEventFactory({ threadId: "thread-1" });
-    const events: TimelineFixtureEvent[] = [
-      event.turnStarted(),
-      event.commandCompleted({
-        itemId: "tool-before-steer",
-        command: "pnpm test",
-      }),
-    ];
-    const steerRequest = event.clientTurnRequested({
+    },
+    {
       initiator: "system",
       senderThreadId: null,
-      target: { kind: "auto", expectedTurnId: "turn-1" },
       text: "[bb system] Continue after reconnect.",
-    });
-    events.push(
-      steerRequest,
-      event.inputAccepted({
-        clientRequestId: steerRequest.data.requestId,
-      }),
-      event.commandCompleted({
-        itemId: "tool-after-steer",
-        command: "sqlite3 ~/.bb-dev/bb.db '.tables'",
-      }),
-      event.assistantCompleted({
-        itemId: "assistant-1",
-        text: "Done.",
-      }),
-      event.turnCompleted(),
-    );
+    },
+  ] as const)(
+    "does not split completed turn summaries around accepted $initiator steers",
+    ({ initiator, senderThreadId, text }) => {
+      const event = createTimelineEventFactory({ threadId: "thread-1" });
+      const events: TimelineFixtureEvent[] = [
+        event.turnStarted(),
+        event.commandCompleted({
+          itemId: "tool-before-steer",
+          command: "pnpm test",
+        }),
+      ];
+      const steerRequest = event.clientTurnRequested({
+        initiator,
+        senderThreadId,
+        target: { kind: "auto", expectedTurnId: "turn-1" },
+        text,
+      });
+      events.push(
+        steerRequest,
+        event.inputAccepted({
+          clientRequestId: steerRequest.data.requestId,
+        }),
+        event.commandCompleted({
+          itemId: "tool-after-steer",
+          command: "sqlite3 ~/.bb-dev/bb.db '.tables'",
+        }),
+        event.assistantCompleted({
+          itemId: "assistant-1",
+          text: "Done.",
+        }),
+        event.turnCompleted(),
+      );
 
-    const timeline = renderCompletedTimeline({ events });
+      const timeline = renderCompletedTimeline({ events });
 
-    expect(rowSignatures(timeline.rows)).toEqual([
-      "turn:1-7",
-      "conversation:assistant",
-    ]);
-    expect(topLevelWorkRows(timeline.rows)).toHaveLength(0);
+      expect(rowSignatures(timeline.rows)).toEqual([
+        "turn:1-7",
+        "conversation:assistant",
+      ]);
+      expect(topLevelWorkRows(timeline.rows)).toHaveLength(0);
 
-    const turnRow = requireOnlyTurnRow(timeline.rows);
-    expect(turnRow.summaryCount).toBe(3);
-    expect(rowSignatures(turnRow.children ?? [])).toEqual([
-      "work:command",
-      "conversation:user",
-      "work:command",
-    ]);
-  });
+      const turnRow = requireOnlyTurnRow(timeline.rows);
+      expect(turnRow.summaryCount).toBe(3);
+      expect(rowSignatures(turnRow.children ?? [])).toEqual([
+        "work:command",
+        "conversation:user",
+        "work:command",
+      ]);
+    },
+  );
 
   it("splits completed turn summaries around converted legacy user messages", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
@@ -626,44 +631,6 @@ describe("completed turn summary rendering", () => {
     ).toEqual([["work:command"], ["work:command"]]);
   });
 
-  it("keeps summary rows on both sides of debug raw events", () => {
-    const event = createTimelineEventFactory({ threadId: "thread-1" });
-
-    const timeline = renderCompletedTimeline({
-      events: [
-        event.turnStarted(),
-        event.commandCompleted({
-          itemId: "tool-before-debug",
-          command: "pnpm test",
-        }),
-        event.providerUnhandled({
-          rawType: "session.unexpected",
-        }),
-        event.commandCompleted({
-          itemId: "tool-after-debug",
-          command: "git status --short",
-        }),
-        event.assistantCompleted({
-          itemId: "assistant-1",
-          text: "Done.",
-        }),
-        event.turnCompleted(),
-      ],
-      includeDebugRawEvents: true,
-    });
-
-    expect(rowSignatures(timeline.rows)).toEqual([
-      "turn:2-2",
-      "system:debug",
-      "turn:4-4",
-      "conversation:assistant",
-    ]);
-    expect(topLevelWorkRows(timeline.rows)).toHaveLength(0);
-    expect(turnRows(timeline.rows).map((row) => row.summaryCount)).toEqual([
-      1, 1,
-    ]);
-  });
-
   it("does not synthesize empty summary rows for user-only completed turns", () => {
     const event = createTimelineEventFactory({ threadId: "thread-1" });
     const request = event.clientTurnRequested({
@@ -691,5 +658,123 @@ describe("completed turn summary rendering", () => {
       "conversation:assistant",
     ]);
     expect(turnRows(timeline.rows)).toHaveLength(0);
+  });
+});
+
+describe("flat completed turn display", () => {
+  function narratedTurn() {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+    const request = event.clientTurnRequested({
+      target: { kind: "new-turn" },
+      text: "Is the daemon command blob pruning durable?",
+    });
+    const liveEvents = [
+      request,
+      event.turnStarted(),
+      event.inputAccepted({ clientRequestId: request.data.requestId }),
+      event.assistantCompleted({
+        itemId: "assistant-1",
+        text: "Let me check the pruning code.",
+      }),
+      event.commandCompleted({ itemId: "tool-1", command: "rg prune" }),
+      event.assistantCompleted({
+        itemId: "assistant-2",
+        text: "Yes: pruning runs inside the daemon transaction.",
+      }),
+    ];
+    return {
+      liveEvents,
+      finishedEvents: [...liveEvents, event.turnCompleted()],
+    };
+  }
+
+  it("keeps a finished turn's rows exactly as they rendered while it ran", () => {
+    const { liveEvents, finishedEvents } = narratedTurn();
+
+    const live = renderTimelineFixture({
+      completedTurnDisplay: "flat",
+      events: liveEvents,
+      includeNestedRows: false,
+      projectionOptions: {
+        threadStatus: "active",
+        turnMessageDetail: "summary",
+      },
+    });
+    const finished = renderTimelineFixture({
+      completedTurnDisplay: "flat",
+      events: finishedEvents,
+      includeNestedRows: false,
+      projectionOptions: { threadStatus: "idle", turnMessageDetail: "summary" },
+    });
+
+    expect(rowSignatures(finished.rows)).toEqual([
+      "conversation:user",
+      "conversation:assistant",
+      "work:command",
+      "conversation:assistant",
+    ]);
+    expect(finished.rows.map((row) => row.id)).toEqual(
+      live.rows.map((row) => row.id),
+    );
+    expect(turnRows(finished.rows)).toHaveLength(0);
+    expect(finished.text).not.toContain("Worked for");
+  });
+
+  it("keeps the work of a finished turn that summary detail would drop", () => {
+    const event = createTimelineEventFactory({ threadId: "thread-1" });
+
+    const finished = renderTimelineFixture({
+      completedTurnDisplay: "flat",
+      events: [
+        event.turnStarted(),
+        event.commandCompleted({ itemId: "tool-1", command: "pnpm test" }),
+        event.assistantCompleted({
+          itemId: "assistant-1",
+          text: "All tests pass.",
+        }),
+        event.turnCompleted(),
+      ],
+      includeNestedRows: false,
+      projectionOptions: { threadStatus: "idle", turnMessageDetail: "summary" },
+    });
+
+    expect(rowSignatures(finished.rows)).toEqual([
+      "work:command",
+      "conversation:assistant",
+    ]);
+  });
+
+  it("answers a turn details request with the flat rows instead of a missing match", () => {
+    const { finishedEvents } = narratedTurn();
+    const events = fromRows(finishedEvents);
+    const detailOptions = {
+      includeDiagnosticOperations: false,
+      sourceSeqStart: 4,
+      threadName: "",
+      threadStatus: "idle" as const,
+      turnId: "turn-1",
+      workspaceRoot: null,
+    };
+
+    const flat = buildThreadTimelineTurnDetailsFromEvents({
+      events,
+      options: { ...detailOptions, completedTurnDisplay: "flat" },
+    });
+    const collapsed = buildThreadTimelineTurnDetailsFromEvents({
+      events,
+      options: { ...detailOptions, completedTurnDisplay: "collapse" },
+    });
+
+    expect(flat.kind).toBe("ungrouped");
+    expect(flat.kind === "ungrouped" ? rowSignatures(flat.rows) : []).toEqual([
+      "conversation:user",
+      "conversation:assistant",
+      "work:command",
+      "conversation:assistant",
+    ]);
+    expect(collapsed.kind).toBe("matched");
+    expect(
+      collapsed.kind === "matched" ? rowSignatures(collapsed.rows) : [],
+    ).toEqual(["conversation:assistant", "work:command"]);
   });
 });

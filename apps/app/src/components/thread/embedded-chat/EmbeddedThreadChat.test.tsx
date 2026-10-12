@@ -1,27 +1,40 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useEffect, useLayoutEffect, type ReactNode } from "react";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { LazyQueuedMessagesList } from "@/components/promptbox/banner/LazyQueuedMessagesList";
 import type { FollowUpComposerProps } from "@/components/promptbox/FollowUpPromptBox";
+import type { PluginComposerHost } from "@/components/plugin/plugin-composer-host";
+import { getPromptDraftAccessor } from "@/hooks/usePromptDraftStorage";
 import { EmbeddedThreadChat } from "./EmbeddedThreadChat";
 
 const mocks = vi.hoisted(() => ({
   createQueuedMessageMutateAsync: vi.fn(),
-  markThreadReadMutate: vi.fn(),
   onOpenLink: vi.fn(),
   onOpenLocalFileLink: vi.fn(),
-  pendingInteractions: [] as Array<{
-    id: string;
-    createdAt: number;
-    payload: { kind: string };
-  }>,
+  pendingInteractions: [] as
+    | Array<{
+        id: string;
+        createdAt: number;
+        payload: { kind: string };
+      }>
+    | undefined,
+  pendingInteractionsIsError: false,
+  pendingInteractionsIsFetching: false,
+  pendingInteractionsIsLoading: false,
   queuedMessages: [] as Array<{ id: string }>,
-  readTrackingThreads: [] as Array<unknown>,
+  sendQueuedMessageMutateAsync: vi.fn(),
   sendThreadMessageMutateAsync: vi.fn(),
   threadRuntimeDisplayStatus: "idle" as string,
-  // Stands in for the realtime-updated timeline query cache: rows appended here
-  // while the component is unmounted must appear after a remount.
   timelineRows: [] as Array<{ text: string }>,
   injectedTimelineProps: [] as Array<unknown>,
   timelinePanelProps: [] as Array<Record<string, unknown>>,
@@ -29,39 +42,96 @@ const mocks = vi.hoisted(() => ({
   resolveMentionLink: vi.fn(),
 }));
 
-vi.mock("@/components/promptbox/FollowUpPromptBox", () => ({
-  FollowUpPromptBox: ({
-    composer,
-    stack,
-  }: {
-    composer: Pick<
-      FollowUpComposerProps,
-      "message" | "onChangeMessage" | "onSubmit"
-    >;
-    stack: ReactNode;
-  }) => (
-    <div>
-      {stack}
-      <input
-        data-testid="embedded-chat-composer"
-        value={composer.message}
-        onChange={(event) => composer.onChangeMessage(event.target.value, [])}
-      />
-      <button type="button" onClick={composer.onSubmit}>
-        Send
-      </button>
-    </div>
-  ),
+const hostDraftMocks = vi.hoisted(() => ({
+  latestHost: null as PluginComposerHost | null,
+  textAtNotify: [] as string[],
+  subscribed: false,
 }));
+
+vi.mock("@/components/promptbox/FollowUpPromptBox", async () => {
+  const { usePluginComposerHostDraft } =
+    await import("@/components/plugin/plugin-composer-host");
+  function BottomHostDraftProbe({ host }: { host: PluginComposerHost | null }) {
+    useLayoutEffect(() => {
+      hostDraftMocks.latestHost = host;
+    }, [host]);
+    useEffect(() => {
+      if (hostDraftMocks.subscribed || !host) return;
+      hostDraftMocks.subscribed = true;
+      host.subscribeDraft(() => {
+        hostDraftMocks.textAtNotify.push(
+          hostDraftMocks.latestHost?.getCurrent().text ?? "",
+        );
+      });
+    }, [host]);
+    const draft = usePluginComposerHostDraft(host);
+    return <div data-testid="embedded-host-draft">{draft?.text ?? ""}</div>;
+  }
+  return {
+    FollowUpPromptBox: ({
+      composer,
+      pendingInteraction,
+      stack,
+      pluginComposerHost,
+    }: {
+      composer: Pick<
+        FollowUpComposerProps,
+        "message" | "onChangeMessage" | "onSubmit" | "submitMode"
+      >;
+      pendingInteraction?: ReactNode;
+      stack: ReactNode;
+      pluginComposerHost?: PluginComposerHost | null;
+    }) => (
+      <div>
+        {stack}
+        {pendingInteraction}
+        <input
+          data-testid="embedded-chat-composer"
+          data-submit-mode={composer.submitMode.kind}
+          data-submit-reason={
+            composer.submitMode.kind === "blocked"
+              ? composer.submitMode.reason
+              : undefined
+          }
+          hidden={
+            pendingInteraction !== undefined && pendingInteraction !== null
+          }
+          value={composer.message}
+          onChange={(event) => composer.onChangeMessage(event.target.value, [])}
+        />
+        <button type="button" onClick={composer.onSubmit}>
+          Send
+        </button>
+        <BottomHostDraftProbe host={pluginComposerHost ?? null} />
+      </div>
+    ),
+  };
+});
 
 vi.mock("@/components/promptbox/banner/QueuedMessagesList", () => ({
   QueuedMessagesList: ({
+    attachedToComposer,
+    onSend,
     queuedMessages,
+    sendAction,
+    sendDisabled,
   }: {
+    attachedToComposer: boolean;
+    onSend: (queuedMessageId: string) => void;
     queuedMessages: readonly unknown[];
+    sendAction: "send-now" | "steer-when-ready";
+    sendDisabled: boolean;
   }) => (
-    <div data-testid="embedded-chat-queued-messages">
+    <div
+      data-testid="embedded-chat-queued-messages"
+      data-attached-to-composer={String(attachedToComposer)}
+      data-send-action={sendAction}
+      data-send-disabled={sendDisabled ? "" : undefined}
+    >
       <span data-testid="queued-count">{queuedMessages.length}</span>
+      <button type="button" onClick={() => onSend("q1")}>
+        Send queued message
+      </button>
     </div>
   ),
 }));
@@ -148,7 +218,7 @@ vi.mock("@/hooks/useThreadCreationOptions", () => ({
 vi.mock("@/hooks/usePromptMentions", () => ({
   usePromptMentions: () => ({
     triggers: [],
-    suggestions: [],
+    results: { groups: [], suggestions: [] },
     isLoading: false,
     isError: false,
     setQuery: vi.fn(),
@@ -157,7 +227,7 @@ vi.mock("@/hooks/usePromptMentions", () => ({
 
 vi.mock("@/hooks/useCommandSuggestions", () => ({
   useCommandSuggestions: () => ({
-    trigger: null,
+    triggers: [],
     suggestions: [],
     isLoading: false,
     isError: false,
@@ -181,16 +251,21 @@ vi.mock("@/hooks/queries/thread-queries", () => ({
         : undefined,
   }),
   useThreadQueuedMessages: () => ({ data: mocks.queuedMessages }),
-  useThreadPendingInteractions: () => ({ data: mocks.pendingInteractions }),
-  getLatestPendingInteraction: (
+  useThreadPendingInteractions: () => ({
+    data: mocks.pendingInteractions,
+    isError: mocks.pendingInteractionsIsError,
+    isFetching: mocks.pendingInteractionsIsFetching,
+    isLoading: mocks.pendingInteractionsIsLoading,
+  }),
+  orderPendingInteractions: (
     interactions: readonly { createdAt: number }[] | undefined,
-  ) => (interactions && interactions.length > 0 ? interactions[0] : null),
+  ) => interactions ?? [],
 }));
 
 vi.mock(
   "@/components/thread/pending-interactions/ThreadPendingInteractionBanner",
   () => ({
-    ThreadPendingInteractionBanner: ({ threadId }: { threadId: string }) => (
+    ThreadPendingInteractionBanners: ({ threadId }: { threadId: string }) => (
       <div data-testid="pending-interaction-banner">{threadId}</div>
     ),
   }),
@@ -242,7 +317,7 @@ vi.mock("@/hooks/mutations/thread-runtime-mutations", () => ({
     isPending: false,
   }),
   useSendThreadQueuedMessage: () => ({
-    mutateAsync: vi.fn(),
+    mutateAsync: mocks.sendQueuedMessageMutateAsync,
     isPending: false,
   }),
   useSetThreadQueuedMessageGroupBoundary: () => ({
@@ -255,14 +330,13 @@ vi.mock("@/hooks/mutations/thread-runtime-mutations", () => ({
   }),
 }));
 
-vi.mock("@/hooks/mutations/thread-state-mutations", () => ({
-  useMarkThreadRead: () => ({ mutate: mocks.markThreadReadMutate }),
-}));
+vi.mock("@/hooks/mutations/thread-state-mutations", () => {
+  const mutate = vi.fn();
+  return { useMarkThreadRead: () => ({ mutate }) };
+});
 
 vi.mock("@/hooks/useThreadReadTracking", () => ({
-  useThreadReadTracking: ({ thread }: { thread?: unknown }) => {
-    mocks.readTrackingThreads.push(thread);
-  },
+  useThreadReadTracking: () => {},
 }));
 
 vi.mock("@/hooks/mutations/project-mutations", () => ({
@@ -272,25 +346,23 @@ vi.mock("@/hooks/mutations/project-mutations", () => ({
   }),
 }));
 
-function renderEmbeddedChat({
+function buildEmbeddedChat({
   threadId = "thr_child",
-  isActive = true,
   surfaceTone = "background",
+  pluginComposerBottomScope,
 }: {
-  threadId?: string | null;
-  isActive?: boolean;
+  threadId?: string;
   surfaceTone?: "background" | "sidebar";
+  pluginComposerBottomScope?: PluginComposerHost["scope"];
 } = {}) {
-  return render(
+  return (
     <EmbeddedThreadChat
       variant="compact"
       surfaceTone={surfaceTone}
       threadId={threadId}
-      surfaceFallbackKey="tab-1"
       projectId="proj-1"
       providerId="provider-1"
       promptContextEnvironmentId={null}
-      isActive={isActive}
       onOpenLink={mocks.onOpenLink}
       onOpenLocalFileLink={mocks.onOpenLocalFileLink}
       resolveMentionLink={mocks.resolveMentionLink}
@@ -299,34 +371,48 @@ function renderEmbeddedChat({
         draftScope: {
           kind: "thread",
           projectId: "proj-1",
-          threadId: threadId ?? "thr_parent",
+          threadId,
         },
-        executionDefaultsThreadId: threadId ?? "thr_parent",
+        executionDefaultsThreadId: threadId,
         executionResetKey: "thr_parent",
         permissionPolicy: "snapshot",
         environmentSummary: null,
+        ...(pluginComposerBottomScope ? { pluginComposerBottomScope } : {}),
       }}
-    />,
+    />
   );
 }
 
+function renderEmbeddedChat(
+  options: Parameters<typeof buildEmbeddedChat>[0] = {},
+) {
+  return render(buildEmbeddedChat(options));
+}
+
 describe("EmbeddedThreadChat", () => {
+  beforeAll(() => LazyQueuedMessagesList.preload());
+
   beforeEach(() => {
     window.localStorage.clear();
     mocks.createQueuedMessageMutateAsync.mockReset().mockResolvedValue({});
     mocks.sendThreadMessageMutateAsync.mockReset().mockResolvedValue({});
-    mocks.markThreadReadMutate.mockReset();
     mocks.onOpenLink.mockReset();
     mocks.onOpenLocalFileLink.mockReset();
     mocks.pendingInteractions = [];
+    mocks.pendingInteractionsIsError = false;
+    mocks.pendingInteractionsIsFetching = false;
+    mocks.pendingInteractionsIsLoading = false;
     mocks.queuedMessages = [];
-    mocks.readTrackingThreads = [];
+    mocks.sendQueuedMessageMutateAsync.mockReset().mockResolvedValue({});
     mocks.threadRuntimeDisplayStatus = "idle";
     mocks.timelineRows = [];
     mocks.injectedTimelineProps = [];
     mocks.timelinePanelProps = [];
     mocks.timelineProjectIds = [];
     mocks.resolveMentionLink.mockReset();
+    hostDraftMocks.latestHost = null;
+    hostDraftMocks.textAtNotify = [];
+    hostDraftMocks.subscribed = false;
   });
 
   it("applies the requested surface tone to the timeline and footer", () => {
@@ -337,9 +423,6 @@ describe("EmbeddedThreadChat", () => {
         '[data-thread-window][data-surface-tone="sidebar"]',
       ),
     ).not.toBeNull();
-    expect(screen.getByTestId("embedded-chat-scroll-area").classList).toContain(
-      "bg-sidebar",
-    );
     expect(screen.getByTestId("embedded-chat-overflow-fade").dataset.tone).toBe(
       "sidebar",
     );
@@ -352,8 +435,6 @@ describe("EmbeddedThreadChat", () => {
   });
 
   it("forwards the project to the timeline so attachment images resolve to API URLs", () => {
-    // Without it, uploaded attachment paths stay relative and the browser
-    // resolves them against the current route (e.g. /plugins/<id>/...).
     renderEmbeddedChat();
     expect(mocks.timelineProjectIds.at(-1)).toBe("proj-1");
   });
@@ -371,6 +452,22 @@ describe("EmbeddedThreadChat", () => {
     );
   });
 
+  it("keeps add-to-chat callbacks stable while the composer draft changes", () => {
+    renderEmbeddedChat();
+    const initialTimelineProps = mocks.timelinePanelProps.at(-1);
+
+    fireEvent.change(screen.getByTestId("embedded-chat-composer"), {
+      target: { value: "Typing must not invalidate timeline rows" },
+    });
+
+    expect(mocks.timelinePanelProps.at(-1)).toEqual(
+      expect.objectContaining({
+        onMessageAddToChat: initialTimelineProps?.onMessageAddToChat,
+        onSelectionAddToChat: initialTimelineProps?.onSelectionAddToChat,
+      }),
+    );
+  });
+
   it("restores the draft and a stream that advanced while unmounted on remount", () => {
     mocks.threadRuntimeDisplayStatus = "active";
     mocks.timelineRows = [{ text: "First reply" }];
@@ -381,9 +478,6 @@ describe("EmbeddedThreadChat", () => {
     expect(screen.getAllByTestId("embedded-chat-timeline-row")).toHaveLength(1);
     first.unmount();
 
-    // The stream advances while no surface is mounted (rows land in the shared
-    // timeline store); a fresh mount must pick up both the persisted draft and
-    // the newly streamed rows.
     mocks.timelineRows = [{ text: "First reply" }, { text: "Streamed later" }];
     renderEmbeddedChat();
     expect(
@@ -392,7 +486,6 @@ describe("EmbeddedThreadChat", () => {
     const rows = screen.getAllByTestId("embedded-chat-timeline-row");
     expect(rows).toHaveLength(2);
     expect(rows[1]?.textContent).toBe("Streamed later");
-    // No injected controller: the component owns timeline loading here.
     expect(mocks.injectedTimelineProps.at(-1)).toBeUndefined();
   });
 
@@ -415,7 +508,6 @@ describe("EmbeddedThreadChat", () => {
       }),
     );
     expect(mocks.sendThreadMessageMutateAsync).not.toHaveBeenCalled();
-    // The submitted draft clears — and stays cleared on a remount.
     expect(
       screen.getByTestId<HTMLInputElement>("embedded-chat-composer").value,
     ).toBe("");
@@ -440,20 +532,6 @@ describe("EmbeddedThreadChat", () => {
     );
   });
 
-  it("tracks read state only while active", () => {
-    renderEmbeddedChat({ isActive: false });
-    expect(mocks.readTrackingThreads.every((t) => t === undefined)).toBe(true);
-    cleanup();
-
-    mocks.readTrackingThreads = [];
-    renderEmbeddedChat({ isActive: true });
-    expect(
-      mocks.readTrackingThreads.some(
-        (t) => (t as { id?: string } | undefined)?.id === "thr_child",
-      ),
-    ).toBe(true);
-  });
-
   it("keeps queued messages adjacent to the composer", () => {
     mocks.queuedMessages = [{ id: "q1" }, { id: "q2" }];
     renderEmbeddedChat();
@@ -464,16 +542,28 @@ describe("EmbeddedThreadChat", () => {
     expect(screen.getByTestId("queued-count").textContent).toBe("2");
   });
 
-  it("keeps queued messages visible while a retained embedded chat is inactive", () => {
+  it("steers a queued row once provisioning is ready", async () => {
+    mocks.threadRuntimeDisplayStatus = "provisioning";
     mocks.queuedMessages = [{ id: "q1" }];
-    renderEmbeddedChat({ isActive: false });
+    renderEmbeddedChat();
 
-    expect(screen.getByTestId("queued-count").textContent).toBe("1");
+    const queue = screen.getByTestId("embedded-chat-queued-messages");
+    expect(queue.dataset.sendAction).toBe("steer-when-ready");
+    expect(queue.dataset.sendDisabled).toBeUndefined();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Send queued message" }),
+    );
+
+    await vi.waitFor(() => {
+      expect(mocks.sendQueuedMessageMutateAsync).toHaveBeenCalledWith({
+        id: "thr_child",
+        mode: "steer",
+        queuedMessageId: "q1",
+      });
+    });
   });
 
-  // Only the main thread view used to render approvals, so a side chat in a
-  // plugin panel would sit on an approval the user could not answer.
-  it("swaps the composer for a pending approval so it can be answered", () => {
+  it("shows a pending approval in place of the composer", () => {
     mocks.pendingInteractions = [
       { id: "int_1", createdAt: 1, payload: { kind: "approval" } },
     ];
@@ -483,10 +573,22 @@ describe("EmbeddedThreadChat", () => {
     expect(screen.getByTestId("pending-interaction-banner").textContent).toBe(
       "thr_side_chat",
     );
-    expect(screen.queryByTestId("embedded-chat-composer")).toBeNull();
+    expect(screen.getByTestId("embedded-chat-composer").hidden).toBe(true);
   });
 
-  // A plugin-owned interaction has its own composer, so the draft must stay.
+  it("hides held messages while a pending side-chat question is answered", () => {
+    mocks.pendingInteractions = [
+      { id: "int_1", createdAt: 1, payload: { kind: "user_question" } },
+    ];
+    mocks.queuedMessages = [{ id: "q1" }];
+
+    renderEmbeddedChat({ threadId: "thr_side_chat" });
+
+    expect(screen.getByTestId("pending-interaction-banner")).toBeTruthy();
+    expect(screen.queryByTestId("embedded-chat-queued-messages")).toBeNull();
+    expect(screen.getByTestId("embedded-chat-composer").hidden).toBe(true);
+  });
+
   it("keeps the composer for a plugin-owned interaction", () => {
     mocks.pendingInteractions = [
       { id: "int_2", createdAt: 1, payload: { kind: "plugin" } },
@@ -496,5 +598,166 @@ describe("EmbeddedThreadChat", () => {
 
     expect(screen.queryByTestId("pending-interaction-banner")).toBeNull();
     expect(screen.getByTestId("embedded-chat-composer")).toBeTruthy();
+  });
+
+  it("keeps queued messages attached for a plugin-owned interaction", () => {
+    mocks.pendingInteractions = [
+      { id: "int_2", createdAt: 1, payload: { kind: "plugin" } },
+    ];
+    mocks.queuedMessages = [{ id: "q1" }];
+
+    renderEmbeddedChat({ threadId: "thr_side_chat" });
+
+    expect(
+      screen
+        .getByTestId("embedded-chat-queued-messages")
+        .getAttribute("data-attached-to-composer"),
+    ).toBe("true");
+  });
+
+  it("keeps sending available while the first interaction check is pending", async () => {
+    mocks.pendingInteractions = undefined;
+    mocks.pendingInteractionsIsFetching = true;
+    mocks.pendingInteractionsIsLoading = true;
+
+    renderEmbeddedChat({ threadId: "thr_side_chat" });
+
+    const composer = screen.getByTestId("embedded-chat-composer");
+    expect(composer.hidden).toBe(false);
+    expect(composer.dataset.submitMode).toBe("ready");
+    fireEvent.change(composer, { target: { value: "Keep this draft" } });
+    expect(screen.getByDisplayValue("Keep this draft")).toBe(composer);
+    fireEvent.click(screen.getByText("Send"));
+    await vi.waitFor(() => {
+      expect(mocks.sendThreadMessageMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "thr_side_chat",
+          input: [{ type: "text", text: "Keep this draft", mentions: [] }],
+        }),
+      );
+    });
+  });
+
+  it("preserves the editor and queued messages through an interaction refresh", () => {
+    mocks.queuedMessages = [{ id: "q1" }];
+    const view = renderEmbeddedChat({ threadId: "thr_side_chat" });
+    const composer = screen.getByTestId("embedded-chat-composer");
+    const queue = screen.getByTestId("embedded-chat-queued-messages");
+    expect(queue.dataset.sendDisabled).toBeUndefined();
+    fireEvent.change(composer, { target: { value: "Keep this draft" } });
+
+    mocks.pendingInteractionsIsFetching = true;
+    view.rerender(buildEmbeddedChat({ threadId: "thr_side_chat" }));
+
+    expect(composer.hidden).toBe(false);
+    expect(composer.dataset.submitMode).toBe("ready");
+    expect(screen.getByTestId("embedded-chat-queued-messages")).toBeTruthy();
+    expect(queue.dataset.sendDisabled).toBeUndefined();
+    expect(screen.getByDisplayValue("Keep this draft")).toBe(composer);
+
+    mocks.pendingInteractionsIsFetching = false;
+    view.rerender(buildEmbeddedChat({ threadId: "thr_side_chat" }));
+
+    expect(composer.dataset.submitMode).toBe("ready");
+    expect(queue.dataset.sendDisabled).toBeUndefined();
+    expect(screen.getByDisplayValue("Keep this draft")).toBe(composer);
+  });
+
+  it("keeps the composer available after an interaction check fails, like a normal thread", () => {
+    mocks.pendingInteractions = undefined;
+    mocks.pendingInteractionsIsError = true;
+    mocks.queuedMessages = [{ id: "q1" }];
+
+    renderEmbeddedChat({ threadId: "thr_side_chat" });
+
+    const composer = screen.getByTestId("embedded-chat-composer");
+    expect(composer.hidden).toBe(false);
+    expect(composer.dataset.submitMode).toBe("ready");
+    expect(screen.getByTestId("embedded-chat-queued-messages")).toBeTruthy();
+  });
+
+  it("keeps the composer key across a remount and writes after unmount to the thread draft", () => {
+    const scope = { kind: "thread", threadId: "thr_key" } as const;
+    const draftKey = getPromptDraftAccessor({
+      kind: "thread",
+      projectId: "proj-1",
+      threadId: "thr_key",
+    }).storageKey;
+    const first = render(
+      buildEmbeddedChat({
+        threadId: "thr_key",
+        pluginComposerBottomScope: scope,
+      }),
+    );
+    const firstHost = hostDraftMocks.latestHost!;
+    expect(firstHost.textEffectKey).toBe(draftKey);
+    expect(firstHost.getSelection?.()).toEqual({
+      providerId: "provider-1",
+      model: "gpt-5",
+      reasoningLevel: "medium",
+      permissionMode: "auto",
+    });
+    first.unmount();
+
+    firstHost.setDraft({ text: "late result", mentions: [], attachments: [] });
+
+    render(
+      buildEmbeddedChat({
+        threadId: "thr_key",
+        pluginComposerBottomScope: scope,
+      }),
+    );
+    const secondHost = hostDraftMocks.latestHost!;
+    expect(secondHost.textEffectKey).toBe(draftKey);
+    expect(screen.getByTestId("embedded-host-draft").textContent).toBe(
+      "late result",
+    );
+  });
+
+  it("delivers the new thread's draft to host subscribers immediately on a thread switch", () => {
+    getPromptDraftAccessor({
+      kind: "thread",
+      projectId: "proj-1",
+      threadId: "thr_switch_a",
+    }).setDraft({ text: "alpha draft", mentions: [], attachments: [] });
+    getPromptDraftAccessor({
+      kind: "thread",
+      projectId: "proj-1",
+      threadId: "thr_switch_b",
+    }).setDraft({ text: "beta draft", mentions: [], attachments: [] });
+
+    const scopeFor = (threadId: string) =>
+      ({ kind: "thread", threadId }) as const;
+    const view = render(
+      buildEmbeddedChat({
+        threadId: "thr_switch_a",
+        pluginComposerBottomScope: scopeFor("thr_switch_a"),
+      }),
+    );
+    expect(screen.getByTestId("embedded-host-draft").textContent).toBe(
+      "alpha draft",
+    );
+
+    view.rerender(
+      buildEmbeddedChat({
+        threadId: "thr_switch_b",
+        pluginComposerBottomScope: scopeFor("thr_switch_b"),
+      }),
+    );
+    expect(screen.getByTestId("embedded-host-draft").textContent).toBe(
+      "beta draft",
+    );
+    expect(hostDraftMocks.textAtNotify).toEqual(["beta draft"]);
+
+    view.rerender(
+      buildEmbeddedChat({
+        threadId: "thr_switch_a",
+        pluginComposerBottomScope: scopeFor("thr_switch_a"),
+      }),
+    );
+    expect(screen.getByTestId("embedded-host-draft").textContent).toBe(
+      "alpha draft",
+    );
+    expect(hostDraftMocks.textAtNotify).toEqual(["beta draft", "alpha draft"]);
   });
 });

@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   act,
@@ -9,84 +15,102 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { createStore, Provider } from "jotai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import type {
+  ComposerView,
+  ExperimentalComposerSelection,
   PluginComposerApi,
+  PluginFileOpenerProps,
   PluginNewThreadPanelProps,
   PluginThreadPanelProps,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import { createPluginPanelFixedPanelTab } from "@/lib/fixed-panel-tabs-state";
 import {
   resetPluginSlotStoreForTest,
   setPluginSlotRegistrations,
   type PluginNavPanelSlot,
-  type PluginRegistrationSet,
 } from "@/lib/plugin-slots";
+import { PLUGIN_PANEL_ROUTE_PATH } from "@/lib/route-paths";
 import {
-  AUTOMATIONS_PLUGIN_ID,
-  PLUGIN_PANEL_ROUTE_PATH,
-  AUTOMATIONS_PLUGIN_PANEL_PATH,
-} from "@/lib/route-paths";
+  markPluginFrontendsSettled,
+  resetPluginFrontendBootStateForTest,
+} from "@/lib/plugin-frontend-boot-state";
 import { PluginPanelView } from "@/views/PluginPanelView";
 import {
   PluginPanelHeaderActions,
   PluginPanelHeaderCenter,
 } from "./PluginPanelHeader";
 import { resetAllCrashedPluginSlotsForTest } from "./PluginSlotMount";
-import { PluginComposerActions } from "./PluginComposerActions";
+import { applyPluginCss, resetPluginCssForTest } from "@/lib/plugin-css";
+import { ComposerActionsSlot } from "./PluginComposerActions";
 import { PluginContext } from "./plugin-context";
+import {
+  clearComposerEditorBridge,
+  publishComposerEditorBridge,
+  type ComposerEditorBridge,
+} from "@/lib/composer-editor-registry";
 import {
   PluginComposerHostProvider,
   PluginComposerHostScopeProvider,
   type PluginComposerHost,
+  useComposerHostDraftNotifier,
   usePublishPluginComposerHost,
 } from "./plugin-composer-host";
 import { PluginHomepageSections } from "./PluginHomepageSections";
-import { PluginNavSidebarItems } from "./PluginNavSidebarItems";
+import { makePluginRegistrationSet as registrationSet } from "@/test/fixtures/plugins";
 import {
   getComposerInputLock,
   useComposer,
+  useComposers,
   useComposerView,
 } from "@/lib/plugin-sdk-hooks";
 import { subscribeComposerFocusRequests } from "@/lib/composer-focus-requests";
 import { getComposerTextEffects } from "@/lib/composer-text-effects";
-import { usePromptDraftStorage } from "@/hooks/usePromptDraftStorage";
+import {
+  getPromptDraftAccessor,
+  usePromptDraftStorage,
+} from "@/hooks/usePromptDraftStorage";
 import {
   PluginPanelTabContent,
   usePluginNewThreadPanelActions,
   usePluginPanelActions,
   type OpenPluginPanelArgs,
 } from "./PluginPanelActions";
-import { NewTabActions } from "@/components/secondary-panel/NewTabFileSearch";
-import { splitLayoutAtom } from "@/lib/split-layout/atoms";
-import type { PromptDraftState } from "@/lib/prompt-draft";
+import {
+  NewTabActions,
+  useNewTabActions,
+} from "@/components/secondary-panel/NewTabActions";
+import { buildFileOpenerPanelTab } from "./file-opener-tabs";
+import type { PromptDraftState } from "@bb/client-core";
 
 function composerTextEffectValues(storageKey: string | null) {
   return getComposerTextEffects(storageKey).map(({ effect }) => effect);
 }
 
-function registrationSet(
-  overrides: Partial<PluginRegistrationSet>,
-): PluginRegistrationSet {
-  return {
-    homepageSections: [],
-    settingsSections: [],
-    navPanels: [],
-    threadPanelActions: [],
-    composerCustomizations: [],
-    sidebarFooterActions: [],
-    fileOpeners: [],
-    messageDirectives: [],
-    ...overrides,
-  };
+function RoutedPluginPanelView() {
+  const params = useParams<{
+    pluginId: string;
+    panelPath: string;
+    "*": string;
+  }>();
+  return (
+    <PluginPanelView
+      pluginId={params.pluginId ?? ""}
+      panelPath={params.panelPath ?? ""}
+      subPath={params["*"] ?? ""}
+    />
+  );
 }
 
 afterEach(() => {
   cleanup();
   resetPluginSlotStoreForTest();
+  resetPluginFrontendBootStateForTest();
+  window.localStorage.clear();
   resetAllCrashedPluginSlotsForTest();
+  resetPluginCssForTest();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -240,8 +264,7 @@ describe("useComposer", () => {
         <div>
           <div>scope: {composer.scope.kind}</div>
           <div data-testid={`${label}-scope-project`}>
-            {composer.scope.kind === "new-thread" ||
-            composer.scope.kind === "side-chat"
+            {composer.scope.kind === "new-thread"
               ? (composer.scope.projectId ?? "null")
               : "none"}
           </div>
@@ -336,8 +359,133 @@ describe("useComposer", () => {
 
   function ComposerCustomizationMount() {
     const view = useComposerView();
-    return <PluginComposerActions view={view} />;
+    return <ComposerActionsSlot view={view} />;
   }
+
+  it("does not re-render a plugin that never reads the text while the draft changes", () => {
+    const quietRenders = vi.fn<(composer: PluginComposerApi) => void>();
+    const readingRenders = vi.fn();
+    function QuietProbe() {
+      const composer = useComposer();
+      quietRenders(composer);
+      return (
+        <button
+          type="button"
+          onClick={() => composer.updateText((t) => `${t}!`)}
+        >
+          quiet-update
+        </button>
+      );
+    }
+    function ReadingProbe() {
+      const composer = useComposer();
+      readingRenders();
+      return <div data-testid="reading-text">{composer.text}</div>;
+    }
+    setPluginSlotRegistrations(
+      "demo",
+      registrationSet({
+        composerCustomizations: [
+          {
+            id: "probe",
+            actions: [
+              { id: "quiet", component: QuietProbe },
+              { id: "reading", component: ReadingProbe },
+            ],
+          },
+        ],
+      }),
+    );
+    const staticView: ComposerView = {
+      scope: { kind: "thread", threadId: "thr_quiet" },
+      layout: "expanded",
+      draft: { text: "", isEmpty: true, attachmentCount: 0 },
+      run: { isRunning: false, isSubmitting: false },
+    };
+    render(
+      <MemoryRouter initialEntries={["/threads/thr_quiet"]}>
+        <ComposerActionsSlot view={staticView} />
+      </MemoryRouter>,
+    );
+    const draft = getPromptDraftAccessor({
+      kind: "thread",
+      projectId: PERSONAL_PROJECT_ID,
+      threadId: "thr_quiet",
+    });
+    const quietRendersBefore = quietRenders.mock.calls.length;
+    const readingRendersBefore = readingRenders.mock.calls.length;
+
+    for (const text of ["a", "ab", "abc", "abcd", "abcde"]) {
+      act(() => draft.setDraft({ text, mentions: [], attachments: [] }));
+    }
+
+    expect(quietRenders).toHaveBeenCalledTimes(quietRendersBefore);
+    expect(readingRenders).toHaveBeenCalledTimes(readingRendersBefore + 5);
+    expect(screen.getByTestId("reading-text").textContent).toBe("abcde");
+    expect(quietRenders.mock.lastCall?.[0].text).toBe("abcde");
+
+    fireEvent.click(screen.getByText("quiet-update"));
+    expect(draft.getCurrent().text).toBe("abcde!");
+    expect(screen.getByTestId("reading-text").textContent).toBe("abcde!");
+  });
+
+  it("keeps following the draft once a plugin starts reading it after mount", () => {
+    function LateReader() {
+      const composer = useComposer();
+      const [reading, setReading] = useState(false);
+      return (
+        <div>
+          <button type="button" onClick={() => setReading(true)}>
+            start-reading
+          </button>
+          <div data-testid="late-text">
+            {reading ? composer.text : "not reading"}
+          </div>
+          <div data-testid="late-empty">
+            {reading ? String(composer.isEmpty) : "not reading"}
+          </div>
+        </div>
+      );
+    }
+    setPluginSlotRegistrations(
+      "demo",
+      registrationSet({
+        composerCustomizations: [
+          { id: "probe", actions: [{ id: "late", component: LateReader }] },
+        ],
+      }),
+    );
+    const staticView: ComposerView = {
+      scope: { kind: "thread", threadId: "thr_late" },
+      layout: "expanded",
+      draft: { text: "", isEmpty: true, attachmentCount: 0 },
+      run: { isRunning: false, isSubmitting: false },
+    };
+    render(
+      <MemoryRouter initialEntries={["/threads/thr_late"]}>
+        <ComposerActionsSlot view={staticView} />
+      </MemoryRouter>,
+    );
+    const draft = getPromptDraftAccessor({
+      kind: "thread",
+      projectId: PERSONAL_PROJECT_ID,
+      threadId: "thr_late",
+    });
+
+    act(() => draft.setDraft({ text: "a", mentions: [], attachments: [] }));
+    expect(screen.getByTestId("late-text").textContent).toBe("not reading");
+
+    fireEvent.click(screen.getByText("start-reading"));
+    expect(screen.getByTestId("late-text").textContent).toBe("a");
+
+    act(() => draft.setDraft({ text: "ab", mentions: [], attachments: [] }));
+    expect(screen.getByTestId("late-text").textContent).toBe("ab");
+    expect(screen.getByTestId("late-empty").textContent).toBe("false");
+
+    act(() => draft.setDraft({ text: "", mentions: [], attachments: [] }));
+    expect(screen.getByTestId("late-text").textContent).toBe("");
+    expect(screen.getByTestId("late-empty").textContent).toBe("true");
+  });
 
   it("writes quotes into the thread draft and fires the focus bus", () => {
     registerComposerProbe("t");
@@ -501,6 +649,7 @@ describe("useComposer", () => {
       });
       const draftRef = useRef(draft);
       draftRef.current = draft;
+      const subscribeDraft = useComposerHostDraftNotifier(draft);
       const host = useMemo<PluginComposerHost>(
         () => ({
           scope: {
@@ -508,13 +657,13 @@ describe("useComposer", () => {
             threadId: "thr_queue",
             queuedMessageId,
           },
-          draft,
           textEffectKey: `queued-message:thr_queue:${queuedMessageId}:1`,
           getCurrent: () => draftRef.current,
+          subscribeDraft,
           setDraft,
           focus: () => {},
         }),
-        [draft, queuedMessageId],
+        [queuedMessageId, subscribeDraft],
       );
 
       return (
@@ -605,10 +754,10 @@ describe("useComposer", () => {
                   threadId: "thr_queue",
                   queuedMessageId: "qmsg_1",
                 },
-                draft,
                 textEffectKey:
                   "queued-message:thr_queue:qmsg_1:sibling-surface",
                 getCurrent: () => draft,
+                subscribeDraft: () => () => {},
                 setDraft,
                 focus: () => {},
               }
@@ -651,96 +800,6 @@ describe("useComposer", () => {
 
     fireEvent.click(screen.getByText("dismiss-queued-edit"));
     expect(screen.getByTestId("sibling-scope").textContent).toBe("thread");
-  });
-
-  it("binds side-chat customizations and hooks to the visible side-chat draft", () => {
-    registerComposerProbe("side");
-
-    function SideChatComposerHarness() {
-      const [childThreadId, setChildThreadId] = useState<string | null>(null);
-      const [draft, setDraft] = useState<PromptDraftState>({
-        text: "side-chat draft",
-        mentions: [],
-        attachments: [
-          {
-            type: "localFile",
-            path: "uploads/side-spec.md",
-            name: "side-spec.md",
-            sizeBytes: 42,
-          },
-        ],
-      });
-      const draftRef = useRef(draft);
-      draftRef.current = draft;
-      const host = useMemo<PluginComposerHost>(
-        () => ({
-          scope: {
-            kind: "side-chat",
-            projectId: "proj_side",
-            parentThreadId: "thr_parent",
-            tabId: "side-chat:one",
-            childThreadId,
-          },
-          draft,
-          textEffectKey: `side-chat:side-chat:one:${childThreadId ?? ""}`,
-          getCurrent: () => draftRef.current,
-          setDraft,
-          focus: () => {},
-        }),
-        [childThreadId, draft],
-      );
-
-      return (
-        <PluginComposerHostProvider value={host}>
-          <ComposerCustomizationMount />
-          <div data-testid="side-attachments">
-            {JSON.stringify(draft.attachments)}
-          </div>
-          <button type="button" onClick={() => setChildThreadId("thr_side")}>
-            create-side-child
-          </button>
-        </PluginComposerHostProvider>
-      );
-    }
-
-    render(
-      <MemoryRouter initialEntries={["/threads/thr_parent"]}>
-        <SideChatComposerHarness />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByText("scope: side-chat")).toBeDefined();
-    expect(
-      JSON.parse(screen.getByTestId("side-scope-details").textContent ?? "{}"),
-    ).toEqual({
-      kind: "side-chat",
-      projectId: "proj_side",
-      parentThreadId: "thr_parent",
-      tabId: "side-chat:one",
-      childThreadId: null,
-    });
-
-    fireEvent.click(screen.getByText("side-replace"));
-    expect(screen.getByTestId("side-composer-text").textContent).toBe(
-      "replacement",
-    );
-    expect(
-      JSON.parse(screen.getByTestId("side-attachments").textContent ?? "[]"),
-    ).toHaveLength(1);
-
-    fireEvent.click(screen.getByText("create-side-child"));
-    expect(
-      JSON.parse(screen.getByTestId("side-scope-details").textContent ?? "{}"),
-    ).toEqual({
-      kind: "side-chat",
-      projectId: "proj_side",
-      parentThreadId: "thr_parent",
-      tabId: "side-chat:one",
-      childThreadId: "thr_side",
-    });
-    expect(screen.getByTestId("side-composer-text").textContent).toBe(
-      "replacement",
-    );
   });
 
   it("targets the new-thread composer without leaking replacements to thread drafts", () => {
@@ -804,16 +863,17 @@ describe("useComposer", () => {
       });
       const draftRef = useRef(draft);
       draftRef.current = draft;
+      const subscribeDraft = useComposerHostDraftNotifier(draft);
       const host = useMemo<PluginComposerHost>(
         () => ({
           scope: { kind: "new-thread", projectId },
-          draft,
           textEffectKey: `root:${projectId}`,
           getCurrent: () => draftRef.current,
+          subscribeDraft,
           setDraft,
           focus: () => {},
         }),
-        [draft, projectId],
+        [projectId, subscribeDraft],
       );
 
       return (
@@ -890,9 +950,9 @@ describe("useComposer", () => {
         };
         return {
           scope: { kind: "new-thread", projectId },
-          draft,
           textEffectKey: `root-state:${projectId ?? "null"}`,
           getCurrent: () => draft,
+          subscribeDraft: () => () => {},
           setDraft: () => {},
           focus: () => {},
         };
@@ -1039,11 +1099,9 @@ describe("useComposer", () => {
             threadId: "thr_scope_owner",
             queuedMessageId,
           },
-          draft,
-          // A host can retain its editable surface while its logical scope
-          // changes, as root compose does when the selected project changes.
           textEffectKey: "shared-scope-effect",
           getCurrent: () => draft,
+          subscribeDraft: () => () => {},
           setDraft: () => {},
           focus: () => {},
         }),
@@ -1075,37 +1133,6 @@ describe("useComposer", () => {
     expect(composerTextEffectValues("shared-scope-effect")).toEqual([
       { className: "test-text-effect" },
     ]);
-  });
-
-  it("clears a text effect when the plugin composer scope changes", () => {
-    registerComposerProbe("scope-effect");
-    function ChangeScope() {
-      const navigate = useNavigate();
-      return (
-        <button
-          type="button"
-          onClick={() => navigate("/threads/thr_effect_next")}
-        >
-          change-scope
-        </button>
-      );
-    }
-    render(
-      <MemoryRouter initialEntries={["/threads/thr_effect"]}>
-        <ComposerCustomizationMount />
-        <ThreadDraftViewer threadId="thr_effect" />
-        <ChangeScope />
-      </MemoryRouter>,
-    );
-    const storageKey = screen.getByTestId("draft-key").textContent ?? "";
-
-    fireEvent.click(screen.getByText("scope-effect-start-effect"));
-    expect(composerTextEffectValues(storageKey)).toEqual([
-      { className: "test-text-effect" },
-    ]);
-    fireEvent.click(screen.getByText("change-scope"));
-
-    expect(composerTextEffectValues(storageKey)).toEqual([]);
   });
 
   it("clears and rejects captured lock and effect setters after scope cleanup or unmount", () => {
@@ -1216,7 +1243,6 @@ describe("useComposer", () => {
       },
     ]);
 
-    // A second mention lands after the first with a preserved gap.
     fireEvent.click(screen.getByText("n-mention"));
     expect(screen.getByTestId("draft-text").textContent).toBe(
       "ideas.md ideas.md ",
@@ -1238,43 +1264,376 @@ describe("useComposer", () => {
       expect.stringContaining("invalid provider id"),
     );
   });
+
+  it("routes experimental_submit to the composer that owns the submission, and refuses where none does", async () => {
+    const submit = vi.fn(async () => {});
+    let captured: PluginComposerApi | null = null;
+    registerComposerProbe("submit", (composer) => {
+      captured = composer;
+    });
+    const draft: PromptDraftState = {
+      text: "ship the notes",
+      mentions: [],
+      attachments: [],
+    };
+
+    function Harness({ withSubmit }: { withSubmit: boolean }) {
+      const host = useMemo<PluginComposerHost>(
+        () => ({
+          scope: { kind: "thread", threadId: "thr_submit" },
+          textEffectKey: "thread:thr_submit",
+          getCurrent: () => draft,
+          subscribeDraft: () => () => {},
+          setDraft: () => {},
+          focus: () => {},
+          ...(withSubmit ? { submit } : {}),
+        }),
+        [withSubmit],
+      );
+      return (
+        <PluginComposerHostProvider value={host}>
+          <ComposerCustomizationMount />
+        </PluginComposerHostProvider>
+      );
+    }
+
+    const readyEditor: ComposerEditorBridge = {
+      openPopup: () => false,
+      closePopup: () => false,
+      isPopupOpen: () => false,
+      host: {
+        scope: { kind: "thread", threadId: "thr_submit" },
+        textEffectKey: "thread:thr_submit",
+        getCurrent: () => draft,
+        subscribeDraft: () => () => {},
+        setDraft: () => {},
+        focus: () => {},
+      },
+      pluginCustomizable: true,
+      state: {
+        layout: "expanded",
+        isRunning: false,
+        isSubmitting: false,
+        isSubmittingBlocked: false,
+        submittingBlockedReason: null,
+        isAttaching: false,
+        attachmentError: null,
+      },
+      insertAtCursor: () => true,
+    };
+    publishComposerEditorBridge("thread:thr_submit", readyEditor);
+    const view = render(
+      <MemoryRouter initialEntries={["/threads/thr_submit"]}>
+        <Harness withSubmit />
+      </MemoryRouter>,
+    );
+    const sendAt = Date.now() + 3_600_000;
+    await act(async () => {
+      await captured!.experimental_submit({ sendAt });
+    });
+    expect(submit).toHaveBeenCalledWith({ sendAt }, undefined);
+
+    const experimental_data = { kind: "draft" };
+    await act(async () => {
+      await captured!.experimental_submit({ experimental_data });
+    });
+    expect(submit).toHaveBeenLastCalledWith(
+      { experimental_data },
+      { pluginId: "demo", data: experimental_data },
+    );
+
+    await expect(
+      captured!.experimental_submit({ sendAt: Date.now() - 1 }),
+    ).rejects.toThrow(/future/);
+    expect(submit).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+    render(
+      <MemoryRouter initialEntries={["/threads/thr_submit"]}>
+        <Harness withSubmit={false} />
+      </MemoryRouter>,
+    );
+    await expect(captured!.experimental_submit({ sendAt })).rejects.toThrow(
+      /cannot submit/,
+    );
+    expect(submit).toHaveBeenCalledTimes(2);
+    clearComposerEditorBridge("thread:thr_submit", readyEditor);
+  });
 });
 
-describe("PluginNavSidebarItems + PluginPanelView", () => {
+describe("useComposer().experimental_setSelection", () => {
+  function ComposerCustomizationMount() {
+    const view = useComposerView();
+    return <ComposerActionsSlot view={view} />;
+  }
+
+  function registerSelectionProbe(
+    onRender: (
+      composer: PluginComposerApi,
+      listed: readonly PluginComposerApi[],
+    ) => void,
+  ) {
+    function SelectionProbe() {
+      const composer = useComposer();
+      const listed = useComposers();
+      onRender(composer, listed);
+      return <div>selection probe</div>;
+    }
+    setPluginSlotRegistrations("demo", {
+      homepageSections: [],
+      settingsSections: [],
+      navPanels: [],
+      threadPanelActions: [],
+      sidebarFooterActions: [],
+      fileOpeners: [],
+      messageDirectives: [],
+      composerCustomizations: [
+        {
+          id: "selection",
+          actions: [{ id: "probe", component: SelectionProbe }],
+        },
+      ],
+    });
+  }
+
+  const emptyDraft: PromptDraftState = {
+    text: "",
+    mentions: [],
+    attachments: [],
+  };
+
+  function Harness({
+    host,
+  }: {
+    host: Omit<
+      PluginComposerHost,
+      "getCurrent" | "subscribeDraft" | "setDraft" | "focus"
+    >;
+  }) {
+    const value = useMemo<PluginComposerHost>(
+      () => ({
+        ...host,
+        getCurrent: () => emptyDraft,
+        subscribeDraft: () => () => {},
+        setDraft: () => {},
+        focus: () => {},
+      }),
+      [host],
+    );
+    return (
+      <PluginComposerHostProvider value={value}>
+        <ComposerCustomizationMount />
+      </PluginComposerHostProvider>
+    );
+  }
+
+  it("re-renders the same composer handle when its picker snapshot changes", async () => {
+    const listeners = new Set<() => void>();
+    let selection: ExperimentalComposerSelection = {
+      providerId: "codex",
+      model: "gpt-5",
+    };
+    const reads: Array<{
+      handle: PluginComposerApi;
+      selection: ExperimentalComposerSelection | null;
+      listedSelection: ExperimentalComposerSelection | null;
+    }> = [];
+    registerSelectionProbe((composer, listed) => {
+      reads.push({
+        handle: composer,
+        selection: composer.selection,
+        listedSelection: listed[0]?.selection ?? null,
+      });
+    });
+    const host: PluginComposerHost = {
+      scope: { kind: "thread", threadId: "thr_selection" },
+      textEffectKey: "thread:thr_selection",
+      getCurrent: () => emptyDraft,
+      subscribeDraft: () => () => {},
+      setDraft: () => {},
+      focus: () => {},
+      getSelection: () => selection,
+      subscribeSelection: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const editor: ComposerEditorBridge = {
+      openPopup: () => false,
+      closePopup: () => false,
+      isPopupOpen: () => false,
+      host,
+      pluginCustomizable: true,
+      state: {
+        layout: "expanded",
+        isRunning: false,
+        isSubmitting: false,
+        isSubmittingBlocked: false,
+        submittingBlockedReason: null,
+        isAttaching: false,
+        attachmentError: null,
+      },
+      insertAtCursor: () => true,
+    };
+    publishComposerEditorBridge("thread:thr_selection", editor);
+    const view = render(
+      <MemoryRouter initialEntries={["/threads/thr_selection"]}>
+        <Harness host={host} />
+      </MemoryRouter>,
+    );
+    expect(reads.at(-1)?.selection).toEqual({
+      providerId: "codex",
+      model: "gpt-5",
+    });
+    expect(reads.at(-1)?.listedSelection).toEqual(reads.at(-1)?.selection);
+    const handle = reads.at(-1)?.handle;
+    await act(async () => {
+      selection = { providerId: "claude-code", model: "claude-opus-5" };
+      for (const listener of listeners) listener();
+    });
+    expect(reads.at(-1)?.handle).toBe(handle);
+    expect(reads.at(-1)?.selection).toEqual(selection);
+    expect(reads.at(-1)?.listedSelection).toEqual(selection);
+    view.unmount();
+    clearComposerEditorBridge("thread:thr_selection", editor);
+  });
+
+  it("re-renders a plugin that reads only its own composer's selection", async () => {
+    const listeners = new Set<() => void>();
+    let selection: ExperimentalComposerSelection = {
+      providerId: "codex",
+      model: "gpt-5",
+    };
+    function OwnSelectionProbe() {
+      const composer = useComposer();
+      return (
+        <div data-testid="own-selection">
+          {composer.selection?.model ?? "none"}
+        </div>
+      );
+    }
+    setPluginSlotRegistrations(
+      "demo",
+      registrationSet({
+        composerCustomizations: [
+          {
+            id: "selection",
+            actions: [{ id: "own", component: OwnSelectionProbe }],
+          },
+        ],
+      }),
+    );
+    const host = {
+      scope: { kind: "thread", threadId: "thr_own_selection" },
+      textEffectKey: "thread:thr_own_selection",
+      getSelection: () => selection,
+      subscribeSelection: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    } as const;
+    render(
+      <MemoryRouter initialEntries={["/threads/thr_own_selection"]}>
+        <Harness host={host} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("own-selection").textContent).toBe("gpt-5");
+
+    await act(async () => {
+      selection = { providerId: "claude-code", model: "claude-opus-5" };
+      for (const listener of listeners) listener();
+    });
+
+    expect(screen.getByTestId("own-selection").textContent).toBe(
+      "claude-opus-5",
+    );
+  });
+
+  it("routes to the composer host, validates the selection, and refuses where there are no pickers", async () => {
+    const setSelection = vi.fn(
+      async (selection: ExperimentalComposerSelection) => ({
+        ...selection,
+        model: "gpt-5",
+      }),
+    );
+    let captured: PluginComposerApi | null = null;
+    registerSelectionProbe((composer) => {
+      captured = composer;
+    });
+
+    const threadView = render(
+      <MemoryRouter initialEntries={["/threads/thr_selection"]}>
+        <Harness
+          host={{
+            scope: { kind: "thread", threadId: "thr_selection" },
+            textEffectKey: "thread:thr_selection",
+            setSelection,
+          }}
+        />
+      </MemoryRouter>,
+    );
+    await expect(
+      captured!.experimental_setSelection({
+        providerId: "codex",
+        model: "gpt-5-mini",
+        reasoningLevel: "high",
+      }),
+    ).resolves.toEqual({
+      providerId: "codex",
+      model: "gpt-5",
+      reasoningLevel: "high",
+    });
+    expect(setSelection).toHaveBeenCalledWith({
+      providerId: "codex",
+      model: "gpt-5-mini",
+      reasoningLevel: "high",
+    });
+
+    await expect(
+      captured!.experimental_setSelection({ reasoningLevel: "" }),
+    ).rejects.toThrow(/reasoning level/);
+    await expect(
+      captured!.experimental_setSelection({ permissionMode: "yolo" as never }),
+    ).rejects.toThrow(/permission mode/);
+    await expect(
+      captured!.experimental_setSelection({ serviceTier: "" }),
+    ).rejects.toThrow(/service tier/);
+    await expect(
+      captured!.experimental_setSelection({
+        environment: { type: "teleport" } as never,
+      }),
+    ).rejects.toThrow(/environment/);
+    expect(setSelection).toHaveBeenCalledTimes(1);
+    threadView.unmount();
+
+    for (const scope of [
+      {
+        kind: "queued-message" as const,
+        threadId: "thr_selection",
+        queuedMessageId: "qmsg_1",
+      },
+    ]) {
+      const view = render(
+        <MemoryRouter initialEntries={["/threads/thr_selection"]}>
+          <Harness host={{ scope, textEffectKey: `${scope.kind}:probe` }} />
+        </MemoryRouter>,
+      );
+      await expect(
+        captured!.experimental_setSelection({ model: "gpt-5" }),
+      ).rejects.toThrow(/no pickers/);
+      view.unmount();
+    }
+    expect(setSelection).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("PluginPanelView routes", () => {
   function Board() {
     return <div>board panel body</div>;
   }
 
-  function registerAutomationsPanel() {
-    setPluginSlotRegistrations(
-      AUTOMATIONS_PLUGIN_ID,
-      registrationSet({
-        navPanels: [
-          {
-            id: AUTOMATIONS_PLUGIN_PANEL_PATH,
-            title: "Automations",
-            icon: "Calendar",
-            path: AUTOMATIONS_PLUGIN_PANEL_PATH,
-            component: Board,
-          },
-        ],
-      }),
-    );
-  }
-
-  it("keeps the Automations row in the nav list", () => {
-    registerAutomationsPanel();
-
-    render(
-      <MemoryRouter>
-        <PluginNavSidebarItems />
-      </MemoryRouter>,
-    );
-
-    expect(screen.getByRole("button", { name: "Automations" })).toBeDefined();
-  });
-
-  it("renders a sidebar entry that routes to the plugin panel", () => {
+  it("releases the plugin stylesheet when navigation unmounts the panel route", async () => {
+    vi.useFakeTimers();
     setPluginSlotRegistrations(
       "demo",
       registrationSet({
@@ -1289,120 +1648,64 @@ describe("PluginNavSidebarItems + PluginPanelView", () => {
         ],
       }),
     );
+    applyPluginCss("demo", "/demo.css?h=route");
+    function LeavePanel() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate("/")}>
+          Leave panel
+        </button>
+      );
+    }
     render(
-      <MemoryRouter initialEntries={["/"]}>
-        <PluginNavSidebarItems />
+      <MemoryRouter initialEntries={["/plugins/demo/board"]}>
         <Routes>
+          <Route
+            path={PLUGIN_PANEL_ROUTE_PATH}
+            element={
+              <>
+                <LeavePanel />
+                <RoutedPluginPanelView />
+              </>
+            }
+          />
           <Route path="/" element={<div>home</div>} />
-          <Route path={PLUGIN_PANEL_ROUTE_PATH} element={<PluginPanelView />} />
         </Routes>
       </MemoryRouter>,
     );
-    fireEvent.click(screen.getByText("Demo board"));
-    expect(screen.getByText("board panel body")).toBeDefined();
-  });
-
-  it("shows a plugin panel's position when it is open in a split", () => {
-    setPluginSlotRegistrations(
-      "demo",
-      registrationSet({
-        navPanels: [
-          {
-            id: "board",
-            title: "Demo board",
-            icon: "columns",
-            path: "board",
-            component: Board,
-          },
-        ],
-      }),
-    );
-    const store = createStore();
-    store.set(splitLayoutAtom, {
-      focusedPaneId: "pane-thread",
-      root: {
-        type: "split",
-        dir: "row",
-        sizes: [0.5, 0.5],
-        children: [
-          {
-            type: "pane",
-            paneId: "pane-plugin",
-            content: {
-              kind: "plugin-panel",
-              pluginId: "demo",
-              panelPath: "board",
-              subPath: "card/1",
-            },
-          },
-          {
-            type: "pane",
-            paneId: "pane-thread",
-            content: {
-              kind: "thread",
-              projectId: "proj_test",
-              threadId: "thr_test",
-            },
-          },
-        ],
-      },
-    });
-
-    render(
-      <Provider store={store}>
-        <MemoryRouter initialEntries={["/"]}>
-          <PluginNavSidebarItems splitEnabled />
-        </MemoryRouter>
-      </Provider>,
-    );
-
-    const splitMap = screen.getByRole("img", {
-      name: "Demo board — open in split",
-    });
-    const label = screen.getByText("Demo board");
-    expect(label.nextElementSibling).toBe(splitMap);
-  });
-
-  it("keeps the sidebar entry active on nested plugin panel routes", () => {
-    setPluginSlotRegistrations(
-      "simple-notes",
-      registrationSet({
-        navPanels: [
-          {
-            id: "simple-notes",
-            title: "Simple notes",
-            icon: "note",
-            path: "simple-notes",
-            component: Board,
-          },
-        ],
-      }),
-    );
-    render(
-      <MemoryRouter
-        initialEntries={[
-          "/plugins/simple-notes/simple-notes/bb-plugin-marketplaces-and-compatible-updates.md",
-        ]}
-      >
-        <PluginNavSidebarItems />
-      </MemoryRouter>,
-    );
-
     expect(
-      screen
-        .getByRole("button", { name: "Simple notes" })
-        .getAttribute("aria-current"),
-    ).toBe("page");
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave panel" }));
+    await act(async () => {});
+    expect(screen.getByText("home")).toBeDefined();
+    expect(
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).not.toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).toBeNull();
   });
 
-  it("shows a placeholder for an unknown plugin panel route", () => {
+  it("stays quiet for an unknown panel until plugin frontends have booted", () => {
+    resetPluginFrontendBootStateForTest();
     render(
       <MemoryRouter initialEntries={["/plugins/ghost/board"]}>
         <Routes>
-          <Route path={PLUGIN_PANEL_ROUTE_PATH} element={<PluginPanelView />} />
+          <Route
+            path={PLUGIN_PANEL_ROUTE_PATH}
+            element={<RoutedPluginPanelView />}
+          />
         </Routes>
       </MemoryRouter>,
     );
+    expect(screen.queryByText(/This plugin panel is not available/)).toBeNull();
+
+    act(() => markPluginFrontendsSettled());
     expect(
       screen.getByText(/This plugin panel is not available/),
     ).toBeDefined();
@@ -1433,7 +1736,10 @@ describe("plugin panel shared title bar and full-bleed body", () => {
     return render(
       <MemoryRouter initialEntries={[route]}>
         <Routes>
-          <Route path={PLUGIN_PANEL_ROUTE_PATH} element={<PluginPanelView />} />
+          <Route
+            path={PLUGIN_PANEL_ROUTE_PATH}
+            element={<RoutedPluginPanelView />}
+          />
         </Routes>
       </MemoryRouter>,
     );
@@ -1448,23 +1754,24 @@ describe("plugin panel shared title bar and full-bleed body", () => {
     const panel = panelSlot({ headerContent: ExplodingAccessory });
     render(
       <>
-        <PluginPanelHeaderCenter panel={panel} />
+        <PluginPanelHeaderCenter chrome={panel} />
         <PluginPanelHeaderActions panel={panel} subPath="" />
       </>,
     );
-    // The header center survives; the accessory is hidden, not chip-ified.
     expect(screen.getByText("Demo board")).toBeDefined();
     expect(screen.queryByText(/plugin demo crashed/)).toBeNull();
   });
 
-  it("always renders the shared title and headerContent", () => {
+  it("gives headerContent independent CSS ownership without a mounted panel body", async () => {
+    vi.useFakeTimers();
     function Accessory() {
       return <button type="button">Toggle sidebar</button>;
     }
     const panel = panelSlot({ headerContent: Accessory });
-    render(
+    applyPluginCss("demo", "/demo.css?h=header");
+    const view = render(
       <>
-        <PluginPanelHeaderCenter panel={panel} />
+        <PluginPanelHeaderCenter chrome={panel} />
         <PluginPanelHeaderActions panel={panel} subPath="notes/today.md" />
       </>,
     );
@@ -1472,18 +1779,35 @@ describe("plugin panel shared title bar and full-bleed body", () => {
     expect(
       screen.getByRole("button", { name: "Toggle sidebar" }),
     ).toBeDefined();
+    expect(
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).not.toBeNull();
+    expect(screen.queryByTestId("plugin-panel-body")).toBeNull();
+
+    view.unmount();
+    await act(async () => {});
+    expect(
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).not.toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(
+      document.head.querySelector('link[data-bb-plugin-css="demo"]'),
+    ).toBeNull();
   });
 
-  it("gives the component a zero-padding full-bleed body", () => {
-    setPluginSlotRegistrations(
-      "demo",
-      registrationSet({ navPanels: [panelSlot({})] }),
+  it("keys the right-panel toggle target to its owning pane", () => {
+    const panel = panelSlot({});
+    render(
+      <PluginPanelHeaderActions panel={panel} paneId="pane-docs" subPath="" />,
     );
-    renderPanelBody();
-    const body = screen.getByTestId("plugin-panel-body");
-    expect(body.className).toContain("-m-4");
-    expect(body.className).toContain("md:-m-5");
-    expect(body.className).not.toMatch(/(?:^|\s)p[trblxy]?-/u);
+
+    expect(
+      document
+        .querySelector("[data-plugin-right-panel-toggle-portal]")
+        ?.getAttribute("data-plugin-right-panel-toggle-portal"),
+    ).toBe("plugin-panel:demo:board:pane-docs");
   });
 
   it("still contains a crashing panel inside the error boundary", () => {
@@ -1594,8 +1918,9 @@ describe("plugin thread panel actions", () => {
     ).toBeDefined();
   });
 
-  it("contains a throwing run and rejects non-JSON params without opening", () => {
+  it("contains a throwing run and declines non-JSON params without opening", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const declines: boolean[] = [];
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     setPluginSlotRegistrations(
@@ -1614,14 +1939,19 @@ describe("plugin thread panel actions", () => {
             id: "cyclic",
             title: "Cyclic",
             component: PanelProbe,
-            run: ({ openPanel }) => openPanel({ params: cyclic as never }),
+            run: ({ openPanel }) => {
+              declines.push(openPanel({ params: cyclic as never }));
+            },
           },
           {
             id: "coerced",
             title: "Coerced",
             component: PanelProbe,
-            run: ({ openPanel }) =>
-              openPanel({ params: new Date("2026-01-01") as never }),
+            run: ({ openPanel }) => {
+              declines.push(
+                openPanel({ params: new Date("2026-01-01") as never }),
+              );
+            },
           },
         ],
       }),
@@ -1632,7 +1962,63 @@ describe("plugin thread panel actions", () => {
     fireEvent.click(screen.getByText("Cyclic"));
     fireEvent.click(screen.getByText("Coerced"));
     expect(openPluginPanel).not.toHaveBeenCalled();
+    expect(declines).toEqual([false, false]);
     expect(warn).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports an accepted open as true from both panel action kinds", () => {
+    const accepted: boolean[] = [];
+    setPluginSlotRegistrations(
+      "demo",
+      registrationSet({
+        threadPanelActions: [
+          {
+            id: "issue",
+            title: "Thread action",
+            component: PanelProbe,
+            run: ({ openPanel }) => {
+              accepted.push(openPanel({ params: { source: "thread" } }));
+            },
+          },
+        ],
+        newThreadPanelActions: [
+          {
+            id: "setup",
+            title: "Root action",
+            component: NewThreadPanelProbe,
+            run: ({ openPanel }) => {
+              accepted.push(openPanel({ params: { source: "root" } }));
+            },
+          },
+        ],
+      }),
+    );
+
+    function BothActionsHarness() {
+      const threadEntries = usePluginPanelActions({
+        openPluginPanel: () => undefined,
+        threadId: "thr_9",
+      });
+      const rootEntries = usePluginNewThreadPanelActions({
+        openPluginPanel: () => undefined,
+        projectId: "proj_1",
+      });
+      return (
+        <div>
+          {[...threadEntries, ...rootEntries].map((entry) => (
+            <button key={entry.id} type="button" onClick={entry.onSelect}>
+              {entry.title}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    render(<BothActionsHarness />);
+    fireEvent.click(screen.getByText("Thread action"));
+    fireEvent.click(screen.getByText("Root action"));
+
+    expect(accepted).toEqual([true, true]);
   });
 
   it("offers no actions outside a thread context", () => {
@@ -1661,11 +2047,12 @@ describe("plugin thread panel actions", () => {
             title: "Set up thread",
             icon: "Wand",
             component: NewThreadPanelProbe,
-            run: ({ projectId, openPanel }) =>
+            run: ({ projectId, openPanel }) => {
               openPanel({
                 title: `Setup for ${String(projectId)}`,
                 params: { source: "root" },
-              }),
+              });
+            },
           },
         ],
       }),
@@ -1679,12 +2066,13 @@ describe("plugin thread panel actions", () => {
         openPluginPanel: (args) => setTab(createPluginPanelFixedPanelTab(args)),
         projectId: "proj_1",
       });
+      const actions = useNewTabActions({
+        onStartTerminal: () => undefined,
+        pluginActions: entries,
+      });
       return (
         <>
-          <NewTabActions
-            onStartTerminal={() => undefined}
-            pluginActions={entries}
-          />
+          <NewTabActions actions={actions} />
           {tab ? (
             <PluginPanelTabContent
               tab={tab}
@@ -1710,7 +2098,7 @@ describe("plugin thread panel actions", () => {
     expect(screen.queryByText("Set up thread")).toBeNull();
   });
 
-  it("degrades to a placeholder when the tab's action is gone", () => {
+  it("degrades to a placeholder once plugins settle without the tab's action", () => {
     const tab = createPluginPanelFixedPanelTab({
       actionId: "issue",
       paramsJson: null,
@@ -1723,6 +2111,10 @@ describe("plugin thread panel actions", () => {
         context={{ kind: "thread", threadId: "thr_9" }}
       />,
     );
+    expect(screen.queryByText(/This plugin tab is not available/)).toBeNull();
+
+    act(() => markPluginFrontendsSettled());
+
     expect(screen.getByText(/This plugin tab is not available/)).toBeDefined();
   });
 
@@ -1776,55 +2168,259 @@ describe("plugin file opener tabs", () => {
             id: "editor",
             title: "Notes editor",
             extensions: ["md"],
-            component: MarkdownEditorProbe,
+            component: (props) => (
+              <>
+                <MarkdownEditorProbe {...props} />
+                <output data-testid="opener-target">
+                  {JSON.stringify(props.experimental_lineRange)}
+                </output>
+              </>
+            ),
           },
         ],
       }),
     );
-    const tab = createPluginPanelFixedPanelTab({
-      actionId: "file-opener:editor",
-      paramsJson: JSON.stringify({
-        path: "notes/todo.md",
-        source: {
-          kind: "workspace",
-          threadId: null,
-          environmentId: "env_1",
-          projectId: null,
-        },
+    const tab = {
+      ...createPluginPanelFixedPanelTab({
+        actionId: "file-opener:editor",
+        paramsJson: JSON.stringify({
+          path: "notes/todo.md",
+          source: {
+            kind: "workspace",
+            threadId: null,
+            environmentId: "env_1",
+            projectId: null,
+          },
+        }),
+        pluginId: "notes",
+        title: "todo.md",
       }),
-      pluginId: "notes",
-      title: "todo.md",
-    });
+      fileOpenerOwner: {
+        kind: "workspace-file-preview" as const,
+        environmentId: "env_1",
+        projectId: null,
+        tab: {
+          lineRange: { startLineNumber: 7, endLineNumber: 9 },
+          path: "notes/todo.md",
+          source: { kind: "working-tree" as const },
+          statusLabel: null,
+        },
+        threadId: null,
+      },
+    };
 
     render(
       <PluginPanelTabContent
         tab={tab}
         context={{ kind: "new-thread", projectId: null }}
+        fileOpenerOriginal={<div>native preview</div>}
       />,
     );
 
     expect(
       screen.getByText("editor notes/todo.md @ workspace:env_1"),
     ).toBeDefined();
+    expect(screen.getByTestId("opener-target").textContent).toBe(
+      '{"startLineNumber":7,"endLineNumber":9}',
+    );
   });
 
-  it("degrades to a placeholder when the opener is gone or params are junk", () => {
-    const orphanTab = createPluginPanelFixedPanelTab({
-      actionId: "file-opener:gone",
-      paramsJson: JSON.stringify({
-        path: "a.md",
-        source: { kind: "workspace" },
+  it.each(["workspace", "host", "thread-storage"] as const)(
+    "forwards %s targets and refreshes only when the owner changes",
+    (kind) => {
+      const seen = vi.fn<(props: PluginFileOpenerProps) => void>();
+      setPluginSlotRegistrations(
+        "notes",
+        registrationSet({
+          fileOpeners: [
+            {
+              id: "editor",
+              title: "Notes editor",
+              extensions: ["md"],
+              component: (props) => {
+                seen(props);
+                return <div>editor</div>;
+              },
+            },
+          ],
+        }),
+      );
+      const makeTab = (
+        lineRange: { startLineNumber: number; endLineNumber: number } | null,
+      ) =>
+        buildFileOpenerPanelTab(
+          { id: "editor", pluginId: "notes" },
+          {
+            path: "notes/todo.md",
+            source: {
+              kind,
+              environmentId: "env_1",
+              projectId: null,
+              threadId: "thr_1",
+            },
+          },
+          kind === "workspace"
+            ? {
+                kind: "workspace-file-preview",
+                environmentId: "env_1",
+                projectId: null,
+                threadId: "thr_1",
+                tab: {
+                  path: "notes/todo.md",
+                  lineRange,
+                  source: { kind: "working-tree" },
+                  statusLabel: null,
+                },
+              }
+            : kind === "host"
+              ? {
+                  kind: "host-file-preview",
+                  environmentId: "env_1",
+                  hostId: null,
+                  threadId: "thr_1",
+                  tab: { path: "notes/todo.md", lineRange },
+                }
+              : {
+                  kind: "thread-storage-file-preview",
+                  environmentId: "env_1",
+                  threadId: "thr_1",
+                  tab: { path: "notes/todo.md", lineRange },
+                },
+        );
+      let tab = makeTab({ startLineNumber: 12, endLineNumber: 12 });
+      const content = () => (
+        <PluginPanelTabContent
+          tab={tab}
+          context={{ kind: "thread", threadId: "thr_1" }}
+          fileOpenerOriginal={<div>native</div>}
+        />
+      );
+      const mounted = render(content());
+      const first = seen.mock.lastCall?.[0];
+      expect(first?.experimental_lineRange).toEqual({
+        startLineNumber: 12,
+        endLineNumber: 12,
+      });
+      mounted.rerender(content());
+      expect(seen.mock.lastCall?.[0].experimental_lineRange).toBe(
+        first?.experimental_lineRange,
+      );
+      tab = makeTab({ startLineNumber: 12, endLineNumber: 12 });
+      mounted.rerender(content());
+      expect(seen.mock.lastCall?.[0].experimental_lineRange).not.toBe(
+        first?.experimental_lineRange,
+      );
+      expect(seen.mock.lastCall?.[0].source).toBe(first?.source);
+      tab = makeTab({ startLineNumber: 20, endLineNumber: 24 });
+      mounted.rerender(content());
+      expect(seen.mock.lastCall?.[0].experimental_lineRange).toEqual({
+        startLineNumber: 20,
+        endLineNumber: 24,
+      });
+      tab = makeTab(null);
+      mounted.rerender(content());
+      expect(seen.mock.lastCall?.[0].experimental_lineRange).toBeNull();
+    },
+  );
+
+  it("lets an opener delegate to the exact native preview node", () => {
+    function DelegatingEditor({ Original }: PluginFileOpenerProps) {
+      return <Original />;
+    }
+    setPluginSlotRegistrations(
+      "notes",
+      registrationSet({
+        fileOpeners: [
+          {
+            id: "editor",
+            title: "Notes editor",
+            extensions: ["md"],
+            component: DelegatingEditor,
+          },
+        ],
       }),
-      pluginId: "ghost",
-      title: "a.md",
-    });
+    );
+    const tab = buildFileOpenerPanelTab(
+      { id: "editor", pluginId: "notes" },
+      {
+        path: "notes/todo.md",
+        source: {
+          kind: "workspace",
+          environmentId: "env_1",
+          projectId: null,
+          threadId: "thr_1",
+        },
+      },
+      {
+        kind: "workspace-file-preview",
+        environmentId: "env_1",
+        projectId: null,
+        tab: {
+          lineRange: { startLineNumber: 7, endLineNumber: 9 },
+          path: "notes/todo.md",
+          source: { kind: "working-tree" },
+          statusLabel: null,
+        },
+        threadId: "thr_1",
+      },
+    );
+
+    render(
+      <PluginPanelTabContent
+        tab={tab}
+        context={{ kind: "thread", threadId: "thr_1" }}
+        fileOpenerOriginal={
+          <button type="button">Native line 7 and editor actions</button>
+        }
+      />,
+    );
+
+    expect(screen.getByRole("button").textContent).toBe(
+      "Native line 7 and editor actions",
+    );
+  });
+
+  it("uses the owner when the opener is gone and a placeholder for junk params", () => {
+    const orphanTab = {
+      ...createPluginPanelFixedPanelTab({
+        actionId: "file-opener:gone",
+        paramsJson: JSON.stringify({
+          path: "a.md",
+          source: {
+            kind: "workspace",
+            threadId: null,
+            environmentId: "env_1",
+            projectId: null,
+          },
+        }),
+        pluginId: "ghost",
+        title: "a.md",
+      }),
+      fileOpenerOwner: {
+        kind: "workspace-file-preview" as const,
+        environmentId: "env_1",
+        projectId: null,
+        tab: {
+          lineRange: { startLineNumber: 3, endLineNumber: 4 },
+          path: "a.md",
+          source: { kind: "working-tree" as const },
+          statusLabel: null,
+        },
+        threadId: null,
+      },
+    };
     const { unmount } = render(
       <PluginPanelTabContent
         tab={orphanTab}
         context={{ kind: "new-thread", projectId: null }}
+        fileOpenerOriginal={
+          <button type="button">Native preview actions for a.md</button>
+        }
       />,
     );
-    expect(screen.getByText(/file opener is not available/)).toBeDefined();
+    expect(screen.getByRole("button").textContent).toBe(
+      "Native preview actions for a.md",
+    );
     unmount();
 
     setPluginSlotRegistrations(
@@ -1850,6 +2446,7 @@ describe("plugin file opener tabs", () => {
       <PluginPanelTabContent
         tab={junkParamsTab}
         context={{ kind: "new-thread", projectId: null }}
+        fileOpenerOriginal={<div>must not render</div>}
       />,
     );
     expect(screen.getByText(/file opener is not available/)).toBeDefined();

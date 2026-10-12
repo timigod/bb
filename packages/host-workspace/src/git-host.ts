@@ -1,5 +1,4 @@
-import { execFile, type ExecFileException } from "node:child_process";
-import { promisify } from "node:util";
+import type { ExecFileException } from "node:child_process";
 import {
   type GitHostPullRequest,
   type GitHostPullRequestCheck,
@@ -10,21 +9,15 @@ import {
   type GitHostPullRequestReviewDecision,
   gitHostPullRequestSchema,
 } from "@bb/domain";
-import { sanitizeInheritedChildProcessEnv } from "@bb/process-utils";
+import {
+  execPortableFile,
+  sanitizeInheritedChildProcessEnv,
+} from "@bb/process-utils";
 import { runGit, type GitCommandResult, WorkspaceError } from "./git.js";
 
-const execFileAsync = promisify(execFile);
-
-/** `gh` is a network round-trip; cap it so it never blocks a status poll. */
 const GH_PR_VIEW_TIMEOUT_MS = 10_000;
 const GIT_UPSTREAM_LOOKUP_TIMEOUT_MS = 10_000;
 
-/**
- * Explicit stdout cap rather than Node's 1 MB execFile default. The selected
- * field set is tiny (a few hundred bytes) so this is never reached today, but
- * stating the bound keeps it intentional and matches the package's git buffer
- * if the field list ever grows.
- */
 const GH_PR_VIEW_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const GH_PR_ACTION_TIMEOUT_MS = 60_000;
 const GH_PR_ACTION_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -35,6 +28,7 @@ const GH_PR_VIEW_JSON_FIELDS = [
   "state",
   "url",
   "isDraft",
+  "autoMergeRequest",
   "baseRefName",
   "headRefName",
   "updatedAt",
@@ -45,19 +39,23 @@ const GH_PR_VIEW_JSON_FIELDS = [
   "mergeable",
 ].join(",");
 
-interface GetPullRequestForCurrentBranchArgs {
+export interface GitHostCliOptions {
+  shellPath?: string;
+}
+
+interface GetPullRequestForCurrentBranchArgs extends GitHostCliOptions {
   cwd: string;
   localBranch: string;
 }
 
-export type GitHostPullRequestMergeMethod = "merge" | "squash" | "rebase";
+type GitHostPullRequestMergeMethod = "merge" | "squash" | "rebase";
 
 export type GitHostPullRequestAction =
   | { operation: "ready" }
   | { operation: "draft" }
   | { operation: "merge"; method: GitHostPullRequestMergeMethod };
 
-interface RunPullRequestActionForCurrentBranchArgs {
+interface RunPullRequestActionForCurrentBranchArgs extends GitHostCliOptions {
   cwd: string;
   localBranch: string;
   action: GitHostPullRequestAction;
@@ -250,9 +248,6 @@ function normalizeChecks(value: unknown): GitHostPullRequestCheck[] {
       url:
         getNullableUrl(object, "detailsUrl") ??
         getNullableUrl(object, "targetUrl"),
-      // CheckRun exposes startedAt; StatusContext exposes the equivalent
-      // creation time. Preserve one comparable value so the server can apply
-      // latest-run rollup policy without depending on GitHub's array order.
       startedAt:
         getNullableDateTime(object, "startedAt") ??
         getNullableDateTime(object, "createdAt"),
@@ -278,6 +273,8 @@ function normalizeGitHubPullRequestView(
     state: normalizeUppercase(object.state),
     url: getString(object, "url"),
     isDraft: getBoolean(object, "isDraft"),
+    autoMerge: asObject(object.autoMergeRequest) !== null,
+    inMergeQueue: null,
     baseRefName: getString(object, "baseRefName"),
     headRefName: getString(object, "headRefName"),
     updatedAt: getString(object, "updatedAt"),
@@ -350,12 +347,6 @@ function createGitHostCommandFailedError(
   );
 }
 
-/**
- * Parse the stdout of `gh pr view --json <fields>` into a validated
- * {@link GitHostPullRequest}. Returns `null` for any output that is not a
- * well-formed PR object (empty, non-JSON, missing/extra fields, unexpected
- * state) so callers never have to special-case malformed `gh` output.
- */
 export function parseGitHostPullRequest(
   stdout: string,
 ): GitHostPullRequest | null {
@@ -372,18 +363,11 @@ export function parseGitHostPullRequest(
   return normalizeGitHubPullRequestView(json);
 }
 
-/**
- * Structured result of a pull-request detection attempt. "none" is a real
- * answer (`gh` ran and reported no PR for the branch); "unavailable" means the
- * lookup could not produce an answer (gh missing, not authenticated, timeout,
- * unparseable output), so callers must not treat it as "no PR exists".
- */
 export type GitHostPullRequestLookup =
   | { outcome: "found"; pullRequest: GitHostPullRequest }
   | { outcome: "none" }
   | { outcome: "unavailable"; message: string };
 
-/** `gh pr view` stderr for a branch that genuinely has no pull request. */
 const GH_NO_PULL_REQUEST_PATTERN = /no pull requests found for branch/iu;
 
 type PullRequestTargetLookup =
@@ -421,11 +405,6 @@ function ghCommandUnavailable(
   };
 }
 
-/**
- * Classify a failed `gh pr view` invocation. Only the "no pull requests
- * found" answer is genuine absence; everything else (gh missing, auth
- * failure, no remote, timeout, crash) means the lookup itself failed.
- */
 function classifyPullRequestViewError(
   error: unknown,
 ): Extract<GitHostPullRequestLookup, { outcome: "none" | "unavailable" }> {
@@ -466,10 +445,6 @@ function parseNullTerminatedGitConfig(stdout: string): Map<string, string> {
 const GIT_REMOTE_OWNER_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/u;
 const GIT_REMOTE_REPOSITORY_PATTERN = /^[a-zA-Z0-9._-]+$/u;
 
-/**
- * Parse a GitHub-style remote locally. The URL is never passed to `gh`: Git
- * config is workspace-controlled, while `gh` inherits the user's auth tokens.
- */
 function parseGitRemoteRepository(
   remoteUrl: string,
 ): GitRemoteRepository | null {
@@ -533,6 +508,7 @@ async function getPullRequestTarget(
       ],
       {
         cwd: args.cwd,
+        ...(args.shellPath !== undefined ? { shellPath: args.shellPath } : {}),
         allowFailure: true,
         timeoutMs: GIT_UPSTREAM_LOOKUP_TIMEOUT_MS,
       },
@@ -563,9 +539,6 @@ async function getPullRequestTarget(
     return { outcome: "current-branch" };
   }
 
-  // Managed worktrees intentionally track the base branch on origin so Git
-  // can report ahead/behind state. That is not the PR head: a pushed PR still
-  // uses the managed local branch name, which bare `gh pr view` resolves.
   if (remote === "origin") {
     return { outcome: "current-branch" };
   }
@@ -590,9 +563,6 @@ async function getPullRequestTarget(
     };
   }
 
-  // A differently named branch on an alias of the origin repository is base
-  // or integration tracking, not a fork PR head. Only substitute the tracked
-  // branch when the remote belongs to another GitHub owner.
   if (
     originRepository.owner.toLowerCase() ===
     upstreamRepository.owner.toLowerCase()
@@ -606,23 +576,6 @@ async function getPullRequestTarget(
   };
 }
 
-/**
- * Detect the open/most-relevant GitHub pull request for the branch checked out
- * in `cwd` by shelling out to the host `gh` CLI. Bare `gh pr view` correctly
- * resolves the configured upstream owner, but combines it with the local branch
- * name. When Git tracks a differently named branch on a different-owner fork,
- * parse the owner locally from a same-host upstream and pass the fully
- * qualified `owner:branch` selector. Base-branch tracking on origin continues
- * to use the managed local branch name. Configured URLs are never passed to
- * `gh`, which inherits user auth tokens.
- *
- * Never throws: a branch with no PR is `outcome: "none"`, while every lookup
- * failure (`gh` not installed, not authenticated, no GitHub remote, a timeout,
- * unparseable output) is `outcome: "unavailable"` so callers can distinguish
- * "no PR" from "could not check". The inherited environment preserves
- * `PATH`/`HOME`/token vars so `gh` auth resolves the same way it would in the
- * user's shell.
- */
 export async function getPullRequestForCurrentBranch(
   args: GetPullRequestForCurrentBranchArgs,
 ): Promise<GitHostPullRequestLookup> {
@@ -639,10 +592,12 @@ export async function getPullRequestForCurrentBranch(
   ];
   let stdout: string;
   try {
-    ({ stdout } = await execFileAsync("gh", ghArgs, {
+    ({ stdout } = await execPortableFile("gh", ghArgs, {
       cwd: args.cwd,
-      encoding: "utf8",
-      env: sanitizeInheritedChildProcessEnv({ env: process.env }),
+      env: sanitizeInheritedChildProcessEnv({
+        env: process.env,
+        ...(args.shellPath !== undefined ? { shellPath: args.shellPath } : {}),
+      }),
       timeout: GH_PR_VIEW_TIMEOUT_MS,
       maxBuffer: GH_PR_VIEW_MAX_BUFFER_BYTES,
     }));
@@ -656,14 +611,47 @@ export async function getPullRequestForCurrentBranch(
       message: "gh pr view returned unparseable output",
     };
   }
+  if (pullRequest.state === "OPEN" && !pullRequest.isDraft) {
+    try {
+      const { stdout: queueOutput } = await execPortableFile(
+        "gh",
+        [
+          "api",
+          "graphql",
+          "--hostname",
+          new URL(pullRequest.url).hostname,
+          "-f",
+          "query=query($url: URI!) { resource(url: $url) { ... on PullRequest { isInMergeQueue } } }",
+          "-f",
+          `url=${pullRequest.url}`,
+        ],
+        {
+          cwd: args.cwd,
+          env: sanitizeInheritedChildProcessEnv({
+            env: process.env,
+            ...(args.shellPath !== undefined
+              ? { shellPath: args.shellPath }
+              : {}),
+          }),
+          timeout: GH_PR_VIEW_TIMEOUT_MS,
+          maxBuffer: GH_PR_VIEW_MAX_BUFFER_BYTES,
+        },
+      );
+      const response = asObject(JSON.parse(queueOutput));
+      const data = asObject(response?.data);
+      const resource = asObject(data?.resource);
+      pullRequest.inMergeQueue = resource
+        ? getBoolean(resource, "isInMergeQueue")
+        : null;
+    } catch {
+      pullRequest.inMergeQueue = null;
+    }
+  } else {
+    pullRequest.inMergeQueue = false;
+  }
   return { outcome: "found", pullRequest };
 }
 
-/**
- * Mutate the GitHub pull request for the branch checked out in `cwd`. Uses the
- * same qualified upstream target as detection when the tracked branch has a
- * different name. Mutation failures are meaningful and surface to the caller.
- */
 export async function runPullRequestActionForCurrentBranch(
   args: RunPullRequestActionForCurrentBranchArgs,
 ): Promise<void> {
@@ -676,10 +664,12 @@ export async function runPullRequestActionForCurrentBranch(
     target.outcome === "upstream-branch" ? target.selector : null,
   );
   try {
-    await execFileAsync("gh", ghArgs, {
+    await execPortableFile("gh", ghArgs, {
       cwd: args.cwd,
-      encoding: "utf8",
-      env: sanitizeInheritedChildProcessEnv({ env: process.env }),
+      env: sanitizeInheritedChildProcessEnv({
+        env: process.env,
+        ...(args.shellPath !== undefined ? { shellPath: args.shellPath } : {}),
+      }),
       timeout: GH_PR_ACTION_TIMEOUT_MS,
       maxBuffer: GH_PR_ACTION_MAX_BUFFER_BYTES,
     });

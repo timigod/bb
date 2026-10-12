@@ -6,30 +6,27 @@ import type {
   HostDaemonOnlineRpcResult,
   HostPathEntryKind,
 } from "@bb/host-daemon-contract";
-import { CommandDispatchError } from "../command-dispatch-support.js";
-import type { CommandOf } from "../command-dispatch-support.js";
+import {
+  CommandDispatchError,
+  type CommandDispatchOptions,
+  type CommandOf,
+} from "../command-dispatch-support.js";
 import { isFsErrorWithCode } from "../fs-errors.js";
+import { userExecutableProcessOptions } from "../user-executable-env.js";
 import {
   finalizeListedFiles,
   finalizeListedPaths,
-  listFilesRecursively,
-  listPathsRecursively,
+  listWorkspacePaths,
 } from "./file-list.js";
 import {
   readFileForTransport,
+  readFileChunkForTransport,
   readFileFromGitRef,
-  readFileMetadataForTransport,
   readRootRelativeFileForTransport,
+  type ReadFileContentForTransportResult,
 } from "./file-read.js";
 import { resolveNonSymlinkDirectoryPath } from "./root-path.js";
 
-/**
- * Conservative subset of git's ref name grammar. We only need to refuse
- * shell-meaningful punctuation and ref-traversal sequences before passing
- * the value as a `git` argument. `execFile` already prevents shell expansion,
- * but rejecting bad refs early gives a clean error and avoids ambiguity in
- * the `<ref>:<path>` join.
- */
 const SAFE_GIT_REF_REGEX = /^[A-Za-z0-9_./~^@-]+$/;
 
 interface HostDiskPathCommand {
@@ -73,7 +70,16 @@ export async function listHostFiles(
     });
 
     return finalizeListedFiles({
-      filePaths: await listFilesRecursively(realRootPath, realRootPath),
+      filePaths: (
+        await listWorkspacePaths({
+          root: realRootPath,
+          includeHidden: command.includeHidden,
+          excludeNames: command.excludeNames,
+          respectGitIgnore: command.respectGitIgnore,
+          includeFiles: true,
+          includeDirectories: false,
+        })
+      ).map((entry) => entry.path),
       limit: command.limit,
       ...(command.query ? { query: command.query } : {}),
     });
@@ -99,11 +105,13 @@ export async function listHostPaths(
     });
 
     return finalizeListedPaths({
-      paths: await listPathsRecursively({
-        dir: realRootPath,
+      paths: await listWorkspacePaths({
         root: realRootPath,
         includeFiles: command.includeFiles,
         includeDirectories: command.includeDirectories,
+        includeHidden: command.includeHidden,
+        excludeNames: command.excludeNames,
+        respectGitIgnore: command.respectGitIgnore,
       }),
       limit: command.limit,
       includeFiles: command.includeFiles,
@@ -135,9 +143,6 @@ export async function browseHostDirectory(
     throw new CommandDispatchError("invalid_path", "Path must be absolute");
   }
 
-  // Follow a symlinked base directory: single-level browsing has no recursion
-  // loop risk (unlike the recursive lister), and users legitimately navigate
-  // through symlinked folders.
   const stat = await fs.stat(requestedPath);
   if (!stat.isDirectory()) {
     throw new CommandDispatchError(
@@ -156,7 +161,6 @@ export async function browseHostDirectory(
     const fullPath = path.join(directory, dirent.name);
     let kind: HostPathEntryKind;
     if (dirent.isSymbolicLink()) {
-      // Classify by the symlink target; skip broken links.
       try {
         kind = (await fs.stat(fullPath)).isDirectory() ? "directory" : "file";
       } catch {
@@ -167,7 +171,7 @@ export async function browseHostDirectory(
     } else if (dirent.isFile()) {
       kind = "file";
     } else {
-      continue; // sockets, fifos, devices — not browsable
+      continue;
     }
 
     entries.push({ kind, name: dirent.name, path: fullPath });
@@ -192,8 +196,17 @@ export async function checkHostPathsExist(
   return { existence: Object.fromEntries(entries) };
 }
 
+export function readHostFile(
+  command: CommandOf<"host.read_file"> & { ifNoneMatch?: undefined },
+  options?: Pick<CommandDispatchOptions, "runtimeManager">,
+): Promise<ReadFileContentForTransportResult>;
+export function readHostFile(
+  command: CommandOf<"host.read_file">,
+  options?: Pick<CommandDispatchOptions, "runtimeManager">,
+): Promise<HostDaemonOnlineRpcResult<"host.read_file">>;
 export async function readHostFile(
   command: CommandOf<"host.read_file">,
+  options?: Pick<CommandDispatchOptions, "runtimeManager">,
 ): Promise<HostDaemonOnlineRpcResult<"host.read_file">> {
   assertAbsoluteHostDiskPathCommand(command);
 
@@ -206,28 +219,40 @@ export async function readHostFile(
     }
     assertSafeGitRef(command.ref);
     return readFileFromGitRef({
+      ...(command.ifNoneMatch !== undefined
+        ? { ifNoneMatch: command.ifNoneMatch }
+        : {}),
       rootPath: command.rootPath,
       resolvedPath: command.path,
       resultPath: command.path,
       ref: command.ref,
+      ...userExecutableProcessOptions(
+        options?.runtimeManager.getShellEnv() ?? {},
+      ),
     });
   }
 
   return readFileForTransport({
+    ...(command.ifNoneMatch !== undefined
+      ? { ifNoneMatch: command.ifNoneMatch }
+      : {}),
     resolvedPath: command.path,
     resultPath: command.path,
     ...(command.rootPath !== undefined ? { rootPath: command.rootPath } : {}),
   });
 }
 
-export async function readHostFileMetadata(
-  command: CommandOf<"host.file_metadata">,
-): Promise<HostDaemonOnlineRpcResult<"host.file_metadata">> {
+export async function readHostFileChunk(
+  command: CommandOf<"host.read_file_chunk">,
+): Promise<HostDaemonOnlineRpcResult<"host.read_file_chunk">> {
   assertAbsoluteHostDiskPathCommand(command);
-  return readFileMetadataForTransport({
+  return readFileChunkForTransport({
     resolvedPath: command.path,
     resultPath: command.path,
-    ...(command.rootPath !== undefined ? { rootPath: command.rootPath } : {}),
+    rootPath: command.rootPath,
+    offset: command.offset,
+    length: command.length,
+    revision: command.revision,
   });
 }
 
@@ -246,11 +271,12 @@ async function pathExists(path: string): Promise<boolean> {
     await fs.stat(path);
     return true;
   } catch (error) {
-    if (isFsErrorWithCode(error, "ENOENT") || isFsErrorWithCode(error, "ENOTDIR")) {
+    if (
+      isFsErrorWithCode(error, "ENOENT") ||
+      isFsErrorWithCode(error, "ENOTDIR")
+    ) {
       return false;
     }
-    // Permission denied / loops / etc. — we can't tell, but the entry exists
-    // enough to error on, so don't claim it's missing.
     return true;
   }
 }

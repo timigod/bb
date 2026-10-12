@@ -1,38 +1,35 @@
 import { useState } from "react";
-import { useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { UrlLink, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { DelegationRpcContract } from "../../delegate/contract.js";
 import type {
   Preset,
   TaskPullRequest,
   TaskThread,
 } from "../../shared/contract.js";
+import { errorMessage } from "../../shared/errors.js";
 import {
   PR_STATE_META,
   THREAD_STATUS_META,
   formatRelativeTime,
   isActiveThread,
 } from "./meta.js";
+import { PresetDialog, savePresetDraft } from "../manage/preset-dialog.js";
 import {
-  PresetDialog,
-  savePresetDraft,
-} from "../manage/preset-dialog.js";
+  ConfirmDeleteDialog,
+  ConfirmDeleteDialogContent,
+} from "@/components/ui/confirm-delete-dialog";
 import { useTasksRpc } from "../../shell/data.js";
-import { Button } from "@bb/shared-ui/button";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
-} from "@bb/shared-ui/dropdown-menu";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/dropdown-menu";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 
-/**
- * PR pill on a thread card: a real link to GitHub when the thread's
- * environment has a pull request, a quiet muted marker when the lookup
- * failed, nothing while loading or when no PR exists.
- */
 function ThreadPullRequestPill({
   pullRequest,
   unavailable,
@@ -43,19 +40,17 @@ function ThreadPullRequestPill({
   if (pullRequest) {
     const meta = PR_STATE_META[pullRequest.state];
     return (
-      <a
+      <UrlLink
         href={pullRequest.url}
         target="_blank"
         rel="noopener noreferrer"
         title={`${pullRequest.title} (${meta.label})`}
         aria-label={`Pull request #${pullRequest.number}: ${pullRequest.title} (${meta.label})`}
-        // Mirrors the app's PullRequestStatusPill: the state icon carries the
-        // color, the text stays the normal foreground.
         className="flex shrink-0 items-center gap-1 rounded-full border border-border bg-secondary px-2 py-0.5 text-xs font-medium shadow-2xs hover:border-input"
       >
-        <Icon name={meta.icon} className={cn("size-3", meta.textClassName)} />
-        #{pullRequest.number}
-      </a>
+        <Icon name={meta.icon} className={cn("size-3", meta.textClassName)} />#
+        {pullRequest.number}
+      </UrlLink>
     );
   }
   if (unavailable) {
@@ -75,10 +70,14 @@ function ThreadCard({
   thread,
   pullRequest,
   pullRequestUnavailable,
+  busy,
+  onDetach,
 }: {
   thread: TaskThread;
   pullRequest: TaskPullRequest | undefined;
   pullRequestUnavailable: boolean;
+  busy: boolean;
+  onDetach: () => void;
 }) {
   const navigate = useBbNavigate();
   const meta = THREAD_STATUS_META[thread.liveStatus];
@@ -114,6 +113,16 @@ function ThreadCard({
         Open thread
         <Icon name="ArrowUpRight" className="size-3" />
       </button>
+      <button
+        type="button"
+        aria-label={`Detach ${thread.title}`}
+        title="Detach from task"
+        disabled={busy}
+        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-state-hover hover:text-foreground disabled:opacity-70"
+        onClick={onDetach}
+      >
+        <Icon name="X" className="size-3" />
+      </button>
     </div>
   );
 }
@@ -131,12 +140,10 @@ function loadLastPresetId(): string | null {
 function storeLastPresetId(presetId: string): void {
   try {
     window.localStorage.setItem(LAST_PRESET_STORAGE_KEY, presetId);
-  } catch {
-    // Persistence is best-effort (e.g. sandboxed iframes without storage).
-  }
+  } catch {}
 }
 
-export interface DispatchControlProps {
+interface DispatchControlProps {
   taskId: string;
   presets: Preset[] | undefined;
   onError: (message: string) => void;
@@ -144,17 +151,6 @@ export interface DispatchControlProps {
   className?: string;
 }
 
-/**
- * The single dispatch control for a task — rendered in the properties rail
- * on wide layouts and in the inline property row when the rail is hidden.
- * GitHub-merge-style split button around the dispatch RPC: the primary
- * segment dispatches immediately with the last-used preset (persisted in
- * localStorage; first preset alphabetically as the fallback), the chevron
- * segment opens the preset menu, which also updates the remembered choice.
- * The label is just the preset name — the dropdown's "Dispatch with preset"
- * header carries the verb. With zero presets it collapses to an
- * "Add a preset…" button opening the preset dialog in create mode.
- */
 export function DispatchControl({
   taskId,
   presets,
@@ -166,7 +162,6 @@ export function DispatchControl({
   const tasksRpc = useTasksRpc();
   const [dispatching, setDispatching] = useState(false);
   const [lastPresetId, setLastPresetId] = useState(loadLastPresetId);
-  // Keyed remount resets the create dialog's draft per open.
   const [createDialogKey, setCreateDialogKey] = useState<number | null>(null);
 
   const dispatch = async (presetId: string) => {
@@ -174,7 +169,7 @@ export function DispatchControl({
     try {
       await rpc.call("delegate", { taskId, presetId });
     } catch (error) {
-      onError(error instanceof Error ? error.message : String(error));
+      onError(errorMessage(error));
     } finally {
       setDispatching(false);
     }
@@ -186,9 +181,6 @@ export function DispatchControl({
     void dispatch(preset.id);
   };
 
-  // bg-primary (not the default bg-foreground): custom palettes like Nord
-  // define an accent primary the hero CTA should pick up; in the default
-  // theme both read as intended.
   const primarySegment =
     "bg-primary text-primary-foreground hover:bg-primary/90";
 
@@ -239,9 +231,7 @@ export function DispatchControl({
           }}
         >
           <span className="truncate">
-            {dispatching
-              ? "Dispatching…"
-              : (current?.name ?? "Dispatch")}
+            {dispatching ? "Dispatching…" : (current?.name ?? "Dispatch")}
           </span>
         </Button>
         <DropdownMenu>
@@ -280,21 +270,39 @@ export function DispatchControl({
   );
 }
 
-export interface ThreadsSectionProps {
+interface ThreadsSectionProps {
   threads: TaskThread[];
-  /** Undefined while the PR lookup is in flight (cards render without pills). */
   pullRequests: TaskPullRequest[] | undefined;
   unavailableThreadIds: string[];
+  onDetach: (thread: TaskThread) => Promise<void>;
+  onError: (message: string) => void;
 }
 
-/** Attached-thread list; the caller skips it entirely when there are none.
- *  Dispatching lives in a single DispatchControl (rail on wide layouts,
- *  inline property row on narrow), not here. */
 export function ThreadsSection({
   threads,
   pullRequests,
   unavailableThreadIds,
+  onDetach,
+  onError,
 }: ThreadsSectionProps) {
+  const [confirm, setConfirm] = useState<TaskThread | null>(null);
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
+
+  const performDetach = async (thread: TaskThread) => {
+    setPending((current) => new Set(current).add(thread.id));
+    try {
+      await onDetach(thread);
+    } catch (error) {
+      onError(errorMessage(error));
+    } finally {
+      setPending((current) => {
+        const next = new Set(current);
+        next.delete(thread.id);
+        return next;
+      });
+    }
+  };
+
   const activeCount = threads.filter(isActiveThread).length;
   const pullRequestByThread = new Map<string, TaskPullRequest>();
   for (const pullRequest of pullRequests ?? []) {
@@ -318,8 +326,32 @@ export function ThreadsSection({
           thread={thread}
           pullRequest={pullRequestByThread.get(thread.threadId)}
           pullRequestUnavailable={unavailable.has(thread.threadId)}
+          busy={pending.has(thread.id)}
+          onDetach={() => setConfirm(thread)}
         />
       ))}
+      <ConfirmDeleteDialog
+        className="max-w-sm"
+        open={confirm !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirm(null);
+        }}
+      >
+        {confirm ? (
+          <ConfirmDeleteDialogContent
+            title="Detach thread?"
+            description={`"${confirm.title}" will no longer be listed on this task. The thread itself is not deleted; re-attach it with bb tasks attach.`}
+            confirmLabel="Detach"
+            pending={false}
+            size="sm"
+            onCancel={() => setConfirm(null)}
+            onConfirm={() => {
+              setConfirm(null);
+              void performDetach(confirm);
+            }}
+          />
+        ) : null}
+      </ConfirmDeleteDialog>
     </section>
   );
 }

@@ -1,18 +1,11 @@
 import { z } from "zod";
 import {
+  FILE_LIST_EXCLUDE_NAME_MAX_LENGTH,
+  FILE_LIST_EXCLUDE_NAMES_MAX,
   FILE_LIST_LIMIT_MAX,
-  type HostDaemonOnlineRpcResultByType,
-} from "@bb/host-daemon-contract";
+} from "@bb/domain";
+import type { HostDaemonOnlineRpcResultByType } from "@bb/host-daemon-contract";
 
-/**
- * Host file read/write API (`POST /files/*`). Unlike the preview-oriented
- * thread file routes, these are host-scoped primitives for callers (plugins,
- * editors) that do read-modify-write against files on a connected host.
- *
- * `hostId` omission has real semantics: the server resolves it to the primary
- * (local) host once at the route boundary. `rootPath`, when set, confines the
- * resolved target beneath that absolute root on the daemon side.
- */
 export const hostFileReadRequestSchema = z
   .object({
     hostId: z.string().min(1).optional(),
@@ -30,13 +23,16 @@ export const hostFileWriteRequestSchema = z
     content: z.string(),
     contentEncoding: z.enum(["utf8", "base64"]).optional(),
     createParents: z.boolean().optional(),
-    // Omitted → unconditional write; hash → compare-and-swap against the
-    // current content; null → create-only (fail if the file exists).
     expectedSha256: z.string().nullable().optional(),
     mode: z.number().int().min(0).max(0o777).optional(),
   })
   .strict();
 export type HostFileWriteRequest = z.infer<typeof hostFileWriteRequestSchema>;
+
+const fileListExcludeNamesRequestSchema = z
+  .array(z.string().min(1).max(FILE_LIST_EXCLUDE_NAME_MAX_LENGTH))
+  .max(FILE_LIST_EXCLUDE_NAMES_MAX)
+  .optional();
 
 export const hostFileListRequestSchema = z
   .object({
@@ -44,6 +40,8 @@ export const hostFileListRequestSchema = z
     path: z.string().min(1),
     query: z.string().optional(),
     limit: z.number().int().positive().max(FILE_LIST_LIMIT_MAX).optional(),
+    includeHidden: z.boolean().optional(),
+    excludeNames: fileListExcludeNamesRequestSchema,
   })
   .strict();
 export type HostFileListRequest = z.infer<typeof hostFileListRequestSchema>;
@@ -56,6 +54,8 @@ export const hostPathListRequestSchema = z
     limit: z.number().int().positive().max(FILE_LIST_LIMIT_MAX).optional(),
     includeFiles: z.boolean(),
     includeDirectories: z.boolean(),
+    includeHidden: z.boolean().optional(),
+    excludeNames: fileListExcludeNamesRequestSchema,
   })
   .strict();
 export type HostPathListRequest = z.infer<typeof hostPathListRequestSchema>;
@@ -105,8 +105,10 @@ export interface CreateFilePreviewResponse {
   expiresAtMs: number;
 }
 
-export type HostFileReadResponse =
-  HostDaemonOnlineRpcResultByType["host.read_file"];
+export type HostFileReadResponse = Exclude<
+  HostDaemonOnlineRpcResultByType["host.read_file"],
+  { notModified: true }
+>;
 export type HostFileWriteResponse =
   HostDaemonOnlineRpcResultByType["host.write_file"];
 export type HostFileListResponse =

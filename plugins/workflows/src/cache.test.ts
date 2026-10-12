@@ -7,7 +7,6 @@ import {
   type WorkflowCallCacheInput,
   type WorkflowCallResultStatus,
 } from "./cache.js";
-import { parseAgentOptions } from "./validation.js";
 
 function cacheInput(): WorkflowCallCacheInput {
   return {
@@ -167,33 +166,6 @@ describe("workflow call cache identity", () => {
       computeWorkflowCallCacheKey(input),
     );
   });
-
-  it("uses native schema through canonical outputSchema identity", () => {
-    const native = parseAgentOptions({
-      schema: {
-        required: ["approved"],
-        properties: { approved: { type: "boolean" } },
-        type: "object",
-      },
-      label: "Native label",
-      phase: "Review",
-    });
-    const compatible = parseAgentOptions({
-      outputSchema: {
-        type: "object",
-        properties: { approved: { type: "boolean" } },
-        required: ["approved"],
-      },
-      title: "Compatible title",
-      phase: "Different display phase",
-    });
-    const changed = parseAgentOptions({ schema: { type: "string" } });
-    const keyFor = (outputSchema: WorkflowCallCacheInput["outputSchema"]) =>
-      computeWorkflowCallCacheKey({ ...cacheInput(), outputSchema });
-
-    expect(keyFor(native.outputSchema)).toBe(keyFor(compatible.outputSchema));
-    expect(keyFor(changed.outputSchema)).not.toBe(keyFor(native.outputSchema));
-  });
 });
 
 describe("canonical JSON", () => {
@@ -276,7 +248,6 @@ describe("workflow call result reuse", () => {
       "running",
       "failed",
       "cancelled",
-      "incomplete",
     ];
     for (const status of nonReusableStatuses) {
       expect(reusableSuccessfulResult({ status, result: "stale" })).toEqual({

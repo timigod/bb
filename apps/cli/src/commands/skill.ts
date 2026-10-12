@@ -5,10 +5,11 @@ import type { RegistryRanking, RegistrySkill } from "@bb/server-contract";
 import type { SkillsRegistryArea } from "@bb/sdk";
 import { action } from "../action.js";
 import { createCliBbSdk } from "../client.js";
-import { resolveMachineId } from "./machine.js";
+import { resolveMachineId, selectMachines } from "./machine.js";
 import type { ContextSnapshot } from "../context-env.js";
 import { renderBorderlessTable } from "../table.js";
 import {
+  collectOption,
   confirmDestructiveAction,
   outputJson,
   type JsonOutputOptions,
@@ -48,10 +49,6 @@ function environmentId(options: SkillWorkspaceOptions): string | null {
   return options.environment ?? null;
 }
 
-function collectMachineTarget(value: string, previous: string[]): string[] {
-  return [...previous, value];
-}
-
 function parseNonnegativeInteger(value: string | undefined, fallback: number) {
   if (value === undefined) return fallback;
   const parsed = Number(value);
@@ -71,12 +68,6 @@ function addWorkspaceOptions(command: Command): Command {
     .option("--json", "Print machine-readable JSON output");
 }
 
-/**
- * Enrichment fans out one request per item, and each one proxies to GitHub or
- * skills.sh. `--per-page` goes up to 100, so both the concurrency and the
- * number of items enriched are capped: unauthenticated GitHub allows 60
- * requests/hour/IP, and an uncapped burst exhausts that in a single search.
- */
 const REGISTRY_ENRICH_CONCURRENCY = 6;
 const REGISTRY_ENRICH_LIMIT = 48;
 
@@ -131,39 +122,15 @@ async function enrichRegistryStars(
   });
 }
 
-/**
- * A registry row as the CLI reports it. `installs` keeps exactly the meaning
- * the page's `ranking` declares — a 24h window count on `trending`, a lifetime
- * total on `all-time` — and `lifetimeInstalls` always means the lifetime
- * total, `null` when it could not be resolved. Neither field ever changes
- * meaning based on what data was available.
- */
 interface EnrichedRegistrySkill extends RegistrySkill {
   lifetimeInstalls: number | null;
 }
 
-/**
- * The registry list deliberately no longer resolves summaries server-side —
- * that preflight was removed because it made browsing O(N) slow. The CLI has
- * no per-card lazy loading to compensate with, so it resolves them here
- * instead, under the same caps as stars.
- *
- * The per-skill entry is also the only source of a lifetime install count on
- * the trending ranking — where the list's `installs` covers just a 24h
- * window — so this is what makes the CLI report the same number the Skills
- * browse page does, carried in `lifetimeInstalls` so the window count in
- * `installs` is never overwritten. `REGISTRY_ENRICH_LIMIT` bounds the
- * fan-out, so a page larger than the cap can leave rows unresolved; those get
- * `lifetimeInstalls: null` rather than a guess.
- */
 async function enrichRegistryEntries(
   registry: SkillsRegistryArea,
   skills: readonly RegistrySkill[],
   ranking: RegistryRanking,
 ): Promise<EnrichedRegistrySkill[]> {
-  // A search already returns lifetime counts in `installs`, so only trending
-  // needs the per-skill entry for the lifetime figure; summaries are still
-  // fetched wherever they are missing.
   const needsLifetimeInstalls = ranking === "trending";
   const missing = skills
     .filter((skill) => skill.summary === null || needsLifetimeInstalls)
@@ -360,10 +327,6 @@ export function registerSkillCommands(
             },
             enrichedResult.skills.map((entry) => [
               entry.id,
-              // Lifetime installs, matching the browse page. A row whose
-              // lifetime figure could not be resolved prints as unknown
-              // rather than showing the ranking window's count under a
-              // heading that means something else.
               entry.lifetimeInstalls === null
                 ? "—"
                 : String(entry.lifetimeInstalls),
@@ -436,8 +399,8 @@ export function registerSkillCommands(
     )
     .option(
       "--machine <id-or-name>",
-      "Machine to report on (repeatable, defaults to every machine)",
-      collectMachineTarget,
+      "Machine to report on (repeatable, defaults to every persistent machine)",
+      collectOption,
       [],
     )
     .option("--json", "Print machine-readable JSON output")
@@ -476,8 +439,8 @@ export function registerSkillCommands(
     )
     .option(
       "--machine <id-or-name>",
-      "Machine to install onto (repeatable, defaults to every connected machine)",
-      collectMachineTarget,
+      "Machine to install onto (repeatable, defaults to every connected persistent machine)",
+      collectOption,
       [],
     )
     .option("--json", "Print machine-readable JSON output")
@@ -488,7 +451,7 @@ export function registerSkillCommands(
         const hostIds =
           options.machine.length > 0
             ? options.machine.map((target) => resolveMachineId(hosts, target))
-            : hosts
+            : selectMachines(hosts, "persistent")
                 .filter((host) => host.status === "connected")
                 .map((host) => host.id);
         if (hostIds.length === 0) {

@@ -1,18 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import {
-  loadHostDaemonStartConfig,
-  type HostDaemonConnectionConfig,
-} from "@bb/config/host-daemon";
-import type { HostType, ToolCallRequest, ToolCallResponse } from "@bb/domain";
+import { loadHostDaemonStartConfig } from "@bb/config/host-daemon";
 import {
   createHostWatcher,
   createSubprocessParcelWatcherBackend,
   setParcelWatcherBackend,
-  type HostWatcher,
 } from "@bb/host-watcher";
 import { createLogger } from "@bb/logger";
-import { type CreateHostDaemonAppOptions, createHostDaemonApp } from "./app.js";
+import { createHostDaemonApp } from "./app.js";
 import {
   readHostAuthState,
   resolveServerUrl,
@@ -22,133 +17,72 @@ import type { HostDaemon } from "./daemon.js";
 import { enrollDaemonHost } from "./enroll.js";
 import { loadHostIdentity, persistHostId } from "./identity.js";
 import { acquireDaemonLock } from "./lock.js";
+import { resolveHostDaemonLocalApiConfig } from "./local-api-config.js";
 import {
-  resolveHostDaemonLocalApiConfig,
-  type HostDaemonLocalApiOverrides,
-} from "./local-api-config.js";
-import {
+  createUserShellPathResolver,
   prepareRuntimeShellEnv,
+  resolvePowerShellExecutionPolicyDefault,
   resolveBbExecutablePathInDirectory,
   resolveLocalBbExecutablePath,
-  resolveUserShellPath,
 } from "./runtime-shell-env.js";
 import type { HostDaemonLogger } from "./logger.js";
 import {
   startMachineAuthProxy,
   type MachineAuthProxy,
 } from "./machine-auth-proxy.js";
-import type { CreateReconnectingWebSocket } from "./server-connection.js";
 
-export interface StartHostDaemonOptions {
-  dataDir?: string;
-  serverUrl?: string;
-  hostDaemonPort?: number;
+interface StartHostDaemonOptions {
   enrollKey?: string;
   hostId?: string;
-  hostName?: string;
   bbExecutableDirectory?: string;
   bridgeBundleDir?: string;
-  hostType?: HostType;
-  enableLocalApi?: boolean;
-  localApi?: HostDaemonLocalApiOverrides;
-  machineCredential?: string;
-  connectMachineId?: string;
+  serverHeaders?: Record<string, string>;
   autoUpdate?: boolean;
-  logger?: HostDaemonLogger;
-  createInstanceId?: () => string;
-  acquireLock?: typeof acquireDaemonLock;
-  loadIdentity?: typeof loadHostIdentity;
-  createRuntime?: CreateHostDaemonAppOptions["createRuntime"];
-  hostWatcher?: HostWatcher;
-  onToolCall?: (request: ToolCallRequest) => Promise<ToolCallResponse>;
-  fetchFn?: typeof fetch;
-  createWebSocket?: CreateReconnectingWebSocket;
-}
-
-function requireHostDaemonConfig(
-  config: HostDaemonConnectionConfig | undefined,
-): HostDaemonConnectionConfig {
-  if (config === undefined) {
-    throw new Error("Host daemon config is required");
-  }
-
-  return config;
+  supervised?: boolean;
 }
 
 export async function startHostDaemon(
   options: StartHostDaemonOptions = {},
 ): Promise<HostDaemon> {
-  const enableLocalApi = options.enableLocalApi ?? true;
-  const resolvedConfig = loadHostDaemonStartConfig({
-    dataDir: options.dataDir,
-    enableLocalApi,
-    hostDaemonPort: options.hostDaemonPort ?? options.localApi?.port,
-    serverUrl: options.serverUrl,
-  });
+  const resolvedConfig = loadHostDaemonStartConfig({});
   const dataDir = resolvedConfig.dataDir;
   const hostDaemonConfig = resolvedConfig.connectionConfig;
-  if (dataDir === undefined) {
-    throw new Error("Host daemon data directory is required");
-  }
-  // The real logger writes into the shared data dir, so it must not exist
-  // before the lock is held (a losing daemon would mutate the winner's
-  // rolling logs). Lock diagnostics delegate to it once it is created below;
-  // until then they fall back to the console. Compromise can only fire after
-  // acquisition, so in practice the logger is already set.
   let lockDiagnosticsLogger: HostDaemonLogger | null = null;
-  // Losing the lock to another live daemon before the app exists exits
-  // directly; once the app is running it gets a graceful shutdown first.
   let handleDaemonLockLost: () => void = () => process.exit(1);
-  const releaseLock = await (options.acquireLock ?? acquireDaemonLock)(
-    dataDir,
-    {
-      logger: {
-        warn: (fields, message) => {
-          if (lockDiagnosticsLogger) {
-            lockDiagnosticsLogger.warn(fields, message);
-          } else {
-            console.warn(message, fields);
-          }
-        },
-        error: (fields, message) => {
-          if (lockDiagnosticsLogger) {
-            lockDiagnosticsLogger.error(fields, message);
-          } else {
-            console.error(message, fields);
-          }
-        },
+  const releaseLock = await acquireDaemonLock(dataDir, {
+    logger: {
+      warn: (fields, message) => {
+        if (lockDiagnosticsLogger) {
+          lockDiagnosticsLogger.warn(fields, message);
+        } else {
+          console.warn(message, fields);
+        }
       },
-      onLockLost: () => handleDaemonLockLost(),
+      error: (fields, message) => {
+        if (lockDiagnosticsLogger) {
+          lockDiagnosticsLogger.error(fields, message);
+        } else {
+          console.error(message, fields);
+        }
+      },
     },
-  );
+    onLockLost: () => handleDaemonLockLost(),
+  });
 
   let app: Awaited<ReturnType<typeof createHostDaemonApp>> | undefined;
   let machineAuthProxy: MachineAuthProxy | undefined;
   try {
     const persistedAuth = await readHostAuthState(dataDir);
-    const identity = await (options.loadIdentity ?? loadHostIdentity)({
+    const identity = await loadHostIdentity({
       dataDir,
       providedHostId: options.hostId,
-      providedHostName: options.hostName,
     });
-    const instanceId = (options.createInstanceId ?? randomUUID)();
+    const instanceId = randomUUID();
     const serverUrl = resolveServerUrl({
-      providedServerUrl: options.serverUrl ?? hostDaemonConfig?.BB_SERVER_URL,
+      providedServerUrl: hostDaemonConfig.BB_SERVER_URL,
     });
     if (!serverUrl) {
       throw new Error("Host daemon server URL is required");
-    }
-
-    const hostType =
-      persistedAuth?.hostType ?? options.hostType ?? "persistent";
-    if (
-      persistedAuth &&
-      options.hostType &&
-      persistedAuth.hostType !== options.hostType
-    ) {
-      throw new Error(
-        `Configured host type ${options.hostType} does not match persisted auth state ${persistedAuth.hostType}`,
-      );
     }
 
     if (persistedAuth && persistedAuth.hostId !== identity.hostId) {
@@ -161,13 +95,10 @@ export async function startHostDaemon(
       persistedAuth?.hostKey ??
       (
         await enrollDaemonHost({
-          fetchFn: options.fetchFn,
           hostId: identity.hostId,
           hostName: identity.hostName,
-          hostType,
-          connectMachineId: options.connectMachineId,
           serverUrl,
-          machineCredential: options.machineCredential,
+          serverHeaders: options.serverHeaders,
           token:
             options.enrollKey ??
             (() => {
@@ -183,65 +114,52 @@ export async function startHostDaemon(
       await writeHostAuthState(dataDir, {
         hostId: identity.hostId,
         hostKey,
-        hostType,
       });
     }
 
-    const localApiConfig = enableLocalApi
-      ? resolveHostDaemonLocalApiConfig({
-          hostDaemonPort:
-            options.hostDaemonPort ??
-            requireHostDaemonConfig(hostDaemonConfig).BB_HOST_DAEMON_PORT,
-          hostType,
-          localApi: options.localApi,
-        })
-      : null;
+    const localApiConfig = resolveHostDaemonLocalApiConfig({
+      hostDaemonPort: hostDaemonConfig.BB_HOST_DAEMON_PORT,
+    });
     const bbExecutablePath =
       options.bbExecutableDirectory !== undefined
         ? resolveBbExecutablePathInDirectory(options.bbExecutableDirectory)
         : await resolveLocalBbExecutablePath();
     const bbExecutableDirectory = dirname(bbExecutablePath);
-    const logger =
-      options.logger ??
-      createLogger({
-        component: "host-daemon",
-        base: { serverUrl },
-        dataDir,
-        transportMode: "worker",
-      });
+    const logger = createLogger({
+      component: "host-daemon",
+      base: { serverUrl },
+      dataDir,
+    });
     lockDiagnosticsLogger = logger;
-    if (options.machineCredential !== undefined) {
+    if (options.serverHeaders !== undefined) {
       machineAuthProxy = await startMachineAuthProxy({
-        machineCredential: options.machineCredential,
+        serverHeaders: options.serverHeaders,
         serverUrl,
       });
     }
-    let hostWatcher = options.hostWatcher;
-    if (hostWatcher === undefined) {
-      // Run @parcel/watcher in an isolated child process. A parcel inotify
-      // crash/hang/leak is then contained in the child and self-heals via
-      // SIGKILL + respawn, instead of taking down the daemon.
-      setParcelWatcherBackend(
-        createSubprocessParcelWatcherBackend({
-          log: (level, message, fields) => {
-            if (level === "error") {
-              logger.error(fields ?? {}, message);
-            } else if (level === "warn") {
-              logger.warn(fields ?? {}, message);
-            } else {
-              logger.info(fields ?? {}, message);
-            }
-          },
-        }),
-      );
-      hostWatcher = createHostWatcher();
-    }
+    setParcelWatcherBackend(
+      createSubprocessParcelWatcherBackend({
+        log: (level, message, fields) => {
+          if (level === "error") {
+            logger.error(fields ?? {}, message);
+          } else if (level === "warn") {
+            logger.warn(fields ?? {}, message);
+          } else {
+            logger.info(fields ?? {}, message);
+          }
+        },
+      }),
+    );
+    const hostWatcher = createHostWatcher();
+    const resolveUserShellPath = createUserShellPathResolver();
     const resolveRuntimeShellEnv = async () =>
       prepareRuntimeShellEnv({
         bbExecutableDirectory,
         bbExecutablePath,
-        hostDaemonPort: localApiConfig?.port,
+        hostDaemonPort: localApiConfig.port,
         inheritedPath: (await resolveUserShellPath()) ?? process.env.PATH,
+        powershellExecutionPolicy:
+          await resolvePowerShellExecutionPolicyDefault(),
         serverUrl: machineAuthProxy?.serverUrl ?? serverUrl,
       });
     const runtimeShellEnv = await resolveRuntimeShellEnv();
@@ -250,48 +168,37 @@ export async function startHostDaemon(
       dataDir,
       serverUrl,
       hostKey,
-      machineCredential: options.machineCredential,
-      connectMachineId: options.connectMachineId,
+      serverHeaders: options.serverHeaders,
       autoUpdate: options.autoUpdate,
+      supervised: options.supervised,
       bridgeBundleDir: options.bridgeBundleDir,
-      hostType,
       hostId: identity.hostId,
       hostName: identity.hostName,
       instanceId,
       appUrl:
-        hostDaemonConfig?.BB_APP_URL === ""
+        hostDaemonConfig.BB_APP_URL === ""
           ? undefined
-          : hostDaemonConfig?.BB_APP_URL,
-      devAppPort: hostDaemonConfig?.BB_DEV_APP_PORT,
+          : hostDaemonConfig.BB_APP_URL,
+      devAppPort: hostDaemonConfig.BB_DEV_APP_PORT,
       logger,
       releaseLock,
       localApiConfig,
-      createRuntime: options.createRuntime,
       runtimeShellEnv,
       runtimeShellEnvResolvedAtMs,
       resolveRuntimeShellEnv,
       hostWatcher,
-      onToolCall: options.onToolCall,
-      fetchFn: options.fetchFn,
-      createWebSocket: options.createWebSocket,
       closeMachineAuthProxy: machineAuthProxy?.close,
-      // This function owns the daemon process, so it arms the shutdown
-      // force-exit. A self-update restart depends on the process exiting.
-      forceExit: (code) => process.exit(code),
+      exitProcess: (code) => process.exit(code),
     });
     const startedApp = app;
     handleDaemonLockLost = () => {
       void startedApp.daemon
-        .shutdown("daemon-lock-lost")
-        .catch(() => undefined)
-        .finally(() => process.exit(1));
+        .shutdown("daemon-lock-lost", 1)
+        .catch(() => process.exit(1));
     };
     await app.daemon.start();
     return app.daemon;
   } catch (error) {
-    // Once the app exists, daemon.start() owns startup-failure cleanup through
-    // the normal shutdown lifecycle. Before that point, release the resources
-    // acquired directly by this function.
     if (!app) {
       await machineAuthProxy?.close().catch(() => undefined);
       await releaseLock().catch(() => undefined);

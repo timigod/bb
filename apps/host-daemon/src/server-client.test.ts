@@ -1,8 +1,10 @@
 import { AbortError } from "p-retry";
 import { describe, expect, it, vi } from "vitest";
 import type { PendingInteractionCreate } from "@bb/domain";
+import { HOST_ARTIFACT_MAX_BYTES } from "@bb/host-daemon-contract/protocol";
 import {
   createServerClient,
+  readHostArtifactBytes,
   ServerResponseError,
   type FetchFn,
 } from "./server-client.js";
@@ -62,10 +64,11 @@ describe("createServerClient", () => {
     const result = client.openSession({
       hostId: "host-1",
       hostName: "Host",
-      hostType: "persistent",
       dataDir: "/tmp/bb",
       instanceId: "instance-1",
+      localApiPort: null,
       activeThreads: [],
+      undeliveredEventThreadIds: [],
       loadedEnvironments: [],
     });
 
@@ -76,18 +79,98 @@ describe("createServerClient", () => {
   });
 
   it.each([
-    { machineCredential: "bbcm_machine", hasMachineCredential: true },
-    { machineCredential: undefined, hasMachineCredential: false },
+    {
+      name: "with headers",
+      details: {
+        serverUrl: "https://studio.example.test",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+        headers: { "x-bb-connect-machine": "bbcm_new" },
+      },
+      expected: {
+        serverUrl: "https://studio.example.test",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+        headers: { "x-bb-connect-machine": "bbcm_new" },
+      },
+    },
+    {
+      name: "from the moved responder",
+      details: {
+        serverUrl: "http://192.168.1.20:38886",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+      },
+      expected: {
+        serverUrl: "http://192.168.1.20:38886",
+        toHostName: "studio",
+        movedAt: 1_700_000_000_000,
+      },
+    },
+    {
+      name: "without a server URL",
+      details: { toHostName: "studio", movedAt: 1_700_000_000_000 },
+      expected: null,
+    },
+  ])(
+    "preserves 410 server_moved details $name",
+    async ({ details, expected }) => {
+      const fetchFn = vi.fn<FetchFn>(async () =>
+        Response.json(
+          {
+            code: "server_moved",
+            message: "This bb server moved to studio",
+            details,
+          },
+          { status: 410 },
+        ),
+      );
+      const client = createServerClient({
+        fetchFn,
+        getSessionId: () => "session-1",
+        hostKey: "host-key",
+        logger: createLogger(),
+        serverUrl: "http://old-server.example.test:38886",
+      });
+
+      await expect(
+        client.openSession({
+          hostId: "host-1",
+          hostName: "Host",
+          dataDir: "/tmp/bb",
+          instanceId: "instance-1",
+          localApiPort: null,
+          activeThreads: [],
+          undeliveredEventThreadIds: [],
+          loadedEnvironments: [],
+        }),
+      ).rejects.toMatchObject({
+        status: 410,
+        code: "server_moved",
+        retryable: false,
+        serverMoved: expected,
+      });
+    },
+  );
+
+  it.each([
+    {
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
+      hasMachineCredential: true,
+    },
+    { serverHeaders: undefined, hasMachineCredential: false },
   ])(
     "reports live machine-credential capability as $hasMachineCredential",
-    async ({ machineCredential, hasMachineCredential }) => {
+    async ({ serverHeaders, hasMachineCredential }) => {
       const fetchFn = vi.fn<FetchFn>(async (_input, init) => {
         expect(JSON.parse(String(init?.body))).toMatchObject({
           hasMachineCredential,
+          localApiPort: 38_888,
         });
         return Response.json(
           {
             sessionId: "session-1",
+            machineEnvironment: { revision: 0, entries: [] },
             heartbeatIntervalMs: 5_000,
             leaseTimeoutMs: 30_000,
           },
@@ -99,17 +182,18 @@ describe("createServerClient", () => {
         getSessionId: () => "session-1",
         hostKey: "host-key",
         logger: createLogger(),
-        ...(machineCredential !== undefined ? { machineCredential } : {}),
+        ...(serverHeaders !== undefined ? { serverHeaders } : {}),
         serverUrl: "https://bb.example.test",
       });
 
       await client.openSession({
         hostId: "host-1",
         hostName: "Host",
-        hostType: "persistent",
         dataDir: "/tmp/bb",
         instanceId: "instance-1",
+        localApiPort: 38_888,
         activeThreads: [],
+        undeliveredEventThreadIds: [],
         loadedEnvironments: [],
       });
       expect(fetchFn).toHaveBeenCalledOnce();
@@ -228,6 +312,50 @@ describe("createServerClient", () => {
     });
   });
 
+  it("rejects oversized host artifacts before fetching them", async () => {
+    const fetchFn = vi.fn<FetchFn>();
+    const client = createServerClient({
+      fetchFn,
+      getSessionId: () => "session-1",
+      hostKey: "host-key",
+      logger: createLogger(),
+      serverUrl: "https://bb.example.test",
+    });
+
+    await expect(
+      client.fetchPluginHostArtifact({
+        pluginId: "fixture",
+        digest: "a".repeat(64),
+        expectedByteLength: HOST_ARTIFACT_MAX_BYTES + 1,
+      }),
+    ).rejects.toThrow(/exceeds the .* byte limit/u);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("stops a chunked host artifact response at the byte limit", async () => {
+    const chunkBytes = 1024 * 1024;
+    const maxBytes = chunkBytes * 2;
+    let emittedChunks = 0;
+    const cancel = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          emittedChunks += 1;
+          controller.enqueue(new Uint8Array(chunkBytes));
+          if (emittedChunks === 32) controller.close();
+        },
+        cancel,
+      }),
+      { status: 200 },
+    );
+
+    await expect(
+      readHostArtifactBytes(response, maxBytes + chunkBytes * 2, maxBytes),
+    ).rejects.toThrow(/exceeds the .* byte limit/u);
+    expect(emittedChunks).toBeLessThan(32);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("adds the connect machine credential to internal HTTP requests", async () => {
     const treeHash = "b".repeat(64);
     const fetchFn = vi.fn<FetchFn>(async (_input, init) => {
@@ -243,7 +371,7 @@ describe("createServerClient", () => {
       getSessionId: () => "session-1",
       hostKey: "host-key",
       logger: createLogger(),
-      machineCredential: "bbcm_machine",
+      serverHeaders: { "x-bb-connect-machine": "bbcm_machine" },
       serverUrl: "https://bb.example.test",
     });
 
@@ -372,7 +500,6 @@ describe("createServerClient", () => {
           threadId: "thr_123",
         },
       ],
-      kind: "accepted",
       rejectedEvents: [],
     });
   });
@@ -479,5 +606,39 @@ describe("createServerClient", () => {
     });
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("dynamic tool cancellation", () => {
+  it("passes cancellation to the tool-call HTTP transport", async () => {
+    const controller = new AbortController();
+    let transportSignal: AbortSignal | null | undefined;
+    const fetchFn = vi.fn<FetchFn>(async (_input, init) => {
+      transportSignal = init?.signal;
+      return Response.json({ success: true, contentItems: [] });
+    });
+    const client = createServerClient({
+      fetchFn,
+      getSessionId: () => "session-1",
+      hostKey: "key",
+      logger: createLogger(),
+      serverUrl: "http://localhost",
+    });
+    await client.callTool(
+      {
+        requestId: 1,
+        threadId: "thread",
+        providerThreadId: "provider-thread",
+        turnId: "turn",
+        callId: "call",
+        tool: "question",
+      },
+      controller.signal,
+    );
+    controller.abort();
+    expect(transportSignal?.aborted).toBe(true);
+    expect(
+      JSON.parse(String(fetchFn.mock.calls[0]?.[1]?.body)),
+    ).not.toHaveProperty("signal");
   });
 });

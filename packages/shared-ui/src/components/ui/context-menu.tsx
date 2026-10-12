@@ -1,4 +1,3 @@
-/* shadcn/ui-derived */
 import * as React from "react";
 import * as ContextMenuPrimitive from "@radix-ui/react-context-menu";
 
@@ -77,8 +76,6 @@ type ContextMenuSeparatorProps = React.ComponentPropsWithoutRef<
 
 type ContextMenuShortcutProps = React.HTMLAttributes<HTMLSpanElement>;
 
-// Sticky application chrome can reach z-60 (for example sidebar group labels).
-// Context menus portal to the document root and must paint above those tiers.
 const CONTEXT_MENU_LAYER_CLASS = "z-[70]";
 
 const ContextMenu = ContextMenuPrimitive.Root;
@@ -112,7 +109,7 @@ const ContextMenuSubTrigger = React.forwardRef<
       <ContextMenuPrimitive.SubTrigger
         ref={ref}
         className={cn(
-          "flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-[0.3125rem] text-xs outline-none focus:bg-state-hover focus:text-foreground data-[state=open]:bg-state-active data-[state=open]:text-foreground [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+          "flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-[0.3125rem] text-xs outline-none focus:bg-state-hover focus:text-foreground data-[state=open]:bg-state-active data-[state=open]:text-foreground [&_[data-icon-root]]:pointer-events-none [&_[data-icon-root]]:size-4 [&_[data-icon-root]]:shrink-0",
           LIST_HOVER_TRANSITION,
           MENU_ITEM_LAST_HOVERED_CLASS,
           inset && "pl-8",
@@ -135,8 +132,6 @@ const ContextMenuSubContent = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <ContextMenuPrimitive.SubContent
     ref={ref}
-    // Sub menus portal beside the root content, not inside it — stamp them
-    // too so plugin CSS reaches sub-menu items (see portal-scope.ts).
     {...usePortalScopeProps()}
     className={cn(
       CONTEXT_MENU_LAYER_CLASS,
@@ -151,12 +146,10 @@ ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName;
 const ContextMenuContent = React.forwardRef<
   ContextMenuContentElement,
   ContextMenuContentProps
->(({ className, children, ...props }, ref) => (
+>(({ className, children, onPointerUpCapture, ...props }, ref) => (
   <ContextMenuPrimitive.Portal>
     <ContextMenuPrimitive.Content
       ref={ref}
-      // Portaled outside every plugin mount; re-attach the plugin CSS scope
-      // when rendered from a plugin slot (see portal-scope.ts).
       {...usePortalScopeProps()}
       className={cn(
         CONTEXT_MENU_LAYER_CLASS,
@@ -164,6 +157,10 @@ const ContextMenuContent = React.forwardRef<
         className,
       )}
       {...props}
+      onPointerUpCapture={(event) => {
+        onPointerUpCapture?.(event);
+        if (event.button !== 0) event.preventDefault();
+      }}
     >
       <MenuHoverProvider>{children}</MenuHoverProvider>
     </ContextMenuPrimitive.Content>
@@ -194,7 +191,7 @@ const ContextMenuItem = React.forwardRef<
       <ContextMenuPrimitive.Item
         ref={ref}
         className={cn(
-          "relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-[0.3125rem] text-xs outline-none focus:bg-state-hover focus:text-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&>svg]:size-4 [&>svg]:shrink-0",
+          "relative flex cursor-default select-none items-center gap-2 rounded-sm px-2 py-[0.3125rem] text-xs outline-none focus:bg-state-hover focus:text-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&>[data-icon-root]]:size-4 [&>[data-icon-root]]:shrink-0",
           LIST_HOVER_TRANSITION,
           MENU_ITEM_LAST_HOVERED_CLASS,
           inset && "pl-8",

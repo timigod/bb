@@ -18,6 +18,7 @@ type RootComposeSecondaryContentProps = ComponentProps<
 >;
 
 interface PanelGroupHandle {
+  getLayout: () => number[];
   setLayout: (layout: number[]) => void;
 }
 
@@ -33,7 +34,6 @@ interface RenderRootComposeArgs {
   isCompactViewport: boolean;
   isSecondaryPanelOpen: boolean;
   isTopRow?: boolean;
-  panelTogglePositionClassName?: string;
 }
 
 type TestDesktopWindow = {
@@ -41,6 +41,7 @@ type TestDesktopWindow = {
 };
 
 const panelGroupState = vi.hoisted(() => ({
+  getLayout: vi.fn(() => [60, 40]),
   setLayout: vi.fn(),
 }));
 
@@ -66,7 +67,10 @@ vi.mock("react-resizable-panels", async () => {
     ({ children }, ref) => {
       React.useImperativeHandle(
         ref,
-        () => ({ setLayout: panelGroupState.setLayout }),
+        () => ({
+          getLayout: panelGroupState.getLayout,
+          setLayout: panelGroupState.setLayout,
+        }),
         [],
       );
       return React.createElement(
@@ -137,23 +141,29 @@ vi.mock("@/components/secondary-panel/ThreadSecondaryPanel", async () => {
   return { ThreadSecondaryPanel };
 });
 
+vi.mock("@/components/plugin/PluginHomepageSections", async () => {
+  const React = await import("react");
+  return {
+    PluginHomepageSections: () =>
+      React.createElement("div", { "data-testid": "plugin-homepage-sections" }),
+  };
+});
+
 function createSecondaryPanel(
   isOpen: boolean,
 ): RootComposeSecondaryContentProps["secondaryPanel"] {
   return {
     activeTab: null,
     canUseGitUi: false,
-    fileTabs: [],
+    tabs: [],
+    fixedTabs: [],
     isOpen,
     metadataContent: null,
     onCollapse: noop,
     onClose: noop,
-    onFileTabReorder: noop,
+    onTabReorder: noop,
     onOpenNewTab: noop,
-    onPanelChange: noop,
     onPanelFocus: noop,
-    showGitDiffTab: false,
-    showInfoTab: false,
   };
 }
 
@@ -186,12 +196,10 @@ function renderRootCompose(args: RenderRootComposeArgs) {
       isCompactViewport={renderArgs.isCompactViewport}
     >
       <RootComposeSecondaryContent
+        compactScrollContent={null}
+        isCompactHomeLayout={false}
         isSecondaryPanelOpen={renderArgs.isSecondaryPanelOpen}
         onToggleSecondaryPanel={() => undefined}
-        panelTogglePositionClassName={
-          renderArgs.panelTogglePositionClassName ??
-          ROOT_COMPOSE_PINNED_PANEL_TOGGLE_POSITION_CLASS
-        }
         secondaryPanel={createSecondaryPanel(renderArgs.isSecondaryPanelOpen)}
       >
         <div data-testid="root-compose-content" />
@@ -209,12 +217,10 @@ function renderRootCompose(args: RenderRootComposeArgs) {
           isCompactViewport={renderArgs.isCompactViewport}
         >
           <RootComposeSecondaryContent
+            compactScrollContent={null}
+            isCompactHomeLayout={false}
             isSecondaryPanelOpen={renderArgs.isSecondaryPanelOpen}
             onToggleSecondaryPanel={() => undefined}
-            panelTogglePositionClassName={
-              renderArgs.panelTogglePositionClassName ??
-              ROOT_COMPOSE_PINNED_PANEL_TOGGLE_POSITION_CLASS
-            }
             secondaryPanel={createSecondaryPanel(
               renderArgs.isSecondaryPanelOpen,
             )}
@@ -235,31 +241,19 @@ afterEach(() => {
 });
 
 describe("RootComposeSecondaryContent desktop layout", () => {
-  it("always offers a new tab from the new-thread right panel", () => {
+  it("always offers a new tab from the new-thread right panel", async () => {
     renderRootCompose({
       isCompactViewport: false,
       isSecondaryPanelOpen: true,
     });
 
     expect(
-      screen
-        .getByTestId("inline-secondary-panel")
-        .getAttribute("data-show-new-tab-button"),
+      (await screen.findByTestId("inline-secondary-panel")).getAttribute(
+        "data-show-new-tab-button",
+      ),
     ).toBe("true");
-  });
-
-  it("marks the root compose top strip as a macOS window drag region", () => {
-    setMacosDesktopChrome();
-
-    renderRootCompose({
-      isCompactViewport: false,
-      isSecondaryPanelOpen: false,
-    });
-
-    const strip = screen.getByTestId("root-compose-main-window-drag-strip");
-    expect(strip.className).toContain("h-[48px]");
-    expect(strip.className).toContain("[app-region:drag]");
-    expect(strip.className).toContain("[-webkit-app-region:drag]");
+    expect(screen.getByTestId("root-compose-content")).not.toBeNull();
+    expect(screen.getByTestId("plugin-homepage-sections")).not.toBeNull();
   });
 
   it("keeps the drag strip on a split pane that touches the window top edge", () => {
@@ -290,13 +284,6 @@ describe("RootComposeSecondaryContent desktop layout", () => {
     ).toBeNull();
   });
 
-  // Electron resolves app-regions in DOM order (later wins), and the drag strip
-  // renders after root compose's fixed right-panel toggle, so the strip itself
-  // must carve the toggle's footprint back out — a no-drag on the toggle would
-  // be re-added by the strip's own drag rect and the closed panel could never
-  // be opened. jsdom can't run the native region resolution, so these lock the
-  // class/DOM contract that drives it: the cutout is a child of the strip
-  // (resolved after it) at the pinned toggle's shared position.
   it("carves the pinned toggle footprint out of the drag strip while the panel is closed", () => {
     setMacosDesktopChrome();
 
@@ -333,65 +320,50 @@ describe("RootComposeSecondaryContent desktop layout", () => {
     ).toBeNull();
   });
 
-  it("syncs the panel group when persisted open state arrives after mount", () => {
+  it("forwards root panel open and close state to the shared desktop layout", () => {
     const view = renderRootCompose({
       isCompactViewport: false,
       isSecondaryPanelOpen: false,
     });
 
+    expect(panelGroupState.setLayout).toHaveBeenCalledTimes(1);
     expect(panelGroupState.setLayout).toHaveBeenLastCalledWith([100, 0]);
     panelGroupState.setLayout.mockClear();
 
     view.rerenderWith({ isSecondaryPanelOpen: true });
-
     expect(panelGroupState.setLayout).toHaveBeenCalledTimes(1);
     expect(panelGroupState.setLayout).toHaveBeenLastCalledWith([60, 40]);
-    expect(
-      screen.getByTestId("inline-secondary-panel").getAttribute("data-open"),
-    ).toBe("true");
-  });
 
-  it("syncs the panel group when the desktop root panel closes", () => {
-    const view = renderRootCompose({
-      isCompactViewport: false,
-      isSecondaryPanelOpen: true,
-    });
-
-    expect(panelGroupState.setLayout).toHaveBeenLastCalledWith([60, 40]);
     panelGroupState.setLayout.mockClear();
-
     view.rerenderWith({ isSecondaryPanelOpen: false });
-
     expect(panelGroupState.setLayout).toHaveBeenCalledTimes(1);
     expect(panelGroupState.setLayout).toHaveBeenLastCalledWith([100, 0]);
   });
 
-  it("leaves the panel group alone while the root panel renders as a drawer", () => {
+  it("shows the root fallback before realizing compact drawer content", async () => {
     vi.useFakeTimers();
     try {
-      const view = renderRootCompose({
+      renderRootCompose({
         isCompactViewport: true,
-        isSecondaryPanelOpen: false,
+        isSecondaryPanelOpen: true,
       });
 
       expect(panelGroupState.setLayout).not.toHaveBeenCalled();
-
-      view.rerenderWith({ isSecondaryPanelOpen: true });
-
-      expect(panelGroupState.setLayout).not.toHaveBeenCalled();
-      // The panel mounts after the light drawer shell gets its first paint.
-      // A skeleton fills the sheet during those first two frames.
       expect(screen.queryByTestId("drawer-secondary-panel")).toBeNull();
       expect(
-        screen.queryByTestId("drawer-panel-loading-skeleton"),
+        screen.getByTestId("drawer-panel-loading-skeleton"),
       ).not.toBeNull();
-      act(() => {
-        vi.advanceTimersByTime(40);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120);
       });
+      vi.useRealTimers();
+
       expect(
-        screen.getByTestId("drawer-secondary-panel").getAttribute("data-open"),
-      ).toBe("true");
+        await screen.findByTestId("drawer-secondary-panel"),
+      ).not.toBeNull();
     } finally {
+      cleanup();
       vi.useRealTimers();
     }
   });

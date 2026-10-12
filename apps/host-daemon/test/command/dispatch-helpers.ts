@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
   AgentRuntime,
-  AgentRuntimeExecutionOptions,
+  AgentRuntimeBridgeLaunch,
   AgentRuntimeProviderSession,
 } from "@bb/agent-runtime";
 import type {
@@ -15,7 +16,7 @@ import type {
   GitHostPullRequest,
   PromptInput,
 } from "@bb/domain";
-import type { HostDaemonAcpLaunchSpec } from "@bb/host-daemon-contract";
+import type { HostDaemonBridgeLaunch } from "@bb/host-daemon-contract";
 import { makeWorkspaceMergeBase, makeWorkspaceStatus } from "@bb/test-helpers";
 import type {
   HostWorkspace,
@@ -23,17 +24,52 @@ import type {
   PullRequestActionOptions,
 } from "@bb/host-workspace";
 import { RuntimeManager } from "../../src/runtime-manager.js";
-import { listFilesRecursively } from "../../src/command-handlers/file-list.js";
-import { noopEventSink } from "../../src/command-dispatch-support.js";
 import type { CommandDispatchOptions } from "../../src/command-dispatch-support.js";
 import type { FetchProjectAttachment } from "../../src/project-attachments.js";
 
 const tempDirs: string[] = [];
 const execFileAsync = promisify(execFile);
+export const noopEventSink: CommandDispatchOptions["eventSink"] = {
+  emit: () => undefined,
+  flush: async () => undefined,
+};
+
+export const silentLogger: CommandDispatchOptions["logger"] = {
+  debug: () => undefined,
+  warn: () => undefined,
+};
+
 export const unexpectedProjectAttachmentFetch: FetchProjectAttachment =
   async () => {
     throw new Error("Unexpected project attachment fetch");
   };
+
+export const unexpectedProviderMaintenance: Pick<
+  CommandDispatchOptions,
+  | "listModels"
+  | "providerHealth"
+  | "providerUsage"
+  | "providerInstallationStatus"
+  | "providerInstallationRun"
+  | "refreshShellEnv"
+> = {
+  listModels: async () => {
+    throw new Error("Unexpected provider.list_models call");
+  },
+  providerHealth: async () => {
+    throw new Error("Unexpected provider.health call");
+  },
+  providerUsage: async () => {
+    throw new Error("Unexpected provider.usage call");
+  },
+  providerInstallationStatus: async () => {
+    throw new Error("Unexpected provider.installation.status call");
+  },
+  providerInstallationRun: async () => {
+    throw new Error("Unexpected provider.installation.run call");
+  },
+  refreshShellEnv: async () => undefined,
+};
 
 type GitCommandArgs = string[];
 
@@ -52,19 +88,14 @@ interface FakeWorkspaceState {
   lastCommitMessage: string | undefined;
   lastDiffTarget: FakeWorkspaceDiffTarget | undefined;
   lastPullRequestAction: PullRequestActionOptions | undefined;
-  listedModelsProviderId: string | undefined;
-  listedModelsAcpLaunchSpec: HostDaemonAcpLaunchSpec | undefined;
+  pullRequestActionShellPath: string | undefined;
   pullRequest: GitHostPullRequest | null;
   pullRequestLookupError: string | null;
-  resetCount: number;
+  pullRequestLookupShellPath: string | undefined;
   statusReads: number;
 }
 
-/**
- * Direct mutators for the fake runtime's thread state, replacing what the
- * deleted RuntimeManager thread bookkeeping used to provide in tests.
- */
-export interface FakeRuntimeThreadControls {
+interface FakeRuntimeThreadControls {
   clearProviderSession: (threadId: string) => void;
   endActiveTurn: (threadId: string) => void;
   setActiveTurn: (threadId: string, turnId: string) => void;
@@ -75,50 +106,36 @@ export interface FakeRuntimeThreadControls {
 }
 
 interface FakeRuntimeState {
+  archivedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   archivedProviderId: string | undefined;
   archivedProviderThreadId: string | undefined;
   archivedThreadId: string | undefined;
-  listedModelsProviderId: string | undefined;
-  listedModelsAcpLaunchSpec: HostDaemonAcpLaunchSpec | undefined;
   ranTurnClientRequestId: ClientTurnRequestId | undefined;
   ranTurnInput: PromptInput[] | undefined;
-  ranTurnInputGroups: PromptInput[][] | undefined;
-  ranTurnInstructions: string | undefined;
-  ranTurnOptions: AgentRuntimeExecutionOptions | undefined;
   ranTurnText: string | undefined;
   renamedTitle: string | undefined;
-  resumedDynamicTools: DynamicTool[] | undefined;
-  resumedAcpLaunchSpec: HostDaemonAcpLaunchSpec | undefined;
+  resumedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   resumedEnvironmentId: string | undefined;
-  resumedInstructions: string | undefined;
-  resumedOptions: AgentRuntimeExecutionOptions | undefined;
   resumedProviderThreadId: string | undefined;
   resumedThreadId: string | undefined;
   runningProviders: string[];
   shutdownCount: number;
   startedDynamicTools: DynamicTool[] | undefined;
-  startedAcpLaunchSpec: HostDaemonAcpLaunchSpec | undefined;
+  startedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   startedEnvironmentId: string | undefined;
   startedInput: PromptInput[] | undefined;
-  startedInputGroups: PromptInput[][] | undefined;
   startedInstructions: string | undefined;
-  startedOptions: AgentRuntimeExecutionOptions | undefined;
   startedThreadId: string | undefined;
   steeredClientRequestId: ClientTurnRequestId | undefined;
-  steeredInput: PromptInput[] | undefined;
-  steeredInputGroups: PromptInput[][] | undefined;
   steeredTurnId: string | undefined;
   steeredTurnInstructions: string | undefined;
-  steeredTurnOptions: AgentRuntimeExecutionOptions | undefined;
   stoppedThreadId: string | undefined;
+  unarchivedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   unarchivedProviderId: string | undefined;
   unarchivedProviderThreadId: string | undefined;
   unarchivedThreadId: string | undefined;
 }
 
-// Tests reassign workspace fields (e.g. isWorktree, getCurrentBranch) on the
-// fake to vary behavior per test, so the fake exposes mutable equivalents of
-// HostWorkspace's otherwise-readonly fields.
 type FakeHostWorkspace = {
   -readonly [K in keyof HostWorkspace]: HostWorkspace[K];
 };
@@ -128,17 +145,15 @@ export function createFakeWorkspace(pathname: string) {
     statusReads: 0,
     lastDiffTarget: undefined,
     lastCommitMessage: undefined,
-    resetCount: 0,
     destroyed: false,
-    listedModelsProviderId: undefined,
-    listedModelsAcpLaunchSpec: undefined,
     lastPullRequestAction: undefined,
+    pullRequestActionShellPath: undefined,
     pullRequest: null,
     pullRequestLookupError: null,
+    pullRequestLookupShellPath: undefined,
   };
   const workspace: FakeHostWorkspace = {
     path: pathname,
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
     async getDefaultBranch() {
@@ -204,12 +219,14 @@ export function createFakeWorkspace(pathname: string) {
         files: [],
         shortstat: "",
         mergeBaseRef: null,
+        truncated: false,
       };
     },
     async diffPatch() {
       return [];
     },
-    async getPullRequest() {
+    async getPullRequest(options) {
+      state.pullRequestLookupShellPath = options?.shellPath;
       if (state.pullRequestLookupError !== null) {
         return {
           outcome: "unavailable" as const,
@@ -220,14 +237,9 @@ export function createFakeWorkspace(pathname: string) {
         ? { outcome: "none" as const }
         : { outcome: "found" as const, pullRequest: state.pullRequest };
     },
-    async runPullRequestAction(action) {
+    async runPullRequestAction(action, options) {
       state.lastPullRequestAction = action;
-    },
-    async listBranches() {
-      return ["main"];
-    },
-    async listFiles() {
-      return listFilesRecursively(pathname, pathname);
+      state.pullRequestActionShellPath = options?.shellPath;
     },
     async commit(options: { message: string; noVerify: boolean }) {
       state.lastCommitMessage = options.message;
@@ -236,24 +248,6 @@ export function createFakeWorkspace(pathname: string) {
         commitSubject: options.message,
       };
     },
-    async reset() {
-      state.resetCount += 1;
-    },
-    async fetch() {},
-    async squashMerge(options: {
-      targetBranch: string;
-      commitMessage: string;
-    }) {
-      return {
-        merged: true,
-        commitSha: `merge-${options.targetBranch}`,
-        commitSubject: options.commitMessage,
-        targetBranch: options.targetBranch,
-      };
-    },
-    async destroy() {
-      state.destroyed = true;
-    },
   };
 
   return { workspace, state };
@@ -261,42 +255,31 @@ export function createFakeWorkspace(pathname: string) {
 
 export function createFakeRuntime() {
   const state: FakeRuntimeState = {
+    archivedBridgeLaunch: undefined,
     archivedProviderId: undefined,
     archivedProviderThreadId: undefined,
     archivedThreadId: undefined,
-    listedModelsProviderId: undefined,
-    listedModelsAcpLaunchSpec: undefined,
     ranTurnClientRequestId: undefined,
     ranTurnInput: undefined,
-    ranTurnInputGroups: undefined,
-    ranTurnInstructions: undefined,
-    ranTurnOptions: undefined,
     ranTurnText: undefined,
     renamedTitle: undefined,
-    resumedDynamicTools: undefined,
-    resumedAcpLaunchSpec: undefined,
+    resumedBridgeLaunch: undefined,
     resumedEnvironmentId: undefined,
-    resumedInstructions: undefined,
-    resumedOptions: undefined,
     resumedProviderThreadId: undefined,
     resumedThreadId: undefined,
     runningProviders: [],
     shutdownCount: 0,
     startedDynamicTools: undefined,
-    startedAcpLaunchSpec: undefined,
+    startedBridgeLaunch: undefined,
     startedEnvironmentId: undefined,
     startedInput: undefined,
-    startedInputGroups: undefined,
     startedInstructions: undefined,
-    startedOptions: undefined,
     startedThreadId: undefined,
     steeredClientRequestId: undefined,
-    steeredInput: undefined,
-    steeredInputGroups: undefined,
     steeredTurnId: undefined,
     steeredTurnInstructions: undefined,
-    steeredTurnOptions: undefined,
     stoppedThreadId: undefined,
+    unarchivedBridgeLaunch: undefined,
     unarchivedProviderId: undefined,
     unarchivedProviderThreadId: undefined,
     unarchivedThreadId: undefined,
@@ -315,8 +298,6 @@ export function createFakeRuntime() {
       activeTurnsByThreadId.delete(threadId);
     },
     setActiveTurn(threadId, turnId) {
-      // An active turn implies a hosted thread, mirroring the real runtime
-      // where turn/started can only be observed for a registered thread.
       if (!providerSessionsByThreadId.has(threadId)) {
         providerSessionsByThreadId.set(threadId, {
           providerId: "fake",
@@ -332,13 +313,11 @@ export function createFakeRuntime() {
   const runtime: AgentRuntime = {
     async ensureProvider() {},
     async startThread(args) {
-      state.startedAcpLaunchSpec = args.acpLaunchSpec;
+      state.startedBridgeLaunch = args.bridgeLaunch;
       state.startedEnvironmentId = args.environmentId;
       state.startedThreadId = args.threadId;
       state.startedDynamicTools = args.dynamicTools;
       state.startedInput = args.input;
-      state.startedInputGroups = args.inputGroups;
-      state.startedOptions = args.options;
       state.startedInstructions = args.instructions;
       providerSessionsByThreadId.set(args.threadId, {
         providerId: args.providerId,
@@ -356,12 +335,9 @@ export function createFakeRuntime() {
     },
     async discardThreadRewind() {},
     async resumeThread(args) {
-      state.resumedAcpLaunchSpec = args.acpLaunchSpec;
+      state.resumedBridgeLaunch = args.bridgeLaunch;
       state.resumedEnvironmentId = args.environmentId;
       state.resumedThreadId = args.threadId;
-      state.resumedDynamicTools = args.dynamicTools;
-      state.resumedOptions = args.options;
-      state.resumedInstructions = args.instructions;
       state.resumedProviderThreadId = args.providerThreadId;
       const providerThreadId =
         args.providerThreadId ?? `provider-${args.threadId}`;
@@ -377,17 +353,11 @@ export function createFakeRuntime() {
         firstInput?.type === "text" ? firstInput.text : undefined;
       state.ranTurnClientRequestId = args.clientRequestId;
       state.ranTurnInput = args.input;
-      state.ranTurnInputGroups = args.inputGroups;
-      state.ranTurnOptions = args.options;
-      state.ranTurnInstructions = args.instructions;
       activeTurnsByThreadId.set(args.threadId, `turn-${nextTurnNumber++}`);
     },
     async steerTurn(args) {
       state.steeredTurnId = args.expectedTurnId;
       state.steeredClientRequestId = args.clientRequestId;
-      state.steeredInput = args.input;
-      state.steeredInputGroups = args.inputGroups;
-      state.steeredTurnOptions = args.options;
       state.steeredTurnInstructions = args.instructions;
       return { status: "steered" };
     },
@@ -407,6 +377,7 @@ export function createFakeRuntime() {
       state.archivedThreadId = args.threadId;
       state.archivedProviderId = args.providerId;
       state.archivedProviderThreadId = args.providerThreadId;
+      state.archivedBridgeLaunch = args.bridgeLaunch;
       activeTurnsByThreadId.delete(args.threadId);
       providerSessionsByThreadId.delete(args.threadId);
     },
@@ -414,6 +385,7 @@ export function createFakeRuntime() {
       state.unarchivedThreadId = args.threadId;
       state.unarchivedProviderId = args.providerId;
       state.unarchivedProviderThreadId = args.providerThreadId;
+      state.unarchivedBridgeLaunch = args.bridgeLaunch;
     },
     listRunningProviders() {
       return state.runningProviders;
@@ -422,8 +394,6 @@ export function createFakeRuntime() {
       return activeTurnsByThreadId.get(threadId) ?? null;
     },
     async waitForActiveTurn(threadId) {
-      // The fake resolves immediately with the current state; waiting
-      // semantics are covered by the real runtime's tests.
       return activeTurnsByThreadId.get(threadId) ?? null;
     },
     getProviderSession(threadId) {
@@ -441,13 +411,23 @@ export function createFakeRuntime() {
     hasOpenBackgroundWork() {
       return false;
     },
-    async listModels(args) {
-      state.listedModelsProviderId = args.providerId;
-      state.listedModelsAcpLaunchSpec = args.acpLaunchSpec;
+    async listModels() {
       return {
         models: [] satisfies AvailableModel[],
         selectedOnlyModels: [] satisfies AvailableModel[],
       };
+    },
+    async providerHealth() {
+      return { supported: false as const };
+    },
+    async providerUsage() {
+      return { supported: false as const };
+    },
+    async providerInstallationStatus() {
+      throw new Error("Unexpected provider installation status call");
+    },
+    async providerInstallationRun() {
+      throw new Error("Unexpected provider installation run call");
     },
     async shutdown() {
       state.shutdownCount += 1;
@@ -498,14 +478,16 @@ export function createHarness(
     setProvisionedWorkspace(nextWorkspace: HostWorkspace): void {
       provisionedWorkspace = nextWorkspace;
     },
-    /** Default dispatch options with threadStorageRootPath for tests. */
     dispatchOptions(
       overrides: { dataDir?: string; threadStorageRootPath?: string } = {},
     ): CommandDispatchOptions {
       return {
-        dataDir: overrides.dataDir ?? "/tmp/bb-test-data",
+        dataDir: overrides.dataDir ?? DISPATCH_TEST_DATA_DIR,
+        logger: silentLogger,
         eventSink: noopEventSink,
         fetchProjectAttachment: unexpectedProjectAttachmentFetch,
+        fetchPluginHostArtifact: fetchDispatchTestArtifact,
+        ...unexpectedProviderMaintenance,
         runtimeManager: manager,
         threadStorageRootPath:
           overrides.threadStorageRootPath ?? "/tmp/bb-test-thread-storage",
@@ -514,15 +496,17 @@ export function createHarness(
   };
 }
 
-/** Build a complete CommandDispatchOptions using an already-created RuntimeManager. */
 export function makeDispatchOptions(
   overrides: Partial<CommandDispatchOptions> &
     Pick<CommandDispatchOptions, "runtimeManager">,
 ): CommandDispatchOptions {
   return {
-    dataDir: "/tmp/bb-test-data",
+    dataDir: DISPATCH_TEST_DATA_DIR,
+    logger: silentLogger,
     eventSink: noopEventSink,
     fetchProjectAttachment: unexpectedProjectAttachmentFetch,
+    fetchPluginHostArtifact: fetchDispatchTestArtifact,
+    ...unexpectedProviderMaintenance,
     threadStorageRootPath: "/tmp/bb-test-thread-storage",
     ...overrides,
   };
@@ -543,8 +527,66 @@ export async function runGitCommand(
 
 export async function cleanupTempDirs(): Promise<void> {
   await Promise.all(
-    tempDirs
-      .splice(0)
-      .map((dir) => fs.rm(dir, { recursive: true, force: true })),
+    tempDirs.splice(0).map((dir) =>
+      fs.rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 100,
+      }),
+    ),
   );
+}
+
+export const DISPATCH_TEST_ARTIFACT_BYTES = Buffer.from(
+  "export const bridge = true;\n",
+);
+const DISPATCH_TEST_ARTIFACT_DIGEST = createHash("sha256")
+  .update(DISPATCH_TEST_ARTIFACT_BYTES)
+  .digest("hex");
+const DISPATCH_TEST_DATA_DIR = "/tmp/bb-test-data";
+
+export const fetchDispatchTestArtifact = async (): Promise<Uint8Array> =>
+  new Uint8Array(DISPATCH_TEST_ARTIFACT_BYTES);
+
+export const DISPATCH_TEST_BRIDGE_LAUNCH: HostDaemonBridgeLaunch = {
+  pluginId: "provider-pi",
+  source: {
+    kind: "artifact",
+    digest: DISPATCH_TEST_ARTIFACT_DIGEST,
+    byteLength: DISPATCH_TEST_ARTIFACT_BYTES.byteLength,
+  },
+  providerOptions: {},
+  envPassthrough: [],
+  capabilities: {
+    providerInstallation: false,
+    supportsServiceTier: true,
+    permissionModes: ["accept-edits", "auto", "full"],
+    supportsThreadArchive: true,
+    supportsThreadRename: true,
+    fork: "checkpoint",
+  },
+};
+
+export function dispatchTestRuntimeBridgeLaunch(
+  dataDir: string = DISPATCH_TEST_DATA_DIR,
+): AgentRuntimeBridgeLaunch {
+  return {
+    pluginId: "provider-pi",
+    dataDir: path.join(dataDir, "plugins", "provider-pi", "bridge-data"),
+    source: {
+      kind: "artifact",
+      digest: DISPATCH_TEST_ARTIFACT_DIGEST,
+      artifactPath: path.join(
+        dataDir,
+        "plugin-host-artifacts",
+        "provider-pi",
+        DISPATCH_TEST_ARTIFACT_DIGEST,
+        "host.mjs",
+      ),
+    },
+    capabilities: DISPATCH_TEST_BRIDGE_LAUNCH.capabilities,
+    providerOptions: {},
+    envPassthrough: [],
+  };
 }

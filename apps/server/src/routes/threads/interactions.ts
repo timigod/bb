@@ -1,3 +1,4 @@
+import { PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES } from "@bb/domain";
 import {
   publicApiRoutes,
   typedRoutes,
@@ -67,9 +68,12 @@ export function registerThreadInteractionRoutes(
     );
   });
 
-  post(routes.respondToInteraction, (context, payload) => {
+  post(routes.respondToInteraction, async (context, payload) => {
     const thread = requirePublicThread(deps.db, context.req.param("id"));
-    if (Buffer.byteLength(JSON.stringify(payload.value), "utf8") > 64 * 1024) {
+    if (
+      Buffer.byteLength(JSON.stringify(payload.value), "utf8") >
+      PLUGIN_INTERACTION_MAX_PAYLOAD_BYTES
+    ) {
       throw new ApiError(
         413,
         "invalid_request",
@@ -77,7 +81,7 @@ export function registerThreadInteractionRoutes(
       );
     }
     return context.json(
-      deps.pendingInteractions.respondToPluginInteraction({
+      await deps.pendingInteractions.respondToInteraction({
         threadId: thread.id,
         interactionId: parsePendingInteractionId(
           context.req.param("interactionId"),

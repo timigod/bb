@@ -1,7 +1,6 @@
 import { useMemo } from "react";
-import { useBbNavigate } from "@bb/plugin-sdk/app";
+import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 
-/** The nav panel `path` registered in app.tsx; panel URLs are /plugins/tasks/<PANEL_PATH>/<subPath>. */
 export const PANEL_PATH = "tasks";
 
 export type TaskViewMode = "list" | "board";
@@ -10,19 +9,13 @@ export type TasksRoute =
   | { kind: "all" }
   | { kind: "active" }
   | { kind: "manage" }
-  | { kind: "project"; projectId: string; view: TaskViewMode }
+  | { kind: "project"; projectId: string; view: TaskViewMode | null }
   | { kind: "task"; taskKey: string };
 
-/**
- * subPath grammar (the trailing route below /plugins/tasks/tasks):
- *   ""                      → all tasks (default)
- *   "all"                   → all tasks
- *   "active"                → tasks with agents working
- *   "manage"                → manage panel (labels, presets, folders)
- *   "task/<taskKey>"        → task detail (e.g. task/TSK-4)
- *   "<projectId>"           → project list view
- *   "<projectId>?view=board" → project board view
- */
+export type ResolvedTasksRoute =
+  | Exclude<TasksRoute, { kind: "project" }>
+  | { kind: "project"; projectId: string; view: TaskViewMode };
+
 function decodeSegment(segment: string): string {
   try {
     return decodeURIComponent(segment);
@@ -32,8 +25,6 @@ function decodeSegment(segment: string): string {
 }
 
 export function parseTasksRoute(rawSubPath: string): TasksRoute {
-  // The host hands the splat through URL-encoded; the `?view=` marker inside
-  // a segment arrives as %3F.
   const subPath = rawSubPath.split("/").map(decodeSegment).join("/");
   const queryIndex = subPath.indexOf("?");
   const path = queryIndex === -1 ? subPath : subPath.slice(0, queryIndex);
@@ -52,7 +43,7 @@ export function parseTasksRoute(rawSubPath: string): TasksRoute {
   return {
     kind: "project",
     projectId: head,
-    view: view === "board" ? "board" : "list",
+    view: view === "board" || view === "list" ? view : null,
   };
 }
 
@@ -67,9 +58,9 @@ export function tasksRouteToSubPath(route: TasksRoute): string {
     case "task":
       return `task/${route.taskKey}`;
     case "project":
-      return route.view === "board"
-        ? `${route.projectId}?view=board`
-        : route.projectId;
+      return route.view === null
+        ? route.projectId
+        : `${route.projectId}?view=${route.view}`;
   }
 }
 

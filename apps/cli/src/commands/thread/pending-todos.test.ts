@@ -106,11 +106,15 @@ describe("fetchThreadPendingTodos", () => {
   ): ThreadTimelineResponse {
     return {
       activePromptMode: null,
+      contextBoundarySeq: null,
+      completedTurnDisplay: "collapse",
       activeThinking: null,
       activeWorkflows: [],
       activeBackgroundCommands: [],
       pendingTodos,
       goal: null,
+      providerCommands: null,
+      sessionOptions: null,
       modelFallback: null,
       rows: [],
       maxSeq: 0,

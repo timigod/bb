@@ -1,14 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { cn } from "@bb/shared-ui/lib/utils";
-import { Icon } from "@bb/shared-ui/icon";
+import { Icon } from "@/components/ui/icon";
 
-export interface DetailToast {
+interface DetailToast {
   id: number;
-  tone: "error" | "info";
   message: string;
 }
 
-/** Minimal transient toast state for the detail page (no host toast API). */
 export function useDetailToasts() {
   const [toasts, setToasts] = useState<DetailToast[]>([]);
   const nextIdRef = useRef(1);
@@ -17,9 +14,9 @@ export function useDetailToasts() {
     () => () => timersRef.current.forEach((timer) => clearTimeout(timer)),
     [],
   );
-  const push = useCallback((tone: DetailToast["tone"], message: string) => {
+  const push = useCallback((message: string) => {
     const id = nextIdRef.current++;
-    setToasts((current) => [...current, { id, tone, message }]);
+    setToasts((current) => [...current, { id, message }]);
     timersRef.current.push(
       window.setTimeout(() => {
         setToasts((current) => current.filter((toast) => toast.id !== id));
@@ -46,19 +43,12 @@ export function DetailToasts({
         <div
           key={toast.id}
           role="status"
-          className={cn(
-            "pointer-events-auto flex max-w-md items-center gap-2 rounded-md border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-md",
-            toast.tone === "error" ? "border-destructive/50" : "border-border",
-          )}
+          className="pointer-events-auto flex max-w-md items-center gap-2 rounded-md border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-md border-destructive/50"
         >
-          {toast.tone === "error" ? (
-            <Icon
-              name="AlertCircle"
-              className="size-4 shrink-0 text-destructive"
-            />
-          ) : (
-            <Icon name="Info" className="size-4 shrink-0 text-muted-foreground" />
-          )}
+          <Icon
+            name="AlertCircle"
+            className="size-4 shrink-0 text-destructive"
+          />
           <span className="min-w-0 flex-1">{toast.message}</span>
           <button
             type="button"

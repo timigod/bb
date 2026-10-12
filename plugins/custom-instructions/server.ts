@@ -1,133 +1,121 @@
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import {
+  PluginCliError,
+  cliCommand,
+  defineCli,
+  type BbPluginApi,
+} from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
 export const MAX_CUSTOM_INSTRUCTIONS_LENGTH = 4096;
 const STORAGE_KEY = "customInstructions";
+const customInstructionsSchema = z
+  .string()
+  .max(
+    MAX_CUSTOM_INSTRUCTIONS_LENGTH,
+    `Custom instructions must be at most ${MAX_CUSTOM_INSTRUCTIONS_LENGTH} characters`,
+  );
 
-const instructionsInputSchema = z
-  .object({
-    instructions: z.string().max(MAX_CUSTOM_INSTRUCTIONS_LENGTH),
-  })
-  .strict();
-
-const instructionsResponseSchema = z
-  .object({
-    instructions: z.string(),
-    maxLength: z.number().int().positive(),
-  })
-  .strict();
-
-export const customInstructionsRpcContract = defineRpcContract({
-  getInstructions: { input: z.null(), output: instructionsResponseSchema },
-  saveInstructions: {
-    input: instructionsInputSchema,
-    output: instructionsResponseSchema,
-  },
-});
-
-function parseInstructionsInput(input: unknown): string {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    throw new Error("expected { instructions: string }");
-  }
-  const entries = Object.entries(input);
-  if (entries.length !== 1 || entries[0]?.[0] !== "instructions") {
-    throw new Error('expected exactly one field: "instructions"');
-  }
-  const instructions = entries[0][1];
-  if (typeof instructions !== "string") {
-    throw new Error('"instructions" must be a string');
-  }
-  if (instructions.length > MAX_CUSTOM_INSTRUCTIONS_LENGTH) {
-    throw new Error(
-      `"instructions" must be at most ${MAX_CUSTOM_INSTRUCTIONS_LENGTH} characters`,
-    );
-  }
-  return instructions;
-}
+const JSON_OPTION = {
+  type: "boolean",
+  description: "Emit machine-readable JSON",
+} as const;
 
 export default async function plugin(bb: BbPluginApi) {
-  let customInstructions = (await bb.storage.kv.get<string>(STORAGE_KEY)) ?? "";
+  const settings = bb.settings.define({
+    instructions: {
+      type: "string",
+      label: "Custom instructions",
+      description:
+        "Give agents extra instructions and context for tasks on this bb host.",
+      experimental_multiline: true,
+      experimental_schema: customInstructionsSchema,
+      default: "",
+    },
+  });
 
-  bb.rpc.register(customInstructionsRpcContract, {
-    getInstructions() {
-      return {
-        instructions: customInstructions,
-        maxLength: MAX_CUSTOM_INSTRUCTIONS_LENGTH,
-      };
-    },
-    async saveInstructions({ instructions }) {
-      await bb.storage.kv.set(STORAGE_KEY, instructions);
-      customInstructions = instructions;
-      return {
-        instructions: customInstructions,
-        maxLength: MAX_CUSTOM_INSTRUCTIONS_LENGTH,
-      };
-    },
+  let current = await settings.get();
+  const legacy = await bb.storage.kv.get<string>(STORAGE_KEY);
+  if (legacy !== undefined) {
+    if (current.instructions.length === 0 && legacy.length > 0) {
+      current = await settings.experimental_set({ instructions: legacy });
+    }
+    await bb.storage.kv.delete(STORAGE_KEY);
+  }
+  let customInstructions = current.instructions;
+
+  settings.onChange((next) => {
+    customInstructions = next.instructions;
   });
 
   bb.agents.contributeInstructions(() =>
     customInstructions.trim().length > 0 ? customInstructions : null,
   );
 
-  bb.cli.register({
-    name: "instructions",
-    summary: "Read and update the custom instructions injected into agents",
-    commands: [
-      {
-        name: "get",
-        summary: "Print the current custom instructions",
-        usage: "bb instructions get [--json]",
+  bb.cli.register(
+    defineCli({
+      name: "instructions",
+      summary: "Read and update the custom instructions injected into agents",
+      description:
+        "The text is appended to the instructions bb already gives every agent on this host.",
+      commands: {
+        get: cliCommand({
+          summary: "Print the current custom instructions",
+          options: { json: JSON_OPTION },
+          run: (input) => ({
+            exitCode: 0,
+            stdout: input.options.json
+              ? JSON.stringify({ instructions: customInstructions })
+              : customInstructions,
+          }),
+        }),
+        set: cliCommand({
+          summary: "Replace the custom instructions",
+          positionals: [
+            {
+              name: "text",
+              description: `Replacement instructions, joined with single spaces; at most ${MAX_CUSTOM_INSTRUCTIONS_LENGTH} characters`,
+              required: true,
+              variadic: true,
+            },
+          ],
+          options: { json: JSON_OPTION },
+          async run(input) {
+            const parsed = customInstructionsSchema.safeParse(
+              input.positionals.text.join(" "),
+            );
+            if (!parsed.success) {
+              throw new PluginCliError(
+                parsed.error.issues[0]?.message ?? "invalid instructions",
+                { code: "invalid_instructions" },
+              );
+            }
+            const next = await settings.experimental_set({
+              instructions: parsed.data,
+            });
+            customInstructions = next.instructions;
+            return {
+              exitCode: 0,
+              stdout: input.options.json
+                ? JSON.stringify({ instructions: customInstructions })
+                : "Custom instructions updated",
+            };
+          },
+        }),
+        clear: cliCommand({
+          summary: "Clear the custom instructions",
+          options: { json: JSON_OPTION },
+          async run(input) {
+            const next = await settings.experimental_set({ instructions: "" });
+            customInstructions = next.instructions;
+            return {
+              exitCode: 0,
+              stdout: input.options.json
+                ? JSON.stringify({ instructions: "" })
+                : "Custom instructions cleared",
+            };
+          },
+        }),
       },
-      {
-        name: "set",
-        summary: "Replace the custom instructions",
-        usage: "bb instructions set <text...> [--json]",
-      },
-      {
-        name: "clear",
-        summary: "Clear the custom instructions",
-        usage: "bb instructions clear [--json]",
-      },
-    ],
-    async run(argv) {
-      const json = argv.includes("--json");
-      const positional = argv.filter((value) => value !== "--json");
-      const [command, ...rest] = positional;
-      if (command === "get") {
-        return {
-          exitCode: 0,
-          stdout: json
-            ? JSON.stringify({ instructions: customInstructions })
-            : customInstructions,
-        };
-      }
-      if (command === "set") {
-        const instructions = parseInstructionsInput({
-          instructions: rest.join(" "),
-        });
-        await bb.storage.kv.set(STORAGE_KEY, instructions);
-        customInstructions = instructions;
-        return {
-          exitCode: 0,
-          stdout: json
-            ? JSON.stringify({ instructions: customInstructions })
-            : "Custom instructions updated",
-        };
-      }
-      if (command === "clear") {
-        await bb.storage.kv.set(STORAGE_KEY, "");
-        customInstructions = "";
-        return {
-          exitCode: 0,
-          stdout: json
-            ? JSON.stringify({ instructions: "" })
-            : "Custom instructions cleared",
-        };
-      }
-      return {
-        exitCode: 1,
-        stderr: "Usage: bb instructions get|set <text...>|clear [--json]",
-      };
-    },
-  });
+    }),
+  );
 }

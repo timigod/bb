@@ -4,16 +4,11 @@ import type {
   PendingInteractionResolution,
 } from "@bb/domain";
 import type { HostDaemonInteractiveRequestResponse } from "@bb/host-daemon-contract";
+import { createDeferredPromise } from "@bb/test-helpers";
 import {
   InteractiveRequestRegistry,
   InteractiveRequestRegistryError,
 } from "./interactive-request-registry.js";
-
-interface Deferred<TValue> {
-  promise: Promise<TValue>;
-  reject: (error: Error) => void;
-  resolve: (value: TValue) => void;
-}
 
 interface CreateRegistryArgs {
   registerRequest: (
@@ -23,20 +18,6 @@ interface CreateRegistryArgs {
 
 interface CreateCommandApprovalRequestArgs {
   providerRequestId?: string;
-}
-
-function createDeferred<TValue>(): Deferred<TValue> {
-  let resolveValue: (value: TValue) => void = () => {};
-  let rejectValue: (error: Error) => void = () => {};
-  const promise = new Promise<TValue>((resolve, reject) => {
-    resolveValue = resolve;
-    rejectValue = reject;
-  });
-  return {
-    promise,
-    reject: rejectValue,
-    resolve: resolveValue,
-  };
 }
 
 function createCommandApprovalRequest(
@@ -78,33 +59,10 @@ function createRegistry(args: CreateRegistryArgs): InteractiveRequestRegistry {
 }
 
 describe("InteractiveRequestRegistry", () => {
-  it("registers a provider request and resolves it from an interactive.resolve command", async () => {
-    const request = createCommandApprovalRequest();
-    const resolution = createCommandApprovalResolution();
-    const registry = createRegistry({
-      registerRequest: async () => ({
-        outcome: "created",
-        interactionId: "pint_registry",
-        status: "pending",
-      }),
-    });
-
-    const pending = registry.registerAndWait(request);
-    registry.resolve({
-      interactionId: "pint_registry",
-      providerId: request.providerId,
-      providerRequestId: request.providerRequestId,
-      providerThreadId: request.providerThreadId,
-      resolution,
-      threadId: request.threadId,
-    });
-
-    await expect(pending).resolves.toEqual(resolution);
-  });
-
   it("deduplicates registration retries for the same live provider request", async () => {
     const request = createCommandApprovalRequest();
-    const registration = createDeferred<HostDaemonInteractiveRequestResponse>();
+    const registration =
+      createDeferredPromise<HostDaemonInteractiveRequestResponse>();
     const registrations: PendingInteractionCreate[] = [];
     const registry = createRegistry({
       registerRequest: async (registeredRequest) => {

@@ -11,6 +11,7 @@ const DEFAULT_COMPRESSION_CONCURRENCY = 8;
 const MIN_COMPRESS_BYTES = 1024;
 const COMPRESSIBLE_EXTENSIONS = new Set([
   ".css",
+  ".html",
   ".js",
   ".json",
   ".mjs",
@@ -82,7 +83,7 @@ async function compressFile(filePath) {
   };
 }
 
-export async function precompressDirectory(args) {
+async function precompressDirectory(args) {
   const candidateFiles = [];
   for (const filePath of await walkFiles(args.distDir)) {
     if (!shouldPrecompress(filePath)) {

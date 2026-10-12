@@ -1,7 +1,4 @@
-import type {
-  ThreadTimelineResponse,
-  TimelineRow,
-} from "@bb/server-contract";
+import type { ThreadTimelineResponse, TimelineRow } from "@bb/server-contract";
 
 export function timelineHasAssistantConversation(
   timeline: ThreadTimelineResponse,
@@ -14,7 +11,9 @@ export function timelineHasAssistantConversation(
 export function formatTimelineRowKindsForDiagnostics(
   timeline: ThreadTimelineResponse,
 ): string {
-  return flattenTimelineRows(timeline.rows).map(formatTimelineRowKind).join(", ");
+  return flattenTimelineRows(timeline.rows)
+    .map(formatTimelineRowKind)
+    .join(", ");
 }
 
 function flattenTimelineRows(rows: readonly TimelineRow[]): TimelineRow[] {
@@ -28,7 +27,7 @@ function flattenTimelineRows(rows: readonly TimelineRow[]): TimelineRow[] {
         }
         break;
       case "work":
-        if (row.workKind === "delegation") {
+        if (row.workKind === "delegation" && row.childRows !== null) {
           flattened.push(...flattenTimelineRows(row.childRows));
         }
         break;

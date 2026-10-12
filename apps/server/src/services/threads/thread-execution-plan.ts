@@ -1,16 +1,20 @@
-import { getSupportedPermissionModes } from "@bb/agent-providers";
-import { getProjectExecutionDefaults, getThread } from "@bb/db";
-import type {
-  CallerExecutionInputSource,
-  PermissionMode,
-  ProjectExecutionDefaults,
-  ReasoningLevel,
-  ResolvedThreadExecutionOptions,
-  ServiceTier,
-  ThreadExecutionSource,
+import { getAppSettings, getProjectExecutionDefaults, getThread } from "@bb/db";
+import {
+  DEFAULT_SERVICE_TIER,
+  isStandardReasoningLevel,
+  providerServiceTierOptions,
+  reconcileServiceTier,
+  type CallerExecutionInputSource,
+  type PermissionMode,
+  type ProjectExecutionDefaults,
+  type ReasoningLevel,
+  type ResolvedThreadExecutionOptions,
+  type ServiceTier,
+  type ThreadExecutionSource,
 } from "@bb/domain";
 import { ApiError } from "../../errors.js";
 import type { AppDeps } from "../../types.js";
+import type { ProviderRegistryService } from "../providers/provider-registry.js";
 import {
   clampPermissionModeToHost,
   isHostPermissionCeilingConflictError,
@@ -18,19 +22,17 @@ import {
 } from "../hosts/permission-ceiling.js";
 import {
   DEFAULT_REASONING_LEVEL,
-  DEFAULT_SERVICE_TIER,
-  resolveCreateThreadExecutionDefaults,
   resolveThreadExecutionPermissionMode,
 } from "./thread-default-policy.js";
 import { getLastExecutionOptions } from "./thread-events.js";
 import { getSupportedReasoningLevelsForProvider } from "./thread-reasoning-policy.js";
 
-export interface ExecutionPlanFieldInput<TValue> {
+interface ExecutionPlanFieldInput<TValue> {
   source: CallerExecutionInputSource;
   value: TValue;
 }
 
-export interface ExistingThreadExecutionInput {
+interface ExistingThreadExecutionInput {
   model?: ExecutionPlanFieldInput<string>;
   permissionMode?: ExecutionPlanFieldInput<PermissionMode>;
   reasoningLevel?: ExecutionPlanFieldInput<ReasoningLevel>;
@@ -45,69 +47,36 @@ export interface ExistingThreadExecutionInputRequest {
   executionInputSources?: ExistingThreadExecutionInputRequestSources;
 }
 
-export interface ExistingThreadExecutionInputRequestSources {
+interface ExistingThreadExecutionInputRequestSources {
   model?: CallerExecutionInputSource;
   permissionMode?: CallerExecutionInputSource;
   reasoningLevel?: CallerExecutionInputSource;
   serviceTier?: CallerExecutionInputSource;
 }
 
-export interface ResolveExistingThreadExecutionPlanArgs {
+interface ResolveExistingThreadExecutionPlanArgs {
   executionSource: ThreadExecutionSource;
-  /**
-   * Machine the resolved execution runs on. Omitted means "read it from the
-   * thread's environment"; thread creation passes it because the environment
-   * is still being provisioned.
-   */
   hostId?: string | null;
   input: ExistingThreadExecutionInput;
   projectDefaults?: ProjectExecutionDefaults | null;
   threadId: string;
 }
 
-export interface ResolveProjectCreateDefaultExecutionPlanArgs {
-  projectId: string;
-  requestedProviderId?: string;
-}
-
-export interface ExistingThreadExecutionPlan {
-  defaultView: ResolvedThreadExecutionOptions;
-  eventExecution: ResolvedThreadExecutionOptions;
-  queuedExecution: ResolvedThreadExecutionOptions;
+interface ExistingThreadExecutionPlan {
   resolvedExecution: ResolvedThreadExecutionOptions;
 }
 
-export interface ProjectCreateDefaultExecutionPlan {
-  defaultView: ProjectExecutionDefaults | null;
-  providerId: string;
-}
-
-interface ResolveStoredThreadPermissionModeArgs {
-  /**
-   * Machine the thread's work lands on. Omitted means "read it from the
-   * thread's environment"; callers pass it when the environment does not exist
-   * yet (thread creation resolves the host from the provisioning intent).
-   */
-  hostId?: string | null;
-  projectDefaults?: ProjectExecutionDefaults | null;
-  resolvingThreadIds: ReadonlySet<string>;
-  threadId: string;
-}
-
-function resolveStoredThreadPermissionMode(
-  deps: Pick<AppDeps, "db">,
-  args: ResolveStoredThreadPermissionModeArgs,
+export function resolveExistingThreadPermissionMode(
+  deps: Pick<AppDeps, "db" | "providerRegistry">,
+  threadId: string,
 ): PermissionMode {
-  const thread = getThread(deps.db, args.threadId);
+  const thread = getThread(deps.db, threadId);
   if (!thread) {
     throw new ApiError(404, "thread_not_found", "Thread not found");
   }
-  const projectDefaults =
-    args.projectDefaults === undefined
-      ? getProjectExecutionDefaults(deps.db, {
-          projectId: thread.projectId,
-        })
-      : args.projectDefaults;
+  const projectDefaults = getProjectExecutionDefaults(deps.db, {
+    projectId: thread.projectId,
+  });
   const projectExecution =
     projectDefaults?.providerId === thread.providerId ? projectDefaults : null;
   const parentThread =
@@ -119,34 +88,28 @@ function resolveStoredThreadPermissionMode(
     thread.id,
   )?.permissionMode;
   const permissionMode = clampPermissionModeToHost(deps, {
-    hostId:
-      args.hostId === undefined
-        ? resolveEnvironmentHostId(deps, thread.environmentId)
-        : args.hostId,
-    permissionMode: resolveThreadExecutionPermissionMode({
-      lastExecutionPermissionMode,
-      parentThread,
-      parentThreadExecutionPermissionMode:
-        parentThread !== null
-          ? getLastExecutionOptions(deps, parentThread.id)?.permissionMode
-          : undefined,
-      projectExecutionPermissionMode: projectExecution?.permissionMode,
-      thread,
-    }),
-    ...(thread.providerId ? { providerId: thread.providerId } : {}),
+    hostId: resolveEnvironmentHostId(deps, thread.environmentId),
+    permissionMode: resolveThreadExecutionPermissionMode(
+      deps.providerRegistry,
+      {
+        lastExecutionPermissionMode,
+        parentThread,
+        parentThreadExecutionPermissionMode:
+          parentThread !== null
+            ? getLastExecutionOptions(deps, parentThread.id)?.permissionMode
+            : undefined,
+        projectExecutionPermissionMode: projectExecution?.permissionMode,
+        thread,
+      },
+    ),
+    providerId: thread.providerId,
   });
-  validateProviderPermissionMode(thread.providerId, permissionMode);
+  validateProviderPermissionMode(
+    deps.providerRegistry,
+    thread.providerId,
+    permissionMode,
+  );
   return permissionMode;
-}
-
-export function resolveExistingThreadPermissionMode(
-  deps: Pick<AppDeps, "db">,
-  threadId: string,
-): PermissionMode {
-  return resolveStoredThreadPermissionMode(deps, {
-    resolvingThreadIds: new Set(),
-    threadId,
-  });
 }
 
 function createMissingThreadExecutionModelError(threadId: string): ApiError {
@@ -234,14 +197,11 @@ export function buildExistingThreadExecutionInput(
 }
 
 function validateProviderPermissionMode(
-  providerId: string | undefined,
+  registry: ProviderRegistryService,
+  providerId: string,
   permissionMode: PermissionMode,
 ): void {
-  if (!providerId) {
-    return;
-  }
-
-  const supported = getSupportedPermissionModes(providerId);
+  const supported = registry.getSupportedPermissionModes(providerId);
   if (!supported || supported.includes(permissionMode)) {
     return;
   }
@@ -254,15 +214,18 @@ function validateProviderPermissionMode(
 }
 
 function validateProviderReasoningLevel(
-  providerId: string | undefined,
+  registry: ProviderRegistryService,
+  providerId: string,
   reasoningLevel: ReasoningLevel,
 ): void {
   const supportedLevels = getSupportedReasoningLevelsForProvider(
-    providerId ?? "",
+    registry,
+    providerId,
   );
   if (
     supportedLevels.length === 0 ||
-    supportedLevels.includes(reasoningLevel)
+    supportedLevels.includes(reasoningLevel) ||
+    !isStandardReasoningLevel(reasoningLevel)
   ) {
     return;
   }
@@ -271,6 +234,40 @@ function validateProviderReasoningLevel(
     400,
     "invalid_request",
     `Provider ${providerId} does not support ${reasoningLevel} reasoning level. Supported reasoning levels: ${supportedLevels.join(", ")}.`,
+  );
+}
+
+function resolveProviderServiceTier(
+  registry: ProviderRegistryService,
+  args: {
+    providerId: string;
+    requested: ExecutionPlanFieldInput<ServiceTier> | undefined;
+    inherited: ServiceTier | undefined;
+  },
+): ServiceTier {
+  const provider = registry.get(args.providerId);
+  const candidate = args.requested?.value ?? args.inherited;
+  if (candidate === undefined || candidate === DEFAULT_SERVICE_TIER) {
+    return DEFAULT_SERVICE_TIER;
+  }
+  if (provider === null) {
+    return candidate;
+  }
+  const supported = providerServiceTierOptions(provider.info);
+  const reconciled = reconcileServiceTier(candidate, supported);
+  if (reconciled === candidate || args.requested?.source !== "explicit") {
+    return reconciled;
+  }
+
+  throw new ProviderCapabilityValidationError(
+    400,
+    "invalid_request",
+    supported.length === 0
+      ? `Provider ${args.providerId} does not support service tiers.`
+      : `Provider ${args.providerId} does not support the ${candidate} service tier. Supported service tiers: ${[
+          DEFAULT_SERVICE_TIER,
+          ...supported.map((tier) => tier.id),
+        ].join(", ")}.`,
   );
 }
 
@@ -293,7 +290,7 @@ function resolveFieldWithDefault<TValue>(
 }
 
 export async function resolveExistingThreadExecutionPlan(
-  deps: Pick<AppDeps, "db">,
+  deps: Pick<AppDeps, "db" | "providerRegistry">,
   args: ResolveExistingThreadExecutionPlanArgs,
 ): Promise<ExistingThreadExecutionPlan> {
   const lastExecution = getLastExecutionOptions(deps, args.threadId);
@@ -301,8 +298,6 @@ export async function resolveExistingThreadExecutionPlan(
   if (!thread) {
     throw new ApiError(404, "thread_not_found", "Thread not found");
   }
-  // Omitted project defaults means "load current project policy"; callers pass
-  // null only when they need to prove project defaults are intentionally absent.
   const rawProjectExecution =
     args.projectDefaults === undefined
       ? getProjectExecutionDefaults(deps.db, {
@@ -331,24 +326,29 @@ export async function resolveExistingThreadExecutionPlan(
     throw createMissingThreadExecutionModelError(args.threadId);
   }
 
-  // The machine's ceiling wins over every other source, including an explicit
-  // request, so a capped machine cannot be talked into privileged work.
   const permissionMode = clampPermissionModeToHost(deps, {
     hostId:
       args.hostId === undefined
         ? resolveEnvironmentHostId(deps, thread.environmentId)
         : args.hostId,
-    permissionMode: resolveThreadExecutionPermissionMode({
-      requestedPermissionMode: args.input.permissionMode?.value,
-      lastExecutionPermissionMode: lastExecution?.permissionMode,
-      parentThread,
-      parentThreadExecutionPermissionMode: parentExecution?.permissionMode,
-      projectExecutionPermissionMode: projectExecution?.permissionMode,
-      thread,
-    }),
-    ...(thread.providerId ? { providerId: thread.providerId } : {}),
+    permissionMode: resolveThreadExecutionPermissionMode(
+      deps.providerRegistry,
+      {
+        requestedPermissionMode: args.input.permissionMode?.value,
+        lastExecutionPermissionMode: lastExecution?.permissionMode,
+        parentThread,
+        parentThreadExecutionPermissionMode: parentExecution?.permissionMode,
+        projectExecutionPermissionMode: projectExecution?.permissionMode,
+        thread,
+      },
+    ),
+    providerId: thread.providerId,
   });
-  validateProviderPermissionMode(thread.providerId, permissionMode);
+  validateProviderPermissionMode(
+    deps.providerRegistry,
+    thread.providerId,
+    permissionMode,
+  );
 
   const reasoningLevel = resolveFieldWithDefault<ReasoningLevel>(
     [
@@ -359,16 +359,19 @@ export async function resolveExistingThreadExecutionPlan(
     ],
     DEFAULT_REASONING_LEVEL,
   );
-  validateProviderReasoningLevel(thread.providerId, reasoningLevel);
-
-  const serviceTier = resolveFieldWithDefault<ServiceTier>(
-    [
-      args.input.serviceTier?.value,
-      lastExecution?.serviceTier,
-      projectExecution?.serviceTier,
-    ],
-    DEFAULT_SERVICE_TIER,
+  validateProviderReasoningLevel(
+    deps.providerRegistry,
+    thread.providerId,
+    reasoningLevel,
   );
+
+  const serviceTier = getAppSettings(deps.db).allowFastServiceTier
+    ? resolveProviderServiceTier(deps.providerRegistry, {
+        providerId: thread.providerId,
+        requested: args.input.serviceTier,
+        inherited: lastExecution?.serviceTier ?? projectExecution?.serviceTier,
+      })
+    : DEFAULT_SERVICE_TIER;
 
   const resolvedExecution = {
     model,
@@ -378,15 +381,12 @@ export async function resolveExistingThreadExecutionPlan(
     source: args.executionSource,
   };
   return {
-    defaultView: resolvedExecution,
-    eventExecution: resolvedExecution,
-    queuedExecution: resolvedExecution,
     resolvedExecution,
   };
 }
 
 export async function tryResolveExistingThreadExecutionPlan(
-  deps: Pick<AppDeps, "db">,
+  deps: Pick<AppDeps, "db" | "providerRegistry">,
   args: ResolveExistingThreadExecutionPlanArgs,
 ): Promise<ExistingThreadExecutionPlan | null> {
   try {
@@ -404,21 +404,4 @@ export async function tryResolveExistingThreadExecutionPlan(
     }
     throw error;
   }
-}
-
-export function resolveProjectCreateDefaultExecutionPlan(
-  deps: Pick<AppDeps, "db">,
-  args: ResolveProjectCreateDefaultExecutionPlanArgs,
-): ProjectCreateDefaultExecutionPlan {
-  const storedDefaults = getProjectExecutionDefaults(deps.db, {
-    projectId: args.projectId,
-  });
-  const resolution = resolveCreateThreadExecutionDefaults({
-    requestedProviderId: args.requestedProviderId,
-    storedDefaults,
-  });
-  return {
-    defaultView: resolution.executionDefaults,
-    providerId: resolution.providerId,
-  };
 }

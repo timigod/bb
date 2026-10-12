@@ -1,18 +1,21 @@
+import { createHash } from "node:crypto";
 import { and, eq, inArray, isNotNull, lt, ne } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import { betterAuth } from "better-auth";
 import { apiKey } from "@better-auth/api-key";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { authApiKeys, authUsers, type DbConnection } from "@bb/db";
-import { hostTypeSchema, type HostType } from "@bb/domain";
 import { readOrCreateSecretFile } from "@bb/secret-storage";
 import { z } from "zod";
 import type { ServerLogger } from "../types.js";
+import { runSerialized } from "./lib/async-deduper.js";
 
 const AUTH_SECRET_FILE_NAME = "auth-secret";
-const DAEMON_ENROLL_CONFIG_ID = "daemon-enroll";
-const DAEMON_HOST_CONFIG_ID = "daemon-host";
+export const DAEMON_ENROLL_CONFIG_ID = "daemon-enroll";
+export const DAEMON_HOST_CONFIG_ID = "daemon-host";
 const ENROLL_KEY_TTL_SECONDS = 60 * 15;
+const DAEMON_KEY_CACHE_TTL_MS = 30_000;
+const DAEMON_KEY_CACHE_MAX_ENTRIES = 1024;
 const MACHINE_AUTH_SYSTEM_USER_ID = "bb-machine-auth-system-user";
 const MACHINE_AUTH_SYSTEM_USER_EMAIL = "machine-auth@bb.internal";
 const MACHINE_AUTH_SYSTEM_USER_NAME = "Machine Auth System";
@@ -22,58 +25,56 @@ const machineAuthSchema = {
   user: authUsers,
 };
 
-const machineCredentialMetadataSchema = z
+const currentMachineCredentialMetadataSchema = z
   .object({
     hostId: z.string().min(1),
-    hostType: hostTypeSchema,
-    enrollSource: z.enum(["loopback", "public-multi-machine"]).optional(),
+    enrollSource: z
+      .enum(["loopback", "public-multi-machine", "reconnect"])
+      .optional(),
   })
   .strict();
 
-export type MachineCredentialMetadata = z.infer<
+const legacyMachineCredentialMetadataSchema = z
+  .object({
+    hostId: z.string().min(1),
+    hostType: z.literal("persistent"),
+    enrollSource: z.enum(["loopback", "public-multi-machine"]).optional(),
+  })
+  .strict()
+  .transform(({ hostId, enrollSource }) => ({
+    hostId,
+    ...(enrollSource === undefined ? {} : { enrollSource }),
+  }));
+
+const machineCredentialMetadataSchema = z.union([
+  currentMachineCredentialMetadataSchema,
+  legacyMachineCredentialMetadataSchema,
+]);
+
+type MachineCredentialMetadata = z.infer<
   typeof machineCredentialMetadataSchema
 >;
 
-export interface IssueHostEnrollKeyArgs {
+interface IssueHostEnrollKeyArgs {
   hostId: string;
-  hostType: HostType;
-  enrollSource: "loopback" | "public-multi-machine";
+  enrollSource: "loopback" | "public-multi-machine" | "reconnect";
 }
 
-export interface RevokeHostEnrollKeysArgs {
+interface RevokeHostAuthKeysArgs {
   hostId: string;
-  hostType: HostType;
 }
 
-export interface RevokeHostAuthKeysArgs {
+interface IssueDaemonHostKeyArgs {
   hostId: string;
-  hostType: HostType;
 }
 
-export interface IssueDaemonHostKeyArgs {
-  hostId: string;
-  hostType: HostType;
-}
-
-export interface RotateDaemonHostKeyArgs {
-  keyId: string;
-  hostId: string;
-  hostType: HostType;
-}
-
-export interface DisableMachineKeyArgs {
-  keyId: string;
-}
-
-export interface IssueHostEnrollKeyResult {
+interface IssueHostEnrollKeyResult {
   expiresAt: number;
   key: string;
 }
 
 export interface EnrollHostArgs {
-  allowPublicEnrollment: boolean;
   hostId: string;
-  hostType: HostType;
   token: string;
 }
 
@@ -82,7 +83,7 @@ export interface EnrollHostResult {
   metadata: MachineCredentialMetadata;
 }
 
-export interface VerifyMachineKeyResult {
+interface VerifyMachineKeyResult {
   keyId: string;
   metadata: MachineCredentialMetadata;
 }
@@ -92,14 +93,13 @@ interface CreateDaemonHostKeyResult {
   keyId: string;
 }
 
-export interface CreateMachineAuthServiceArgs {
+interface CreateMachineAuthServiceArgs {
   dataDir: string;
   db: DbConnection;
   logger: ServerLogger;
 }
 
 export interface MachineAuthService {
-  disableMachineKey(args: DisableMachineKeyArgs): Promise<void>;
   ensureReady(): Promise<void>;
   enrollHost(args: EnrollHostArgs): Promise<EnrollHostResult | null>;
   issueDaemonHostKey(args: IssueDaemonHostKeyArgs): Promise<string>;
@@ -107,9 +107,8 @@ export interface MachineAuthService {
     args: IssueHostEnrollKeyArgs,
   ): Promise<IssueHostEnrollKeyResult>;
   pruneExpiredKeys(): Promise<void>;
-  revokeHostEnrollKeys(args: RevokeHostEnrollKeysArgs): Promise<void>;
   revokeHostAuthKeys(args: RevokeHostAuthKeysArgs): Promise<void>;
-  rotateDaemonHostKey(args: RotateDaemonHostKeyArgs): Promise<string>;
+  revokeHostEnrollKeys(args: RevokeHostAuthKeysArgs): Promise<void>;
   verifyDaemonHostKey(token: string): Promise<VerifyMachineKeyResult | null>;
 }
 
@@ -121,6 +120,8 @@ interface ApiKeyVerificationArgs {
 interface ApiKeyVerificationResult {
   keyId: string;
   metadata: MachineCredentialMetadata;
+  expiresAtMs: number | null;
+  cacheable: boolean;
 }
 
 function parseCredentialMetadata(
@@ -174,6 +175,21 @@ export async function createMachineAuthService(
   });
 
   let readyPromise: Promise<void> | null = null;
+  const hostOperations = new Map<string, Promise<unknown>>();
+  const daemonKeyCache = new Map<
+    string,
+    { result: ApiKeyVerificationResult; validUntilMs: number }
+  >();
+  const pendingDaemonVerifications = new Set<Set<string>>();
+
+  function invalidateDaemonHostKeys(hostId: string): void {
+    for (const invalidatedHosts of pendingDaemonVerifications) {
+      invalidatedHosts.add(hostId);
+    }
+    for (const [key, entry] of daemonKeyCache) {
+      if (entry.result.metadata.hostId === hostId) daemonKeyCache.delete(key);
+    }
+  }
 
   async function ensureSystemUser(): Promise<void> {
     const now = new Date();
@@ -215,7 +231,7 @@ export async function createMachineAuthService(
       },
     });
 
-    if (!result.valid || !result.key) {
+    if (!result.valid || !result.key || !result.key.enabled) {
       return null;
     }
 
@@ -231,6 +247,12 @@ export async function createMachineAuthService(
     return {
       keyId: result.key.id,
       metadata,
+      expiresAtMs: result.key.expiresAt?.getTime() ?? null,
+      cacheable:
+        result.key.rateLimitEnabled === false &&
+        result.key.remaining === null &&
+        result.key.refillAmount === null &&
+        result.key.refillInterval === null,
     };
   }
 
@@ -254,24 +276,13 @@ export async function createMachineAuthService(
     };
   }
 
-  async function disableMachineKey(
-    disableArgs: DisableMachineKeyArgs,
+  async function disableActiveKeysForHost(
+    configId: string,
+    hostId: string,
+    preserveKeyId?: string,
   ): Promise<void> {
     await ensureReady();
-    await args.db
-      .update(authApiKeys)
-      .set({
-        enabled: false,
-        updatedAt: new Date(),
-      })
-      .where(eq(authApiKeys.id, disableArgs.keyId))
-      .run();
-  }
-
-  async function disableActiveEnrollKeysForHost(
-    metadata: MachineCredentialMetadata,
-  ): Promise<void> {
-    await ensureReady();
+    if (configId === DAEMON_HOST_CONFIG_ID) invalidateDaemonHostKeys(hostId);
     await args.db
       .update(authApiKeys)
       .set({
@@ -280,54 +291,12 @@ export async function createMachineAuthService(
       })
       .where(
         and(
-          eq(authApiKeys.configId, DAEMON_ENROLL_CONFIG_ID),
+          eq(authApiKeys.configId, configId),
           eq(authApiKeys.enabled, true),
-          sql`json_extract(${authApiKeys.metadata}, '$.hostId') = ${metadata.hostId}`,
-          sql`json_extract(${authApiKeys.metadata}, '$.hostType') = ${metadata.hostType}`,
-        ),
-      )
-      .run();
-  }
-
-  async function disableOtherActiveDaemonHostKeysForHost(
-    metadata: MachineCredentialMetadata,
-    preserveKeyId: string,
-  ): Promise<void> {
-    await ensureReady();
-    await args.db
-      .update(authApiKeys)
-      .set({
-        enabled: false,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(authApiKeys.configId, DAEMON_HOST_CONFIG_ID),
-          eq(authApiKeys.enabled, true),
-          ne(authApiKeys.id, preserveKeyId),
-          sql`json_extract(${authApiKeys.metadata}, '$.hostId') = ${metadata.hostId}`,
-          sql`json_extract(${authApiKeys.metadata}, '$.hostType') = ${metadata.hostType}`,
-        ),
-      )
-      .run();
-  }
-
-  async function disableActiveDaemonHostKeysForHost(
-    metadata: MachineCredentialMetadata,
-  ): Promise<void> {
-    await ensureReady();
-    await args.db
-      .update(authApiKeys)
-      .set({
-        enabled: false,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(authApiKeys.configId, DAEMON_HOST_CONFIG_ID),
-          eq(authApiKeys.enabled, true),
-          sql`json_extract(${authApiKeys.metadata}, '$.hostId') = ${metadata.hostId}`,
-          sql`json_extract(${authApiKeys.metadata}, '$.hostType') = ${metadata.hostType}`,
+          preserveKeyId === undefined
+            ? undefined
+            : ne(authApiKeys.id, preserveKeyId),
+          sql`json_extract(${authApiKeys.metadata}, '$.hostId') = ${hostId}`,
         ),
       )
       .run();
@@ -351,145 +320,142 @@ export async function createMachineAuthService(
   }
 
   return {
-    async disableMachineKey(disableArgs: DisableMachineKeyArgs): Promise<void> {
-      await disableMachineKey(disableArgs);
-    },
     async ensureReady(): Promise<void> {
       await ensureReady();
     },
     async enrollHost({
-      allowPublicEnrollment,
       hostId,
-      hostType,
       token,
     }: EnrollHostArgs): Promise<EnrollHostResult | null> {
-      const verified = await verifyKey({
-        configId: DAEMON_ENROLL_CONFIG_ID,
-        token,
+      return runSerialized(hostOperations, hostId, async () => {
+        const verified = await verifyKey({
+          configId: DAEMON_ENROLL_CONFIG_ID,
+          token,
+        });
+        if (!verified) {
+          return null;
+        }
+        if (verified.metadata.hostId !== hostId) {
+          return null;
+        }
+
+        const hostMetadata: MachineCredentialMetadata = {
+          hostId: verified.metadata.hostId,
+        };
+
+        const hostKey = await createDaemonHostKey(hostMetadata);
+        await disableActiveKeysForHost(
+          DAEMON_HOST_CONFIG_ID,
+          hostMetadata.hostId,
+          hostKey.keyId,
+        );
+        return {
+          hostKey: hostKey.key,
+          metadata: hostMetadata,
+        };
       });
-      if (!verified) {
-        return null;
-      }
-      if (
-        verified.metadata.hostId !== hostId ||
-        verified.metadata.hostType !== hostType
-      ) {
-        return null;
-      }
-      if (
-        verified.metadata.enrollSource === "public-multi-machine" &&
-        !allowPublicEnrollment
-      ) {
-        return null;
-      }
-
-      const hostMetadata: MachineCredentialMetadata = {
-        hostId: verified.metadata.hostId,
-        hostType: verified.metadata.hostType,
-      };
-
-      // Create the replacement key before revoking prior daemon-host keys so
-      // reenrollment does not strand the host if key creation fails mid-flow.
-      const hostKey = await createDaemonHostKey(hostMetadata);
-      await disableOtherActiveDaemonHostKeysForHost(
-        hostMetadata,
-        hostKey.keyId,
-      );
-      return {
-        hostKey: hostKey.key,
-        metadata: hostMetadata,
-      };
     },
     async issueDaemonHostKey({
       hostId,
-      hostType,
     }: IssueDaemonHostKeyArgs): Promise<string> {
-      const created = await createDaemonHostKey({
-        hostId,
-        hostType,
-      });
+      const created = await createDaemonHostKey({ hostId });
       return created.key;
     },
     async issueHostEnrollKey({
       enrollSource,
       hostId,
-      hostType,
     }: IssueHostEnrollKeyArgs): Promise<IssueHostEnrollKeyResult> {
-      await ensureReady();
-      const metadata = {
-        enrollSource,
-        hostId,
-        hostType,
-      };
-      await disableActiveEnrollKeysForHost(metadata);
+      return runSerialized(hostOperations, hostId, async () => {
+        await ensureReady();
+        const metadata = {
+          enrollSource,
+          hostId,
+        };
+        await disableActiveKeysForHost(DAEMON_ENROLL_CONFIG_ID, hostId);
 
-      const created = await auth.api.createApiKey({
-        body: {
-          configId: DAEMON_ENROLL_CONFIG_ID,
-          metadata,
-          remaining: 1,
-          rateLimitEnabled: false,
-          userId: MACHINE_AUTH_SYSTEM_USER_ID,
-        },
+        const created = await auth.api.createApiKey({
+          body: {
+            configId: DAEMON_ENROLL_CONFIG_ID,
+            metadata,
+            remaining: 1,
+            rateLimitEnabled: false,
+            userId: MACHINE_AUTH_SYSTEM_USER_ID,
+          },
+        });
+
+        if (!created.expiresAt) {
+          throw new Error("Machine enroll key is missing an expiration time");
+        }
+
+        return {
+          expiresAt: created.expiresAt.getTime(),
+          key: created.key,
+        };
       });
-
-      if (!created.expiresAt) {
-        throw new Error("Machine enroll key is missing an expiration time");
-      }
-
-      return {
-        expiresAt: created.expiresAt.getTime(),
-        key: created.key,
-      };
     },
     async pruneExpiredKeys(): Promise<void> {
       await pruneExpiredKeys();
     },
     async revokeHostEnrollKeys({
       hostId,
-      hostType,
-    }: RevokeHostEnrollKeysArgs): Promise<void> {
-      await disableActiveEnrollKeysForHost({
-        hostId,
-        hostType,
-      });
+    }: RevokeHostAuthKeysArgs): Promise<void> {
+      await runSerialized(hostOperations, hostId, () =>
+        disableActiveKeysForHost(DAEMON_ENROLL_CONFIG_ID, hostId),
+      );
     },
     async revokeHostAuthKeys({
       hostId,
-      hostType,
     }: RevokeHostAuthKeysArgs): Promise<void> {
-      const metadata = { hostId, hostType };
-      await disableActiveEnrollKeysForHost(metadata);
-      await disableActiveDaemonHostKeysForHost(metadata);
-    },
-    async rotateDaemonHostKey({
-      keyId,
-      hostId,
-      hostType,
-    }: RotateDaemonHostKeyArgs): Promise<string> {
-      // Create the replacement key before revoking existing daemon-host keys so
-      // host auth remains available if key creation fails mid-rotation.
-      const nextHostKey = await createDaemonHostKey({
-        hostId,
-        hostType,
-      });
-      await disableOtherActiveDaemonHostKeysForHost(
-        {
-          hostId,
-          hostType,
-        },
-        nextHostKey.keyId,
-      );
-      await disableMachineKey({ keyId });
-      return nextHostKey.key;
+      await disableActiveKeysForHost(DAEMON_ENROLL_CONFIG_ID, hostId);
+      await disableActiveKeysForHost(DAEMON_HOST_CONFIG_ID, hostId);
     },
     async verifyDaemonHostKey(
       token: string,
     ): Promise<VerifyMachineKeyResult | null> {
-      return verifyKey({
-        configId: DAEMON_HOST_CONFIG_ID,
-        token,
-      });
+      const cacheKey = createHash("sha256").update(token).digest("hex");
+      const startedAt = Date.now();
+      const cached = daemonKeyCache.get(cacheKey);
+      if (cached && startedAt < cached.validUntilMs) {
+        daemonKeyCache.delete(cacheKey);
+        daemonKeyCache.set(cacheKey, cached);
+        return {
+          keyId: cached.result.keyId,
+          metadata: { ...cached.result.metadata },
+        };
+      }
+      daemonKeyCache.delete(cacheKey);
+
+      const invalidatedHosts = new Set<string>();
+      pendingDaemonVerifications.add(invalidatedHosts);
+      try {
+        const result = await verifyKey({
+          configId: DAEMON_HOST_CONFIG_ID,
+          token,
+        });
+        if (
+          !result ||
+          invalidatedHosts.has(result.metadata.hostId) ||
+          (result.expiresAtMs !== null && Date.now() >= result.expiresAtMs)
+        ) {
+          return null;
+        }
+
+        const validUntilMs = Math.min(
+          startedAt + DAEMON_KEY_CACHE_TTL_MS,
+          result.expiresAtMs ?? Infinity,
+        );
+        if (result.cacheable && Date.now() < validUntilMs) {
+          daemonKeyCache.delete(cacheKey);
+          daemonKeyCache.set(cacheKey, { result, validUntilMs });
+          while (daemonKeyCache.size > DAEMON_KEY_CACHE_MAX_ENTRIES) {
+            const oldest = daemonKeyCache.keys().next();
+            if (!oldest.done) daemonKeyCache.delete(oldest.value);
+          }
+        }
+        return { keyId: result.keyId, metadata: { ...result.metadata } };
+      } finally {
+        pendingDaemonVerifications.delete(invalidatedHosts);
+      }
     },
   };
 }

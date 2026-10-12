@@ -5,6 +5,7 @@ import {
   findPane,
   findPaneByContent,
   findPaneByThread,
+  isSamePaneContent,
   MAX_PANES,
   replacePaneContent,
   setFocus,
@@ -12,13 +13,21 @@ import {
 } from "@/lib/split-layout";
 import { decideThreadDrop, type SplitZone } from "@/lib/split-drag";
 import type { PaneContent, SplitLayout } from "@/lib/split-layout";
+import { matchPath } from "react-router-dom";
+import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import {
+  APP_ROOT_ROUTE_PATH,
+  getPluginDetailRoutePath,
   getPluginPanelRoutePath,
   getRootComposeRoutePath,
   getThreadRoutePath,
+  PLUGIN_DETAIL_ROUTE_PATH,
+  PLUGIN_PANEL_ROUTE_PATH,
 } from "@/lib/route-paths";
 
 const FIRST_PANE_ID = "pane-1";
+const SPLITTABLE_THREAD_ROUTE_PATH = "/projects/:projectId/threads/:threadId";
+const SPLITTABLE_PERSONAL_THREAD_ROUTE_PATH = "/threads/:threadId";
 
 export function threadPaneContent(thread: ThreadRoutePathArgs): PaneContent {
   return {
@@ -41,9 +50,7 @@ export function createSinglePaneLayout(
   };
 }
 
-export function createSinglePaneContentLayout(
-  content: PaneContent,
-): SplitLayout {
+function createSinglePaneContentLayout(content: PaneContent): SplitLayout {
   return {
     root: { type: "pane", paneId: FIRST_PANE_ID, content },
     focusedPaneId: FIRST_PANE_ID,
@@ -57,6 +64,9 @@ export function paneContentRoute(content: PaneContent): string {
   if (content.kind === "new-thread") {
     return getRootComposeRoutePath();
   }
+  if (content.kind === "plugin-detail") {
+    return getPluginDetailRoutePath({ pluginId: content.pluginId });
+  }
   return getPluginPanelRoutePath({
     pluginId: content.pluginId,
     path: content.panelPath,
@@ -64,7 +74,48 @@ export function paneContentRoute(content: PaneContent): string {
   });
 }
 
-/** Reconciles any splittable page route into the focused pane. */
+export function paneContentForPathname(pathname: string): PaneContent | null {
+  if (pathname === APP_ROOT_ROUTE_PATH) {
+    return { kind: "new-thread" };
+  }
+  const thread = matchPath(
+    { path: SPLITTABLE_THREAD_ROUTE_PATH, end: false },
+    pathname,
+  );
+  if (thread?.params.projectId && thread.params.threadId) {
+    return {
+      kind: "thread",
+      projectId: thread.params.projectId,
+      threadId: thread.params.threadId,
+    };
+  }
+  const personalThread = matchPath(
+    { path: SPLITTABLE_PERSONAL_THREAD_ROUTE_PATH, end: false },
+    pathname,
+  );
+  if (personalThread?.params.threadId) {
+    return {
+      kind: "thread",
+      projectId: PERSONAL_PROJECT_ID,
+      threadId: personalThread.params.threadId,
+    };
+  }
+  const detail = matchPath(PLUGIN_DETAIL_ROUTE_PATH, pathname);
+  if (detail?.params.pluginId) {
+    return { kind: "plugin-detail", pluginId: detail.params.pluginId };
+  }
+  const panel = matchPath(PLUGIN_PANEL_ROUTE_PATH, pathname);
+  if (panel?.params.pluginId && panel.params.panelPath) {
+    return {
+      kind: "plugin-panel",
+      pluginId: panel.params.pluginId,
+      panelPath: panel.params.panelPath,
+      subPath: panel.params["*"] ?? "",
+    };
+  }
+  return null;
+}
+
 export function reconcileLayoutForContent(
   layout: SplitLayout | null,
   content: PaneContent,
@@ -87,6 +138,22 @@ export function reconcileLayoutForContent(
   return replacePaneContent(layout, layout.focusedPaneId, content);
 }
 
+export function replaceOriginPaneContent(
+  layout: SplitLayout,
+  paneId: string,
+  originContent: PaneContent,
+  content: PaneContent,
+): SplitLayout | null {
+  const pane = findPane(layout.root, paneId);
+  if (pane === null || !isSamePaneContent(pane.content, originContent)) {
+    return null;
+  }
+  return {
+    ...replacePaneContent(layout, paneId, content),
+    focusedPaneId: layout.focusedPaneId,
+  };
+}
+
 export function focusedPaneRoute(layout: SplitLayout): string | null {
   const focused = findPane(layout.root, layout.focusedPaneId);
   return focused === null ? null : paneContentRoute(focused.content);
@@ -96,11 +163,6 @@ function threadOpenSplitZone(split: ThreadOpenSplit): SplitZone {
   return split === "replace" ? "center" : split === "down" ? "bottom" : split;
 }
 
-/**
- * Applies a CLI/SDK thread-open intent to the current layout. This deliberately
- * routes through the same drop decision as sidebar dragging so already-open
- * threads focus, and edge splits at the pane cap coerce to replacement.
- */
 export function applyThreadOpenToLayout(
   layout: SplitLayout | null,
   thread: ThreadRoutePathArgs,
@@ -130,14 +192,12 @@ export function applyThreadOpenToLayout(
     : splitPane(layout, layout.focusedPaneId, decision.zone, content);
 }
 
-export interface ThreadPaneActionLayoutResult {
+interface ThreadPaneActionLayoutResult {
   layout: SplitLayout;
   maximizedPaneId: string | null;
-  /** Explicit preference update requested by the action, or null when unchanged. */
   dimInactiveSplits: boolean | null;
 }
 
-/** Apply one CLI/SDK pane action without creating or replacing pane content. */
 export function applyThreadPaneActionToLayout(
   layout: SplitLayout,
   maximizedPaneId: string | null,

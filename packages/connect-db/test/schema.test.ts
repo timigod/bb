@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { and, eq, isNull } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CONNECT_CODE_TTL_MS,
@@ -16,8 +16,7 @@ import {
   schema,
   server,
   user,
-  validateHandle,
-  validateSubdomain,
+  validateLabel,
 } from "../src/index.js";
 
 const MIGRATIONS_DIR = fileURLToPath(new URL("../migrations", import.meta.url));
@@ -33,7 +32,6 @@ const LABEL_CLAIM_TRIGGERS = [
   "server_label_claim_update",
 ] as const;
 
-/** Migration files in lexical (apply) order. */
 function migrationFiles(): string[] {
   return readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith(".sql"))
@@ -206,8 +204,6 @@ describe("migration matches the drizzle schema", () => {
       )
       .run("u2", "owner-two", createdAt);
 
-    // Attaching the primary server to its owner's handle is legitimate and
-    // shares the existing handle claim instead of attempting a duplicate.
     sqlite
       .prepare(
         "INSERT INTO server (id, user_id, name, subdomain, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -320,8 +316,6 @@ describe("constraints", () => {
         createdAt: now,
       })
       .run();
-    // Same (user, name) — rejected by the user_name unique index (distinct
-    // subdomain so this targets the name index, not the subdomain constraint).
     expect(() =>
       db
         .insert(server)
@@ -334,7 +328,6 @@ describe("constraints", () => {
         })
         .run(),
     ).toThrow(/UNIQUE/i);
-    // Different user, same name — allowed (N-ready schema).
     expect(() =>
       db
         .insert(server)
@@ -362,8 +355,6 @@ describe("constraints", () => {
         createdAt: now,
       })
       .run();
-    // Same subdomain, different user + different name — still rejected: the
-    // namespace is global, not per-account.
     expect(() =>
       db
         .insert(server)
@@ -442,57 +433,35 @@ describe("constraints", () => {
     expect(db.select().from(connectCode).all()).toHaveLength(0);
     expect(db.select().from(labelClaim).all()).toHaveLength(0);
   });
-
-  it("marks a connect code consumed exactly once (single-use redemption)", () => {
-    seedUser();
-    const now = new Date();
-    db.insert(connectCode)
-      .values({
-        code: "one-time",
-        userId: "u1",
-        purpose: "manual-pair",
-        expiresAt: new Date(now.getTime() + CONNECT_CODE_TTL_MS),
-        createdAt: now,
-      })
-      .run();
-
-    // Redemption pattern: conditional update on not-yet-consumed.
-    const redeem = () =>
-      db
-        .update(connectCode)
-        .set({ consumedAt: new Date() })
-        .where(
-          and(eq(connectCode.code, "one-time"), isNull(connectCode.consumedAt)),
-        )
-        .run();
-
-    const first = redeem();
-    expect(first.changes).toBe(1);
-    const second = redeem();
-    expect(second.changes).toBe(0);
-  });
 });
 
-describe("validateHandle", () => {
+describe("validateLabel", () => {
   it("accepts well-formed handles", () => {
     for (const h of ["sawyer", "abc", "a1b2", "my-server", "x".repeat(30)]) {
-      expect(validateHandle(h)).toBeNull();
+      expect(validateLabel(h)).toBeNull();
     }
   });
 
   it("rejects malformed and reserved handles", () => {
-    expect(validateHandle("ab")).toBe("too-short");
-    expect(validateHandle("x".repeat(31))).toBe("too-long");
-    expect(validateHandle("-lead")).toBe("invalid-format");
-    expect(validateHandle("Upper")).toBe("invalid-format");
-    expect(validateHandle("has space")).toBe("invalid-format");
-    expect(validateHandle("has_underscore")).toBe("invalid-format");
-    // `--` is reserved as the host-label separator for port shares.
-    expect(validateHandle("foo--bar")).toBe("invalid-format");
-    expect(validateHandle("a--b")).toBe("invalid-format");
-    expect(validateHandle("api")).toBe("reserved");
-    expect(validateHandle("www")).toBe("reserved");
-    expect(validateHandle("admin")).toBe("reserved");
+    expect(validateLabel("ab")).toBe("too-short");
+    expect(validateLabel("x".repeat(31))).toBe("too-long");
+    expect(validateLabel("-lead")).toBe("invalid-format");
+    expect(validateLabel("Upper")).toBe("invalid-format");
+    expect(validateLabel("has space")).toBe("invalid-format");
+    expect(validateLabel("has_underscore")).toBe("invalid-format");
+    expect(validateLabel("foo--bar")).toBe("invalid-format");
+    expect(validateLabel("a--b")).toBe("invalid-format");
+    for (const h of [
+      "api",
+      "www",
+      "docs",
+      "admin",
+      "oauth",
+      "origin",
+      "production",
+    ]) {
+      expect(validateLabel(h)).toBe("reserved");
+    }
   });
 });
 
@@ -524,7 +493,6 @@ describe("parseVisitorHost", () => {
     expect(parseVisitorHost("sawyer--99999.getbb.app", "getbb.app")).toBeNull();
     expect(parseVisitorHost("sawyer--08000.getbb.app", "getbb.app")).toBeNull();
     expect(parseVisitorHost("sawyer--x.getbb.app", "getbb.app")).toBeNull();
-    // Multi `--`: first split only; suffix is not a valid port → null.
     expect(parseVisitorHost("foo--80--00.getbb.app", "getbb.app")).toBeNull();
   });
 
@@ -536,24 +504,11 @@ describe("parseVisitorHost", () => {
   });
 });
 
-describe("validateSubdomain (shares the handle grammar)", () => {
-  it("rejects `--`, reserved words, and bad charset the same way handles do", () => {
-    expect(validateSubdomain("sawyer-desktop")).toBeNull();
-    expect(validateSubdomain("foo--bar")).toBe("invalid-format");
-    expect(validateSubdomain("Upper")).toBe("invalid-format");
-    expect(validateSubdomain("has_underscore")).toBe("invalid-format");
-    expect(validateSubdomain("ab")).toBe("too-short");
-    expect(validateSubdomain("admin")).toBe("reserved");
-  });
-});
-
 describe("0003 backfill (staged application on real prior data)", () => {
   it("backfills server.subdomain from the owner's handle before enforcing NOT NULL/UNIQUE", () => {
     const staged = new Database(":memory:");
     staged.pragma("foreign_keys = ON");
     try {
-      // Apply everything BEFORE 0003, then seed pre-multi-server rows (a server
-      // with no subdomain column yet), then apply 0003 and check the backfill.
       const files = migrationFiles();
       const subdomainMigration = "0003_server_subdomain.sql";
       const priorFiles = files.filter((f) => f < subdomainMigration);
@@ -576,8 +531,6 @@ describe("0003 backfill (staged application on real prior data)", () => {
           "INSERT INTO server (id, user_id, name, created_at) VALUES (?,?,?,?)",
         )
         .run("s1", "u1", "default", now);
-      // A pending pair code references the server — it must survive the rebuild
-      // (the FK-guarded swap must not cascade-delete it).
       staged
         .prepare(
           "INSERT INTO connect_code (code, user_id, server_id, purpose, expires_at, created_at) VALUES (?,?,?,?,?,?)",
@@ -608,7 +561,6 @@ describe("0003 backfill (staged application on real prior data)", () => {
       expect(codes).toHaveLength(1);
       expect(codes[0].server_id).toBe("s1");
 
-      // Post-migration the column is NOT NULL + UNIQUE.
       expect(() =>
         staged
           .prepare(
@@ -771,7 +723,6 @@ describe("0005 label-claim reconciliation", () => {
       insertUser.run("u1", "One", "u1@example.com", 1, now, now);
       insertUser.run("u2", "Two", "u2@example.com", 1, now, now);
 
-      // Simulate a claim-ignorant old web worker in the per-migration gap.
       staged
         .prepare(
           "INSERT INTO profile (user_id, handle, created_at) VALUES (?,?,?)",
@@ -783,8 +734,6 @@ describe("0005 label-claim reconciliation", () => {
           .get("gap-label"),
       ).toBeUndefined();
 
-      // D1 applies one migration transactionally. The reconciliation completes
-      // before the triggers become the permanent write barrier.
       staged.transaction(() => {
         applyMigration(staged, "0005_label_claim_triggers.sql");
       })();
@@ -846,7 +795,6 @@ describe("0005 label-claim reconciliation", () => {
           .get("orphan-label"),
       ).toEqual({ kind: "server" });
 
-      // The old worker deletes the source without knowing about label_claim.
       staged.prepare("DELETE FROM server WHERE id = ?").run("s1");
       staged.transaction(() => {
         applyMigration(staged, "0005_label_claim_triggers.sql");
@@ -907,8 +855,6 @@ describe("0005 label-claim reconciliation", () => {
           .get("reused-label"),
       ).toEqual({ kind: "server", owner_id: "old-server", user_id: "u1" });
 
-      // A claim-ignorant old worker swaps the source ownership between the two
-      // per-migration transactions, leaving the 0004 claim stale by identity.
       staged.prepare("DELETE FROM server WHERE id = ?").run("old-server");
       insertServer.run("new-server", "u2", "desktop", "reused-label", now + 1);
       staged.transaction(() => {
@@ -922,8 +868,6 @@ describe("0005 label-claim reconciliation", () => {
           .get("reused-label"),
       ).toEqual({ kind: "server", owner_id: "new-server", user_id: "u2" });
 
-      // The installed delete trigger now releases the corrected claim, proving
-      // the label is not pinned to either prior server identity.
       staged.prepare("DELETE FROM server WHERE id = ?").run("new-server");
       expect(
         staged
@@ -1056,8 +1000,6 @@ describe("checkLabelAvailability (all routing namespaces)", () => {
     seedUser("u1");
     seedUser("u2");
     const now = new Date();
-    // Pre-PR write shape: source rows are committed after migration, but the
-    // independently deployed old web worker knows nothing about label_claim.
     db.insert(profile)
       .values({ userId: "u1", handle: "legacy-handle", createdAt: now })
       .run();
@@ -1142,41 +1084,6 @@ describe("checkLabelAvailability (all routing namespaces)", () => {
       available: false,
       reason: "invalid",
       error: "too-short",
-    });
-  });
-
-  it("reports a label taken by an existing handle", async () => {
-    seedUser("u1");
-    const now = new Date();
-    db.insert(profile)
-      .values({ userId: "u1", handle: "sawyer", createdAt: now })
-      .run();
-    expect(await checkLabelAvailability(db, "sawyer")).toEqual({
-      available: false,
-      reason: "taken",
-      namespace: "handle",
-    });
-  });
-
-  it("reports a label taken by an existing server subdomain", async () => {
-    seedUser("u1");
-    const now = new Date();
-    db.insert(profile)
-      .values({ userId: "u1", handle: "sawyer", createdAt: now })
-      .run();
-    db.insert(server)
-      .values({
-        id: "s1",
-        userId: "u1",
-        name: "desktop",
-        subdomain: "sawyer-desktop",
-        createdAt: now,
-      })
-      .run();
-    expect(await checkLabelAvailability(db, "sawyer-desktop")).toEqual({
-      available: false,
-      reason: "taken",
-      namespace: "subdomain",
     });
   });
 

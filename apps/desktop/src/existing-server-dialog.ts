@@ -1,15 +1,20 @@
-import { BrowserWindow, ipcMain } from "electron";
-import { escapeHtmlText } from "@bb/domain";
+import { ipcMain, type BrowserWindow } from "electron";
+import { escapeHtmlText } from "@bb/text-utils";
+import {
+  createDesktopDialogWindow,
+  DESKTOP_DIALOG_BASE_CSS,
+  showDesktopDialogHtml,
+} from "./desktop-dialog-window.js";
 import {
   BB_DESKTOP_EXISTING_SERVER_DIALOG_CHOOSE_CHANNEL,
   existingServerDialogChooseRequestSchema,
 } from "./existing-server-dialog-ipc.js";
 import type { ForeignRuntimeDetails } from "./foreign-runtime.js";
+import { BUILTIN_SERVER_NAME } from "./server-target.js";
 
-export type ExistingServerDialogChoice = "connect" | "quit" | "replace";
+type ExistingServerDialogChoice = "connect" | "quit" | "replace";
 
-export interface OpenExistingServerDialogArgs {
-  /** Null when the running bb is too old to describe itself. */
+interface OpenExistingServerDialogArgs {
   details: ForeignRuntimeDetails | null;
   parentWindow: BrowserWindow | null;
   preloadPath: string;
@@ -69,7 +74,7 @@ function buildDetailRows(args: {
   return rows;
 }
 
-export interface RenderExistingServerDialogHtmlArgs {
+interface RenderExistingServerDialogHtmlArgs {
   details: ForeignRuntimeDetails | null;
   now: Date;
   serverUrl: string;
@@ -91,9 +96,6 @@ export function renderExistingServerDialogHtml(
         )}</code></div>`,
     )
     .join("\n      ");
-  // Stopping the other copy needs a verified pid, which only the runtime file
-  // provides. Hide the option, and its warning, rather than offer an action
-  // that cannot work.
   const canReplace = args.details !== null;
   const replaceButtonHtml = canReplace
     ? `<button type="button" data-choice="replace">Quit other bb</button>`
@@ -112,30 +114,7 @@ export function renderExistingServerDialogHtml(
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
   <title>bb is already running</title>
   <style>
-    :root {
-      color-scheme: light dark;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-
-    body {
-      background: Canvas;
-      color: CanvasText;
-      margin: 0;
-      padding: 20px;
-    }
-
-    h1 {
-      font-size: 14px;
-      font-weight: 600;
-      margin: 0 0 4px;
-    }
-
-    p {
-      color: color-mix(in srgb, CanvasText 70%, transparent);
-      font-size: 12px;
-      line-height: 1.45;
-      margin: 0 0 12px;
-    }
+${DESKTOP_DIALOG_BASE_CSS}
 
     .details {
       border: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
@@ -172,15 +151,6 @@ export function renderExistingServerDialogHtml(
       margin-top: 14px;
     }
 
-    button {
-      background: color-mix(in srgb, CanvasText 8%, Canvas);
-      border: 1px solid color-mix(in srgb, CanvasText 22%, transparent);
-      border-radius: 6px;
-      color: CanvasText;
-      font-size: 13px;
-      padding: 5px 14px;
-    }
-
     button[data-choice="connect"] {
       background: AccentColor;
       border-color: AccentColor;
@@ -189,7 +159,7 @@ export function renderExistingServerDialogHtml(
   </style>
 </head>
 <body>
-  <h1>bb is already running on this Mac</h1>
+  <h1>bb is already running on ${BUILTIN_SERVER_NAME}</h1>
   <p>${introText}</p>
   <div class="details">
       ${detailHtml}
@@ -204,29 +174,13 @@ export function renderExistingServerDialogHtml(
 </html>`;
 }
 
-/**
- * Ask before the desktop app attaches to a bb it did not start. Closing the
- * window resolves to "quit", because attaching must always be a deliberate act.
- */
 export function openExistingServerDialog(
   args: OpenExistingServerDialogArgs,
 ): Promise<ExistingServerDialogChoice> {
-  const dialogWindow = new BrowserWindow({
-    fullscreenable: false,
-    height: args.details === null ? 182 : 280,
-    maximizable: false,
-    minimizable: false,
-    modal: args.parentWindow !== null,
-    parent: args.parentWindow ?? undefined,
-    resizable: false,
-    show: false,
+  const dialogWindow = createDesktopDialogWindow({
+    parentWindow: args.parentWindow,
+    preloadPath: args.preloadPath,
     title: "bb is already running",
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      preload: args.preloadPath,
-      sandbox: true,
-    },
     width: 460,
   });
 
@@ -267,17 +221,13 @@ export function openExistingServerDialog(
       finish("quit");
     });
 
-    dialogWindow.once("ready-to-show", () => {
-      dialogWindow.show();
-    });
-    void dialogWindow.loadURL(
-      `data:text/html;charset=utf-8,${encodeURIComponent(
-        renderExistingServerDialogHtml({
-          details: args.details,
-          now: new Date(),
-          serverUrl: args.serverUrl,
-        }),
-      )}`,
+    showDesktopDialogHtml(
+      dialogWindow,
+      renderExistingServerDialogHtml({
+        details: args.details,
+        now: new Date(),
+        serverUrl: args.serverUrl,
+      }),
     );
   });
 }

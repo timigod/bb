@@ -1,5 +1,8 @@
 import type { QueryClient } from "@tanstack/react-query";
-import type { TerminalListResponse, TerminalSession } from "@bb/server-contract";
+import type {
+  TerminalListResponse,
+  TerminalSession,
+} from "@bb/server-contract";
 import {
   allTerminalsQueryKeyPrefix,
   terminalsQueryKey,
@@ -80,6 +83,22 @@ export function applyTerminalSessionUpsert({
       (current) => upsertTerminalSession(current, session),
     );
   }
+  queryClient.invalidateQueries({
+    queryKey: allTerminalsQueryKeyPrefix(),
+  });
+}
+
+export function applyTerminalSessionMissing({
+  queryClient,
+  terminalId,
+}: {
+  queryClient: QueryClient;
+  terminalId: string;
+}): void {
+  queryClient.setQueriesData<TerminalListResponse>(
+    { queryKey: allTerminalsQueryKeyPrefix() },
+    (current) => removeTerminalSession(current, terminalId),
+  );
   queryClient.invalidateQueries({
     queryKey: allTerminalsQueryKeyPrefix(),
   });

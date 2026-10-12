@@ -1,5 +1,6 @@
 import {
   getLatestSessionForHost,
+  getHost,
   listRetiredLoadedEnvironmentIdsOnHost,
   openSession,
   upsertHost,
@@ -9,10 +10,13 @@ import {
   HOST_DAEMON_PROTOCOL_VERSION,
   hostDaemonProjectAttachmentContentQuerySchema,
   hostDaemonSessionOpenRequestSchema,
+  SERVER_MOVED_ERROR_CODE,
   typedRoutes,
   type HostDaemonInternalSchema,
+  type ServerMovedErrorDetails,
 } from "@bb/host-daemon-contract";
 import type { Hono } from "hono";
+import { z } from "zod";
 import type { AppDeps } from "../types.js";
 import { HEARTBEAT_INTERVAL_MS, LEASE_TIMEOUT_MS } from "../constants.js";
 import { ApiError } from "../errors.js";
@@ -25,118 +29,186 @@ import { requireAuthenticatedDaemonSession } from "./session-state.js";
 import { readAttachment } from "../services/projects/attachments.js";
 import { handleHostSessionOpened } from "./session-owner-side-effects.js";
 import { resolveReportedConnectMachineId } from "./hosts.js";
+import type { PluginService } from "../services/plugins/plugin-service.js";
+import { HostEnvironmentSync } from "../services/hosts/host-environment-sync.js";
 
-export function registerInternalSessionRoutes(app: Hono, deps: AppDeps): void {
-  const { get, post } = typedRoutes<HostDaemonInternalSchema>(app, {
+const sessionOpenCompatibilitySchema = z
+  .object({
+    hostId: z.string().min(1),
+    protocolVersion: z.number().int().positive(),
+  })
+  .passthrough();
+
+export interface ServerMoveSessionGate {
+  movedTo(): ServerMovedErrorDetails | null;
+  pendingMoveId(): string | null;
+  sessionOpened(hostId: string): Promise<void>;
+}
+
+function invalidSessionOpenRequest(message: string): ApiError {
+  return new ApiError(400, "invalid_request", message);
+}
+
+function sessionOpenValidationMessage(error: z.ZodError): string {
+  const issue = error.issues[0];
+  if (issue?.code === "invalid_type" && issue.input === undefined) {
+    return "Required";
+  }
+  return issue?.message ?? "Invalid request";
+}
+
+export function registerInternalSessionRoutes(
+  app: Hono,
+  deps: AppDeps,
+  plugins: PluginService,
+  serverMove: ServerMoveSessionGate,
+): void {
+  const machineEnvironment = new HostEnvironmentSync(deps);
+  const { get } = typedRoutes<HostDaemonInternalSchema>(app, {
     onValidationError: (msg) => new ApiError(400, "invalid_request", msg),
   });
 
-  post(
-    "/session/open",
-    hostDaemonSessionOpenRequestSchema,
-    async (context, payload) => {
-      const daemon = getAuthenticatedDaemon(context);
-      assertAuthenticatedHostMatches(daemon, {
-        hostId: payload.hostId,
-        hostType: payload.hostType,
-      });
-
-      if (payload.protocolVersion !== HOST_DAEMON_PROTOCOL_VERSION) {
-        updateHost(deps.db, deps.hub, daemon.hostId, {
-          lastRejectedProtocolVersion: payload.protocolVersion,
-        });
-        const retryUpdate = deps.hub.takeHostProtocolUpdateRetry(daemon.hostId);
-        deps.hub.notifyHost(daemon.hostId, ["host-disconnected"]);
-        deps.logger.error(
-          {
-            hostId: daemon.hostId,
-            daemonProtocolVersion: payload.protocolVersion,
-            serverProtocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
-          },
-          "Rejecting daemon session: protocol version mismatch. An older auto-update-enabled daemon will install this server's bb-app; a newer daemon requires the server to be updated.",
-        );
-        throw new ApiError(
-          400,
-          "protocol_version_mismatch",
-          `Daemon protocol version ${payload.protocolVersion} does not match server protocol version ${HOST_DAEMON_PROTOCOL_VERSION}`,
-          {
-            details: {
-              retryUpdate,
-              serverProtocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
-            },
-          },
-        );
-      }
-
-      // The latest session regardless of status/lease: a crashed daemon's
-      // session is closed the moment its socket drops, so requiring an active
-      // previous session would skip the restarted-daemon reconciliation in
-      // exactly the case it exists for.
-      const previousSession = getLatestSessionForHost(deps.db, {
-        hostId: daemon.hostId,
-      });
-      const connectMachineId = resolveReportedConnectMachineId(
-        context,
-        payload.connectMachineId,
+  app.post("/session/open", async (context) => {
+    const pendingMoveId = serverMove.pendingMoveId();
+    if (pendingMoveId !== null) {
+      throw new ApiError(
+        503,
+        "server_move_pending",
+        "This server is finishing a move and doesn't accept machines yet",
+        { details: { moveId: pendingMoveId }, retryable: true },
       );
-      upsertHost(deps.db, deps.hub, {
-        ...(connectMachineId !== undefined ? { connectMachineId } : {}),
-        id: daemon.hostId,
-        name: payload.hostName,
-        type: daemon.hostType,
-      });
+    }
+    const movedTo = serverMove.movedTo();
+    if (movedTo !== null) {
+      throw new ApiError(
+        410,
+        SERVER_MOVED_ERROR_CODE,
+        `This bb server moved to ${movedTo.toHostName} (${movedTo.serverUrl})`,
+        { details: movedTo, retryable: false },
+      );
+    }
+    const input: unknown = await context.req.json().catch(() => {
+      throw invalidSessionOpenRequest("Invalid JSON request body");
+    });
+    const compatibility = sessionOpenCompatibilitySchema.safeParse(input);
+    if (!compatibility.success) {
+      throw invalidSessionOpenRequest(
+        sessionOpenValidationMessage(compatibility.error),
+      );
+    }
+    const daemon = getAuthenticatedDaemon(context);
+    assertAuthenticatedHostMatches(daemon, {
+      hostId: compatibility.data.hostId,
+    });
+
+    if (compatibility.data.protocolVersion !== HOST_DAEMON_PROTOCOL_VERSION) {
       updateHost(deps.db, deps.hub, daemon.hostId, {
-        lastRejectedProtocolVersion: null,
+        lastRejectedProtocolVersion: compatibility.data.protocolVersion,
       });
-      const session = openSession(deps.db, deps.hub, {
-        hostId: daemon.hostId,
-        instanceId: payload.instanceId,
-        hostName: payload.hostName,
-        hostType: daemon.hostType,
-        dataDir: payload.dataDir,
-        protocolVersion: payload.protocolVersion,
-        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
-        leaseTimeoutMs: LEASE_TIMEOUT_MS,
-      });
-      deps.hub.recordDaemonSessionPlatform(session.id, payload.platform);
-      deps.sharedPorts.recordHostConnectCapability({
-        hostId: daemon.hostId,
-        sessionId: session.id,
-        hasMachineCredential: payload.hasMachineCredential,
-      });
-
-      await handleHostSessionOpened(deps, {
-        activeThreads: payload.activeThreads,
-        hostId: daemon.hostId,
-        openedSession: session,
-        previousSession,
-      });
-
-      const retiredEnvironmentIds = listRetiredLoadedEnvironmentIdsOnHost(
-        deps.db,
+      const retryUpdate = deps.hub.takeHostProtocolUpdateRetry(daemon.hostId);
+      deps.hub.notifyHost(daemon.hostId, ["host-disconnected"]);
+      deps.logger.error(
         {
           hostId: daemon.hostId,
-          environmentIds: (payload.loadedEnvironments ?? []).map(
-            (environment) => environment.environmentId,
-          ),
+          daemonProtocolVersion: compatibility.data.protocolVersion,
+          serverProtocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
         },
+        "Rejecting daemon session: protocol version mismatch. An older auto-update-enabled daemon will install this server's bb-app; a newer daemon requires the server to be updated.",
       );
-
-      return context.json(
+      throw new ApiError(
+        400,
+        "protocol_version_mismatch",
+        `Daemon protocol version ${compatibility.data.protocolVersion} does not match server protocol version ${HOST_DAEMON_PROTOCOL_VERSION}`,
         {
-          sessionId: session.id,
-          heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
-          leaseTimeoutMs: LEASE_TIMEOUT_MS,
-          watchSet: deps.watchInterests.reconcileWatchSetForHost(daemon.hostId),
-          connectShares: deps.sharedPorts.reconcileSharedPortsForHost(
-            daemon.hostId,
-          ),
-          retiredEnvironmentIds,
+          details: {
+            retryUpdate,
+            serverProtocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
+          },
         },
-        201,
       );
-    },
-  );
+    }
+
+    const parsed = hostDaemonSessionOpenRequestSchema.safeParse(input);
+    if (!parsed.success) {
+      throw invalidSessionOpenRequest(
+        sessionOpenValidationMessage(parsed.error),
+      );
+    }
+    const payload = parsed.data;
+
+    const host = getHost(deps.db, daemon.hostId);
+    if (host?.phase === "suspending" || host?.phase === "suspended") {
+      throw new ApiError(
+        409,
+        "machine_suspended",
+        "Machine daemon sessions are disabled while the machine is suspending or suspended",
+      );
+    }
+
+    const previousSession = getLatestSessionForHost(deps.db, {
+      hostId: daemon.hostId,
+    });
+    const connectMachineId = resolveReportedConnectMachineId(context);
+    upsertHost(deps.db, deps.hub, {
+      ...(connectMachineId !== undefined ? { connectMachineId } : {}),
+      id: daemon.hostId,
+      name: payload.hostName,
+    });
+    updateHost(deps.db, deps.hub, daemon.hostId, {
+      lastRejectedProtocolVersion: null,
+    });
+    const session = openSession(deps.db, {
+      hostId: daemon.hostId,
+      instanceId: payload.instanceId,
+      hostName: payload.hostName,
+      dataDir: payload.dataDir,
+      protocolVersion: payload.protocolVersion,
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+      leaseTimeoutMs: LEASE_TIMEOUT_MS,
+    });
+    deps.hub.recordDaemonSessionPlatform(session.id, payload.platform);
+    deps.hub.recordDaemonSessionLocalApiPort(session.id, payload.localApiPort);
+    deps.sharedPorts.recordHostConnectCapability({
+      hostId: daemon.hostId,
+      sessionId: session.id,
+      hasMachineCredential: payload.hasMachineCredential,
+    });
+
+    await handleHostSessionOpened(deps, {
+      activeThreads: payload.activeThreads,
+      hostId: daemon.hostId,
+      undeliveredEventThreadIds: payload.undeliveredEventThreadIds,
+      openedSession: session,
+      previousSession,
+    });
+    await serverMove.sessionOpened(daemon.hostId);
+
+    const retiredEnvironmentIds = listRetiredLoadedEnvironmentIdsOnHost(
+      deps.db,
+      {
+        hostId: daemon.hostId,
+        environmentIds: (payload.loadedEnvironments ?? []).map(
+          (environment) => environment.environmentId,
+        ),
+      },
+    );
+
+    return context.json(
+      {
+        sessionId: session.id,
+        heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+        leaseTimeoutMs: LEASE_TIMEOUT_MS,
+        watchSet: deps.watchInterests.reconcileWatchSetForHost(daemon.hostId),
+        connectShares: deps.sharedPorts.reconcileSharedPortsForHost(
+          daemon.hostId,
+        ),
+        pluginHostGenerations: plugins.listHostArtifactGenerations(),
+        retiredEnvironmentIds,
+        machineEnvironment: await machineEnvironment.snapshot(daemon.hostId),
+      },
+      201,
+    );
+  });
 
   get(
     "/session/project-attachment-content",
@@ -152,8 +224,6 @@ export function registerInternalSessionRoutes(app: Hono, deps: AppDeps): void {
         deps.db,
         query.threadId,
       );
-      // Attachment paths are project-scoped upload tokens, so cross-check
-      // projectId before reading bytes even though threadId identifies a thread.
       if (thread.projectId !== query.projectId) {
         throw new ApiError(
           403,

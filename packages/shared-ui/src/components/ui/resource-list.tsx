@@ -1,27 +1,24 @@
 export {
-  RESOURCE_ROUTE_LABEL_EVENT,
   ResourceCardStat,
-  ResourceLocationMeta,
+  ResourceIconFrame,
   ResourceMeta,
-  ResourceState,
   ResourceStatus,
   type ResourceStatusTone,
-  useResourceRouteLabel,
 } from "./resource/atoms";
+export { useResourceRouteLabel } from "./resource-route-label";
 export {
+  ResourceControlButton,
+  ResourceMultiSelectMenuItems,
+  ResourceSortMenuItems,
+  type ResourceOption,
   ResourceCreateButton,
   type ResourceCreateMenuAction,
-  type ResourceCreateTemplate,
   type ResourceCreateTemplateGroup,
-  type ResourceFilterGroup,
   ResourceFilterMenu,
   ResourceMultiSelectMenu,
-  type ResourceOption,
-  ResourceOptionMenu,
   ResourceSortMenu,
-  ResourceTabDescription,
   ResourceToolbar,
-  ResourceToolbarAction,
+  ResourceTabDescription,
 } from "./resource/toolbar";
 export {
   ResourceActionButton,
@@ -31,23 +28,13 @@ export {
   type ResourceOverflowMenuItem,
   ResourceRow,
   ResourceRowDetailChevron,
+  targetsResourceAction,
 } from "./resource/row";
 export {
-  ResourceDetailActionRow,
   ResourceDetailCollection,
-  ResourceDetailList,
-  ResourceDetailListItem,
   ResourceDetailPanel,
-  type ResourceDetailSurface,
   ResourceDetailStack,
-  ResourceOverview,
-  ResourcePromptEditor,
-  type ResourcePromptContextItem,
   ResourcePromptPreview,
-  ResourceProperty,
-  ResourcePropertyList,
-  ResourceSection,
-  ResourceSectionTitle,
 } from "./resource/detail-shell";
 export {
   ResourceActivitySection,
@@ -57,30 +44,18 @@ export {
   ResourceDetailOverviewSection,
   ResourceDetailPage,
   ResourceDetailReleaseSection,
-  ResourceDetailSection,
-  type ResourceDetailSectionKind,
-  type ResourceDetailSectionProps,
 } from "./resource/detail-sections";
 export {
-  ResourceDetailFact,
-  ResourceDetailFacts,
   ResourceInstallControl,
   ResourceInstalledControl,
-  ResourceLifecycleStatus,
 } from "./resource/detail-controls";
 export {
   ResourceBrowseCard,
   ResourceBrowseGrid,
-  ResourceBrowseSection,
-  type ResourceBrowseSectionItem,
   ResourceCollectionPage,
-  type ResourceCollectionMode,
   ResourceCollectionViewport,
-  ResourceOverviewPage,
-  ResourceOverviewSection,
-  ResourceShelfAction,
   ResourceShelfSeeAllAction,
-  ResourceSourceItem,
+  ResourceShelfAction,
   ResourceSourceShelf,
   ResourceTemplateBrowseCard,
 } from "./resource/collection";

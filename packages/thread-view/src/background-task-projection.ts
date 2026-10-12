@@ -1,8 +1,5 @@
-import type {
-  ThreadEvent,
-  ThreadEventBackgroundTaskItem,
-  ThreadEventItemStatus,
-} from "@bb/domain";
+import { itemStatusToExecStatus } from "./exec-lifecycle.js";
+import type { ThreadEvent, ThreadEventBackgroundTaskItem } from "@bb/domain";
 import type { EventMeta } from "./event-decode.js";
 import type {
   EventProjectionMessage,
@@ -17,21 +14,6 @@ export interface BackgroundTaskProjectionState {
 interface BackgroundTaskLifecycleEvent {
   kind: "begin" | "update" | "end";
   item: ThreadEventBackgroundTaskItem;
-}
-
-function toWorkflowMessageStatus(
-  status: ThreadEventItemStatus,
-): EventProjectionWorkflowMessage["status"] {
-  switch (status) {
-    case "pending":
-      return "pending";
-    case "completed":
-      return "completed";
-    case "failed":
-      return "error";
-    case "interrupted":
-      return "interrupted";
-  }
 }
 
 export function parseBackgroundTaskLifecycleEvent(
@@ -61,10 +43,11 @@ function applyBackgroundTaskItem(
   meta: EventMeta,
 ): void {
   const item = lifecycle.item;
+  message.familyId = item.familyId ?? null;
   message.taskType = item.taskType;
   message.workflowName = item.workflowName ?? null;
   message.description = item.description;
-  message.status = toWorkflowMessageStatus(item.status);
+  message.status = itemStatusToExecStatus(item.status);
   message.taskStatus = item.taskStatus;
   message.skipTranscript = item.skipTranscript;
   message.workflow = item.workflow ?? null;
@@ -76,22 +59,6 @@ function applyBackgroundTaskItem(
   }
 }
 
-/**
- * Folds a background-task lifecycle event into the single per-item workflow
- * message. Deliberately does not require matching event scopes: the
- * turn-scoped item/started anchors the message's placement, and the
- * thread-scoped progress/completed events that arrive (possibly turns) later
- * replace its payload in place — each event carries the full current item
- * state, so replace-not-merge is correct.
- *
- * The message's source range stays pinned to its anchor event. Late events
- * must not stretch `sourceSeqEnd`: turn and segment bounds are derived from
- * member-message ranges, and the server validates turn-summary expansion
- * requests against those ranges — a range stretched past later turns' rows is
- * rejected, permanently breaking expansion of the spawning turn.
- *
- * Returns true when the event was a background-task lifecycle event.
- */
 export function upsertBackgroundTaskMessage(
   state: BackgroundTaskProjectionState,
   meta: EventMeta,
@@ -109,13 +76,11 @@ export function upsertBackgroundTaskMessage(
     return true;
   }
 
-  // Progress/completed without an in-range item/started (e.g. a timeline
-  // window that backfills only the latest task state) still materializes a
-  // message, placed by its own event's scope.
   const message: EventProjectionWorkflowMessage = {
     kind: "workflow",
     id: lifecycle.item.id,
     threadId: decoded.threadId,
+    sourceEvent: { seq: meta.seq, part: 0 },
     sourceSeqStart: meta.seq,
     sourceSeqEnd: meta.seq,
     createdAt: meta.createdAt,
@@ -124,11 +89,16 @@ export function upsertBackgroundTaskMessage(
     ...(lifecycle.item.parentToolCallId
       ? { parentToolCallId: lifecycle.item.parentToolCallId }
       : {}),
+    ...(lifecycle.item.presentation
+      ? { presentation: lifecycle.item.presentation }
+      : {}),
     itemId: lifecycle.item.id,
+    familyId: lifecycle.item.familyId ?? null,
     taskType: lifecycle.item.taskType,
     workflowName: lifecycle.item.workflowName ?? null,
     description: lifecycle.item.description,
-    status: toWorkflowMessageStatus(lifecycle.item.status),
+    model: null,
+    status: itemStatusToExecStatus(lifecycle.item.status),
     taskStatus: lifecycle.item.taskStatus,
     skipTranscript: lifecycle.item.skipTranscript,
     workflow: lifecycle.item.workflow ?? null,

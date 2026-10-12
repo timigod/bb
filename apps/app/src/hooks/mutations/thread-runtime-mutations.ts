@@ -1,3 +1,4 @@
+import { notifyComposerSubmitted } from "@/lib/composer-submissions";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { ThreadQueuedMessage } from "@bb/domain";
 import type {
@@ -7,7 +8,7 @@ import type {
   ThreadQueuedMessageListResponse,
   UpdateQueuedMessageRequest,
 } from "@bb/server-contract";
-import type { AppCreateThreadRequest } from "@/lib/api-types";
+import type { AppCreateThreadRequest } from "@bb/client-core";
 import { BbHttpError, sdk } from "@/lib/sdk";
 import { wsManager } from "@/lib/ws";
 import type { QueuedMessageReorderRequest } from "@/lib/queued-message-reorder";
@@ -19,8 +20,7 @@ import {
   applyCreateThreadResult,
   applyQueuedMessageCreateResult,
   applyQueuedMessageDeleteResult,
-  applyQueuedMessageGroupBoundaryResult,
-  applyQueuedMessageReorderResult,
+  applyQueuedMessagesResult,
   applyQueuedMessageSendResult,
   applyQueuedMessageUpdateResult,
   applySendThreadMessageSuccess,
@@ -35,6 +35,7 @@ import {
   beginSendThreadMessageTransaction,
   beginStopThreadTransaction,
   beginUpdateQueuedMessageTransaction,
+  prefetchThreadQueuedMessages,
   rollbackCreateQueuedMessageTransaction,
   rollbackRemoveQueuedMessageTransaction,
   rollbackReorderQueuedMessageTransaction,
@@ -137,6 +138,21 @@ export function useCreateThread() {
       }),
     onMutate: async () => beginCreateThreadTransaction({ queryClient }),
     onSuccess: (thread, variables) => {
+      notifyComposerSubmitted({
+        kind: "new-thread",
+        projectId: variables.projectId,
+      });
+      if (thread.queuedMessageCount > 0) {
+        void prefetchThreadQueuedMessages({
+          queryClient,
+          threadId: thread.id,
+          load: (signal) =>
+            sdk.threads.queuedMessages.list({
+              threadId: thread.id,
+              signal,
+            }),
+        });
+      }
       applyCreateThreadResult({
         queryClient,
         request: variables,
@@ -163,20 +179,22 @@ export function useSendThreadMessage() {
       reasoningLevel,
       permissionMode,
       mode,
+      sendAt,
       senderThreadId,
+      pluginSubmission,
       executionInputSources,
     }: SendThreadMessageMutationRequest) => {
-      await sdk.threads.send({
+      return await sdk.threads.send({
         threadId: id,
         input,
         model,
         serviceTier,
         reasoningLevel,
         permissionMode,
+        ...(sendAt === undefined ? {} : { sendAt }),
+        ...(pluginSubmission === undefined ? {} : { pluginSubmission }),
         executionInputSources,
         mode,
-        // Non-null only for cross-thread sends (e.g. a side chat handing a
-        // result back); the target renders it as "Message from {sender}".
         ...(senderThreadId !== undefined ? { senderThreadId } : {}),
       });
     },
@@ -192,11 +210,13 @@ export function useSendThreadMessage() {
         transaction: context,
       });
     },
-    onSuccess: (_data, variables, context) => {
+    onSuccess: (data, variables, context) => {
+      notifyComposerSubmitted({ kind: "thread", threadId: variables.id });
       applySendThreadMessageSuccess({
         queryClient,
         realtimeConnected: wsManager.getConnectionState() === "connected",
         request: variables,
+        result: data,
         transaction: context,
       });
     },
@@ -267,6 +287,7 @@ export function useCreateThreadQueuedMessage() {
       });
     },
     onSuccess: (queuedMessage, variables, context) => {
+      notifyComposerSubmitted({ kind: "thread", threadId: variables.id });
       applyQueuedMessageCreateResult({
         queryClient,
         queuedMessage,
@@ -347,10 +368,12 @@ export function useSendThreadQueuedMessage() {
         transaction: context,
       });
     },
-    onSuccess: (_data, variables) => {
+    onSuccess: (data, variables, transaction) => {
       applyQueuedMessageSendResult({
         queryClient,
-        threadId: variables.id,
+        request: variables,
+        result: data,
+        transaction,
       });
     },
   });
@@ -392,7 +415,7 @@ export function useReorderThreadQueuedMessage() {
       });
     },
     onSuccess: (queuedMessages, variables) => {
-      applyQueuedMessageReorderResult({
+      applyQueuedMessagesResult({
         queryClient,
         queuedMessages,
         request: variables,
@@ -438,7 +461,7 @@ export function useSetThreadQueuedMessageGroupBoundary() {
       });
     },
     onSuccess: (queuedMessages, variables) => {
-      applyQueuedMessageGroupBoundaryResult({
+      applyQueuedMessagesResult({
         queryClient,
         queuedMessages,
         request: variables,

@@ -31,6 +31,7 @@ function conversationRow({
     turnId: `turn_${Math.floor(index / 2)}`,
     sourceSeqStart: index + 1,
     sourceSeqEnd: index + 1,
+    messageSeq: index + 1,
     startedAt: now + index * 1_000,
     createdAt: now + index * 1_000,
     kind: "conversation" as const,
@@ -74,12 +75,13 @@ const timelineRows: TimelineRow[] = Array.from(
       attachments:
         turnIndex === 2
           ? {
-              webImages: 0,
-              localImages: 1,
+              webImages: 1,
+              localImages: 0,
               localFiles: 0,
-              imageUrls: [],
-              localImagePaths: ["/workspace/design-reference.png"],
+              imageUrls: ["/icon-192.png"],
+              localImagePaths: [],
               localFilePaths: [],
+              localFileDetails: [],
             }
           : null,
     }),
@@ -101,6 +103,7 @@ export function Default() {
         contentClassName="gap-2 pt-4"
         scrollOverlay={
           <ThreadTableOfContents
+            contextBoundarySeq={null}
             threadId="thr_toc_story"
             timelineRows={timelineRows}
             hasOlderTimelineRows={false}
@@ -110,6 +113,7 @@ export function Default() {
       >
         <ThreadTimelineSurface
           activeThinking={null}
+          contextBoundarySeq={null}
           isThreadTimelinePending={false}
           timelineError={false}
           showOngoingIndicator={false}

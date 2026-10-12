@@ -1,7 +1,7 @@
 import {
   ConfirmDeleteDialog,
   ConfirmDeleteDialogContent,
-} from "./ConfirmDeleteDialog";
+} from "@bb/shared-ui/confirm-delete-dialog";
 
 export interface ProjectDeleteDialogTarget {
   id: string;
@@ -34,7 +34,7 @@ export function ProjectDeleteDialog({
   );
 }
 
-export interface ProjectDeleteDialogContentProps {
+interface ProjectDeleteDialogContentProps {
   target: ProjectDeleteDialogTarget;
   pending: boolean;
   onDelete: (projectId: string) => void;

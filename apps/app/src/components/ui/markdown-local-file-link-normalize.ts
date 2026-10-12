@@ -1,4 +1,5 @@
 import {
+  isWindowsDriveLocalFilePath,
   parseLocalFileHref,
   type MarkdownAbsoluteLocalFileLinkRouting,
 } from "./markdown-local-file-link.js";
@@ -119,7 +120,10 @@ function findCodeSpanEnd(value: string, openingIndex: number): number | null {
     value,
   });
   const closingMarker = "`".repeat(markerLength);
-  const closingIndex = value.indexOf(closingMarker, openingIndex + markerLength);
+  const closingIndex = value.indexOf(
+    closingMarker,
+    openingIndex + markerLength,
+  );
 
   return closingIndex === -1 ? null : closingIndex + markerLength;
 }
@@ -158,6 +162,10 @@ function findInlineLinkDestinationEnd(
   destinationStartIndex: number,
 ): number | null {
   let nestedParentheses = 0;
+  const destinationStart = value.slice(destinationStartIndex);
+  const backslashIsPathSeparator = isWindowsDriveLocalFilePath(
+    destinationStart.slice(findMarkdownWhitespaceEnd(destinationStart)),
+  );
 
   for (let index = destinationStartIndex; index < value.length; index += 1) {
     const character = value[index];
@@ -166,7 +174,11 @@ function findInlineLinkDestinationEnd(
       return null;
     }
 
-    if (character === "\\" && index + 1 < value.length) {
+    if (
+      character === "\\" &&
+      index + 1 < value.length &&
+      !backslashIsPathSeparator
+    ) {
       index += 1;
       continue;
     }
@@ -397,6 +409,24 @@ function buildLocalFileMarkdownLinkRepair(
     return null;
   }
 
+  if (isWindowsDriveLocalFilePath(payload.destination)) {
+    const windowsDestination = payload.destination.replaceAll("\\", "/");
+    if (
+      windowsDestination.includes("<") ||
+      windowsDestination.includes(">") ||
+      !parseLocalFileHref({
+        absoluteLinks: TRUSTED_HOST_ABSOLUTE_LINKS,
+        href: windowsDestination,
+      })
+    ) {
+      return null;
+    }
+    return {
+      endIndex: destinationEndIndex,
+      replacement: `${payload.leadingWhitespace}<${windowsDestination}>${payload.suffix}`,
+    };
+  }
+
   const destination = unescapeMarkdownEscapes(payload.destination);
   if (
     !MARKDOWN_WHITESPACE_PATTERN.test(destination) ||
@@ -451,9 +481,6 @@ function normalizeLocalFileMarkdownLinksInLine(line: string): string {
   return output + line.slice(lastCopiedIndex);
 }
 
-// CommonMark requires angle brackets around link destinations with literal
-// spaces. Agents often emit local absolute paths without them, so repair only
-// those local destinations before react-markdown parses the message.
 export function normalizeLocalFileMarkdownLinks(content: string): string {
   if (!content.includes(MARKDOWN_LINK_DESTINATION_OPEN)) {
     return content;

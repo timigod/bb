@@ -5,19 +5,20 @@ import {
 
 export type FileChangeAction = "created" | "deleted" | "renamed" | "edited";
 
-export interface FileChangeDiffStats {
+interface FileChangeDiffStats {
   added: number;
   removed: number;
 }
 
-export interface FileChangeLike {
+interface FileChangeLike {
   path: string;
   kind?: string | null;
   movePath?: string | null;
   diff?: string | null;
+  diffStats?: { added: number; removed: number };
 }
 
-export interface FormatFileChangePathArgs {
+interface FormatFileChangePathArgs {
   change: FileChangeLike;
   mode: TimelinePathDisplayMode;
 }
@@ -50,7 +51,11 @@ export function isPatchMetadataLine(line: string): boolean {
 
 function hasSubstantiveDiff(change: FileChangeLike): boolean {
   const diff = change.diff;
-  if (!diff) return false;
+  if (!diff) {
+    return (
+      (change.diffStats?.added ?? 0) + (change.diffStats?.removed ?? 0) > 0
+    );
+  }
   for (const line of diff.split("\n")) {
     if (line.startsWith("+++ ") || line.startsWith("--- ")) continue;
     if (line.startsWith("+") || line.startsWith("-")) return true;
@@ -69,9 +74,7 @@ export function getFileChangeAction(change: FileChangeLike): FileChangeAction {
   return "edited";
 }
 
-export function getFileChangeActionPastTense(
-  action: FileChangeAction,
-): string {
+export function getFileChangeActionPastTense(action: FileChangeAction): string {
   switch (action) {
     case "created":
       return "Created";

@@ -10,20 +10,14 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import type { PromptTextMention, ThreadListEntry } from "@bb/domain";
-import type { TimelineTitleLink } from "@bb/thread-view";
 import { ConversationMessageContent } from "./ConversationMessageContent";
 import { ThreadTitleMentionResourcesProvider } from "@/components/thread/ThreadTitleMentions";
 import { RouteNavigationProvider } from "@/components/ui/app-route-anchor";
 import type { TimelineTitleActionResolver } from "./TimelineTitleView";
 import { createQueryClientTestHarness } from "@/test/queryClientTestHarness";
-import { GENERATED_MESSAGE_COLLAPSED_PREVIEW_CHAR_CAP } from "./conversation-message-limits";
+import { makeThreadListEntry as makeThreadListEntryFixture } from "@bb/test-helpers/domain-fixtures";
+import { GENERATED_MESSAGE_COLLAPSED_PREVIEW_CHAR_CAP } from "@bb/client-core";
 import { generatedConversationCollapsedPreview } from "./GeneratedConversationMessage";
-
-function resolveThreadLink(link: TimelineTitleLink): string | null {
-  return link.kind === "thread"
-    ? `/projects/proj_demo/threads/${link.threadId}`
-    : null;
-}
 
 const MARKDOWN_BODY = [
   "# Final report",
@@ -58,10 +52,8 @@ function renderChildCompleted(text = MARKDOWN_BODY) {
         <ConversationMessageContent
           role="user"
           initiator="system"
-          originKind={null}
           senderThreadId={null}
           senderThreadTitle={null}
-          resolveSegmentLinkHref={resolveThreadLink}
           systemMessageKind="child-completed"
           systemMessageSubject={{
             kind: "thread",
@@ -71,7 +63,10 @@ function renderChildCompleted(text = MARKDOWN_BODY) {
           attachments={null}
           mentions={mentions}
           text={text}
+          timestamp={0}
+          threadId="thr_parent"
           turnRequest={{ kind: "message", status: "accepted" }}
+          workspaceRootPath="/workspace"
           projectId="proj_demo"
         />
       </RouteNavigationProvider>
@@ -85,9 +80,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-// An agent-generated body that carries an offset-based `path` mention and a
-// leading markdown heading. Both Markdown and the structured mention must
-// survive the combined renderer.
+describe("GeneratedConversationMessage images", () => {
+  it("routes images in generated system messages through the current thread", () => {
+    renderChildCompleted("![report](reports/result.png)");
+
+    expect(
+      screen.getByRole("img", { name: "report" }).getAttribute("src"),
+    ).toBe(
+      "/api/v1/threads/thr_parent/host-files/workspace/reports/result.png",
+    );
+  });
+});
+
 const AGENT_BODY = "# notes\nedited path:src/app.ts here";
 const AGENT_PATH_TOKEN = "path:src/app.ts";
 const AGENT_PATH_START = AGENT_BODY.indexOf(AGENT_PATH_TOKEN);
@@ -99,47 +103,17 @@ const RAW_THREAD_BODY = `Continue in ${RAW_THREAD_ID}; exact code reference \`${
 function threadListEntry(
   overrides: Partial<ThreadListEntry> = {},
 ): ThreadListEntry {
-  return {
+  return makeThreadListEntryFixture({
     id: "thr_test",
     projectId: "proj_demo",
-    environmentId: null,
-    providerId: "codex",
     title: "Thread",
     titleFallback: "Thread",
-    sectionId: null,
-    status: "idle",
-    parentThreadId: null,
-    sourceThreadId: null,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    childOrigin: null,
-    archivedAt: null,
-    pinnedAt: null,
-    pinSortKey: null,
-    deletedAt: null,
     lastReadAt: 0,
     latestAttentionAt: 1,
     createdAt: 1,
     updatedAt: 1,
-    activity: {
-      activeWorkflowCount: 0,
-      activeBackgroundAgentCount: 0,
-      activeBackgroundCommandCount: 0,
-      activePlanModeCount: 0,
-      activeGoalCount: 0,
-    },
-    hasPendingInteraction: false,
-    environmentHostId: null,
-    environmentName: null,
-    environmentBranchName: null,
-    environmentWorkspaceDisplayKind: "other",
-    runtime: {
-      displayStatus: "idle",
-      hostReconnectGraceExpiresAt: null,
-    },
     ...overrides,
-  };
+  });
 }
 
 function renderAgentMessage(
@@ -193,17 +167,16 @@ function renderAgentMessage(
           <ConversationMessageContent
             role="user"
             initiator="agent"
-            originKind={null}
             senderThreadId="thr_agent"
             senderThreadTitle={senderThreadTitle}
             senderIsPluginSideChat={senderIsPluginSideChat}
             onTitleAction={onTitleAction}
-            resolveSegmentLinkHref={resolveThreadLink}
             systemMessageKind="unlabeled"
             systemMessageSubject={null}
             attachments={null}
             mentions={mentions}
             text={text}
+            timestamp={0}
             turnRequest={{ kind: "message", status: "accepted" }}
             projectId="proj_demo"
           />
@@ -214,7 +187,52 @@ function renderAgentMessage(
   );
 }
 
-function mockInnerPreviewTextOverflow(text: string): void {
+function mockResizeObserverDeliveries(): () => void {
+  const observers: Array<{
+    callback: ResizeObserverCallback;
+    instance: ResizeObserver;
+    targets: Set<Element>;
+  }> = [];
+
+  class ResizeObserverMock {
+    private readonly record: (typeof observers)[number];
+    constructor(callback: ResizeObserverCallback) {
+      this.record = {
+        callback,
+        instance: this as unknown as ResizeObserver,
+        targets: new Set(),
+      };
+      observers.push(this.record);
+    }
+    observe(target: Element): void {
+      this.record.targets.add(target);
+    }
+    unobserve(target: Element): void {
+      this.record.targets.delete(target);
+    }
+    disconnect(): void {
+      this.record.targets.clear();
+    }
+  }
+
+  vi.stubGlobal("ResizeObserver", ResizeObserverMock);
+  return () => {
+    act(() => {
+      for (const { callback, instance, targets } of observers) {
+        callback(
+          Array.from(
+            targets,
+            (target) => ({ target }) as unknown as ResizeObserverEntry,
+          ),
+          instance,
+        );
+      }
+    });
+  };
+}
+
+function mockInnerPreviewTextOverflow(text: string): () => void {
+  const notifyResize = mockResizeObserverDeliveries();
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(20);
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(20);
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(100);
@@ -226,23 +244,11 @@ function mockInnerPreviewTextOverflow(text: string): void {
         : 100;
     },
   );
+  return notifyResize;
 }
 
 function mockContinuationSensitiveOverflow(): () => void {
-  const resizeCallbacks: Array<() => void> = [];
-
-  class ResizeObserverMock {
-    constructor(callback: ResizeObserverCallback) {
-      resizeCallbacks.push(() =>
-        callback([], this as unknown as ResizeObserver),
-      );
-    }
-
-    observe(): void {}
-    disconnect(): void {}
-  }
-
-  vi.stubGlobal("ResizeObserver", ResizeObserverMock);
+  const notifyResize = mockResizeObserverDeliveries();
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(20);
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(20);
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(
@@ -255,11 +261,7 @@ function mockContinuationSensitiveOverflow(): () => void {
   );
   vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(100);
 
-  return () => {
-    act(() => {
-      for (const callback of resizeCallbacks) callback();
-    });
-  };
+  return notifyResize;
 }
 
 describe("GeneratedConversationMessage markdown body", () => {
@@ -281,9 +283,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     expect(sourcePill?.querySelector('[data-icon="UserRound"]')).not.toBeNull();
     expect(sourcePill?.querySelector('[data-icon="MessageSquare"]')).toBeNull();
     expect(sourcePill?.tagName).toBe("A");
-    expect(sourcePill?.getAttribute("href")).toBe(
-      "/projects/proj_demo/threads/thr_agent",
-    );
+    expect(sourcePill?.getAttribute("href")).toBe("/threads/thr_agent");
   });
 
   it("renders agent Markdown and its offset-based path mention", () => {
@@ -542,8 +542,11 @@ describe("GeneratedConversationMessage markdown body", () => {
   });
 
   it("expands a one-line agent message when its preview text overflows", () => {
-    mockInnerPreviewTextOverflow(OVERFLOWING_ONE_LINE_AGENT_BODY);
+    const notifyResize = mockInnerPreviewTextOverflow(
+      OVERFLOWING_ONE_LINE_AGENT_BODY,
+    );
     renderAgentMessage(OVERFLOWING_ONE_LINE_AGENT_BODY);
+    notifyResize();
 
     const toggle = screen.getByRole("button", { name: /Message from Worker/u });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
@@ -564,7 +567,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     expect(screen.queryByText("**Ready** to merge.")).toBeNull();
 
     const toggle = screen.getByRole("button", {
-      name: /Replying to side chat/u,
+      name: /Message from side chat/u,
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
 
@@ -584,7 +587,7 @@ describe("GeneratedConversationMessage markdown body", () => {
     ).not.toBeNull();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /Replying to side chat/u }),
+      screen.getByRole("button", { name: /Message from side chat/u }),
     );
 
     expect(
@@ -592,8 +595,6 @@ describe("GeneratedConversationMessage markdown body", () => {
     ).not.toBeNull();
   });
 
-  // A side chat opens in the plugin's panel, so its name carries the panel
-  // title action rather than a route link to the thread.
   it("opens a side-chat sender in the plugin panel instead of linking it", () => {
     const openPanel = vi.fn();
     const { container } = renderAgentMessage("Handed back.", {
@@ -615,6 +616,7 @@ describe("GeneratedConversationMessage markdown body (system)", () => {
   it("keeps the continuation width stable when it makes the preview overflow", () => {
     const notifyResize = mockContinuationSensitiveOverflow();
     renderChildCompleted();
+    notifyResize();
 
     const continuation = screen.getByText("...");
     expect(continuation.className).toContain("invisible");

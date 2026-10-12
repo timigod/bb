@@ -1,40 +1,38 @@
+import type { Writable } from "node:stream";
 import {
   resolveContextProjectId,
   resolveContextThreadId,
 } from "./context-env.js";
+import { Agent, type Dispatcher } from "undici";
 import { cliFetch } from "./client.js";
 
-/**
- * Plugin-contributed `bb` subcommands (server design §4.4). The CLI fetches
- * metadata from GET /api/v1/plugins/contributions and proxies invocations to
- * POST /api/v1/plugins/:id/cli — plugin code only ever runs server-side.
- */
 export interface PluginCliContributionEntry {
   pluginId: string;
   name: string;
   summary: string;
   commands: Array<{ name: string; summary: string; usage: string }>;
+  rendersHelp?: boolean;
+}
+
+export function pluginCommandLabel(
+  contribution: PluginCliContributionEntry,
+  argv: readonly string[],
+): string {
+  const declared = new Set(contribution.commands.map((entry) => entry.name));
+  for (let words = Math.min(3, argv.length); words > 0; words -= 1) {
+    const candidate = argv.slice(0, words);
+    if (declared.has(candidate.join("-"))) {
+      return [contribution.name, ...candidate].join(" ");
+    }
+  }
+  return contribution.name;
 }
 
 const CONTRIBUTIONS_TIMEOUT_MS = 2000;
 
-/**
- * The probe is retried on transient causes that may mean the server exists but
- * did not answer in time — a busy event loop, a dropped keep-alive socket. The
- * server's contributions latency is sharply bimodal (single-digit ms at rest,
- * hundreds of ms to seconds while it is under load), so a single 2s attempt
- * turns an ordinary stall into a hard failure and the user's command never
- * runs. Escalating the window rather than repeating it gives a server stalled
- * mid-GC room to finish instead of re-hitting the same block.
- *
- * Not retried: ECONNREFUSED (nothing is listening — bb really is down, and
- * waiting only delays a correct answer) and EPERM/EACCES (a sandbox or
- * firewall is blocking this shell — no amount of waiting changes that).
- */
 const CONTRIBUTIONS_TIMEOUT_MULTIPLIERS = [1, 2, 2] as const;
 const CONTRIBUTIONS_RETRY_DELAYS_MS = [150, 500] as const;
 
-/** Transport-level codes that mean "retry", not "give up". */
 const RETRYABLE_CODES = new Set([
   "ECONNRESET",
   "EPIPE",
@@ -45,17 +43,7 @@ const RETRYABLE_CODES = new Set([
   "UND_ERR_BODY_TIMEOUT",
 ]);
 
-/**
- * Result of asking the server for plugin CLI contributions. "unreachable"
- * (fetch threw: server down, blocked, timeout) is distinguished from
- * "invalid" (an old server without the route, or a malformed payload) so
- * unknown-command handling can tell the user to start bb instead of printing
- * a misleading "unknown command" for a plugin command that would exist if bb
- * were up. The thrown error is kept: EPERM (blocked shell) and a timeout mean
- * something very different from ECONNREFUSED (nothing listening). `attempts`
- * records how many probes were spent so the message can say so.
- */
-export type PluginCliContributionsResult =
+type PluginCliContributionsResult =
   | { outcome: "ok"; contributions: PluginCliContributionEntry[] }
   | {
       outcome: "unreachable";
@@ -65,8 +53,7 @@ export type PluginCliContributionsResult =
     }
   | { outcome: "invalid" };
 
-/** What a failed probe tells us about the server, independent of wording. */
-export interface UnreachableDiagnosis {
+interface UnreachableDiagnosis {
   blockedCode: "EPERM" | "EACCES" | undefined;
   timedOut: boolean;
   refused: boolean;
@@ -74,15 +61,7 @@ export interface UnreachableDiagnosis {
   messages: string[];
 }
 
-/**
- * Walk the cause chain of a failed fetch — Node wraps the real errno in
- * `TypeError: fetch failed`, and a multi-address connect wraps several in an
- * AggregateError — and report every signal it carries. Kept separate from the
- * wording so the retry decision and the message cannot drift apart.
- */
-export function diagnoseUnreachableServer(
-  cause: unknown,
-): UnreachableDiagnosis {
+function diagnoseUnreachableServer(cause: unknown): UnreachableDiagnosis {
   let blockedCode: "EPERM" | "EACCES" | undefined;
   let timedOut = false;
   let retryableCode = false;
@@ -147,21 +126,12 @@ export function diagnoseUnreachableServer(
     blockedCode,
     timedOut,
     refused,
-    // A blocked connection is never retryable even if it also timed out:
-    // the sandbox rule that rejected it will reject the next probe too.
     retryable:
       blockedCode === undefined && !refused && (timedOut || retryableCode),
     messages,
   };
 }
 
-/**
- * Diagnose a failed probe of the server without overclaiming: only when every
- * connection attempt reports ECONNREFUSED is there evidence that bb is not
- * running. Blocked connections (sandboxed agent shells) and timeouts name the
- * address and errno so the reader — often an agent — does not declare a
- * running bb dead.
- */
 export function describeUnreachableServer(
   baseUrl: string,
   cause: unknown,
@@ -180,11 +150,6 @@ export function describeUnreachableServer(
   if (refused) {
     return `bb is not running at ${baseUrl} — open the bb app, then re-run this command.`;
   }
-  // A retryable transport failure does not prove bb is down, but it also does
-  // not prove bb is running: the timeout covers DNS lookup and connection
-  // setup as well as waiting for a response. Say the command did not run and
-  // that retrying is the fix, because the reader is usually an agent that will
-  // otherwise record the write as impossible and silently drop it.
   if (timedOut || retryable) {
     const tried =
       attempts > 1
@@ -200,23 +165,13 @@ export function describeUnreachableServer(
   }`;
 }
 
-export interface FetchPluginCliContributionsOptions {
-  /** Injected so tests exercise the retry schedule without real delays. */
+interface FetchPluginCliContributionsOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Fetch plugin CLI contributions, retrying transient transport failures.
- *
- * This probe gates every plugin-contributed command (`bb memory add`,
- * `bb tasks ...`), so a false negative here does not merely misreport — it
- * stops the command from running at all. Failing the whole invocation on one
- * 2s window made a busy machine look like a stopped app; the work is retried
- * instead, and only a genuinely refused or blocked connection fails fast.
- */
 export async function fetchPluginCliContributions(
   baseUrl: string,
   timeoutMs: number = CONTRIBUTIONS_TIMEOUT_MS,
@@ -243,9 +198,6 @@ export async function fetchPluginCliContributions(
           cliCommands?: unknown;
         } | null;
       } catch (error) {
-        // JSON syntax is an invalid old/malformed route response. Transport
-        // failures while consuming a valid response are still probe failures
-        // and follow the same retry policy as failures before the headers.
         if (!diagnoseUnreachableServer(error).retryable) {
           return { outcome: "invalid" };
         }
@@ -280,22 +232,11 @@ export async function fetchPluginCliContributions(
   return { outcome: "invalid" };
 }
 
-/**
- * Look up an installed-but-disabled plugin whose id matches the unknown
- * command name (the `bb <id>` convention builtins follow), so `bb connect`
- * with the connect plugin disabled explains itself instead of erroring with
- * "unknown command". Best effort: any failure returns null.
- */
 export async function findDisabledPluginForCommand(
   baseUrl: string,
   name: string,
   timeoutMs: number = CONTRIBUTIONS_TIMEOUT_MS,
-): Promise<{
-  id: string;
-  enabled: boolean;
-  status: string | null;
-  statusDetail: string | null;
-} | null> {
+): Promise<string | null> {
   try {
     const response = await cliFetch(`${baseUrl}/api/v1/plugins`, {
       signal: AbortSignal.timeout(timeoutMs),
@@ -304,14 +245,7 @@ export async function findDisabledPluginForCommand(
     const parsed = (await response.json()) as { plugins?: unknown } | null;
     if (!Array.isArray(parsed?.plugins)) return null;
     const match = parsed.plugins.find(
-      (
-        entry,
-      ): entry is {
-        id: string;
-        enabled: boolean;
-        status?: unknown;
-        statusDetail?: unknown;
-      } =>
+      (entry): entry is { id: string } =>
         typeof entry === "object" &&
         entry !== null &&
         (entry as { id?: unknown }).id === name &&
@@ -319,15 +253,7 @@ export async function findDisabledPluginForCommand(
         ((entry as { enabled?: unknown }).enabled === false ||
           (entry as { status?: unknown }).status === "disabled"),
     );
-    return match === undefined
-      ? null
-      : {
-          id: match.id,
-          enabled: match.enabled,
-          status: typeof match.status === "string" ? match.status : null,
-          statusDetail:
-            typeof match.statusDetail === "string" ? match.statusDetail : null,
-        };
+    return match === undefined ? null : match.id;
   } catch {
     return null;
   }
@@ -340,28 +266,64 @@ export function findPluginCliCommand(
   return contributions.find((entry) => entry.name === name);
 }
 
-/**
- * The first CLI token is a plugin-proxy candidate only when it looks like a
- * command (not a flag) and no core command claims it. Core commands always
- * win: commander resolved them before this path runs.
- */
-export function pluginProxyCandidate(
-  firstArg: string | undefined,
-  knownCommandNames: ReadonlySet<string>,
-): string | null {
-  if (firstArg === undefined || firstArg.length === 0) return null;
-  if (firstArg.startsWith("-")) return null;
-  if (knownCommandNames.has(firstArg)) return null;
-  return firstArg;
-}
-
-interface PluginCliOutputStream {
-  write(chunk: string, callback: (error?: Error | null) => void): boolean;
-}
+type PluginCliOutputStream = Writable;
 
 interface PluginCliOutputStreams {
   stdout: PluginCliOutputStream;
   stderr: PluginCliOutputStream;
+}
+
+interface PluginCliInputStream extends AsyncIterable<Buffer | string> {
+  isTTY?: boolean;
+}
+
+const PLUGIN_CLI_STDIN_MAX_BYTES = 16 * 1024;
+const PLUGIN_CLI_STDIN_FLAG = /^--([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)-stdin$/u;
+
+async function materializeStdinFlag(
+  argv: readonly string[],
+  input: PluginCliInputStream,
+): Promise<string[]> {
+  const terminator = argv.indexOf("--");
+  const scanned = terminator === -1 ? argv : argv.slice(0, terminator);
+  const matches = scanned.flatMap((flag, index) => {
+    const match = PLUGIN_CLI_STDIN_FLAG.exec(flag);
+    const name = match?.[1];
+    return name === undefined ? [] : [{ flag, index, name }];
+  });
+  if (matches.length === 0) return [...argv];
+  if (matches.length > 1) throw new Error("Choose only one stdin input flag.");
+  const match = matches[0];
+  if (match === undefined) return [...argv];
+  const valueFlag = `--${match.name}`;
+  if (scanned.includes(valueFlag)) {
+    throw new Error(`Choose only one of ${match.flag} and ${valueFlag}.`);
+  }
+  if (input.isTTY === true) {
+    throw new Error(`${match.flag} requires piped stdin.`);
+  }
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of input) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > PLUGIN_CLI_STDIN_MAX_BYTES) {
+      throw new Error(`${match.flag} input exceeds 16 KiB.`);
+    }
+    chunks.push(buffer);
+  }
+  const value = Buffer.concat(chunks)
+    .toString("utf8")
+    .replace(/\r?\n$/u, "");
+  if (value.length === 0 || /[\r\n]/u.test(value)) {
+    throw new Error(`${match.flag} requires exactly one non-empty stdin line.`);
+  }
+  return [
+    ...argv.slice(0, match.index),
+    valueFlag,
+    value,
+    ...argv.slice(match.index + 1),
+  ];
 }
 
 async function writePluginCliOutput(
@@ -371,20 +333,48 @@ async function writePluginCliOutput(
   if (value.length === 0) return;
   const output = value.endsWith("\n") ? value : `${value}\n`;
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    stream.write(output, (error) => {
-      if (error) rejectPromise(error);
-      else resolvePromise();
-    });
+    const settle = (error?: Error | null) => {
+      stream.off("error", onError);
+      stream.off("close", onClose);
+      if (error && !("code" in error && error.code === "EPIPE")) {
+        rejectPromise(error);
+      } else {
+        resolvePromise();
+      }
+    };
+    const onError = (error: Error) => settle(error);
+    const onClose = () =>
+      settle(
+        stream.errored ??
+          new Error("Plugin CLI output stream closed before flushing"),
+      );
+    stream.once("error", onError);
+    stream.once("close", onClose);
+    if (stream.destroyed) {
+      if (stream.closed) process.nextTick(onClose);
+      return;
+    }
+    try {
+      stream.write(output, (error) => {
+        if (!error) settle();
+      });
+    } catch (error) {
+      stream.off("error", onError);
+      stream.off("close", onClose);
+      rejectPromise(error);
+    }
   });
 }
 
-/**
- * Proxy one invocation to the server and mirror its output. Returns the
- * command's exit code after both output streams have flushed. Waiting for the
- * write callbacks is required because callers terminate the CLI process as
- * soon as this promise resolves; an immediate exit can otherwise drop every
- * buffered byte after the platform pipe capacity.
- */
+export const PLUGIN_CLI_HEADERS_TIMEOUT_MS = 65 * 60 * 1000;
+let pluginCliDispatcher: Dispatcher | undefined;
+function getPluginCliDispatcher(): Dispatcher {
+  pluginCliDispatcher ??= new Agent({
+    headersTimeout: PLUGIN_CLI_HEADERS_TIMEOUT_MS,
+  });
+  return pluginCliDispatcher;
+}
+
 export async function runPluginCliCommand(
   baseUrl: string,
   pluginId: string,
@@ -393,7 +383,18 @@ export async function runPluginCliCommand(
     stdout: process.stdout,
     stderr: process.stderr,
   },
+  input: PluginCliInputStream = process.stdin,
 ): Promise<number> {
+  let resolvedArgv: string[];
+  try {
+    resolvedArgv = await materializeStdinFlag(argv, input);
+  } catch (error) {
+    await writePluginCliOutput(
+      streams.stderr,
+      error instanceof Error ? error.message : String(error),
+    );
+    return 1;
+  }
   const threadId = resolveContextThreadId();
   const projectId = resolveContextProjectId();
   const response = await cliFetch(
@@ -402,11 +403,12 @@ export async function runPluginCliCommand(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        argv,
+        argv: resolvedArgv,
         cwd: process.cwd(),
         ...(threadId ? { threadId } : {}),
         ...(projectId ? { projectId } : {}),
       }),
+      dispatcher: getPluginCliDispatcher(),
     },
   );
   const result = (await response.json().catch(() => null)) as {

@@ -36,16 +36,24 @@ function lenientOptionsByEntity(): Map<string, LenientChangedOption> {
 const maximalThreadMetadata: ThreadChangeMetadata = {
   backgroundActivityChanged: true,
   eventTypes: [...threadEventTypeValues],
+  timelineSequence: 42,
   hasPendingInteraction: true,
   projectId: "proj_1",
+  statusChange: {
+    status: "active",
+    runtime: { displayStatus: "active" },
+    activity: {
+      activeBackgroundAgentCount: 1,
+      activeBackgroundCommandCount: 1,
+      activeGoalCount: 1,
+      activePlanModeCount: 1,
+      activeWorkflowCount: 1,
+    },
+    latestAttentionAt: 1_000,
+    updatedAt: 2_000,
+  },
 };
 
-/**
- * One message per entity populating every declared field with every declared
- * change kind. The "fixtures stay maximal" test below forces this list to be
- * updated whenever a strict schema grows a field, so the lenient round-trip
- * can never silently skip a new field.
- */
 const maximalChangedMessages: ChangedMessage[] = [
   {
     type: "changed",
@@ -79,12 +87,6 @@ const maximalChangedMessages: ChangedMessage[] = [
   },
 ];
 
-/**
- * Drift guard between the strict outgoing schemas and the hand-maintained
- * lenient inbound twins: a field added to a strict schema but not its lenient
- * counterpart would be silently stripped from every inbound message (zod
- * objects strip unknown keys by default), with no compile or runtime error.
- */
 describe("lenient changed-message schema parity", () => {
   it("declares the same entities and field sets as the strict schemas", () => {
     const strictOptions = strictOptionsByEntity();
@@ -107,12 +109,44 @@ describe("lenient changed-message schema parity", () => {
   it.each(maximalChangedMessages)(
     "lenient parse preserves a maximal strict $entity message",
     (message) => {
-      // The fixture is valid strict output...
       expect(changedMessageSchema.parse(message)).toEqual(message);
-      // ...and the lenient parse must not strip or rewrite any of it.
       expect(changedMessageLenientSchema.parse(message)).toEqual(message);
     },
   );
+
+  it("drops a status change a stale client cannot parse but keeps the message", () => {
+    const parsed = changedMessageLenientSchema.parse({
+      type: "changed",
+      entity: "thread",
+      id: "thr_1",
+      metadata: {
+        projectId: "proj_1",
+        statusChange: {
+          status: "active",
+          runtime: {
+            displayStatus: "teleporting",
+          },
+          activity: {
+            activeBackgroundAgentCount: 0,
+            activeBackgroundCommandCount: 0,
+            activeGoalCount: 0,
+            activePlanModeCount: 0,
+            activeWorkflowCount: 0,
+          },
+          latestAttentionAt: 1_000,
+          updatedAt: 2_000,
+        },
+      },
+      changes: ["status-changed"],
+    });
+    expect(parsed).toEqual({
+      type: "changed",
+      entity: "thread",
+      id: "thr_1",
+      metadata: { projectId: "proj_1" },
+      changes: ["status-changed"],
+    });
+  });
 
   it("keeps the maximal fixtures covering every declared strict field", () => {
     const strictOptions = strictOptionsByEntity();

@@ -1,7 +1,14 @@
-import { getThread } from "@bb/db";
+import {
+  archiveThread,
+  createThread,
+  createThreadSection,
+  getThread,
+  markThreadDeleted,
+} from "@bb/db";
 import { threadSchema } from "@bb/domain";
 import {
   apiErrorSchema,
+  sidebarBootstrapResponseSchema,
   threadArchiveAllResponseSchema,
   threadChildSummaryResponseSchema,
   threadListResponseSchema,
@@ -16,9 +23,85 @@ import {
   seedThread,
   seedThreadRuntimeState,
 } from "../helpers/seed.js";
+import { archiveThreadAndReleaseChildren } from "../../src/services/threads/thread-ownership.js";
 import { withTestHarness } from "../helpers/test-app.js";
 
 describe("public thread parenting routes", () => {
+  it.each([
+    { mode: "inherit", parentSection: true },
+    { mode: "inherit", parentSection: false },
+    { mode: "explicit", parentSection: true },
+    { mode: "clear", parentSection: true },
+    { mode: "root", parentSection: true },
+    { mode: "reparent", parentSection: true },
+    { mode: "archive", parentSection: true },
+    { mode: "archive", parentSection: false },
+  ] as const)(
+    "preserves section policy on $mode (parent section: $parentSection)",
+    async ({ mode, parentSection }) => {
+      await withTestHarness(async (harness) => {
+        const { host } = seedHostSession(harness.deps);
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const section = createThreadSection(harness.db, harness.deps.hub, {
+          name: "Parent section",
+        }).section;
+        const original = createThreadSection(harness.db, harness.deps.hub, {
+          name: "Child section",
+        }).section;
+        const parent = createThread(harness.db, harness.deps.hub, {
+          projectId: project.id,
+          providerId: "codex",
+          sectionId: parentSection ? section.id : null,
+        });
+        const child = createThread(harness.db, harness.deps.hub, {
+          projectId: project.id,
+          providerId: "codex",
+          parentThreadId: mode === "root" ? null : parent.id,
+          sectionId: original.id,
+        });
+        const nextParent = seedThread(harness.deps, { projectId: project.id });
+        const expectedSectionId =
+          mode === "clear"
+            ? null
+            : ["explicit", "root", "reparent"].includes(mode)
+              ? original.id
+              : parent.sectionId;
+        const expectedParentId = mode === "reparent" ? nextParent.id : null;
+
+        if (mode === "archive") {
+          archiveThreadAndReleaseChildren(harness.deps, {
+            threadId: parent.id,
+          });
+        } else {
+          const response = await harness.app.request(
+            `/api/v1/threads/${child.id}`,
+            {
+              method: "PATCH",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                parentThreadId: expectedParentId,
+                ...(mode === "explicit" ? { sectionId: original.id } : {}),
+                ...(mode === "clear" ? { sectionId: null } : {}),
+              }),
+            },
+          );
+          expect(response.status).toBe(200);
+          expect(threadSchema.parse(await readJson(response))).toMatchObject({
+            parentThreadId: expectedParentId,
+            sectionId: expectedSectionId,
+          });
+        }
+        expect(getThread(harness.db, child.id)).toMatchObject({
+          parentThreadId: expectedParentId,
+          sectionId: expectedSectionId,
+          archivedAt: null,
+        });
+      });
+    },
+  );
+
   it("creates a child thread under a parent", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
@@ -125,31 +208,92 @@ describe("public thread parenting routes", () => {
     });
   });
 
-  it("assigns a parent to an existing thread", async () => {
+  it("creates and reparents a child thread under a parent from another project", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
+      const { project: parentProject } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
+        name: "Parent Project",
+        path: "/tmp/parent-project",
+      });
+      const { project: childProject } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+        name: "Child Project",
+        path: "/tmp/child-project",
       });
       const parentThread = seedThread(harness.deps, {
-        projectId: project.id,
+        projectId: parentProject.id,
       });
-      const childThread = seedThread(harness.deps, {
-        projectId: project.id,
+      const childEnvironment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        projectId: childProject.id,
       });
 
-      const response = await harness.app.request(
-        `/api/v1/threads/${childThread.id}`,
+      const createResponse = await harness.app.request("/api/v1/threads", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          origin: "app",
+          projectId: childProject.id,
+          providerId: "codex",
+          model: "gpt-5",
+          input: [{ type: "text", text: "Work in the other repo" }],
+          environment: {
+            type: "reuse",
+            environmentId: childEnvironment.id,
+          },
+          parentThreadId: parentThread.id,
+        }),
+      });
+      expect(createResponse.status).toBe(201);
+      const createdThread = threadSchema.parse(await readJson(createResponse));
+      expect(createdThread.parentThreadId).toBe(parentThread.id);
+      expect(createdThread.projectId).toBe(childProject.id);
+
+      const orphanThread = seedThread(harness.deps, {
+        projectId: childProject.id,
+      });
+      const patchResponse = await harness.app.request(
+        `/api/v1/threads/${orphanThread.id}`,
         {
           method: "PATCH",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ parentThreadId: parentThread.id }),
         },
       );
+      expect(patchResponse.status).toBe(200);
+      expect(
+        threadSchema.parse(await readJson(patchResponse)).parentThreadId,
+      ).toBe(parentThread.id);
 
-      expect(response.status).toBe(200);
-      const updatedThread = threadSchema.parse(await readJson(response));
-      expect(updatedThread.parentThreadId).toBe(parentThread.id);
+      const listResponse = await harness.app.request(
+        `/api/v1/threads?parentThreadId=${parentThread.id}`,
+      );
+      expect(listResponse.status).toBe(200);
+      const listed = threadListResponseSchema.parse(
+        await readJson(listResponse),
+      );
+      expect(listed.map((thread) => thread.id).sort()).toEqual(
+        [createdThread.id, orphanThread.id].sort(),
+      );
+
+      const bootstrapResponse = await harness.app.request(
+        "/api/v1/sidebar-bootstrap",
+      );
+      expect(bootstrapResponse.status).toBe(200);
+      const bootstrap = sidebarBootstrapResponseSchema.parse(
+        await readJson(bootstrapResponse),
+      );
+      const childProjectThreads = bootstrap.projects.find(
+        (project) => project.id === childProject.id,
+      )?.threads;
+      expect(childProjectThreads).toContainEqual(
+        expect.objectContaining({
+          id: createdThread.id,
+          parentThreadId: parentThread.id,
+          projectId: childProject.id,
+        }),
+      );
     });
   });
 
@@ -167,6 +311,25 @@ describe("public thread parenting routes", () => {
         projectId: project.id,
       });
 
+      const archivedChild = seedThread(harness.deps, {
+        parentThreadId: parentThread.id,
+        projectId: project.id,
+      });
+      archiveThread(harness.deps.db, harness.deps.hub, archivedChild.id);
+      const deletedChild = seedThread(harness.deps, {
+        parentThreadId: parentThread.id,
+        projectId: project.id,
+      });
+      markThreadDeleted(harness.deps.db, harness.deps.hub, {
+        threadId: deletedChild.id,
+      });
+      seedThread(harness.deps, {
+        parentThreadId: parentThread.id,
+        projectId: project.id,
+        visibility: "hidden",
+      });
+      seedThread(harness.deps, { projectId: project.id });
+
       const response = await harness.app.request(
         `/api/v1/threads/${parentThread.id}/child-summary`,
       );
@@ -175,37 +338,38 @@ describe("public thread parenting routes", () => {
       const summary = threadChildSummaryResponseSchema.parse(
         await readJson(response),
       );
-      expect(summary.nonDeletedChildCount).toBe(1);
+      expect(summary).toEqual({
+        nonDeletedChildCount: 3,
+        unarchivedDescendantCount: 1,
+      });
     });
   });
 
-  it("requires delete confirmation for a parent with children", async () => {
+  it("counts a live grandchild below an archived only child", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
       });
-      const parentThread = seedThread(harness.deps, {
+      const parent = seedThread(harness.deps, { projectId: project.id });
+      const child = seedThread(harness.deps, {
         projectId: project.id,
+        parentThreadId: parent.id,
       });
       seedThread(harness.deps, {
-        parentThreadId: parentThread.id,
         projectId: project.id,
+        parentThreadId: child.id,
       });
+      archiveThread(harness.db, harness.deps.hub, child.id);
 
       const response = await harness.app.request(
-        `/api/v1/threads/${parentThread.id}`,
-        {
-          method: "DELETE",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ childThreadsConfirmed: false }),
-        },
+        `/api/v1/threads/${parent.id}/child-summary`,
       );
-
-      expect(response.status).toBe(409);
-      const error = apiErrorSchema.parse(await readJson(response));
-      expect(error).toMatchObject({
-        code: "child_threads_confirmation_required",
+      expect(
+        threadChildSummaryResponseSchema.parse(await readJson(response)),
+      ).toEqual({
+        nonDeletedChildCount: 1,
+        unarchivedDescendantCount: 1,
       });
     });
   });
@@ -235,6 +399,9 @@ describe("public thread parenting routes", () => {
       );
 
       expect(deleteResponse.status).toBe(409);
+      expect(
+        apiErrorSchema.parse(await readJson(deleteResponse)),
+      ).toMatchObject({ code: "child_threads_confirmation_required" });
       expect(getThread(harness.db, deleteParent.id)?.deletedAt).toBeNull();
       expect(getThread(harness.db, hiddenDeleteChild.id)?.deletedAt).toBeNull();
 
@@ -252,6 +419,13 @@ describe("public thread parenting routes", () => {
         projectId: project.id,
         visibility: "hidden",
       });
+
+      const summaryResponse = await harness.app.request(
+        `/api/v1/threads/${archiveParent.id}/child-summary`,
+      );
+      expect(
+        threadChildSummaryResponseSchema.parse(await readJson(summaryResponse)),
+      ).toMatchObject({ unarchivedDescendantCount: 0 });
 
       const archiveResponse = await harness.app.request(
         `/api/v1/threads/${archiveParent.id}/archive-all`,
@@ -275,86 +449,6 @@ describe("public thread parenting routes", () => {
     });
   });
 
-  it("archives a parent and its child threads", async () => {
-    await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-      });
-      const parentThread = seedThread(harness.deps, {
-        environmentId: environment.id,
-        projectId: project.id,
-      });
-      const childThread = seedThread(harness.deps, {
-        environmentId: environment.id,
-        parentThreadId: parentThread.id,
-        projectId: project.id,
-      });
-
-      const response = await harness.app.request(
-        `/api/v1/threads/${parentThread.id}/archive-all`,
-        { method: "POST" },
-      );
-
-      expect(response.status).toBe(200);
-      const archiveResult = threadArchiveAllResponseSchema.parse(
-        await readJson(response),
-      );
-      expect(archiveResult.archivedThreadIds).toEqual([
-        childThread.id,
-        parentThread.id,
-      ]);
-      expect(getThread(harness.db, parentThread.id)?.archivedAt).not.toBeNull();
-      const archivedChildThread = getThread(harness.db, childThread.id);
-      expect(archivedChildThread?.archivedAt).not.toBeNull();
-      expect(archivedChildThread?.parentThreadId).toBe(parentThread.id);
-    });
-  });
-
-  // Archiving one thread cascades too, not just archive-all: the plugin's
-  // `thread.archived` listener used to cover this route.
-  it("archives hidden source-derived forks when archiving a single thread", async () => {
-    await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-      });
-      const sourceThread = seedThread(harness.deps, {
-        environmentId: environment.id,
-        projectId: project.id,
-      });
-      const sideChatThread = seedThread(harness.deps, {
-        environmentId: environment.id,
-        originKind: "fork",
-        originPluginId: "side-chat",
-        visibility: "hidden",
-        projectId: project.id,
-        sourceThreadId: sourceThread.id,
-      });
-
-      const response = await harness.app.request(
-        `/api/v1/threads/${sourceThread.id}/archive`,
-        { method: "POST" },
-      );
-
-      expect(response.status).toBe(200);
-      expect(getThread(harness.db, sourceThread.id)?.archivedAt).not.toBeNull();
-      expect(
-        getThread(harness.db, sideChatThread.id)?.archivedAt,
-      ).not.toBeNull();
-    });
-  });
-
-  // The cascade is BB's own, not the plugin's: a hidden fork retires with its
-  // source whether or not the plugin that created it is enabled.
   it("archives hierarchy children and hidden source-derived forks", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
@@ -383,6 +477,13 @@ describe("public thread parenting routes", () => {
         sourceThreadId: sourceThread.id,
       });
 
+      const summaryResponse = await harness.app.request(
+        `/api/v1/threads/${sourceThread.id}/child-summary`,
+      );
+      expect(
+        threadChildSummaryResponseSchema.parse(await readJson(summaryResponse)),
+      ).toMatchObject({ unarchivedDescendantCount: 1 });
+
       const response = await harness.app.request(
         `/api/v1/threads/${sourceThread.id}/archive-all`,
         { method: "POST" },
@@ -406,8 +507,115 @@ describe("public thread parenting routes", () => {
     });
   });
 
-  // A side chat is a hidden thread, and the list excludes hidden threads by
-  // default — no dedicated filter needed.
+  it.each([false, true])(
+    "archives all descendants once and preserves their parents (archived intermediary: %s)",
+    async (archivedIntermediary) => {
+      await withTestHarness(async (harness) => {
+        const { host } = seedHostSession(harness.deps);
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+        });
+        const defaults = {
+          environmentId: environment.id,
+          projectId: project.id,
+        };
+        const root = seedThread(harness.deps, defaults);
+        const child = seedThread(harness.deps, {
+          ...defaults,
+          parentThreadId: root.id,
+        });
+        const grandchild = seedThread(harness.deps, {
+          ...defaults,
+          parentThreadId: child.id,
+        });
+        const greatGrandchild = seedThread(harness.deps, {
+          ...defaults,
+          parentThreadId: grandchild.id,
+        });
+        const hiddenFork = seedThread(harness.deps, {
+          ...defaults,
+          originKind: "fork",
+          visibility: "hidden",
+          sourceThreadId: child.id,
+          parentThreadId: child.id,
+        });
+        const forkChild = seedThread(harness.deps, {
+          ...defaults,
+          parentThreadId: hiddenFork.id,
+        });
+        if (archivedIntermediary) {
+          archiveThread(harness.db, harness.deps.hub, grandchild.id);
+        }
+        const unrelated = seedThread(harness.deps, defaults);
+        const visibleFork = seedThread(harness.deps, {
+          ...defaults,
+          originKind: "fork",
+          sourceThreadId: child.id,
+        });
+        const archived = [
+          root,
+          child,
+          grandchild,
+          greatGrandchild,
+          hiddenFork,
+          forkChild,
+        ];
+
+        const summaryResponse = await harness.app.request(
+          `/api/v1/threads/${root.id}/child-summary`,
+        );
+        const summary = threadChildSummaryResponseSchema.parse(
+          await readJson(summaryResponse),
+        );
+        expect(summary.unarchivedDescendantCount).toBe(
+          archivedIntermediary ? 3 : 4,
+        );
+
+        const response = await harness.app.request(
+          `/api/v1/threads/${root.id}/archive-all`,
+          { method: "POST" },
+        );
+
+        expect(response.status).toBe(200);
+        const { archivedThreadIds } = threadArchiveAllResponseSchema.parse(
+          await readJson(response),
+        );
+        expect(archivedThreadIds).toHaveLength(archivedIntermediary ? 5 : 6);
+        expect([...archivedThreadIds].sort()).toEqual(
+          archived
+            .filter(
+              (thread) => !archivedIntermediary || thread.id !== grandchild.id,
+            )
+            .map((thread) => thread.id)
+            .sort(),
+        );
+        for (const thread of archived) {
+          expect(getThread(harness.db, thread.id)).toMatchObject({
+            archivedAt: expect.any(Number),
+            parentThreadId: thread.parentThreadId,
+            sourceThreadId: thread.sourceThreadId,
+          });
+          if (
+            thread.parentThreadId !== null &&
+            archivedThreadIds.includes(thread.parentThreadId) &&
+            archivedThreadIds.includes(thread.id)
+          ) {
+            expect(archivedThreadIds.indexOf(thread.id)).toBeLessThan(
+              archivedThreadIds.indexOf(thread.parentThreadId),
+            );
+          }
+        }
+        for (const thread of [unrelated, visibleFork]) {
+          expect(getThread(harness.db, thread.id)?.archivedAt).toBeNull();
+        }
+      });
+    },
+  );
+
   it("excludes side chats from thread list results", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);

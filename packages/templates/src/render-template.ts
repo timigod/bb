@@ -1,18 +1,13 @@
 import Handlebars from "handlebars";
-import type {
-  TemplateId,
-  TemplateVariables,
+import {
+  templateDefinitions,
+  type TemplateId,
+  type TemplateVariables,
 } from "./generated/templates.generated.js";
-import { type TemplateMetadata, templateRegistry } from "./registry.js";
 
-let partialsRegistered = false;
-function ensurePartialsRegistered() {
-  if (partialsRegistered) return;
-  for (const definition of Object.values(templateRegistry)) {
-    Handlebars.registerPartial(definition.id, definition.body);
-  }
-  partialsRegistered = true;
-}
+const templateBodyById = Object.fromEntries(
+  templateDefinitions.map((definition) => [definition.id, definition.body]),
+) as Record<TemplateId, string>;
 
 const compiledTemplateCache = new Map<
   TemplateId,
@@ -28,7 +23,7 @@ function getCompiledTemplate<TTemplateId extends TemplateId>(
   }
 
   const compiled = Handlebars.compile<TemplateVariables[TTemplateId]>(
-    templateRegistry[templateId].body,
+    templateBodyById[templateId],
     { noEscape: true },
   );
   compiledTemplateCache.set(
@@ -42,17 +37,5 @@ export function renderTemplate<TTemplateId extends TemplateId>(
   templateId: TTemplateId,
   variables: TemplateVariables[TTemplateId],
 ): string {
-  ensurePartialsRegistered();
   return getCompiledTemplate(templateId)(variables).trim();
-}
-
-export function getTemplateMetadata(templateId: TemplateId): TemplateMetadata {
-  const { body: _body, ...metadata } = templateRegistry[templateId];
-  return metadata;
-}
-
-export function listTemplates(): TemplateMetadata[] {
-  return Object.values(templateRegistry).map(
-    ({ body: _body, ...metadata }) => metadata,
-  );
 }

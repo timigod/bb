@@ -1,28 +1,8 @@
 import type { IconName } from "@bb/shared-ui/icon";
-import {
-  showcaseArchetypeId,
-  showcaseArchetypePrompt,
-  type ShowcaseArchetype,
-} from "@/components/showcase-hero/showcase-archetype";
-import { CREATE_PLUGIN_PROMPT } from "@/lib/create-resource-prompts";
+import type { ShowcaseArchetype } from "@/components/showcase-hero/showcase-archetype";
+import { CREATE_PLUGIN_PROMPT } from "@bb/client-core";
 
-/**
- * The Browse hero's job is two questions answered in one glance: what can a
- * plugin do, and what would mine be? Each archetype carries a plain noun (what
- * bb becomes), a hook written as an outcome rather than an API, and the brief
- * that seeds the composer — the same prompt shape `create-via-prompt-examples`
- * uses, so the hero and the New plugin menu stay one voice.
- *
- * `capability` names the real slot or backend surface behind the scene so the
- * inspiration is checkable: every archetype here is buildable with the plugin
- * SDK as it ships today.
- *
- * The shape itself is shared with the Skills hero; only the content is
- * plugin-specific.
- */
-export type BrowseArchetype = ShowcaseArchetype;
-
-const ARCHETYPE_SOURCE: readonly Omit<BrowseArchetype, "id">[] = [
+const ARCHETYPE_SOURCE: readonly Omit<ShowcaseArchetype, "id">[] = [
   {
     noun: "a kanban board",
     title: "Kanban board",
@@ -50,8 +30,6 @@ const ARCHETYPE_SOURCE: readonly Omit<BrowseArchetype, "id">[] = [
     capability: "navPanel + service + experimental_threadList",
     icon: "UserRound",
     accentToken: "--pr-merged",
-    // A chief of staff acts — takes work in, delegates it, keeps it moving —
-    // rather than just visualizing it; the brief must promise the acting.
     brief:
       "adds a chief-of-staff panel that takes in my backlog, opens an agent thread for each item, keeps them moving by answering routine questions itself, and briefs me on progress and the few decisions only I can make",
   },
@@ -87,33 +65,20 @@ const ARCHETYPE_SOURCE: readonly Omit<BrowseArchetype, "id">[] = [
   },
 ];
 
-/** Stable ids derived from the title keep story snapshots and tests readable. */
-export const BROWSE_ARCHETYPES: readonly BrowseArchetype[] =
+export const BROWSE_ARCHETYPES: readonly ShowcaseArchetype[] =
   ARCHETYPE_SOURCE.map((archetype) => ({
     ...archetype,
-    id: showcaseArchetypeId(archetype.title),
+    id: archetype.title.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
   }));
 
-/** The full composer prompt for an archetype, matching the New plugin menu. */
-export function archetypePrompt(archetype: BrowseArchetype): string {
-  return showcaseArchetypePrompt(CREATE_PLUGIN_PROMPT, archetype);
+export function briefPrompt({ brief }: { brief: string }): string {
+  return `${CREATE_PLUGIN_PROMPT}${brief}.`;
 }
 
-/**
- * The second example tier: one small, concrete brief per plugin API surface.
- *
- * The archetypes above are outcome-shaped for someone deciding whether plugins
- * are worth their time; these are for the developer who already knows they
- * want "a panel" or "a CLI command" and needs the shortest path to seeding it.
- * Both tiers feed every create-plugin surface (hero cards, New plugin menu),
- * so the lists cannot drift apart.
- */
-export interface UtilityExample {
+interface UtilityExample {
   id: string;
-  /** The API surface this example exercises, in plain words. */
   label: string;
   icon: IconName;
-  /** Completes CREATE_PLUGIN_PROMPT. */
   brief: string;
 }
 
@@ -161,20 +126,6 @@ export const UTILITY_EXAMPLES: readonly UtilityExample[] = [
   },
 ];
 
-/** The full composer prompt for a utility example. */
-export function utilityPrompt(example: UtilityExample): string {
-  return `${CREATE_PLUGIN_PROMPT}${example.brief}.`;
-}
-
-/**
- * Monotonic nonce for open-the-composer requests. Both producers (the page
- * header and the example cards) draw from one counter, so the hero can merge
- * the two channels by simple comparison instead of relaying through effects.
- *
- * The counter lives on `globalThis`: a module-level `let` re-evaluates to 0 on
- * HMR while React state holds higher nonces, making stale requests win the
- * newest-wins merge (close clicks stop closing during dev).
- */
 const COMPOSER_REQUEST_NONCE_KEY = "__bbBrowseComposerRequestNonce";
 export function nextComposerRequestNonce(): number {
   const holder = globalThis as typeof globalThis & {

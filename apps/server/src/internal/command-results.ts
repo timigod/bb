@@ -9,14 +9,14 @@ import {
   type CommandResultSideEffectsResult,
   type HostDaemonCommandExecutionRecord,
 } from "./command-result-side-effects.js";
-import { settleEnvironmentDestroyCommandResult } from "../services/environments/environment-cleanup-internal.js";
 import {
   settleEnvironmentProvisionCancelCommandResult,
   settleEnvironmentProvisionCommandResult,
-} from "../services/environments/environment-provisioning-internal.js";
+} from "../services/environments/environment-engine.js";
 import {
   settleThreadPlanCancelCommandResult,
   settleThreadStartCommandResult,
+  settleThreadStorageDeleteCommandResult,
   settleThreadStopCommandResult,
   settleTurnSubmitCommandResult,
 } from "../services/threads/thread-lifecycle.js";
@@ -35,80 +35,42 @@ interface ApplyCommandResultSideEffectsArgs<TType extends ParsedCommandType> {
   report: CommandResultReportForType<TType>;
 }
 
-interface CommandResultOwner<TType extends ParsedCommandType> {
-  applySideEffects?(
+type CommandResultSideEffectHandlers = {
+  [TType in ParsedCommandType]?: (
     args: ApplyCommandResultSideEffectsArgs<TType>,
-  ): CommandResultSideEffectsResult | void;
-}
-
-type CommandResultOwnerRegistry = {
-  [TType in ParsedCommandType]?: CommandResultOwner<TType>;
+  ) => CommandResultSideEffectsResult | void;
 };
 
-const commandResultOwners: CommandResultOwnerRegistry = {
-  "environment.destroy": {
-    applySideEffects: settleEnvironmentDestroyCommandResult,
+const commandResultSideEffectHandlers: CommandResultSideEffectHandlers = {
+  "environment.attach": settleEnvironmentProvisionCommandResult,
+  "environment.attach.cancel": settleEnvironmentProvisionCancelCommandResult,
+  "interactive.resolve": ({ deps, command, report }) => {
+    deps.pendingInteractions.settleInteractiveResolveCommandResultInTransaction(
+      {
+        command,
+        deps,
+        report,
+      },
+    );
   },
-  "environment.provision": {
-    applySideEffects: settleEnvironmentProvisionCommandResult,
+  "thread.start": settleThreadStartCommandResult,
+  "thread.stop": settleThreadStopCommandResult,
+  "thread.storage.delete": settleThreadStorageDeleteCommandResult,
+  "thread.plan.cancel": settleThreadPlanCancelCommandResult,
+  "turn.submit": settleTurnSubmitCommandResult,
+  "workspace.commit": ({ deps, command, report }) => {
+    notifyWorkspaceMutationResult(deps, {
+      environmentId: command.environmentId,
+      ok: report.ok,
+    });
   },
-  "environment.provision.cancel": {
-    applySideEffects: settleEnvironmentProvisionCancelCommandResult,
+  "workspace.pull_request_action": ({ deps, command, report }) => {
+    notifyWorkspaceMutationResult(deps, {
+      environmentId: command.environmentId,
+      ok: report.ok,
+    });
   },
-  "interactive.resolve": {
-    applySideEffects: ({ deps, command, report }) => {
-      deps.pendingInteractions.settleInteractiveResolveCommandResultInTransaction(
-        {
-          command,
-          deps,
-          report,
-        },
-      );
-    },
-  },
-  "thread.start": {
-    applySideEffects: settleThreadStartCommandResult,
-  },
-  "thread.stop": {
-    applySideEffects: settleThreadStopCommandResult,
-  },
-  "thread.plan.cancel": {
-    applySideEffects: settleThreadPlanCancelCommandResult,
-  },
-  "turn.submit": {
-    applySideEffects: settleTurnSubmitCommandResult,
-  },
-  "workspace.commit": {
-    applySideEffects: ({ deps, command, report }) => {
-      notifyWorkspaceMutationResult(deps, {
-        environmentId: command.environmentId,
-        ok: report.ok,
-      });
-    },
-  },
-  "workspace.squash_merge": {
-    applySideEffects: ({ deps, command, report }) => {
-      notifyWorkspaceMutationResult(deps, {
-        environmentId: command.environmentId,
-        ok: report.ok,
-      });
-    },
-  },
-  "workspace.pull_request_action": {
-    applySideEffects: ({ deps, command, report }) => {
-      notifyWorkspaceMutationResult(deps, {
-        environmentId: command.environmentId,
-        ok: report.ok,
-      });
-    },
-  },
-} satisfies CommandResultOwnerRegistry;
-
-function getCommandResultOwner<TType extends ParsedCommandType>(
-  command: ParsedCommandForType<TType>,
-): CommandResultOwner<TType> | undefined {
-  return commandResultOwners[command.type];
-}
+} satisfies CommandResultSideEffectHandlers;
 
 export function handleLiveCommandResultSideEffects<
   TType extends ParsedCommandType,
@@ -120,13 +82,13 @@ export function handleLiveCommandResultSideEffects<
     report: CommandResultReportForType<TType>;
   },
 ): CommandResultSideEffectsResult {
-  const owner = getCommandResultOwner(args.command);
-  if (!owner?.applySideEffects) {
+  const handler = commandResultSideEffectHandlers[args.command.type];
+  if (!handler) {
     return emptyCommandResultSideEffects();
   }
 
   return (
-    owner.applySideEffects({
+    handler({
       deps,
       report: args.report,
       command: args.command,

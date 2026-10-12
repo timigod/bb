@@ -1,19 +1,7 @@
+import { rawThreadIdSchema } from "@bb/domain";
 import type { EventProjectionToolParsedIntent } from "./event-projection-types.js";
 
 const SHELL_WRAPPER_NAMES = new Set(["sh", "bash", "zsh"]);
-const DELEGATION_TOOL_NAMES = new Set([
-  "Agent",
-  "Task",
-  "spawnAgent",
-  "resumeAgent",
-]);
-// Claude names these built-ins with title case while Pi uses lowercase names.
-// Keep this as an explicit alias list instead of normalizing every tool name:
-// plugin-contributed tool names are case-sensitive and may not share the
-// built-ins' semantics.
-const STRUCTURED_READ_TOOL_NAMES = new Set(["Read", "read"]);
-const STRUCTURED_SEARCH_TOOL_NAMES = new Set(["Grep", "grep"]);
-const STRUCTURED_LIST_TOOL_NAMES = new Set(["Glob", "glob"]);
 
 const SHELL_SEGMENT_BREAK_TOKENS = new Set(["&&", "||", "|", ";", "\n"]);
 
@@ -26,10 +14,6 @@ function unwrapQuotedShellArg(value: string): string {
   const inner = value.slice(1, -1);
   if (quote === "'") return inner;
 
-  // POSIX double-quote: backslash escapes $, `, ", \, and newline. Any other
-  // backslash is preserved literally. Unescaping here restores the inner
-  // command to a form the tokenizer can parse without tripping over
-  // shell-wrapper-only escapes.
   let result = "";
   for (let i = 0; i < inner.length; i += 1) {
     const ch = inner[i];
@@ -54,8 +38,6 @@ function unwrapQuotedShellArg(value: string): string {
 
 function isKnownShellWrapper(value: string): boolean {
   const shellName = value.split("/").pop() ?? value;
-  // Shell wrapper names are open_external runtime values; unknown shells intentionally
-  // preserve the original command payload for display.
   return SHELL_WRAPPER_NAMES.has(shellName);
 }
 
@@ -77,57 +59,28 @@ export function extractShellCommandFromString(
   return unwrapQuotedShellArg(commandArg.trim());
 }
 
-export function baseToolName(toolName: string): string {
-  const segments = toolName.split(":");
-  return segments[segments.length - 1] ?? toolName;
-}
-
-export function isStructuredReadToolName(toolName: string): boolean {
-  return STRUCTURED_READ_TOOL_NAMES.has(baseToolName(toolName));
-}
-
-export function isStructuredSearchToolName(toolName: string): boolean {
-  return STRUCTURED_SEARCH_TOOL_NAMES.has(baseToolName(toolName));
-}
-
-export function isStructuredListToolName(toolName: string): boolean {
-  return STRUCTURED_LIST_TOOL_NAMES.has(baseToolName(toolName));
-}
-
-export function isDelegationToolName(toolName: string): boolean {
-  return DELEGATION_TOOL_NAMES.has(baseToolName(toolName));
-}
-
-export function stripAgentOutputMetadata(output: string): string {
-  const lines = output
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter(
-      (line) => !line.startsWith("agentId:") && !line.startsWith("<usage>"),
-    );
-  return lines.join("\n").trim();
-}
-
-// Characters that a backslash may escape inside double quotes, per POSIX shell
-// semantics. A backslash before any other character is preserved literally.
 const DOUBLE_QUOTE_ESCAPABLE = new Set(["$", "`", '"', "\\", "\n"]);
 
-/** A shell token carries its literal value and whether any portion of it
- * came from inside a quoted string. The `quoted` flag lets the redirect
- * classifier distinguish operator-shaped characters that originated as shell
- * operators from ones the user typed inside quotes. */
-export interface ShellToken {
+interface ShellToken {
   readonly value: string;
   readonly quoted: boolean;
 }
 
-export function tokenizeShellWords(command: string): ShellToken[] {
-  const tokens: ShellToken[] = [];
+function visitShellCommandSegments(
+  command: string,
+  visit: (segment: ShellToken[]) => boolean,
+): void {
+  let segment: ShellToken[] = [];
+  const appendToken = (token: ShellToken): boolean => {
+    if (!token.quoted && SHELL_SEGMENT_BREAK_TOKENS.has(token.value)) {
+      const completed = segment;
+      segment = [];
+      return completed.length === 0 || visit(completed);
+    }
+    segment.push(token);
+    return true;
+  };
   let current = "";
-  // Track quoted vs unquoted contributions to the current token separately.
-  // A token is `quoted: true` only when *every* character originated inside
-  // quotes — that way `"-n"` (fully quoted) is recognized as a literal, while
-  // `--include='*.html'` (partially quoted) is still treated as a flag.
   let currentHasQuoted = false;
   let currentHasUnquoted = false;
   let quote: "'" | '"' | null = null;
@@ -140,18 +93,19 @@ export function tokenizeShellWords(command: string): ShellToken[] {
     currentHasUnquoted = true;
   };
 
-  const flushCurrent = (): void => {
+  const flushCurrent = (): boolean => {
     const fullyQuoted = currentHasQuoted && !currentHasUnquoted;
     const hasContent = current.length > 0;
     if (!hasContent && !fullyQuoted) {
       currentHasQuoted = false;
       currentHasUnquoted = false;
-      return;
+      return true;
     }
-    tokens.push({ value: current, quoted: fullyQuoted });
+    const keepGoing = appendToken({ value: current, quoted: fullyQuoted });
     current = "";
     currentHasQuoted = false;
     currentHasUnquoted = false;
+    return keepGoing;
   };
 
   for (let index = 0; index < command.length; index += 1) {
@@ -187,7 +141,6 @@ export function tokenizeShellWords(command: string): ShellToken[] {
     if (quote) {
       if (character === quote) {
         quote = null;
-        // An empty quoted string (`""` / `''`) still produces a token.
         if (current.length === 0) recordQuoted();
         continue;
       }
@@ -202,32 +155,30 @@ export function tokenizeShellWords(command: string): ShellToken[] {
     }
 
     if (character === "\n") {
-      flushCurrent();
-      tokens.push({ value: "\n", quoted: false });
+      if (!flushCurrent()) return;
+      if (!appendToken({ value: "\n", quoted: false })) return;
       continue;
     }
 
     if (/\s/u.test(character)) {
-      flushCurrent();
+      if (!flushCurrent()) return;
       continue;
     }
 
     if (character === "|" || character === "&" || character === ";") {
-      // `&>` / `&>>` are stdout+stderr redirects, not a background `&` followed
-      // by redirection. Build them as a compound operator.
       if (character === "&" && command[index + 1] === ">") {
-        flushCurrent();
+        if (!flushCurrent()) return;
         if (command[index + 2] === ">") {
-          tokens.push({ value: "&>>", quoted: false });
+          if (!appendToken({ value: "&>>", quoted: false })) return;
           index += 2;
         } else {
-          tokens.push({ value: "&>", quoted: false });
+          if (!appendToken({ value: "&>", quoted: false })) return;
           index += 1;
         }
         continue;
       }
 
-      flushCurrent();
+      if (!flushCurrent()) return;
 
       const nextCharacter = command[index + 1];
       if (
@@ -235,20 +186,22 @@ export function tokenizeShellWords(command: string): ShellToken[] {
         ((character === "|" && nextCharacter === "|") ||
           (character === "&" && nextCharacter === "&"))
       ) {
-        tokens.push({ value: `${character}${nextCharacter}`, quoted: false });
+        if (
+          !appendToken({
+            value: `${character}${nextCharacter}`,
+            quoted: false,
+          })
+        )
+          return;
         index += 1;
         continue;
       }
 
-      tokens.push({ value: character, quoted: false });
+      if (!appendToken({ value: character, quoted: false })) return;
       continue;
     }
 
     if (character === "<" || character === ">") {
-      // The `<` and `>` family of operators. If the current buffer is exactly
-      // a digit sequence or `&` and was built entirely outside quotes, treat
-      // it as the file-descriptor prefix for this redirect (e.g. `2>`, `&>`);
-      // otherwise flush current as a word.
       let prefix = "";
       const currentIsUnquoted = currentHasUnquoted && !currentHasQuoted;
       if (currentIsUnquoted && (current === "&" || /^\d+$/u.test(current))) {
@@ -256,7 +209,7 @@ export function tokenizeShellWords(command: string): ShellToken[] {
         current = "";
         currentHasUnquoted = false;
       } else if (current.length > 0 || currentHasQuoted) {
-        flushCurrent();
+        if (!flushCurrent()) return;
       }
 
       const next1 = command[index + 1];
@@ -298,7 +251,7 @@ export function tokenizeShellWords(command: string): ShellToken[] {
         }
       }
 
-      tokens.push({ value: `${prefix}${op}`, quoted: false });
+      if (!appendToken({ value: `${prefix}${op}`, quoted: false })) return;
       index += consumed - 1;
       continue;
     }
@@ -311,25 +264,13 @@ export function tokenizeShellWords(command: string): ShellToken[] {
     current += "\\";
     recordUnquoted();
   }
-  flushCurrent();
+  if (!flushCurrent()) return;
 
-  return tokens;
+  if (segment.length > 0) visit(segment);
 }
-
-// ---------------------------------------------------------------------------
-// Shell command intent classification
-//
-// Every classifier (reads, searches, lists, writes) operates on the same
-// tokenized + segment-split representation. This keeps quoting, flag handling,
-// and redirection logic in one place instead of N independent regexes over
-// the raw command string — which previously mis-extracted paths for commands
-// like `cat -n foo`, `head -n 20 foo`, `find -L /path`, and was fooled by
-// operator-looking characters inside quoted arguments.
-// ---------------------------------------------------------------------------
 
 const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 
-/** Search flags that take a separate value. */
 const SEARCH_FLAGS_WITH_VALUE: ReadonlySet<string> = new Set([
   "-g",
   "--glob",
@@ -347,9 +288,6 @@ const SEARCH_FLAGS_WITH_VALUE: ReadonlySet<string> = new Set([
   "--max-count",
 ]);
 
-/** `find` flags whose value is the next token. Only the common ones —
- * unknown flags are treated as value-less, which is harmless for path extraction
- * since `find` puts the start path before the expression. */
 const FIND_FLAGS_WITH_VALUE: ReadonlySet<string> = new Set([
   "-name",
   "-iname",
@@ -377,9 +315,7 @@ type SegmentClassification =
   | { kind: "none" };
 
 interface RedirectScan {
-  /** True when the redirect targets a real file (content is being written). */
   isWrite: boolean;
-  /** Extra tokens consumed past the redirect operator (e.g., the target). */
   consumedExtra: number;
 }
 
@@ -388,67 +324,31 @@ function baseExecutableName(token: string): string {
   return slash >= 0 ? token.slice(slash + 1) : token;
 }
 
-/** Matches `-i`, `-i.bak`, `-iEXT`, `--in-place`, `--in-place=EXT`. */
 function isSedInPlaceFlag(token: string): boolean {
   if (token === "--in-place") return true;
   if (token.startsWith("--in-place=")) return true;
   return /^-i(?:$|[^-])/u.test(token);
 }
 
-/** Splits a command string into per-segment token lists, using `&&`, `||`,
- * `|`, and `;` as segment boundaries. Quoted operator-shaped tokens are never
- * treated as segment breaks (a quoted `|` is just a literal pipe character). */
-function splitShellCommandSegments(command: string): ShellToken[][] {
-  const tokens = tokenizeShellWords(command);
-  const segments: ShellToken[][] = [];
-  let current: ShellToken[] = [];
-  for (const token of tokens) {
-    if (!token.quoted && SHELL_SEGMENT_BREAK_TOKENS.has(token.value)) {
-      if (current.length > 0) {
-        segments.push(current);
-        current = [];
-      }
-      continue;
-    }
-    current.push(token);
-  }
-  if (current.length > 0) segments.push(current);
-  return segments;
-}
-
-/** Identifies a redirect at `tokens[index]` and reports whether it represents
- * a file write. Returns `null` when the token is not a redirect at all.
- *
- * Token shapes (produced by `tokenizeShellWords`): all redirect operators are
- * separate tokens, optionally prefixed by a digit-fd or `&`. Examples:
- * `>`, `>>`, `1>`, `2>`, `&>`, `&>>`, `>|`, `>&`, `>(`, `<`, `<<`, `<<-`,
- * `<<<`, `<(`, `<>`. Targets always follow as their own tokens. */
 function scanRedirectAt(
   tokens: readonly ShellToken[],
   index: number,
 ): RedirectScan | null {
   const token = tokens[index];
   if (token === undefined) return null;
-  // Quoted operator-shaped tokens (e.g. `grep ">" file`) are literal data, not
-  // shell operators; never classify them as redirects.
   if (token.quoted) return null;
 
   const value = token.value;
   const nextValue = tokens[index + 1]?.value;
 
-  // Heredoc body marker: `<<` / `<<-`. Always a write-shape (the command is
-  // mutating something downstream of stdin). Next token is the delimiter.
   if (/^(?:\d+|&)?<<-?$/u.test(value)) {
     return { isWrite: true, consumedExtra: 1 };
   }
 
-  // Here-string: `<<<`. Feeds inline content to stdin — not a write. Next
-  // token is the inline string.
   if (/^(?:\d+|&)?<<<$/u.test(value)) {
     return { isWrite: false, consumedExtra: 1 };
   }
 
-  // Process substitution: `<(` or `>(`. Spans tokens until one ending in `)`.
   if (value === "<(" || value === ">(") {
     let extra = 0;
     for (let j = index + 1; j < tokens.length; j += 1) {
@@ -458,41 +358,31 @@ function scanRedirectAt(
     return { isWrite: false, consumedExtra: extra };
   }
 
-  // Read-write `<>file`: mutates the target.
   if (/^(?:\d+|&)?<>$/u.test(value)) {
     return { isWrite: true, consumedExtra: 1 };
   }
 
-  // Input redirect `<file`: not a write, but skip the target so it doesn't
-  // leak into the positional list.
   if (/^(?:\d+|&)?<$/u.test(value)) {
     return { isWrite: false, consumedExtra: 1 };
   }
 
-  // Clobber `>|file`: forced write — except `>|/dev/null`, which is still a
-  // discard (the clobber flag only matters for files that already exist).
   if (/^(?:\d+|&)?>\|$/u.test(value)) {
     if (nextValue === "/dev/null") return { isWrite: false, consumedExtra: 1 };
     return { isWrite: true, consumedExtra: 1 };
   }
 
-  // FD-copy operator `>&` (next token is a digit fd or, rarely, a file).
   if (/^(\d*|&)>>?&$/u.test(value)) {
     if (nextValue === undefined) return { isWrite: false, consumedExtra: 0 };
     return { isWrite: false, consumedExtra: 1 };
   }
 
-  // Output redirect operator: `>`, `>>`, `1>`, `2>`, `&>`, `&>>`, ...
   const opMatch = /^(\d+|&)?>>?$/u.exec(value);
   if (opMatch) {
     const prefix = opMatch[1] ?? "";
     if (nextValue === undefined) return { isWrite: false, consumedExtra: 0 };
 
-    // Stderr / other-fd redirects (`2>file`, `3>file`) are diagnostic, not a
-    // content write. Skip the target.
     if (/^[2-9]/u.test(prefix)) return { isWrite: false, consumedExtra: 1 };
 
-    // `/dev/null` is a discard, not a real file.
     if (nextValue === "/dev/null") return { isWrite: false, consumedExtra: 1 };
 
     return { isWrite: true, consumedExtra: 1 };
@@ -505,7 +395,6 @@ function getCommandTokenIndex(tokens: readonly ShellToken[]): number {
   let index = 0;
   while (index < tokens.length) {
     const token = tokens[index];
-    // A quoted token like `"FOO=bar"` is a literal word, not an env assignment.
     if (token === undefined || token.quoted) break;
     if (!ENV_ASSIGNMENT_PATTERN.test(token.value)) break;
     index += 1;
@@ -527,10 +416,6 @@ function segmentHasWriteShape(argTokens: readonly ShellToken[]): boolean {
   return false;
 }
 
-/** Walks argument tokens, skipping flags (and their values, when known) and
- * any redirection operator + its consumed targets. Returns the literal values
- * of positional arguments (quoted-ness is no longer relevant once they reach
- * the dispatched classifier). */
 function collectPositionals(
   argTokens: readonly ShellToken[],
   flagsWithValue: ReadonlySet<string>,
@@ -546,8 +431,6 @@ function collectPositionals(
       continue;
     }
 
-    // Flags only count as flags when unquoted — `"-n"` as quoted arg is a
-    // literal positional, not a flag.
     if (!token.quoted && token.value.startsWith("-") && token.value !== "-") {
       if (flagsWithValue.has(token.value)) {
         i += 2;
@@ -574,7 +457,6 @@ function classifyShellSegment(
   const argTokens = tokens.slice(commandIndex + 1);
   const commandName = baseExecutableName(commandToken.value);
 
-  // Write-shape: specific commands that mutate, regardless of redirects.
   if (commandName === "tee") return { kind: "write" };
   if (
     commandName === "sed" &&
@@ -582,7 +464,6 @@ function classifyShellSegment(
   ) {
     return { kind: "write" };
   }
-  // Heredocs and file redirections within this segment.
   if (segmentHasWriteShape(argTokens)) return { kind: "write" };
 
   switch (commandName) {
@@ -646,13 +527,11 @@ function classifyShellSegment(
       };
     }
     case "sed": {
-      // Only classify `sed -n SCRIPT FILE` as a read. Other sed invocations are
-      // too variable to pattern-match reliably.
       if (!argTokens.some((t) => !t.quoted && t.value === "-n")) {
         return { kind: "none" };
       }
       const positionals = collectPositionals(argTokens, NO_FLAGS_WITH_VALUE);
-      const path = positionals[1]; // [script, file]
+      const path = positionals[1];
       if (!path) return { kind: "none" };
       return {
         kind: "intent",
@@ -669,33 +548,204 @@ export function parseShellCommandIntents(
 ): EventProjectionToolParsedIntent[] {
   if (!command) return [];
 
-  const segments = splitShellCommandSegments(command);
-  const classifications = segments.map((segment) =>
-    classifyShellSegment(segment, command),
-  );
-
-  // Any segment that writes disqualifies the whole command from "exploring".
-  if (classifications.some((c) => c.kind === "write")) return [];
-
-  for (const classification of classifications) {
-    if (classification.kind === "intent") return [classification.intent];
-  }
-  return [];
+  let intents: EventProjectionToolParsedIntent[] = [];
+  visitShellCommandSegments(command, (segment) => {
+    const classification = classifyShellSegment(segment, command);
+    if (classification.kind === "write") {
+      intents = [];
+      return false;
+    }
+    if (classification.kind === "intent" && intents.length === 0) {
+      intents.push(classification.intent);
+    }
+    return true;
+  });
+  return intents;
 }
 
-export function formatToolCallCommand(
-  toolName: string,
-  args: Record<string, unknown> | null,
-): string {
-  if (!args) return toolName;
-  const entries = Object.entries(args).filter(([, v]) => v !== undefined);
-  if (entries.length === 0) return toolName;
-  const compact = entries
-    .map(([k, v]) => {
-      const vs = typeof v === "string" ? v.trim() : JSON.stringify(v);
-      const display = vs.length > 40 ? `${vs.slice(0, 37)}...` : vs;
-      return `${k}: ${display}`;
-    })
-    .join(", ");
-  return `${toolName} { ${compact} }`;
+const THREAD_TELL_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "--message-file",
+  "--model",
+  "--service-tier",
+  "--reasoning-level",
+  "--permission-mode",
+  "--mode",
+]);
+
+const THREAD_TELL_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+  "--json",
+  "--plan",
+]);
+
+const THREAD_TELL_HINT = /\bthread\s+(?:tell|message)\b/u;
+const BB_CLI_TOKEN = /^\$\{?BB_CLI(?::-[^}]*)?\}?$/u;
+const SHELL_VARIABLE_TOKEN = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/u;
+const SHELL_EXPANSION = /[$`]/u;
+const HEREDOC_ASSIGNMENT =
+  /^([A-Za-z_][A-Za-z0-9_]*)=\$\(cat <<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\3[ \t]*\n([\s\S]*?)\n(\t*)\4\n[ \t]*\)[ \t]*\n([^\n]*)$/u;
+const STDIN_HEREDOC =
+  /^([^\n]*?)<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\3[ \t]*\n([\s\S]*?)\n(\t*)\4$/u;
+
+export interface ThreadTellCommand {
+  threadId: string;
+  message: string;
+}
+
+interface ThreadTellScript {
+  line: string;
+  stdin: string | null;
+  variable: { name: string; value: string } | null;
+}
+
+interface HeredocMatch {
+  body: string;
+  dash: string;
+  quote: string;
+  terminatorTabs: string;
+}
+
+function heredocBody({
+  body,
+  dash,
+  quote,
+  terminatorTabs,
+}: HeredocMatch): string | null {
+  if (terminatorTabs !== "" && dash !== "-") return null;
+  if (quote === "" && /[$`\\]/u.test(body)) return null;
+  return dash === "-" ? body.replace(/^\t+/gmu, "") : body;
+}
+
+function splitThreadTellScript(script: string): ThreadTellScript | null {
+  let line = script.trim();
+  let variable: ThreadTellScript["variable"] = null;
+  const assignment = HEREDOC_ASSIGNMENT.exec(line);
+  if (assignment) {
+    const [, name, dash, quote, , body, terminatorTabs, rest] = assignment;
+    const value = heredocBody({
+      body: body!,
+      dash: dash!,
+      quote: quote!,
+      terminatorTabs: terminatorTabs!,
+    });
+    if (value === null) return null;
+    variable = { name: name!, value };
+    line = rest!.trim();
+  }
+  let stdin: string | null = null;
+  const piped = STDIN_HEREDOC.exec(line);
+  if (piped) {
+    const [, head, dash, quote, , body, terminatorTabs] = piped;
+    stdin = heredocBody({
+      body: body!,
+      dash: dash!,
+      quote: quote!,
+      terminatorTabs: terminatorTabs!,
+    });
+    if (stdin === null) return null;
+    line = head!.trim();
+  }
+  return { line, stdin, variable };
+}
+
+function resolveThreadTellMessage(
+  value: string,
+  variable: ThreadTellScript["variable"],
+): string | null {
+  const name = SHELL_VARIABLE_TOKEN.exec(value)?.[1];
+  if (name !== undefined) {
+    return variable !== null && variable.name === name ? variable.value : null;
+  }
+  return SHELL_EXPANSION.test(value) ? null : value;
+}
+
+function parseThreadTellSegment(
+  tokens: readonly ShellToken[],
+  script: ThreadTellScript,
+): ThreadTellCommand | null {
+  const commandIndex = getCommandTokenIndex(tokens);
+  const [cli, group, verb, ...argTokens] = tokens.slice(commandIndex);
+  if (
+    cli === undefined ||
+    (baseExecutableName(cli.value) !== "bb" && !BB_CLI_TOKEN.test(cli.value)) ||
+    group?.value !== "thread" ||
+    (verb?.value !== "tell" && verb?.value !== "message")
+  ) {
+    return null;
+  }
+  const positionals: string[] = [];
+  let messageFile: string | null = null;
+  for (let index = 0; index < argTokens.length; index += 1) {
+    const token = argTokens[index]!;
+    const redirect = scanRedirectAt(argTokens, index);
+    if (redirect) {
+      index += redirect.consumedExtra;
+      continue;
+    }
+    if (!token.quoted && token.value.startsWith("-") && token.value !== "-") {
+      const equals = token.value.indexOf("=");
+      const flag = equals === -1 ? token.value : token.value.slice(0, equals);
+      if (THREAD_TELL_BOOLEAN_FLAGS.has(flag) && equals === -1) continue;
+      if (!THREAD_TELL_VALUE_FLAGS.has(flag)) return null;
+      let value: string | undefined = token.value.slice(equals + 1);
+      if (equals === -1) {
+        index += 1;
+        value = argTokens[index]?.value;
+      }
+      if (flag === "--message-file") messageFile = value ?? null;
+      continue;
+    }
+    positionals.push(token.value);
+  }
+  const [threadId, messageArg, ...extra] = positionals;
+  let message: string | null = null;
+  if (messageArg !== undefined && messageFile === null) {
+    message = resolveThreadTellMessage(messageArg, script.variable);
+  } else if (messageArg === undefined && messageFile === "-") {
+    message = script.stdin;
+  }
+  if (
+    extra.length > 0 ||
+    threadId === undefined ||
+    !rawThreadIdSchema.safeParse(threadId).success ||
+    message === null ||
+    message.trim().length === 0
+  ) {
+    return null;
+  }
+  return { threadId, message };
+}
+
+export function parseThreadTellCommand(
+  command: string,
+): ThreadTellCommand | null {
+  if (!THREAD_TELL_HINT.test(command)) return null;
+  const unwrapped = extractShellCommandFromString(command);
+  if (unwrapped === undefined) return null;
+  const script = splitThreadTellScript(unwrapped);
+  if (script === null) return null;
+  const segments: ShellToken[][] = [];
+  visitShellCommandSegments(script.line, (segment) => {
+    segments.push(segment);
+    return segments.length < 2;
+  });
+  return segments.length === 1
+    ? parseThreadTellSegment(segments[0]!, script)
+    : null;
+}
+
+interface CommandCall {
+  command: string;
+  exitCode: number | null;
+  status: string;
+}
+
+export function parseSentThreadMessage({
+  command,
+  exitCode,
+  status,
+}: CommandCall): ThreadTellCommand | null {
+  if (status !== "completed" || (exitCode !== null && exitCode !== 0)) {
+    return null;
+  }
+  return parseThreadTellCommand(command);
 }

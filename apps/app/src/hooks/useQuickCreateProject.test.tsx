@@ -2,6 +2,7 @@
 
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { Host } from "@bb/domain";
+import { makeHost } from "@bb/test-helpers/domain-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useQuickCreateProject } from "./useQuickCreateProject";
 
@@ -27,7 +28,8 @@ vi.mock("@/hooks/mutations/project-mutations", () => ({
   useCreateProject: () => ({ isPending: false, mutate: mocks.mutate }),
 }));
 
-vi.mock("@/hooks/queries/host-queries", () => ({
+vi.mock("@/hooks/queries/host-queries", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/queries/host-queries")>()),
   useHosts: () => ({ data: mocks.hosts, isPending: mocks.isLoadingHosts }),
 }));
 
@@ -59,17 +61,11 @@ function host(
   name: string,
   status: Host["status"] = "connected",
 ): Host {
-  return {
+  return makeHost({
     id,
     name,
-    type: "persistent",
     status,
-    lastSeenAt: null,
-    maxPermissionMode: "full",
-    lastRejectedProtocolVersion: null,
-    createdAt: 0,
-    updatedAt: 0,
-  };
+  });
 }
 
 beforeEach(() => {
@@ -83,9 +79,6 @@ afterEach(() => {
 });
 
 describe("useQuickCreateProject", () => {
-  // Choosing between the native picker and the in-app dialog now lives in
-  // `useLocalPathPicker.openPathEntry`, so it is covered there. This hook only
-  // has to hand the create target to it.
   it("delegates opening to the shared path-entry surface", () => {
     const { result } = renderHook(() => useQuickCreateProject());
 
@@ -94,13 +87,22 @@ describe("useQuickCreateProject", () => {
     expect(mocks.openPathEntry).toHaveBeenCalledWith({ kind: "create" });
   });
 
-  it("exposes the machine list for the dialog's picker", () => {
-    mocks.hosts = [host("host_atum", "atum"), host("host_thoth", "Thoth")];
+  it("exposes every machine for the dialog's picker", () => {
+    mocks.hosts = [
+      host("host_atum", "atum"),
+      host("host_thoth", "Thoth"),
+      makeHost({
+        id: "host_sandbox",
+        name: "Sandbox",
+        machineProviderId: "modal-sandbox",
+      }),
+    ];
     const { result } = renderHook(() => useQuickCreateProject());
 
     expect(result.current.hosts.map((item) => item.id)).toEqual([
       "host_atum",
       "host_thoth",
+      "host_sandbox",
     ]);
   });
 });

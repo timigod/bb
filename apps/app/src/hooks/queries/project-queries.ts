@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useCallback, useRef } from "react";
 import type {
   CommandListResponse,
   ProjectBranchesResponse,
@@ -6,15 +7,17 @@ import type {
   PromptHistoryResponse,
   WorkspacePathListResponse,
 } from "@bb/server-contract";
+import type { FilePreview } from "@bb/client-core";
+import { loadFilePreview } from "@/lib/api";
 import {
-  buildFilePreview,
-  normalizeFilePreviewMimeType,
-  type FilePreview,
-} from "@/lib/file-preview";
-import { buildProjectFileContentUrl } from "@/lib/file-content-urls";
+  buildProjectAttachmentContentUrl,
+  buildProjectFileContentUrl,
+} from "@/lib/file-content-urls";
+import { readProjectBranchOptions } from "@/lib/project-branch-options";
 import { sdk } from "@/lib/sdk";
 import { useProjectDetailRealtimeSubscription } from "@/hooks/useRealtimeSubscription";
 import {
+  projectAttachmentPreviewQueryKey,
   projectCommandsQueryKey,
   projectFilePreviewQueryKey,
   projectPathsQueryKey,
@@ -22,19 +25,20 @@ import {
   projectSourceBranchesQueryKey,
 } from "./query-keys";
 import { resolveProjectSourceBranchesPlaceholder } from "./query-placeholders";
+import { useDebouncedBranchSearchQuery } from "./branch-search-debounce";
 import {
   PROMPT_HISTORY_STALE_TIME_MS,
   requireEnabledQueryArg,
+  requireProjectId,
+  type QueryOptions,
 } from "./query-helpers";
 import {
   EXPENSIVE_MANUAL_QUERY_POLICY,
-  FAST_FOCUS_OWNED_LIVE_QUERY_POLICY,
+  HEAVY_PAYLOAD_QUERY_POLICY,
+  REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
+  SESSION_STATIC_QUERY_POLICY,
   TYPEAHEAD_QUERY_POLICY,
 } from "./query-policies";
-
-interface QueryOptions {
-  enabled?: boolean;
-}
 
 interface BranchQueryOptions extends QueryOptions {
   limit?: number;
@@ -60,26 +64,7 @@ interface UseProjectCommandsArgs {
 }
 
 const PROJECT_SOURCE_BRANCHES_LIMIT = 50;
-
-function decodeBase64Bytes(content: string): Uint8Array {
-  const binaryContent = atob(content);
-  const bytes = new Uint8Array(binaryContent.length);
-  for (let index = 0; index < binaryContent.length; index += 1) {
-    bytes[index] = binaryContent.charCodeAt(index);
-  }
-  return bytes;
-}
-
-function requireProjectId(
-  projectId: string | undefined,
-  hookName: string,
-): string {
-  return requireEnabledQueryArg({
-    value: projectId,
-    hookName,
-    argName: "projectId",
-  });
-}
+const PROJECT_SOURCE_BRANCHES_STALE_MS = 30_000;
 
 function requireProviderId(
   providerId: string | undefined,
@@ -109,10 +94,15 @@ export function useProjectSourceBranches(
   const enabled =
     (options?.enabled ?? true) && Boolean(projectId) && Boolean(hostId);
   useProjectDetailRealtimeSubscription(projectId, { enabled });
-  const query = options?.query?.trim() ?? "";
+  const query = useDebouncedBranchSearchQuery(options?.query?.trim() ?? "");
   const limit = options?.limit ?? PROJECT_SOURCE_BRANCHES_LIMIT;
   const selectedBranch = options?.selectedBranch?.trim() ?? "";
-  return useQuery<ProjectBranchesResponse>({
+  const remoteRefreshRef = useRef<{
+    blockingSignal: AbortSignal | null;
+    inFlight: Promise<void> | null;
+    requested: boolean;
+  }>({ blockingSignal: null, inFlight: null, requested: false });
+  const result = useQuery<ProjectBranchesResponse>({
     queryKey: projectSourceBranchesQueryKey(
       projectId ?? "",
       hostId ?? "",
@@ -120,17 +110,31 @@ export function useProjectSourceBranches(
       limit,
       selectedBranch,
     ),
-    queryFn: ({ signal }) =>
-      sdk.projects.branches({
+    queryFn: ({ signal }) => {
+      const remoteRefresh = remoteRefreshRef.current;
+      const startsBlockingRefresh =
+        remoteRefresh.requested && remoteRefresh.blockingSignal === null;
+      const blocking =
+        startsBlockingRefresh || remoteRefresh.blockingSignal === signal;
+      if (startsBlockingRefresh) {
+        remoteRefresh.requested = false;
+        remoteRefresh.blockingSignal = signal;
+      }
+      const readBranches = blocking
+        ? sdk.projects.branches
+        : readProjectBranchOptions;
+      return readBranches({
         projectId: requireProjectId(projectId, "useProjectSourceBranches"),
         hostId: hostId ?? "",
         ...(query ? { query } : {}),
         ...(selectedBranch ? { selectedBranch } : {}),
         limit: String(limit),
         signal,
-      }),
+      });
+    },
     enabled,
-    ...FAST_FOCUS_OWNED_LIVE_QUERY_POLICY,
+    ...REALTIME_OWNED_NO_FOCUS_QUERY_POLICY,
+    staleTime: PROJECT_SOURCE_BRANCHES_STALE_MS,
     placeholderData: (previousData, previousQuery) =>
       projectId && hostId
         ? resolveProjectSourceBranchesPlaceholder({
@@ -143,6 +147,27 @@ export function useProjectSourceBranches(
           })
         : undefined,
   });
+  const refetch = result.refetch;
+  const refreshFromRemote = useCallback((): Promise<void> => {
+    const remoteRefresh = remoteRefreshRef.current;
+    if (remoteRefresh.inFlight) return remoteRefresh.inFlight;
+
+    const run = async (): Promise<void> => {
+      remoteRefresh.requested = true;
+      remoteRefresh.blockingSignal = null;
+      try {
+        await refetch();
+        if (remoteRefresh.requested) await refetch();
+      } finally {
+        remoteRefresh.requested = false;
+        remoteRefresh.blockingSignal = null;
+        remoteRefresh.inFlight = null;
+      }
+    };
+    remoteRefresh.inFlight = run();
+    return remoteRefresh.inFlight;
+  }, [refetch]);
+  return { ...result, refreshFromRemote };
 }
 
 export function useProjectPromptHistory(
@@ -206,10 +231,15 @@ export function useProjectPathSuggestions(args: UseProjectPathSuggestionsArgs) {
   });
 }
 
+interface ProjectFileRouting {
+  environmentId: string | null;
+  hostId: string | null;
+}
+
 export function useProjectFilePreview(
   projectId: string | undefined,
   path: string | null,
-  routing: { environmentId: string | null; hostId: string | null },
+  routing: ProjectFileRouting,
   options?: QueryOptions,
 ) {
   const enabled =
@@ -233,47 +263,47 @@ export function useProjectFilePreview(
         hookName: "useProjectFilePreview",
         argName: "path",
       });
-      const content = await sdk.projects.fileContent({
-        projectId: requiredProjectId,
-        path: requiredPath,
+      return loadFilePreview(
+        {
+          name: requiredPath.split("/").at(-1),
+          path: requiredPath,
+          url: buildProjectFileContentUrl(
+            requiredProjectId,
+            requiredPath,
+            routing,
+          ),
+        },
         signal,
-        ...(routing.environmentId !== null
-          ? { environmentId: routing.environmentId }
-          : routing.hostId !== null
-            ? { hostId: routing.hostId }
-            : {}),
-      });
-      const contentBytes =
-        content.contentEncoding === "base64"
-          ? decodeBase64Bytes(content.content)
-          : new TextEncoder().encode(content.content);
-      return buildFilePreview({
-        contentBytes,
-        mimeType: normalizeFilePreviewMimeType(content.mimeType),
-        name: requiredPath.split("/").at(-1),
-        path: requiredPath,
-        url: buildProjectFileContentUrl(requiredProjectId, requiredPath, {
-          ...(routing.environmentId !== null
-            ? { environmentId: routing.environmentId }
-            : routing.hostId !== null
-              ? { hostId: routing.hostId }
-              : {}),
-        }),
-      });
+      );
     },
     enabled,
     ...EXPENSIVE_MANUAL_QUERY_POLICY,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
   });
 }
 
-/**
- * Fetches the discoverable provider skills/commands for a project, scoped by
- * provider + environment. Backs `useCommandSuggestions`, which owns trigger
- * resolution, debounce, and mapping to menu rows, and serves both the
- * existing-thread follow-up composer and the new-thread composer. Unlike
- * mentions, the command list is enabled even with an empty query (commands show
- * the full list on `/`); the caller gates fetching via `options.enabled`.
- */
+export function projectCommandsQueryOptions(args: UseProjectCommandsArgs) {
+  return {
+    queryKey: projectCommandsQueryKey(
+      args.projectId,
+      args.providerId,
+      args.environmentId,
+      args.hostId,
+    ),
+    queryFn: ({ signal }: { signal: AbortSignal }) =>
+      sdk.projects.commands({
+        projectId: requireProjectId(args.projectId, "useProjectCommands"),
+        provider: requireProviderId(args.providerId, "useProjectCommands"),
+        signal,
+        ...(args.environmentId !== null
+          ? { environmentId: args.environmentId }
+          : args.hostId !== null
+            ? { hostId: args.hostId }
+            : {}),
+      }),
+  };
+}
+
 export function useProjectCommands(
   args: UseProjectCommandsArgs,
   options?: QueryOptions,
@@ -285,27 +315,32 @@ export function useProjectCommands(
   useProjectDetailRealtimeSubscription(args.projectId, { enabled });
 
   return useQuery<CommandListResponse>({
-    queryKey: projectCommandsQueryKey(
-      args.projectId,
-      args.providerId,
-      args.environmentId,
-      args.hostId,
-    ),
-    queryFn: ({ signal }) =>
-      sdk.projects.commands({
-        projectId: requireProjectId(args.projectId, "useProjectCommands"),
-        provider: requireProviderId(args.providerId, "useProjectCommands"),
-        signal,
-        ...(args.environmentId !== null
-          ? { environmentId: args.environmentId }
-          : args.hostId !== null
-            ? { hostId: args.hostId }
-            : {}),
-      }),
+    ...projectCommandsQueryOptions(args),
     enabled,
     ...TYPEAHEAD_QUERY_POLICY,
-    // Reopening the slash menu refreshes provider-native files that may have
-    // changed on disk; typing keeps the same key and still filters locally.
     staleTime: 0,
+  });
+}
+
+export function useProjectAttachmentPreview(
+  projectId: string,
+  path: string,
+  name: string,
+  options?: QueryOptions,
+) {
+  return useQuery<FilePreview>({
+    queryKey: projectAttachmentPreviewQueryKey(projectId, path),
+    queryFn: ({ signal }) =>
+      loadFilePreview(
+        {
+          name,
+          path: name,
+          url: buildProjectAttachmentContentUrl(projectId, path),
+        },
+        signal,
+      ),
+    enabled: options?.enabled ?? true,
+    ...SESSION_STATIC_QUERY_POLICY,
+    ...HEAVY_PAYLOAD_QUERY_POLICY,
   });
 }

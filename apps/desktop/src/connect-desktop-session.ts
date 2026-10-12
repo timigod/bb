@@ -17,14 +17,14 @@ const rpcSuccessSchema = z.object({
   }),
 });
 
-export interface DesktopSessionCookie {
+interface DesktopSessionCookie {
   domain: string;
   expiresAt: number;
   name: string;
   value: string;
 }
 
-export interface DesktopCookie {
+interface DesktopCookie {
   domain?: string;
   name: string;
   value: string;
@@ -45,7 +45,7 @@ export interface DesktopCookieStore {
   }): Promise<void>;
 }
 
-export type ConnectDesktopSessionFailureCode =
+type ConnectDesktopSessionFailureCode =
   | "cookie_install_failed"
   | "cookie_verification_failed"
   | "invalid_response"
@@ -54,7 +54,6 @@ export type ConnectDesktopSessionFailureCode =
   | "unauthorized";
 
 export type ConnectDesktopSessionResult =
-  /** `expiresAt` is the cookie's epoch-ms expiry, so callers can renew it. */
   | { expiresAt: number; ok: true }
   | {
       code: ConnectDesktopSessionFailureCode;
@@ -62,13 +61,11 @@ export type ConnectDesktopSessionResult =
       ok: false;
     };
 
-export type MintDesktopSessionCookieResult =
+type MintDesktopSessionCookieResult =
   | { cookie: DesktopSessionCookie; ok: true }
   | { code: ConnectDesktopSessionFailureCode; detail: string; ok: false };
 
-/** Where a session cookie comes from: the local plugin, or the connect gate. */
-export type DesktopSessionCookieSource =
-  () => Promise<MintDesktopSessionCookieResult>;
+type DesktopSessionCookieSource = () => Promise<MintDesktopSessionCookieResult>;
 
 function failure(
   code: ConnectDesktopSessionFailureCode,
@@ -81,10 +78,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * Mint through the local bb server's connect plugin. The server holds the
- * pairing secret and forwards the call to the gate.
- */
 export function createLocalServerCookieSource(args: {
   fetchImpl?: typeof fetch;
   localServerUrl: string;
@@ -123,10 +116,6 @@ export function createLocalServerCookieSource(args: {
   };
 }
 
-/**
- * Mint straight from the connect gate with the app's own cached machine
- * credential — no local bb server involved.
- */
 export function createCredentialCookieSource(args: {
   credential: ConnectCredential;
   fetchImpl?: typeof fetch;
@@ -140,8 +129,6 @@ export function createCredentialCookieSource(args: {
       return { cookie: session.cookie, ok: true };
     } catch (error) {
       if (error instanceof ConnectListError) {
-        // "not_paired" belongs to the plugin's own store, never to a call the
-        // app makes with a credential in hand.
         return failure(
           error.code === "not_paired" ? "invalid_response" : error.code,
           error.message,
@@ -149,6 +136,90 @@ export function createCredentialCookieSource(args: {
       }
       return failure("network", errorMessage(error));
     }
+  };
+}
+
+export function createAccountCookieSource(args: {
+  accountCookie: { name: string; value: string };
+  fetchImpl?: typeof fetch;
+  remoteServerUrl: string;
+  targetHandle: string;
+}): DesktopSessionCookieSource {
+  return async () => {
+    const connectApiOrigin = new URL(args.remoteServerUrl).origin;
+    const headers = {
+      cookie: `${args.accountCookie.name}=${args.accountCookie.value}`,
+    };
+    const fetchImpl = args.fetchImpl ?? globalThis.fetch;
+    let serversResponse: Response;
+    try {
+      serversResponse = await fetchImpl(
+        `${connectApiOrigin}/api/connect/servers`,
+        { headers },
+      );
+    } catch (error) {
+      return failure("network", errorMessage(error));
+    }
+    if (serversResponse.status === 401 || serversResponse.status === 403) {
+      return failure("unauthorized", "bb Connect sign-in is no longer valid");
+    }
+    if (!serversResponse.ok) {
+      return failure("request_rejected", `HTTP ${serversResponse.status}`);
+    }
+    let serversBody: unknown;
+    try {
+      serversBody = await serversResponse.json();
+    } catch (error) {
+      return failure("invalid_response", errorMessage(error));
+    }
+    const servers = z
+      .object({ servers: z.array(z.object({ handle: z.string() })) })
+      .safeParse(serversBody);
+    if (!servers.success) {
+      return failure(
+        "invalid_response",
+        "server list did not match the contract",
+      );
+    }
+    if (
+      !servers.data.servers.some(
+        (server) => server.handle === args.targetHandle,
+      )
+    ) {
+      return failure(
+        "unauthorized",
+        "this account does not own the selected server",
+      );
+    }
+    const url = `${connectApiOrigin}/api/connect/desktop-session`;
+    let response: Response;
+    try {
+      response = await fetchImpl(url, {
+        method: "POST",
+        headers,
+      });
+    } catch (error) {
+      return failure("network", errorMessage(error));
+    }
+    if (response.status === 401 || response.status === 403) {
+      return failure("unauthorized", "bb Connect sign-in is no longer valid");
+    }
+    if (!response.ok) {
+      return failure("request_rejected", `HTTP ${response.status}`);
+    }
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (error) {
+      return failure("invalid_response", errorMessage(error));
+    }
+    const parsed = z
+      .object({ cookie: rpcSuccessSchema.shape.result.shape.cookie })
+      .safeParse(body);
+    if (!parsed.success) {
+      return failure("invalid_response", "response did not match the contract");
+    }
+    return { cookie: parsed.data.cookie, ok: true };
   };
 }
 
