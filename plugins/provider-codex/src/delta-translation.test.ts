@@ -313,6 +313,46 @@ describe("codex thread lifecycle translation", () => {
     ]);
   });
 
+  it.each(["blocked", "usageLimited"] as const)(
+    "preserves native goal status %s",
+    (status) => {
+      const harness = createHarness();
+      expect(
+        harness.translate(
+          codexEvent("thread/goal/updated", {
+            threadId: "t1",
+            turnId: null,
+            goal: {
+              threadId: "t1",
+              objective: "Continue after the external limit clears",
+              status,
+              tokenBudget: null,
+              tokensUsed: 100,
+              timeUsedSeconds: 10,
+              createdAt: 0,
+              updatedAt: 10,
+            },
+          }),
+        ),
+      ).toEqual([
+        {
+          type: "thread/extensionState/updated",
+          threadId: "",
+          providerThreadId: "",
+          scope: threadScope(),
+          kind: "provider-codex/goal",
+          payload: {
+            objective: "Continue after the external limit clears",
+            status,
+            tokenBudget: null,
+            tokensUsed: 100,
+            timeUsedSeconds: 10,
+          },
+        },
+      ]);
+    },
+  );
+
   it("translates thread/compacted scoped to its vouched turn", () => {
     const harness = createHarness();
     const events = harness.translate(
