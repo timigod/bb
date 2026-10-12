@@ -633,7 +633,7 @@ describe("PluginHostManager", () => {
     await firstByteCall;
   });
 
-  it("keeps only the active artifact digest in each plugin cache", async () => {
+  it("retains older artifacts when host worker generations change", async () => {
     const versionedArtifact = (index: number): Buffer =>
       Buffer.concat([artifactSource, Buffer.from(`\n// version ${index}\n`)]);
     const sources = [
@@ -667,10 +667,10 @@ describe("PluginHostManager", () => {
       );
     }
 
-    const latestDigest = createHash("sha256").update(sources[2]).digest("hex");
-    await expect(
-      readdir(join(dataDir, "plugin-host-artifacts", "fixture")),
-    ).resolves.toEqual([latestDigest]);
+    const cachedDigests = await readdir(
+      join(dataDir, "plugin-host-artifacts", "fixture"),
+    );
+    expect(cachedDigests.sort()).toEqual([...sourceByDigest.keys()].sort());
   });
 
   it("evicts an idle worker and starts it again without reporting a crash", async () => {

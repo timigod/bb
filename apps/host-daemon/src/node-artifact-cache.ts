@@ -1,13 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  utimes,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { HOST_ARTIFACT_MAX_BYTES } from "@bb/host-daemon-contract";
 import type { HostDaemonLogger } from "./logger.js";
@@ -79,8 +71,6 @@ async function ensureCachedNodeArtifactUnlocked(
       { cacheDir: args.cacheDir, digest: args.digest },
       "Using cached host artifact",
     );
-    await touchDirectory(directory);
-    await pruneStaleDigests(args);
     return artifactPath;
   }
 
@@ -108,7 +98,6 @@ async function ensureCachedNodeArtifactUnlocked(
       await rm(staged, { force: true });
       throw error;
     }
-    await pruneStaleDigests(args);
     return artifactPath;
   }
   throw new Error(
@@ -134,42 +123,4 @@ async function isVerifiedCachedArtifact(
   }
   await rm(artifactPath, { force: true });
   return false;
-}
-
-async function touchDirectory(directory: string): Promise<void> {
-  const now = new Date();
-  await utimes(directory, now, now).catch(() => undefined);
-}
-
-async function pruneStaleDigests(
-  args: EnsureCachedNodeArtifactArgs,
-): Promise<void> {
-  let entries;
-  try {
-    entries = await readdir(args.cacheDir, { withFileTypes: true });
-  } catch (error) {
-    args.logger.warn(
-      { cacheDir: args.cacheDir, err: error },
-      "Failed to inspect host artifact cache",
-    );
-    return;
-  }
-  const stale = entries
-    .filter(
-      (entry) =>
-        entry.isDirectory() &&
-        entry.name !== args.digest &&
-        DIGEST_PATTERN.test(entry.name),
-    )
-    .map((entry) => join(args.cacheDir, entry.name));
-  const results = await Promise.allSettled(
-    stale.map((directory) => rm(directory, { recursive: true, force: true })),
-  );
-  results.forEach((result, index) => {
-    if (result.status === "fulfilled") return;
-    args.logger.warn(
-      { directory: stale[index], err: result.reason },
-      "Failed to prune stale host artifact",
-    );
-  });
 }
